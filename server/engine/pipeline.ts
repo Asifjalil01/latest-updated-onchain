@@ -626,6 +626,7 @@ export class BotOrchestrator {
 
       const candidates = Array.from(rawCandidates.values());
       this.funnel.discovered += candidates.length;
+      this.broadcastStatus();
 
       for (const candidate of candidates) {
         if (this.runState === 'killing') break;

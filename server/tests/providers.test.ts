@@ -39,13 +39,37 @@ test('HttpProvider: enforces HTTP 429 cooldown without immediate retry loops', a
   }
 });
 
-test('PumpPortalWsProvider: reports CLOSED when cleanly stopped/idle instead of HALF_OPEN', () => {
+test('PumpPortalWsProvider: reports CLOSED when idle or connecting cleanly and HALF_OPEN/OPEN only on errors', () => {
   const ws = new PumpPortalWsProvider();
   const initialHealth = ws.getHealth();
   assert.equal(initialHealth.circuitState, 'CLOSED');
   assert.equal(initialHealth.errorCount, 0);
 
+  // Start without forcing network dependency check — immediate CONNECTING state with 0 errors must be CLOSED
+  ws.start();
+  const connectingHealth = ws.getHealth();
+  assert.equal(connectingHealth.circuitState, 'CLOSED');
+
+  // Simulate socket connection failure -> HALF_OPEN (< 5 errors) then OPEN (>= 5 errors)
+  const internal = ws as unknown as {
+    ws: { readyState: number; emit?: (event: string, err?: Error) => void } | null;
+    consecutiveErrors: number;
+    errorCount: number;
+  };
+  internal.consecutiveErrors = 1;
+  internal.errorCount = 1;
+  if (internal.ws) {
+    // Ensure readyState !== OPEN
+    Object.defineProperty(internal.ws, 'readyState', { value: 3, configurable: true });
+  }
+  assert.equal(ws.getHealth().circuitState, 'HALF_OPEN');
+
+  internal.consecutiveErrors = 5;
+  internal.errorCount = 5;
+  assert.equal(ws.getHealth().circuitState, 'OPEN');
+
   ws.stop();
   const stoppedHealth = ws.getHealth();
   assert.equal(stoppedHealth.circuitState, 'CLOSED');
 });
+

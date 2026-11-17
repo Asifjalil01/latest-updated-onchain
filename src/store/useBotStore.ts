@@ -83,6 +83,7 @@ interface BotStoreState {
   apiFetch: <T>(path: string, init?: RequestInit) => Promise<T>;
   hydrateAll: () => Promise<void>;
   refreshModeData: (modeOverride?: ExecutionMode) => Promise<void>;
+  refreshScannerAndHealth: () => Promise<void>;
   connectSse: () => () => void;
 }
 
@@ -90,6 +91,8 @@ const SESSION_TOKEN_KEY = 'ssb_api_token';
 const THEME_KEY = 'ssb_theme';
 const CB_KEY = 'ssb_cb_safe';
 const TUTORIAL_KEY = 'ssb_tutorial_done';
+
+let scannerRefreshInFlight: Promise<void> | null = null;
 
 export const useBotStore = create<BotStoreState>((set, get) => ({
   apiToken: typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SESSION_TOKEN_KEY) : null,
@@ -327,16 +330,60 @@ export const useBotStore = create<BotStoreState>((set, get) => ({
     });
   },
 
+  refreshScannerAndHealth: async () => {
+    const { apiToken, apiFetch } = get();
+    if (!apiToken) return;
+    if (scannerRefreshInFlight) return scannerRefreshInFlight;
+    scannerRefreshInFlight = (async () => {
+      try {
+        const [scanRes, healthRes] = await Promise.all([
+          apiFetch<{ seenTokens: SeenTokenRecord[]; rejections: RejectionRecord[] }>(
+            '/api/scanner/state'
+          ),
+          apiFetch<{ sources: SourceHealthRecord[]; rpcs: RpcEndpointHealth[] }>(
+            '/api/source-health'
+          ),
+        ]);
+        set({
+          seenTokens: scanRes.seenTokens,
+          rejections: scanRes.rejections,
+          sources: healthRes.sources,
+          rpcs: healthRes.rpcs,
+        });
+      } catch {
+        // ignore transient refresh failure; next poll or SSE event will retry
+      } finally {
+        scannerRefreshInFlight = null;
+      }
+    })();
+    return scannerRefreshInFlight;
+  },
+
   connectSse: () => {
     const token = get().apiToken;
     if (!token) return () => undefined;
 
     const es = new EventSource(`/api/stream?token=${encodeURIComponent(token)}`);
+    let rejectionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
     es.addEventListener('status', (ev) => {
       try {
         const data = JSON.parse((ev as MessageEvent).data) as BotStatusSnapshot;
+        const prev = get().status;
         set({ status: data });
+        const scanChanged =
+          !prev ||
+          prev.lastScanAtMs !== data.lastScanAtMs ||
+          prev.runState !== data.runState ||
+          prev.funnel.discovered !== data.funnel.discovered ||
+          prev.funnel.validated !== data.funnel.validated ||
+          prev.funnel.filtered !== data.funnel.filtered ||
+          prev.funnel.securityPassed !== data.funnel.securityPassed ||
+          prev.funnel.scored !== data.funnel.scored ||
+          prev.funnel.bought !== data.funnel.bought;
+        if (scanChanged) {
+          void get().refreshScannerAndHealth();
+        }
       } catch {
         // ignore
       }
@@ -388,6 +435,12 @@ export const useBotStore = create<BotStoreState>((set, get) => ({
       try {
         const rej = JSON.parse((ev as MessageEvent).data) as RejectionRecord;
         set((s) => ({ rejections: [rej, ...s.rejections].slice(0, 200) }));
+        if (!rejectionRefreshTimer) {
+          rejectionRefreshTimer = setTimeout(() => {
+            rejectionRefreshTimer = null;
+            void get().refreshScannerAndHealth();
+          }, 1200);
+        }
       } catch {
         // ignore
       }
@@ -407,6 +460,10 @@ export const useBotStore = create<BotStoreState>((set, get) => ({
     });
 
     return () => {
+      if (rejectionRefreshTimer) {
+        clearTimeout(rejectionRefreshTimer);
+        rejectionRefreshTimer = null;
+      }
       es.close();
     };
   },

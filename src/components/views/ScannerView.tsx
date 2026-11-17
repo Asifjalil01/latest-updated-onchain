@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { RotateCcw, Search, X } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import { SemanticStatusText, formatUsd, maskMint } from '../ui/Primitives';
@@ -8,11 +8,11 @@ export function ScannerView() {
   const {
     status,
     seenTokens,
-    rejections,
     sources,
     colorBlindSafe,
     apiFetch,
     hydrateAll,
+    refreshScannerAndHealth,
     pushToast,
   } = useBotStore();
 
@@ -23,6 +23,18 @@ export function ScannerView() {
   const [selectedToken, setSelectedToken] = useState<SeenTokenRecord | null>(null);
   const [hoveredErrorSource, setHoveredErrorSource] = useState<string | null>(null);
 
+  useEffect(() => {
+    void refreshScannerAndHealth();
+  }, [refreshScannerAndHealth]);
+
+  useEffect(() => {
+    if (status?.runState !== 'running') return;
+    const timer = setInterval(() => {
+      void refreshScannerAndHealth();
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [status?.runState, refreshScannerAndHealth]);
+
   const funnel = status?.funnel ?? {
     discovered: 0,
     validated: 0,
@@ -31,6 +43,16 @@ export function ScannerView() {
     scored: 0,
     bought: 0,
   };
+
+  const decisionCounts = useMemo(() => {
+    let buy = 0;
+    let reject = 0;
+    for (const t of seenTokens) {
+      if (t.lastDecision === 'BUY') buy += 1;
+      else reject += 1;
+    }
+    return { all: seenTokens.length, buy, reject };
+  }, [seenTokens]);
 
   const filteredTokens = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -298,27 +320,43 @@ export function ScannerView() {
           </div>
 
           <div className="flex p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
-            {(['ALL', 'BUY', 'REJECT'] as const).map((f) => (
+            {([
+              { id: 'ALL', label: `ALL (${decisionCounts.all})` },
+              { id: 'BUY', label: `BUY (${decisionCounts.buy})` },
+              { id: 'REJECT', label: `REJECT (${decisionCounts.reject})` },
+            ] as const).map((f) => (
               <button
-                key={f}
+                key={f.id}
                 type="button"
-                onClick={() => setDecisionFilter(f)}
-                className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                  decisionFilter === f
+                onClick={() => setDecisionFilter(f.id)}
+                className={`px-3 py-1 rounded-lg text-xs font-medium tabular-nums ${
+                  decisionFilter === f.id
                     ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
                     : 'text-slate-500'
                 }`}
               >
-                {f}
+                {f.label}
               </button>
             ))}
           </div>
         </div>
 
-        {filteredTokens.length === 0 && rejections.length === 0 ? (
+        {seenTokens.length === 0 ? (
           <div className="py-10 text-center text-xs text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl">
-            No tokens evaluated yet. Click <strong>Scan Once</strong> in the top bar or probe a mint
-            above.
+            {status?.runState === 'running' ? (
+              <>
+                Discovery scan is active — evaluated tokens will appear here live as each candidate completes checks.
+              </>
+            ) : (
+              <>
+                No tokens evaluated in the seen cache yet. Click <strong>Scan Once</strong> in the top bar, <strong>Start Bot</strong>, or probe a mint above.
+              </>
+            )}
+          </div>
+        ) : filteredTokens.length === 0 ? (
+          <div className="py-10 text-center text-xs text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl">
+            No evaluated tokens match the current filter ({decisionFilter}
+            {search.trim() ? ` · "${search.trim()}"` : ''}).
           </div>
         ) : (
           <div className="overflow-x-auto">

@@ -48,9 +48,12 @@ export class PumpPortalWsProvider {
 
   private connect(): void {
     if (!this.enabled) return;
+    let openedThisAttempt = false;
+    let erroredThisAttempt = false;
     try {
       this.ws = new WebSocket('wss://pumpportal.fun/api/data');
       this.ws.on('open', () => {
+        openedThisAttempt = true;
         this.lastOkMs = Date.now();
         this.lastError = null;
         this.consecutiveErrors = 0;
@@ -96,6 +99,7 @@ export class PumpPortalWsProvider {
       });
 
       this.ws.on('error', (err: Error) => {
+        erroredThisAttempt = true;
         this.errorCount += 1;
         this.consecutiveErrors += 1;
         this.lastError = err.message;
@@ -105,6 +109,15 @@ export class PumpPortalWsProvider {
       this.ws.on('close', () => {
         this.ws = null;
         if (this.enabled) {
+          if (!openedThisAttempt && !erroredThisAttempt) {
+            this.errorCount += 1;
+            this.consecutiveErrors += 1;
+            this.lastError = 'WebSocket closed before opening';
+            this.recentErrors = [
+              { message: 'WebSocket closed before opening', atMs: Date.now() },
+              ...this.recentErrors,
+            ].slice(0, 10);
+          }
           this.reconnectTimer = setTimeout(() => this.connect(), 15_000);
         }
       });
@@ -128,7 +141,7 @@ export class PumpPortalWsProvider {
   getHealth(): SourceHealthRecord {
     const isConnected = Boolean(this.ws && this.ws.readyState === WebSocket.OPEN);
     let circuitState: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
-    if (this.enabled && !isConnected) {
+    if (this.enabled && !isConnected && this.consecutiveErrors > 0) {
       circuitState = this.consecutiveErrors >= 5 ? 'OPEN' : 'HALF_OPEN';
     }
     return {
