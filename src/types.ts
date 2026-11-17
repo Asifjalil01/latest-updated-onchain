@@ -57,4 +57,5 @@ export type AppTab =
   | 'settings'
   | 'wallets'
   | 'logs'
+  | 'pipeline'
   | 'risk';

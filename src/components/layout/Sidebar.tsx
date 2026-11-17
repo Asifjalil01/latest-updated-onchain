@@ -10,6 +10,7 @@ import {
   Radar,
   Settings,
   ShieldAlert,
+  Sliders,
   Terminal,
   Wallet,
 } from 'lucide-react';
@@ -25,6 +26,7 @@ const NAV_ITEMS: Array<{ id: AppTab; label: string; icon: React.ComponentType<{ 
   { id: 'settings', label: 'Settings', icon: Settings },
   { id: 'wallets', label: 'Wallets & Signer', icon: Wallet },
   { id: 'logs', label: 'Event Logs', icon: Terminal },
+  { id: 'pipeline', label: 'Pipeline Rules & Config', icon: Sliders },
   { id: 'risk', label: 'Risk Centre', icon: ShieldAlert },
 ];
 

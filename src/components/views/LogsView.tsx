@@ -1,10 +1,10 @@
 import React, { useMemo, useState } from 'react';
-import { Search } from 'lucide-react';
+import { Search, Trash2 } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import type { LogSeverity } from '../../types';
 
 export function LogsView() {
-  const { logs } = useBotStore();
+  const { logs, apiFetch, hydrateAll, pushToast } = useBotStore();
   const [severity, setSeverity] = useState<'ALL' | LogSeverity>('ALL');
   const [query, setQuery] = useState('');
 
@@ -20,6 +20,16 @@ export function LogsView() {
     });
   }, [logs, severity, query]);
 
+  const handleClearLogs = async () => {
+    try {
+      await apiFetch('/api/logs', { method: 'DELETE' });
+      await hydrateAll();
+      pushToast({ kind: 'info', title: 'Event logs cleared' });
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Failed to clear logs' });
+    }
+  };
+
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-4">
@@ -33,6 +43,15 @@ export function LogsView() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void handleClearLogs()}
+            className="px-3 py-1.5 rounded-xl text-xs font-medium border border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 inline-flex items-center gap-1.5 whitespace-nowrap"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>Clear Logs</span>
+          </button>
+
           <div className="relative">
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
             <input

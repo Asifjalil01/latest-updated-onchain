@@ -273,6 +273,12 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.json({ logs: orchestrator.db.getLogs(limit, severity) });
   });
 
+  router.delete('/logs', (_req: Request, res: Response) => {
+    orchestrator.db.clearLogs();
+    orchestrator.log('INFO', 'LOGS', 'Event logs cleared.');
+    res.json({ ok: true });
+  });
+
   router.get('/scanner/state', (_req: Request, res: Response) => {
     res.json({
       seenTokens: orchestrator.db.getSeenTokens(300),

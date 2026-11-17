@@ -67,6 +67,35 @@ export function ScannerView() {
     });
   }, [seenTokens, search, decisionFilter]);
 
+  const [pageSize, setPageSize] = useState<number>(50);
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [customPageSizeInput, setCustomPageSizeInput] = useState<string>('50');
+
+  const totalPages = Math.ceil(filteredTokens.length / pageSize) || 1;
+  const paginatedTokens = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return filteredTokens.slice(start, start + pageSize);
+  }, [filteredTokens, currentPage, pageSize]);
+
+  const handlePageSizeChange = (val: string) => {
+    if (val === 'custom') return;
+    const num = parseInt(val, 10);
+    if (!isNaN(num) && num > 0) {
+      setPageSize(num);
+      setCustomPageSizeInput(String(num));
+      setCurrentPage(1);
+    }
+  };
+
+  const handleCustomPageSizeSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const num = parseInt(customPageSizeInput, 10);
+    if (!isNaN(num) && num > 0) {
+      setPageSize(num);
+      setCurrentPage(1);
+    }
+  };
+
   const handleResetSeen = async () => {
     await apiFetch('/api/seen-tokens/reset', { method: 'POST' });
     await hydrateAll();
@@ -341,6 +370,7 @@ export function ScannerView() {
           </div>
         </div>
 
+
         {seenTokens.length === 0 ? (
           <div className="py-10 text-center text-xs text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl">
             {status?.runState === 'running' ? (
@@ -359,54 +389,109 @@ export function ScannerView() {
             {search.trim() ? ` · "${search.trim()}"` : ''}).
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
-                  <th className="py-2.5 px-3 font-medium whitespace-nowrap">Token</th>
-                  <th className="py-2.5 px-3 font-medium whitespace-nowrap">Source / DEX</th>
-                  <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">Liquidity</th>
-                  <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">Scores (Q / T)</th>
-                  <th className="py-2.5 px-3 font-medium whitespace-nowrap">Decision</th>
-                  <th className="py-2.5 px-3 font-medium whitespace-nowrap">Reason</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70">
-                {filteredTokens.map((t) => (
-                  <tr
-                    key={t.mint}
-                    onClick={() => setSelectedToken(t)}
-                    className="cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-900/50 transition-colors"
-                  >
-                    <td className="py-2.5 px-3">
-                      <span className="font-semibold text-slate-900 dark:text-slate-100">
-                        {t.symbol}
-                      </span>{' '}
-                      <span className="font-mono text-slate-500">{maskMint(t.mint)}</span>
-                    </td>
-                    <td className="py-2.5 px-3 text-slate-500">
-                      {t.source} · {t.dex}
-                    </td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums">
-                      {formatUsd(t.liquidityUsd, true)}
-                    </td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums">
-                      {t.lastQualityScore} / {t.lastTradeScore}
-                    </td>
-                    <td className="py-2.5 px-3">
-                      <SemanticStatusText
-                        status={t.lastDecision === 'BUY' ? 'ok' : 'error'}
-                        text={t.lastDecision}
-                        colorBlindSafe={colorBlindSafe}
-                      />
-                    </td>
-                    <td className="py-2.5 px-3 text-slate-600 dark:text-slate-300 max-w-md truncate">
-                      {t.lastReason}
-                    </td>
+          <div className="space-y-4">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
+                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">Token</th>
+                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">Source / DEX</th>
+                    <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">Liquidity</th>
+                    <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">Scores (Q / T)</th>
+                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">Decision</th>
+                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">Reason</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70">
+                  {paginatedTokens.map((t) => (
+                    <tr
+                      key={t.mint}
+                      onClick={() => setSelectedToken(t)}
+                      className="cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-900/50 transition-colors"
+                    >
+                      <td className="py-2.5 px-3">
+                        <span className="font-semibold text-slate-900 dark:text-slate-100">
+                          {t.symbol}
+                        </span>{' '}
+                        <span className="font-mono text-slate-500">{maskMint(t.mint)}</span>
+                      </td>
+                      <td className="py-2.5 px-3 text-slate-500">
+                        {t.source} · {t.dex}
+                      </td>
+                      <td className="py-2.5 px-3 text-right font-mono tabular-nums">
+                        {formatUsd(t.liquidityUsd, true)}
+                      </td>
+                      <td className="py-2.5 px-3 text-right font-mono tabular-nums">
+                        {t.lastQualityScore} / {t.lastTradeScore}
+                      </td>
+                      <td className="py-2.5 px-3">
+                        <SemanticStatusText
+                          status={t.lastDecision === 'BUY' ? 'ok' : 'error'}
+                          text={t.lastDecision}
+                          colorBlindSafe={colorBlindSafe}
+                        />
+                      </td>
+                      <td className="py-2.5 px-3 text-slate-600 dark:text-slate-300 max-w-md truncate">
+                        {t.lastReason}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination Controls */}
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-100 dark:border-slate-800/70 text-xs">
+              <div className="flex items-center gap-2 text-slate-500">
+                <span>Showing {(currentPage - 1) * pageSize + 1}–{Math.min(filteredTokens.length, currentPage * pageSize)} of {filteredTokens.length} tokens</span>
+                <select
+                  aria-label="Coins per page"
+                  value={[50, 100, 150, 200].includes(pageSize) ? pageSize : 'custom'}
+                  onChange={(e) => handlePageSizeChange(e.target.value)}
+                  className="px-2 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 font-mono"
+                >
+                  <option value={50}>50 per page</option>
+                  <option value={100}>100 per page</option>
+                  <option value={150}>150 per page</option>
+                  <option value={200}>200 per page</option>
+                  <option value="custom">Custom</option>
+                </select>
+                <form onSubmit={handleCustomPageSizeSubmit} className="inline-flex items-center gap-1">
+                  <input
+                    aria-label="Custom coins per page"
+                    type="number"
+                    min="1"
+                    max="1000"
+                    value={customPageSizeInput}
+                    onChange={(e) => setCustomPageSizeInput(e.target.value)}
+                    className="w-16 px-2 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-center"
+                  />
+                  <button type="submit" className="px-2 py-1 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-300">Set</button>
+                </form>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  disabled={currentPage <= 1}
+                  className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 disabled:opacity-40"
+                >
+                  Previous
+                </button>
+                <span className="font-mono text-slate-600 dark:text-slate-300">
+                  Page {currentPage} of {totalPages}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={currentPage >= totalPages}
+                  className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 disabled:opacity-40"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </section>

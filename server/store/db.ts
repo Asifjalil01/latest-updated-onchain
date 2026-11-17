@@ -781,6 +781,10 @@ export class BotDatabase {
     }));
   }
 
+  clearLogs(): void {
+    this.db.prepare('DELETE FROM events').run();
+  }
+
   recordPaperVsLiveGap(entry: Omit<PaperVsLiveGapRecord, 'id'>): void {
     this.db
       .prepare(

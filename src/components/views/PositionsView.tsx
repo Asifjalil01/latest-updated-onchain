@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { ExternalLink, RefreshCw, ShieldAlert } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
-import { PnlText, SparklineSvg, formatSol, formatTokenPriceUsd, maskMint } from '../ui/Primitives';
+import { PnlText, SparklineSvg, formatSol, formatTokenPriceUsd, formatUsd, maskMint } from '../ui/Primitives';
 import type { PositionRecord } from '../../types';
 
 export function PositionsView() {
@@ -244,11 +244,14 @@ export function PositionsView() {
 
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-100 dark:border-slate-800/70">
                   <div>
-                    <span className="text-[11px] text-slate-500 block">Entry / Current</span>
-                    <span className="font-mono text-xs tabular-nums block">
+                    <span className="text-[11px] text-slate-500 block">Entry Price</span>
+                    <span className="font-mono text-xs font-semibold tabular-nums block text-slate-900 dark:text-slate-100">
                       {formatTokenPriceUsd(pos.entryPriceUsd)}
                     </span>
-                    <span className="font-mono text-sm font-semibold tabular-nums">
+                  </div>
+                  <div>
+                    <span className="text-[11px] text-slate-500 block">Current Price</span>
+                    <span className="font-mono text-xs font-semibold tabular-nums block text-teal-600 dark:text-teal-400">
                       {formatTokenPriceUsd(pos.currentPriceUsd)}
                     </span>
                   </div>
@@ -271,20 +274,12 @@ export function PositionsView() {
                       colorBlindSafe={colorBlindSafe}
                     />
                   </div>
-                  <div className="flex flex-col items-end justify-center">
-                    <SparklineSvg
-                      data={pos.priceHistory}
-                      positive={netPnlSol >= 0}
-                      width={110}
-                      height={32}
-                    />
-                  </div>
                 </div>
 
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono tabular-nums pt-3 border-t border-slate-100 dark:border-slate-800/70 text-slate-600 dark:text-slate-300">
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block">Size In</span>
-                    {formatSol(pos.solIn, 4)}
+                    {formatSol(pos.solIn, 4)} <span className="text-slate-500 text-[11px]">({formatUsd(pos.solIn * solUsd, false)})</span>
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block">Break-Even</span>
@@ -304,6 +299,30 @@ export function PositionsView() {
                     {pos.exitParams.takeProfitPct}%
                   </div>
                 </div>
+
+                {/* Trailing Progress Bar */}
+                {(() => {
+                  const armingTargetPct = pos.exitParams.roundTripCostPct + 1.0;
+                  const progressPct = pos.trailingArmed
+                    ? Math.min(100, Math.max(0, ((grossPct - (pos.trailingFloorPct ?? 0)) / (pos.exitParams.takeProfitPct - (pos.trailingFloorPct ?? 0))) * 100))
+                    : Math.min(100, Math.max(0, (grossPct / armingTargetPct) * 100));
+                  return (
+                    <div className="space-y-1.5 pt-2">
+                      <div className="flex justify-between text-[11px] text-slate-500 font-mono">
+                        <span>{pos.trailingArmed ? 'Trailing Ladder Active (Progress to TP)' : `Arming Progress (>+${armingTargetPct.toFixed(1)}%)`}</span>
+                        <span className="font-semibold text-teal-600 dark:text-teal-400">{grossPct >= 0 ? `+${grossPct.toFixed(2)}%` : `${grossPct.toFixed(2)}%`}</span>
+                      </div>
+                      <div className="h-2 w-full rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ${
+                            pos.trailingArmed ? 'bg-gradient-to-r from-teal-500 to-emerald-400' : 'bg-sky-500'
+                          }`}
+                          style={{ width: `${Math.max(4, progressPct)}%` }}
+                        />
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {pos.lastSellError && (
                   <p className="text-xs text-rose-500 font-mono">

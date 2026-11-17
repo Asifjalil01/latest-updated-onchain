@@ -16,6 +16,7 @@ import { HistoryView } from './components/views/HistoryView';
 import { SettingsView } from './components/views/SettingsView';
 import { WalletsView } from './components/views/WalletsView';
 import { LogsView } from './components/views/LogsView';
+import { PipelineConfigView } from './components/views/PipelineConfigView';
 import { RiskCentreView } from './components/views/RiskCentreView';
 
 export default function App() {
@@ -80,6 +81,8 @@ export default function App() {
         return <WalletsView />;
       case 'logs':
         return <LogsView />;
+      case 'pipeline':
+        return <PipelineConfigView />;
       case 'risk':
         return <RiskCentreView />;
       default:
