@@ -10,7 +10,8 @@ import type {
 export function classifyToken(
   token: CandidateToken,
   poolAgeMinutes: number,
-  allowCustomYoungAge = false
+  allowCustomYoungAge = false,
+  customMinLiquidityUsd = 10_000
 ): {
   tokenClass: TokenClass;
   sizeMultiplier: number;
@@ -24,7 +25,8 @@ export function classifyToken(
   if (token.liquidityUsd >= 75_000 && poolAgeMinutes >= 180) {
     return { tokenClass: 'early_stage', sizeMultiplier: 0.7 };
   }
-  if (token.liquidityUsd >= 10_000 && (poolAgeMinutes >= 30 || allowCustomYoungAge)) {
+  const memeFloorUsd = allowCustomYoungAge ? Math.min(10_000, Math.max(50, customMinLiquidityUsd)) : 10_000;
+  if (token.liquidityUsd >= memeFloorUsd && (poolAgeMinutes >= 30 || allowCustomYoungAge)) {
     return { tokenClass: 'meme', sizeMultiplier: 0.4 };
   }
   return { tokenClass: 'high_risk_micro', sizeMultiplier: 0 };
@@ -44,13 +46,25 @@ export function scoreCandidate(params: {
     settings.customAgeWindowEnabled &&
     poolAgeMinutes >= settings.customMinPoolAgeMinutes &&
     poolAgeMinutes <= settings.customMaxPoolAgeMinutes;
-  const { tokenClass, sizeMultiplier } = classifyToken(token, poolAgeMinutes, allowCustomYoungAge);
+  const { tokenClass, sizeMultiplier } = classifyToken(
+    token,
+    poolAgeMinutes,
+    allowCustomYoungAge,
+    settings.minLiquidityUsd
+  );
 
   // Quality score components (max 100)
   const safetyPts = securityReport.passed
     ? Math.max(0, 30 - (securityReport.rugCheckScore ?? 30) * 0.5)
     : 0;
-  const liquidityPts = Math.min(25, (Math.log10(Math.max(1, token.liquidityUsd)) - 4) * 12.5);
+  const baseLiqLog = Math.log10(
+    Math.max(50, allowCustomYoungAge ? Math.min(10_000, settings.minLiquidityUsd) : 10_000)
+  );
+  const liqSpan = Math.max(1, 6 - baseLiqLog);
+  const liquidityPts = Math.min(
+    25,
+    ((Math.log10(Math.max(1, token.liquidityUsd)) - baseLiqLog) / liqSpan) * 25
+  );
   const top10 = securityReport.top10HoldersPct ?? 50;
   const holderPts = Math.max(0, Math.min(20, ((40 - top10) / 30) * 20));
   const contractPts =

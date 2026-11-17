@@ -24,9 +24,25 @@ test('settingsValidation: accepts 90% SL with 25% TP and highlights specific inv
     customMaxPoolAgeMinutes: 10,
   });
 
+  const customMicroLiquidity = validateSettingsDraft({
+    ...DEFAULT_SETTINGS,
+    customAgeWindowEnabled: true,
+    customMinPoolAgeMinutes: 1,
+    customMaxPoolAgeMinutes: 5,
+    minLiquidityUsd: 300,
+  });
+  assert.equal(customMicroLiquidity.valid, true);
+
+  const defaultLiqTooLow = validateSettingsDraft({
+    ...DEFAULT_SETTINGS,
+    customAgeWindowEnabled: false,
+    minLiquidityUsd: 2000,
+  });
+  assert.equal(defaultLiqTooLow.valid, false);
+  assert.match(defaultLiqTooLow.fieldErrors.minLiquidityUsd, /\$10,000/);
+
   assert.equal(invalidCase.valid, false);
   assert.match(invalidCase.fieldErrors.maxOpenPositions, /between 1 and 10/);
-  assert.match(invalidCase.fieldErrors.minLiquidityUsd, /\$10,000/);
   assert.match(invalidCase.fieldErrors.minQualityScore, /between 50 and 100/);
   assert.match(invalidCase.fieldErrors['trailingLadder.0.allowedDropPct'], /less than Peak %/);
   assert.match(invalidCase.fieldErrors.customMaxPoolAgeMinutes, />= Min Coin Age/);

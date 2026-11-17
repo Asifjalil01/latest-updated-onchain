@@ -17,6 +17,7 @@ export class PumpPortalWsProvider {
   private lastOkMs: number | null = null;
   private errorCount = 0;
   private lastError: string | null = null;
+  private recentErrors: Array<{ message: string; atMs: number }> = [];
   private reconnectTimer: NodeJS.Timeout | null = null;
 
   start(): void {
@@ -82,6 +83,7 @@ export class PumpPortalWsProvider {
       this.ws.on('error', (err: Error) => {
         this.errorCount += 1;
         this.lastError = err.message;
+        this.recentErrors = [{ message: err.message, atMs: Date.now() }, ...this.recentErrors].slice(0, 10);
       });
 
       this.ws.on('close', () => {
@@ -92,7 +94,9 @@ export class PumpPortalWsProvider {
       });
     } catch (err) {
       this.errorCount += 1;
-      this.lastError = err instanceof Error ? err.message : String(err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.lastError = errMsg;
+      this.recentErrors = [{ message: errMsg, atMs: Date.now() }, ...this.recentErrors].slice(0, 10);
     }
   }
 
@@ -110,6 +114,7 @@ export class PumpPortalWsProvider {
       lastOkMs: this.lastOkMs,
       errorCount: this.errorCount,
       lastError: this.lastError,
+      recentErrors: [...this.recentErrors],
       rateLimitedUntilMs: null,
       circuitState: this.ws && this.ws.readyState === WebSocket.OPEN ? 'CLOSED' : 'HALF_OPEN',
     };

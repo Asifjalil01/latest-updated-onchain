@@ -43,6 +43,7 @@ export class HttpProvider {
   private lastOkMs: number | null = null;
   private errorCount = 0;
   private lastError: string | null = null;
+  private recentErrors: Array<{ message: string; atMs: number }> = [];
 
   constructor(options: ProviderOptions) {
     this.sourceName = options.sourceName;
@@ -76,6 +77,7 @@ export class HttpProvider {
       lastOkMs: this.lastOkMs,
       errorCount: this.errorCount,
       lastError: this.lastError,
+      recentErrors: [...this.recentErrors],
       rateLimitedUntilMs:
         domainState.rateLimitedUntilMs > Date.now() ? domainState.rateLimitedUntilMs : null,
       circuitState: this.circuitState,
@@ -181,7 +183,9 @@ export class HttpProvider {
 
     this.errorCount += 1;
     this.consecutiveFailures += 1;
-    this.lastError = lastErr ? lastErr.message : 'Unknown provider failure';
+    const errMsg = lastErr ? lastErr.message : 'Unknown provider failure';
+    this.lastError = errMsg;
+    this.recentErrors = [{ message: errMsg, atMs: Date.now() }, ...this.recentErrors].slice(0, 10);
     if (this.consecutiveFailures >= this.circuitFailureThreshold) {
       this.circuitState = 'OPEN';
       this.circuitOpenedAtMs = Date.now();

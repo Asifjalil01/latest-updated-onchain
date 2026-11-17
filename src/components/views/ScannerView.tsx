@@ -21,6 +21,7 @@ export function ScannerView() {
   const [probeMint, setProbeMint] = useState('');
   const [probing, setProbing] = useState(false);
   const [selectedToken, setSelectedToken] = useState<SeenTokenRecord | null>(null);
+  const [hoveredErrorSource, setHoveredErrorSource] = useState<string | null>(null);
 
   const funnel = status?.funnel ?? {
     discovered: 0,
@@ -147,10 +148,17 @@ export function ScannerView() {
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
             {sources.map((src) => {
               const healthy = src.circuitState === 'CLOSED' && src.errorCount < 5;
+              const isHoveringErrors = hoveredErrorSource === src.source;
+              const errorEntries =
+                src.recentErrors && src.recentErrors.length > 0
+                  ? src.recentErrors
+                  : src.lastError
+                    ? [{ message: src.lastError, atMs: src.lastOkMs ?? Date.now() }]
+                    : [];
               return (
                 <div
                   key={src.source}
-                  className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 text-xs space-y-1"
+                  className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 text-xs space-y-1 relative"
                 >
                   <div className="flex items-center justify-between">
                     <span className="font-semibold text-slate-800 dark:text-slate-200">
@@ -164,7 +172,76 @@ export function ScannerView() {
                   </div>
                   <div className="flex items-center justify-between text-slate-500 font-mono tabular-nums">
                     <span>Items: {src.itemsCount}</span>
-                    <span>Errors: {src.errorCount}</span>
+                    <div
+                      className="relative"
+                      onMouseEnter={() => setHoveredErrorSource(src.source)}
+                      onMouseLeave={() =>
+                        setHoveredErrorSource((curr) => (curr === src.source ? null : curr))
+                      }
+                    >
+                      <button
+                        type="button"
+                        onFocus={() => setHoveredErrorSource(src.source)}
+                        onBlur={() =>
+                          setHoveredErrorSource((curr) => (curr === src.source ? null : curr))
+                        }
+                        aria-label={`${src.source} errors: ${src.errorCount}`}
+                        className={
+                          src.errorCount > 0
+                            ? `font-mono underline decoration-dotted underline-offset-2 cursor-help ${
+                                src.errorCount >= 5 || src.circuitState === 'OPEN'
+                                  ? 'text-rose-500 font-semibold'
+                                  : 'text-amber-500 font-semibold'
+                              }`
+                            : 'font-mono text-slate-500 cursor-default'
+                        }
+                      >
+                        Errors: {src.errorCount}
+                      </button>
+
+                      {isHoveringErrors && (
+                        <div
+                          role="tooltip"
+                          className="absolute right-0 top-full mt-1.5 z-40 w-72 sm:w-80 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-900 text-slate-100 p-3 shadow-xl text-left font-sans space-y-2"
+                        >
+                          <div className="flex items-center justify-between gap-2 border-b border-slate-700/80 pb-1.5">
+                            <span className="font-semibold text-xs text-white">
+                              {src.source} — Errors ({src.errorCount})
+                            </span>
+                            {src.rateLimitedUntilMs && src.rateLimitedUntilMs > Date.now() && (
+                              <span className="text-[10px] font-mono text-amber-300">
+                                Cooldown {Math.ceil((src.rateLimitedUntilMs - Date.now()) / 1000)}s
+                              </span>
+                            )}
+                          </div>
+                          {src.errorCount === 0 ? (
+                            <p className="text-[11px] text-slate-300">
+                              No errors recorded for this source.
+                            </p>
+                          ) : errorEntries.length > 0 ? (
+                            <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                              {errorEntries.map((entry, idx) => (
+                                <div
+                                  key={`${entry.atMs}-${idx}`}
+                                  className="rounded-lg bg-rose-950/60 border border-rose-500/40 px-2 py-1.5 text-[11px]"
+                                >
+                                  <div className="text-[10px] font-mono text-rose-300">
+                                    {new Date(entry.atMs).toLocaleTimeString()}
+                                  </div>
+                                  <div className="text-rose-100 break-words leading-snug">
+                                    {entry.message}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-[11px] text-amber-200">
+                              {src.errorCount} error(s) recorded earlier; latest error cleared on recovery.
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
                   <div className="text-[11px] text-slate-400 truncate">
                     {src.lastOkMs ? `OK ${new Date(src.lastOkMs).toLocaleTimeString()}` : 'Not polled yet'}

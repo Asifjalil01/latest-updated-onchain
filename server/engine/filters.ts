@@ -63,29 +63,42 @@ export function evaluateHardFilters(
   }
 
   // 2. Liquidity, volume, tx count, unique traders
+  const isCustomMicroWindow =
+    settings.customAgeWindowEnabled &&
+    (settings.customMaxPoolAgeMinutes <= 60 || settings.minLiquidityUsd < 10_000);
+  const effectiveMinVolume24hUsd = isCustomMicroWindow
+    ? Math.min(settings.minVolume24hUsd, Math.max(50, settings.minLiquidityUsd))
+    : settings.minVolume24hUsd;
+  const effectiveMinTx24h = isCustomMicroWindow
+    ? Math.min(settings.minTx24h, 5)
+    : settings.minTx24h;
+  const effectiveMinUniqueTraders24h = isCustomMicroWindow
+    ? Math.min(settings.minUniqueTraders24h, 3)
+    : settings.minUniqueTraders24h;
+
   if (token.liquidityUsd < settings.minLiquidityUsd) {
     reasons.push(
       `Liquidity $${token.liquidityUsd.toLocaleString()} < $${settings.minLiquidityUsd.toLocaleString()} floor`
     );
   }
-  if (token.volume24hUsd < settings.minVolume24hUsd) {
+  if (token.volume24hUsd < effectiveMinVolume24hUsd) {
     reasons.push(
-      `24h volume $${token.volume24hUsd.toLocaleString()} < $${settings.minVolume24hUsd.toLocaleString()} minimum`
+      `24h volume $${token.volume24hUsd.toLocaleString()} < $${effectiveMinVolume24hUsd.toLocaleString()} minimum`
     );
   }
-  if (token.txCount24h < settings.minTx24h) {
-    reasons.push(`24h tx count ${token.txCount24h} < ${settings.minTx24h} minimum`);
+  if (token.txCount24h < effectiveMinTx24h) {
+    reasons.push(`24h tx count ${token.txCount24h} < ${effectiveMinTx24h} minimum`);
   }
-  if (token.uniqueTraders24h < settings.minUniqueTraders24h) {
+  if (token.uniqueTraders24h < effectiveMinUniqueTraders24h) {
     reasons.push(
-      `24h unique traders ${token.uniqueTraders24h} < ${settings.minUniqueTraders24h} minimum`
+      `24h unique traders ${token.uniqueTraders24h} < ${effectiveMinUniqueTraders24h} minimum`
     );
   }
 
   // 3. Wash-trading & FDV inflation checks
   if (
     volumeLiquidityRatio > settings.maxVolumeLiquidityRatio &&
-    token.uniqueTraders24h < settings.minUniqueTraders24h * 2
+    token.uniqueTraders24h < effectiveMinUniqueTraders24h * 2
   ) {
     reasons.push(
       `Suspected wash trading: vol/liq ${volumeLiquidityRatio.toFixed(1)}x > ${settings.maxVolumeLiquidityRatio}x without trader breadth`

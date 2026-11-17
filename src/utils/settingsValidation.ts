@@ -116,8 +116,14 @@ export function validateSettingsDraft(draft: BotSettings): SettingsValidationRes
     }
   }
 
-  if (!Number.isFinite(draft.minLiquidityUsd) || draft.minLiquidityUsd < 10000) {
-    addError('minLiquidityUsd', 'Must be at least $10,000.');
+  const requiredMinLiquidity = draft.customAgeWindowEnabled ? 50 : 10000;
+  if (!Number.isFinite(draft.minLiquidityUsd) || draft.minLiquidityUsd < requiredMinLiquidity) {
+    addError(
+      'minLiquidityUsd',
+      draft.customAgeWindowEnabled
+        ? 'Custom timeframe active: Min Liquidity ($) must be at least $50.'
+        : 'Must be at least $10,000 (or check "Use Custom Pool Age Timeframe" above for lower liquidity).'
+    );
   }
   if (
     !Number.isFinite(draft.maxTop10HoldersPct) ||
@@ -155,9 +161,9 @@ export function validateSettingsDraft(draft: BotSettings): SettingsValidationRes
   }
   if (
     !Number.isFinite(draft.emergencyLiquidityFloorUsd) ||
-    draft.emergencyLiquidityFloorUsd < 1000
+    draft.emergencyLiquidityFloorUsd < 0
   ) {
-    addError('emergencyLiquidityFloorUsd', 'Must be at least $1,000.');
+    addError('emergencyLiquidityFloorUsd', 'Must be $0 or greater.');
   }
 
   // Custom Stepped Trailing Exit Tiers

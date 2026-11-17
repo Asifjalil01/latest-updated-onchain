@@ -7,6 +7,7 @@ export const HARD_LIMITS = {
   maxPriorityFeeSolCap: 0.05,
   minPoolAgeFloorMinutes: 30,
   minLiquidityFloorUsd: 10000,
+  customMinLiquidityFloorUsd: 50,
   maxTop10HoldersCeilingPct: 50,
   maxSingleHolderCeilingPct: 20,
   maxOpenPositionsCeiling: 10,
@@ -292,10 +293,15 @@ export function validateSettingsUpdate(
       `Max Coin Age must be > 0 and at least ${Number.isFinite(merged.customMinPoolAgeMinutes) ? merged.customMinPoolAgeMinutes : 0} minutes.`
     );
   }
-  if (!Number.isFinite(merged.minLiquidityUsd) || merged.minLiquidityUsd < HARD_LIMITS.minLiquidityFloorUsd) {
+  const requiredMinLiquidity = merged.customAgeWindowEnabled
+    ? HARD_LIMITS.customMinLiquidityFloorUsd
+    : HARD_LIMITS.minLiquidityFloorUsd;
+  if (!Number.isFinite(merged.minLiquidityUsd) || merged.minLiquidityUsd < requiredMinLiquidity) {
     pushErr(
       'minLiquidityUsd',
-      `Min Liquidity ($) must be at least $${HARD_LIMITS.minLiquidityFloorUsd.toLocaleString()}.`
+      merged.customAgeWindowEnabled
+        ? `Custom timeframe active: Min Liquidity ($) must be at least $${HARD_LIMITS.customMinLiquidityFloorUsd}.`
+        : `Must be at least $${HARD_LIMITS.minLiquidityFloorUsd.toLocaleString()} (or check "Use Custom Pool Age Timeframe" above for lower liquidity).`
     );
   }
   if (
@@ -353,8 +359,8 @@ export function validateSettingsUpdate(
   if (!Number.isFinite(merged.maxHoldMinutes) || merged.maxHoldMinutes < 5 || merged.maxHoldMinutes > 10080) {
     pushErr('maxHoldMinutes', 'Max Hold Time must be between 5 and 10080 minutes.');
   }
-  if (!Number.isFinite(merged.emergencyLiquidityFloorUsd) || merged.emergencyLiquidityFloorUsd < 1000) {
-    pushErr('emergencyLiquidityFloorUsd', 'Emergency Liquidity Floor ($) must be at least $1,000.');
+  if (!Number.isFinite(merged.emergencyLiquidityFloorUsd) || merged.emergencyLiquidityFloorUsd < 0) {
+    pushErr('emergencyLiquidityFloorUsd', 'Emergency Liquidity Floor ($) must be $0 or greater.');
   }
   if (!Number.isFinite(merged.slippageBps) || merged.slippageBps < 10 || merged.slippageBps > HARD_LIMITS.maxSlippageBps) {
     pushErr('slippageBps', `Slippage must be between 10 and ${HARD_LIMITS.maxSlippageBps} bps.`);

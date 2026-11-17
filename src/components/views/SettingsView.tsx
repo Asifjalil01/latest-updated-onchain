@@ -671,7 +671,12 @@ export function SettingsView() {
                   checked={draft.customAgeWindowEnabled}
                   onChange={(e) => {
                     updateField('customAgeWindowEnabled', e.target.checked);
-                    clearFieldError('customMinPoolAgeMinutes', 'customMaxPoolAgeMinutes', 'minPoolAgeMinutes');
+                    clearFieldError(
+                      'customMinPoolAgeMinutes',
+                      'customMaxPoolAgeMinutes',
+                      'minPoolAgeMinutes',
+                      'minLiquidityUsd'
+                    );
                   }}
                 />
                 <span>Use Custom Pool Age Timeframe (Min–Max Minutes)</span>
@@ -752,13 +757,18 @@ export function SettingsView() {
                 <span className="text-slate-500 block">Min Liquidity ($)</span>
                 <input
                   type="number"
-                  min="10000"
-                  step="1000"
+                  min={draft.customAgeWindowEnabled ? 50 : 10000}
+                  step={draft.customAgeWindowEnabled ? 50 : 1000}
                   data-field-key="minLiquidityUsd"
                   value={inputValue(draft.minLiquidityUsd)}
                   onChange={(e) => updateField('minLiquidityUsd', parseNumInput(e.target.value))}
                   className={inputClass('minLiquidityUsd')}
                 />
+                {draft.customAgeWindowEnabled && (
+                  <span className="text-[11px] text-teal-600 dark:text-teal-400 block">
+                    Custom timeframe active: min $50 (effective emergency floor auto-scales for micro-pools).
+                  </span>
+                )}
                 <FieldErrorPopup
                   message={fieldErrors.minLiquidityUsd}
                   onDismiss={() => clearFieldError('minLiquidityUsd')}
@@ -873,8 +883,8 @@ export function SettingsView() {
                 <span className="text-slate-500 block">Emergency Liquidity Floor ($)</span>
                 <input
                   type="number"
-                  min="1000"
-                  step="1000"
+                  min="0"
+                  step="100"
                   data-field-key="emergencyLiquidityFloorUsd"
                   value={inputValue(draft.emergencyLiquidityFloorUsd)}
                   onChange={(e) => updateField('emergencyLiquidityFloorUsd', parseNumInput(e.target.value))}

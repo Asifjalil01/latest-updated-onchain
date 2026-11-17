@@ -352,12 +352,18 @@ export interface RejectionRecord {
   detailsJson: string;
 }
 
+export interface SourceErrorEntry {
+  message: string;
+  atMs: number;
+}
+
 export interface SourceHealthRecord {
   source: string;
   itemsCount: number;
   lastOkMs: number | null;
   errorCount: number;
   lastError: string | null;
+  recentErrors?: SourceErrorEntry[];
   rateLimitedUntilMs: number | null;
   circuitState: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 }

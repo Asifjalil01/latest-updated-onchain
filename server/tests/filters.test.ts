@@ -112,3 +112,70 @@ test('filters: custom pool age timeframe filters strictly between min and max mi
   const defaultSettings = { ...customSettings, customAgeWindowEnabled: false };
   assert.equal(evaluateHardFilters(inWindow, defaultSettings, 0.3, now).passed, false);
 });
+
+test('filters: 1-5m custom pool age with $300 minLiquidityUsd passes filter, scoring, and scales emergency floor', async () => {
+  const { snapshotExitParams } = await import('../engine/fees');
+  const now = 1_760_000_000_000;
+  const microSettings = {
+    ...DEFAULT_SETTINGS,
+    customAgeWindowEnabled: true,
+    customMinPoolAgeMinutes: 1,
+    customMaxPoolAgeMinutes: 5,
+    minLiquidityUsd: 300,
+    minQualityScore: 50,
+    minTradeScore: 50,
+  };
+
+  const youngMicroPool: CandidateToken = {
+    ...makeMatureCleanToken(now),
+    poolCreatedAtMs: now - 3 * 60_000, // 3m old
+    liquidityUsd: 400,
+    fdvUsd: 6_000,
+    volume24hUsd: 1200,
+    txCount24h: 20,
+    buys24h: 14,
+    sells24h: 6,
+    uniqueTraders24h: 10,
+  };
+
+  const filterRes = evaluateHardFilters(youngMicroPool, microSettings, 0.4, now);
+  assert.equal(filterRes.passed, true, `Unexpected rejection: ${filterRes.reasons.join('; ')}`);
+
+  const cleanSec: SecurityReport = {
+    passed: true,
+    reasons: [],
+    warnings: [],
+    criticalFlags: [],
+    sourcesAgreed: 2,
+    mintAuthorityRevoked: true,
+    freezeAuthorityRevoked: true,
+    token2022DisallowedExtensions: [],
+    rugCheckScore: 10,
+    rugCheckRisks: [],
+    lpLockedOrBurnedPct: 95,
+    top10HoldersPct: 20,
+    singleMaxHolderPct: 5,
+    holders: [],
+    deployerFlagged: false,
+    sellRouteExists: true,
+    sellRouteImpactPct: 0.4,
+    sellTaxPct: 0,
+    tradingEnabled: true,
+  };
+
+  const scored = scoreCandidate({
+    token: youngMicroPool,
+    filterResult: filterRes,
+    securityReport: cleanSec,
+    settings: microSettings,
+    nowMs: now,
+  });
+  assert.equal(scored.tokenClass, 'meme');
+  assert.equal(scored.decision, 'BUY');
+
+  const snap = snapshotExitParams(microSettings, 1.5);
+  assert.ok(
+    snap.emergencyLiquidityFloorUsd <= 150,
+    `Expected scaled emergency floor <= $150, got ${snap.emergencyLiquidityFloorUsd}`
+  );
+});

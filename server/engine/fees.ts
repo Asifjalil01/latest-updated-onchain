@@ -107,6 +107,10 @@ export function computeBreakEvenPrices(params: {
 export function snapshotExitParams(settings: BotSettings, roundTripCostPct: number): PositionExitSnapshot {
   const clampedSl = Math.max(0.5, settings.stopLossPct);
   const clampedTp = Math.max(1.5, settings.takeProfitPct);
+  const effectiveEmergencyLiquidityFloorUsd =
+    settings.customAgeWindowEnabled && settings.minLiquidityUsd < settings.emergencyLiquidityFloorUsd
+      ? Math.min(settings.emergencyLiquidityFloorUsd, Math.max(0, settings.minLiquidityUsd * 0.5))
+      : settings.emergencyLiquidityFloorUsd;
   return {
     stopLossEnabled: settings.stopLossEnabled,
     stopLossPct: clampedSl,
@@ -118,7 +122,7 @@ export function snapshotExitParams(settings: BotSettings, roundTripCostPct: numb
     maxHoldMinutes: settings.maxHoldMinutes,
     maxHoldStagnationEnabled: settings.maxHoldStagnationEnabled,
     stagnationMinGainPct: settings.stagnationMinGainPct,
-    emergencyLiquidityFloorUsd: settings.emergencyLiquidityFloorUsd,
+    emergencyLiquidityFloorUsd: effectiveEmergencyLiquidityFloorUsd,
     emergencyLiquidityDrainPct: settings.emergencyLiquidityDrainPct,
     emergencyMaxSellTaxPct: settings.emergencyMaxSellTaxPct,
     roundTripCostPct,
