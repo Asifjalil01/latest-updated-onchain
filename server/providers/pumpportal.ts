@@ -12,10 +12,12 @@ export interface PumpPortalEvent {
 export class PumpPortalWsProvider {
   private ws: WebSocket | null = null;
   private enabled = false;
-  private buffer: PumpPortalEvent[] = [];
+  private newTokenBuffer: PumpPortalEvent[] = [];
+  private migrationBuffer: PumpPortalEvent[] = [];
   private itemsCount = 0;
   private lastOkMs: number | null = null;
   private errorCount = 0;
+  private consecutiveErrors = 0;
   private lastError: string | null = null;
   private recentErrors: Array<{ message: string; atMs: number }> = [];
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -23,11 +25,13 @@ export class PumpPortalWsProvider {
   start(): void {
     if (this.enabled) return;
     this.enabled = true;
+    this.consecutiveErrors = 0;
     this.connect();
   }
 
   stop(): void {
     this.enabled = false;
+    this.consecutiveErrors = 0;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -49,6 +53,7 @@ export class PumpPortalWsProvider {
       this.ws.on('open', () => {
         this.lastOkMs = Date.now();
         this.lastError = null;
+        this.consecutiveErrors = 0;
         this.ws?.send(JSON.stringify({ method: 'subscribeNewToken' }));
         this.ws?.send(JSON.stringify({ method: 'subscribeMigration' }));
       });
@@ -63,16 +68,26 @@ export class PumpPortalWsProvider {
           };
           if (msg.mint) {
             this.lastOkMs = Date.now();
+            this.consecutiveErrors = 0;
             this.itemsCount += 1;
-            this.buffer.push({
+            const isMigration = msg.txType === 'migrate';
+            const event: PumpPortalEvent = {
               mint: msg.mint,
               symbol: msg.symbol,
               name: msg.name,
-              eventType: msg.txType === 'migrate' ? 'migration' : 'new_token',
+              eventType: isMigration ? 'migration' : 'new_token',
               receivedAtMs: Date.now(),
-            });
-            if (this.buffer.length > 200) {
-              this.buffer.shift();
+            };
+            if (isMigration) {
+              this.migrationBuffer.push(event);
+              if (this.migrationBuffer.length > 150) {
+                this.migrationBuffer.shift();
+              }
+            } else {
+              this.newTokenBuffer.push(event);
+              if (this.newTokenBuffer.length > 200) {
+                this.newTokenBuffer.shift();
+              }
             }
           }
         } catch {
@@ -82,6 +97,7 @@ export class PumpPortalWsProvider {
 
       this.ws.on('error', (err: Error) => {
         this.errorCount += 1;
+        this.consecutiveErrors += 1;
         this.lastError = err.message;
         this.recentErrors = [{ message: err.message, atMs: Date.now() }, ...this.recentErrors].slice(0, 10);
       });
@@ -94,6 +110,7 @@ export class PumpPortalWsProvider {
       });
     } catch (err) {
       this.errorCount += 1;
+      this.consecutiveErrors += 1;
       const errMsg = err instanceof Error ? err.message : String(err);
       this.lastError = errMsg;
       this.recentErrors = [{ message: errMsg, atMs: Date.now() }, ...this.recentErrors].slice(0, 10);
@@ -102,12 +119,18 @@ export class PumpPortalWsProvider {
 
   drainRecentMints(): string[] {
     const now = Date.now();
-    // Only surface events from the last 45 minutes so enrichment can still evaluate 30m+ pools
-    const valid = this.buffer.filter((e) => now - e.receivedAtMs <= 45 * 60_000);
-    return Array.from(new Set(valid.map((e) => e.mint)));
+    // Keep events from the last 45 minutes so enrichment can evaluate 5-30m+ migrated pools
+    const validMigrations = this.migrationBuffer.filter((e) => now - e.receivedAtMs <= 45 * 60_000);
+    const validNew = this.newTokenBuffer.filter((e) => now - e.receivedAtMs <= 45 * 60_000);
+    return Array.from(new Set([...validMigrations, ...validNew].map((e) => e.mint)));
   }
 
   getHealth(): SourceHealthRecord {
+    const isConnected = Boolean(this.ws && this.ws.readyState === WebSocket.OPEN);
+    let circuitState: 'CLOSED' | 'OPEN' | 'HALF_OPEN' = 'CLOSED';
+    if (this.enabled && !isConnected) {
+      circuitState = this.consecutiveErrors >= 5 ? 'OPEN' : 'HALF_OPEN';
+    }
     return {
       source: 'pumpportal_ws',
       itemsCount: this.itemsCount,
@@ -116,7 +139,7 @@ export class PumpPortalWsProvider {
       lastError: this.lastError,
       recentErrors: [...this.recentErrors],
       rateLimitedUntilMs: null,
-      circuitState: this.ws && this.ws.readyState === WebSocket.OPEN ? 'CLOSED' : 'HALF_OPEN',
+      circuitState,
     };
   }
 }

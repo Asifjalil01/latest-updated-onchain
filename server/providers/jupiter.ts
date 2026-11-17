@@ -123,59 +123,75 @@ export class JupiterProvider {
   }
 
   async fetchRecentTokens(): Promise<CandidateToken[]> {
-    try {
-      const data = await this.tokensHttp.fetchJson<
-        Array<{
-          id?: string;
-          address?: string;
-          symbol?: string;
-          name?: string;
-          decimals?: number;
-          liquidity?: number;
-          usdPrice?: number;
-          createdAt?: string;
-        }>
-      >(
-        'https://lite-api.jup.ag/tokens/v2/recent',
-        { headers: this.getHeaders() },
-        'jup_tokens_recent',
-        25_000
-      );
+    const candidatesByMint = new Map<string, CandidateToken>();
+    const now = Date.now();
+    const endpoints: Array<{ url: string; key: string; ttlMs: number; tag: string; limit: number }> = [
+      {
+        url: 'https://lite-api.jup.ag/tokens/v2/toptrending/5m',
+        key: 'jup_tokens_toptrending_5m',
+        ttlMs: 45_000,
+        tag: 'jupiter_toptrending_5m',
+        limit: 40,
+      },
+      {
+        url: 'https://lite-api.jup.ag/tokens/v2/recent',
+        key: 'jup_tokens_recent',
+        ttlMs: 25_000,
+        tag: 'jupiter_tokens_v2',
+        limit: 45,
+      },
+    ];
 
-      if (!Array.isArray(data)) return [];
-      const now = Date.now();
-      const candidates: CandidateToken[] = [];
-      for (const item of data.slice(0, 60)) {
-        const mint = item.id || item.address;
-        if (!mint || mint === WSOL_MINT) continue;
-        candidates.push({
-          mint,
-          symbol: item.symbol || 'UNKNOWN',
-          name: item.name || item.symbol || 'Unknown Token',
-          source: 'jupiter_tokens_v2',
-          dex: 'jupiter',
-          pairAddress: '',
-          poolCreatedAtMs: item.createdAt ? Date.parse(item.createdAt) || 0 : 0,
-          priceUsd: Number(item.usdPrice || 0),
-          priceSol: 0,
-          liquidityUsd: Number(item.liquidity || 0),
-          volume24hUsd: 0,
-          fdvUsd: 0,
-          txCount24h: 0,
-          buys24h: 0,
-          sells24h: 0,
-          uniqueTraders24h: 0,
-          priceChange1hPct: 0,
-          priceChange24hPct: 0,
-          tokenDecimals: typeof item.decimals === 'number' ? item.decimals : undefined,
-          rawUpdatedAtMs: now,
-        });
+    for (const ep of endpoints) {
+      try {
+        const data = await this.tokensHttp.fetchJson<
+          Array<{
+            id?: string;
+            address?: string;
+            symbol?: string;
+            name?: string;
+            decimals?: number;
+            liquidity?: number;
+            usdPrice?: number;
+            createdAt?: string;
+          }>
+        >(ep.url, { headers: this.getHeaders() }, ep.key, ep.ttlMs);
+
+        if (!Array.isArray(data)) continue;
+        for (const item of data.slice(0, ep.limit)) {
+          const mint = item.id || item.address;
+          if (!mint || mint === WSOL_MINT || candidatesByMint.has(mint)) continue;
+          candidatesByMint.set(mint, {
+            mint,
+            symbol: item.symbol || 'UNKNOWN',
+            name: item.name || item.symbol || 'Unknown Token',
+            source: ep.tag,
+            dex: 'jupiter',
+            pairAddress: '',
+            poolCreatedAtMs: item.createdAt ? Date.parse(item.createdAt) || 0 : 0,
+            priceUsd: Number(item.usdPrice || 0),
+            priceSol: 0,
+            liquidityUsd: Number(item.liquidity || 0),
+            volume24hUsd: 0,
+            fdvUsd: 0,
+            txCount24h: 0,
+            buys24h: 0,
+            sells24h: 0,
+            uniqueTraders24h: 0,
+            priceChange1hPct: 0,
+            priceChange24hPct: 0,
+            tokenDecimals: typeof item.decimals === 'number' ? item.decimals : undefined,
+            rawUpdatedAtMs: now,
+          });
+        }
+      } catch {
+        // resilient per endpoint
       }
-      this.tokensHttp.recordItems(candidates.length);
-      return candidates;
-    } catch {
-      return [];
     }
+
+    const list = Array.from(candidatesByMint.values());
+    this.tokensHttp.recordItems(list.length);
+    return list;
   }
 
   async searchTokens(query: string): Promise<CandidateToken[]> {

@@ -57,10 +57,12 @@ export function scoreCandidate(params: {
   const safetyPts = securityReport.passed
     ? Math.max(0, 30 - (securityReport.rugCheckScore ?? 30) * 0.5)
     : 0;
+  const isMicroCustomWindow = allowCustomYoungAge && settings.minLiquidityUsd < 10_000;
   const baseLiqLog = Math.log10(
     Math.max(50, allowCustomYoungAge ? Math.min(10_000, settings.minLiquidityUsd) : 10_000)
   );
-  const liqSpan = Math.max(1, 6 - baseLiqLog);
+  const targetLiqLog = isMicroCustomWindow ? Math.max(baseLiqLog + 1.5, 4.5) : 6;
+  const liqSpan = Math.max(1, targetLiqLog - baseLiqLog);
   const liquidityPts = Math.min(
     25,
     ((Math.log10(Math.max(1, token.liquidityUsd)) - baseLiqLog) / liqSpan) * 25
@@ -73,7 +75,9 @@ export function scoreCandidate(params: {
     securityReport.token2022DisallowedExtensions.length === 0
       ? 15
       : 0;
-  const agePts = Math.min(10, (Math.log10(Math.max(30, poolAgeMinutes)) - 1.4) * 4.5);
+  const agePts = allowCustomYoungAge
+    ? 8
+    : Math.min(10, (Math.log10(Math.max(30, poolAgeMinutes)) - 1.4) * 4.5);
 
   const qualityBreakdown: Record<string, number> = {
     safety: Number(safetyPts.toFixed(1)),
@@ -94,9 +98,17 @@ export function scoreCandidate(params: {
   const buyPressurePts = Math.max(0, Math.min(25, ((buyRatio - 0.45) / 0.25) * 25));
   const volLiq = filterResult.computed.volumeLiquidityRatio;
   const depthPts = volLiq >= 0.5 && volLiq <= 15 ? 20 : volLiq > 15 ? 12 : 8;
-  const breadthPts = Math.min(15, (token.uniqueTraders24h / 500) * 15);
-  const regimePts =
-    token.priceChange24hPct >= 0 && token.priceChange1hPct <= 60 ? 15 : token.priceChange1hPct <= 100 ? 10 : 5;
+  const breadthTarget = allowCustomYoungAge ? 100 : 500;
+  const breadthPts = Math.min(15, (token.uniqueTraders24h / breadthTarget) * 15);
+  const regimePts = allowCustomYoungAge
+    ? token.priceChange1hPct >= -10 && token.priceChange1hPct <= 300
+      ? 15
+      : 10
+    : token.priceChange24hPct >= 0 && token.priceChange1hPct <= 60
+      ? 15
+      : token.priceChange1hPct <= 100
+        ? 10
+        : 5;
 
   const tradeBreakdown: Record<string, number> = {
     momentum: Number(momentumPts.toFixed(1)),

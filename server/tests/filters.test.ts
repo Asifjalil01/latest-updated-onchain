@@ -179,3 +179,78 @@ test('filters: 1-5m custom pool age with $300 minLiquidityUsd passes filter, sco
     `Expected scaled emergency floor <= $150, got ${snap.emergencyLiquidityFloorUsd}`
   );
 });
+
+test('filters & scoring: 5-30m custom timeframe + $300 minLiquidity accepts volatile young pools with 0.05 SOL price impact while default mode rejects', () => {
+  const now = 1_760_000_000_000;
+  const userSettings = {
+    ...DEFAULT_SETTINGS,
+    tradeSizeSol: 0.05,
+    customAgeWindowEnabled: true,
+    customMinPoolAgeMinutes: 5,
+    customMaxPoolAgeMinutes: 30,
+    minLiquidityUsd: 300,
+    minQualityScore: 75,
+    minTradeScore: 70,
+  };
+
+  const volatile5to30mPool: CandidateToken = {
+    ...makeMatureCleanToken(now),
+    poolCreatedAtMs: now - 14 * 60_000, // 14m old
+    liquidityUsd: 1_200,
+    fdvUsd: 180_000, // 150x FDV/liq (common on new micro-pools)
+    volume24hUsd: 8_500,
+    txCount24h: 95,
+    buys24h: 62,
+    sells24h: 33,
+    uniqueTraders24h: 72,
+    priceChange1hPct: 240, // +240% since launch
+    priceChange24hPct: 240,
+  };
+
+  // Simulated ~2.4% price impact from 0.05 SOL (~$3.62) in a $1,200 pool
+  const filterRes = evaluateHardFilters(volatile5to30mPool, userSettings, 2.4, now);
+  assert.equal(filterRes.passed, true, `Unexpected rejection: ${filterRes.reasons.join('; ')}`);
+
+  const cleanSec: SecurityReport = {
+    passed: true,
+    reasons: [],
+    warnings: [],
+    criticalFlags: [],
+    sourcesAgreed: 2,
+    mintAuthorityRevoked: true,
+    freezeAuthorityRevoked: true,
+    token2022DisallowedExtensions: [],
+    rugCheckScore: 0,
+    rugCheckRisks: [],
+    lpLockedOrBurnedPct: 98,
+    top10HoldersPct: 16,
+    singleMaxHolderPct: 4,
+    holders: [],
+    deployerFlagged: false,
+    sellRouteExists: true,
+    sellRouteImpactPct: 2.5,
+    sellTaxPct: 0,
+    tradingEnabled: true,
+  };
+
+  const scored = scoreCandidate({
+    token: volatile5to30mPool,
+    filterResult: filterRes,
+    securityReport: cleanSec,
+    settings: userSettings,
+    nowMs: now,
+  });
+  assert.equal(scored.tokenClass, 'meme');
+  assert.ok(scored.qualityScore >= 75, `Expected qualityScore >= 75, got ${scored.qualityScore}`);
+  assert.ok(scored.tradeScore >= 70, `Expected tradeScore >= 70, got ${scored.tradeScore}`);
+  assert.equal(scored.decision, 'BUY', `Expected BUY, got rejection: ${scored.reasons.join('; ')}`);
+
+  // Default settings (checkbox unchecked) must still reject this volatile micro-pool
+  const strictDefault = evaluateHardFilters(
+    volatile5to30mPool,
+    { ...userSettings, customAgeWindowEnabled: false },
+    2.4,
+    now
+  );
+  assert.equal(strictDefault.passed, false);
+});

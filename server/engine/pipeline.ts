@@ -75,6 +75,7 @@ export class BotOrchestrator {
   private scanInFlight = false;
   private exitTickInFlight = false;
   private readonly sellingPositionIds = new Set<string>();
+  private readonly youngPoolWatchlist = new Map<string, number>();
   private readonly liveEngine: LiveExecutionEngine;
 
   constructor(
@@ -543,27 +544,76 @@ export class BotOrchestrator {
       }
 
       // Stage 1: DISCOVER
+      const preferYoungPools =
+        settings.customAgeWindowEnabled && settings.customMaxPoolAgeMinutes <= 60;
       const [dsDisc, geckoPools, jupRecent] = await Promise.all([
         this.dexScreener.discoverMints(settings.enableDexScreenerBoosts),
-        this.geckoTerminal.discoverPools(),
+        this.geckoTerminal.discoverPools({ preferYoungPools }),
         this.jupiter.fetchRecentTokens(),
       ]);
       const pumpMints = settings.enablePumpPortalWs ? this.pumpPortal.drainRecentMints() : [];
 
+      const nowMs = Date.now();
       const rawCandidates = new Map<string, CandidateToken>();
-      const mintsToEnrich = new Set<string>();
+      const searchCandidateMints = new Set<string>();
 
-      for (const m of dsDisc.mints) mintsToEnrich.add(m);
-      for (const m of pumpMints) mintsToEnrich.add(m);
-      for (const c of [...dsDisc.candidates, ...geckoPools, ...jupRecent]) {
-        mintsToEnrich.add(c.mint);
+      for (const c of dsDisc.candidates) {
+        searchCandidateMints.add(c.mint);
+        const existing = rawCandidates.get(c.mint);
+        if (!existing || c.liquidityUsd > existing.liquidityUsd) {
+          rawCandidates.set(c.mint, c);
+        }
+      }
+      for (const c of [...geckoPools, ...jupRecent]) {
         const existing = rawCandidates.get(c.mint);
         if (!existing || c.liquidityUsd > existing.liquidityUsd) {
           rawCandidates.set(c.mint, c);
         }
       }
 
-      const enriched = await this.dexScreener.enrichMintsBatch(Array.from(mintsToEnrich).slice(0, 150));
+      // Track newly seen young pools in a rolling watchlist so <5m launches get re-checked once they enter 5-30m+ windows
+      const watchMaxAgeMs = Math.max(75, (settings.customMaxPoolAgeMinutes || 30) + 15) * 60_000;
+      for (const [mint, createdAt] of this.youngPoolWatchlist.entries()) {
+        if (nowMs - createdAt > watchMaxAgeMs) {
+          this.youngPoolWatchlist.delete(mint);
+        }
+      }
+      for (const c of [...geckoPools, ...jupRecent, ...dsDisc.candidates]) {
+        if (c.poolCreatedAtMs > 0 && nowMs - c.poolCreatedAtMs <= watchMaxAgeMs) {
+          if (!this.youngPoolWatchlist.has(c.mint)) {
+            this.youngPoolWatchlist.set(c.mint, c.poolCreatedAtMs);
+          }
+        }
+      }
+      if (this.youngPoolWatchlist.size > 250) {
+        const sortedWatch = Array.from(this.youngPoolWatchlist.entries()).sort((a, b) => b[1] - a[1]);
+        this.youngPoolWatchlist.clear();
+        for (const [mint, createdAt] of sortedWatch.slice(0, 250)) {
+          this.youngPoolWatchlist.set(mint, createdAt);
+        }
+      }
+
+      // Prioritize mints needing DexScreener batch metrics (GeckoTerminal, PumpPortal migrations, Jupiter 5m/recent, maturing watchlist)
+      // ahead of unmigrated $0 token-profiles, and skip re-enriching pairs already returned by DexScreener search.
+      const mintsToEnrich = new Set<string>();
+      for (const c of geckoPools) mintsToEnrich.add(c.mint);
+      for (const m of pumpMints) mintsToEnrich.add(m);
+      for (const c of jupRecent) mintsToEnrich.add(c.mint);
+      for (const [mint, createdAt] of this.youngPoolWatchlist.entries()) {
+        const ageMin = (nowMs - createdAt) / 60_000;
+        const targetMin = settings.customAgeWindowEnabled ? settings.customMinPoolAgeMinutes : 30;
+        const targetMax = settings.customAgeWindowEnabled ? settings.customMaxPoolAgeMinutes : 75;
+        if (ageMin >= Math.max(0, targetMin - 1) && ageMin <= targetMax + 2) {
+          mintsToEnrich.add(mint);
+        }
+      }
+      for (const m of dsDisc.mints) {
+        if (!searchCandidateMints.has(m)) {
+          mintsToEnrich.add(m);
+        }
+      }
+
+      const enriched = await this.dexScreener.enrichMintsBatch(Array.from(mintsToEnrich).slice(0, 180));
       for (const [mint, c] of enriched.entries()) {
         const existing = rawCandidates.get(mint);
         if (!existing || c.liquidityUsd >= existing.liquidityUsd * 0.9) {

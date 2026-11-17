@@ -88,6 +88,10 @@ export class HttpProvider {
     this.cache.clear();
   }
 
+  isRateLimited(): boolean {
+    return this.getDomainState().rateLimitedUntilMs > Date.now();
+  }
+
   async fetchJson<T>(
     url: string,
     init?: RequestInit,
@@ -135,19 +139,15 @@ export class HttpProvider {
         });
 
         if (response.status === 429) {
-          // Silent backoff on HTTP 429 — no log spam
+          // Silent backoff on HTTP 429 — never immediately retry into an active 429 window
           domainState.consecutive429s += 1;
           const retryAfterHeader = response.headers.get('retry-after');
           const retryAfterSec = retryAfterHeader ? Number(retryAfterHeader) : NaN;
           const backoffMs = Number.isFinite(retryAfterSec)
-            ? retryAfterSec * 1000
-            : Math.min(60_000, 2000 * 2 ** Math.min(domainState.consecutive429s, 5));
+            ? Math.max(5_000, retryAfterSec * 1000)
+            : Math.min(180_000, 15_000 * 2 ** Math.min(domainState.consecutive429s - 1, 3));
           domainState.rateLimitedUntilMs = Date.now() + backoffMs;
           lastErr = new Error(`HTTP 429 from ${this.domain}`);
-          if (attempt < this.maxRetries && backoffMs <= 4000) {
-            await new Promise((r) => setTimeout(r, backoffMs));
-            continue;
-          }
           throw lastErr;
         }
 

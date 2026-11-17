@@ -95,6 +95,27 @@ export function evaluateHardFilters(
     );
   }
 
+  const effectiveMaxFdvLiquidityRatio = isCustomMicroWindow
+    ? Math.max(settings.maxFdvLiquidityRatio, 500)
+    : settings.maxFdvLiquidityRatio;
+  const effectiveMinPriceChange1hPct = isCustomMicroWindow
+    ? Math.min(settings.minPriceChange1hPct, -25)
+    : settings.minPriceChange1hPct;
+  const effectiveMinPriceChange24hPct = isCustomMicroWindow
+    ? Math.min(settings.minPriceChange24hPct, -30)
+    : settings.minPriceChange24hPct;
+  const effectiveMaxPriceChange1hPct = isCustomMicroWindow
+    ? Math.max(settings.maxPriceChange1hPct, 2500)
+    : settings.maxPriceChange1hPct;
+  const effectiveMinBuyRatio = isCustomMicroWindow
+    ? Math.min(settings.minBuyRatio, 0.35)
+    : settings.minBuyRatio;
+  const effectiveMaxPlannedPriceImpactPct = isCustomMicroWindow
+    ? settings.minLiquidityUsd < 2_500
+      ? Math.max(settings.maxPlannedPriceImpactPct, 8.0)
+      : Math.max(settings.maxPlannedPriceImpactPct, 4.0)
+    : settings.maxPlannedPriceImpactPct;
+
   // 3. Wash-trading & FDV inflation checks
   if (
     volumeLiquidityRatio > settings.maxVolumeLiquidityRatio &&
@@ -106,38 +127,38 @@ export function evaluateHardFilters(
   }
   if (token.fdvUsd <= 0) {
     warnings.push('FDV unavailable; treating conservatively');
-  } else if (fdvLiquidityRatio > settings.maxFdvLiquidityRatio) {
+  } else if (fdvLiquidityRatio > effectiveMaxFdvLiquidityRatio) {
     reasons.push(
-      `FDV/liquidity ratio ${fdvLiquidityRatio.toFixed(1)}x > ${settings.maxFdvLiquidityRatio}x limit`
+      `FDV/liquidity ratio ${fdvLiquidityRatio.toFixed(1)}x > ${effectiveMaxFdvLiquidityRatio}x limit`
     );
   }
 
   // 4. Momentum & anti-dump / anti-parabolic filters
-  if (token.priceChange1hPct < settings.minPriceChange1hPct) {
+  if (token.priceChange1hPct < effectiveMinPriceChange1hPct) {
     reasons.push(
-      `1h price change ${token.priceChange1hPct.toFixed(2)}% < +${settings.minPriceChange1hPct}%`
+      `1h price change ${token.priceChange1hPct.toFixed(2)}% < ${effectiveMinPriceChange1hPct >= 0 ? '+' : ''}${effectiveMinPriceChange1hPct}%`
     );
   }
-  if (token.priceChange24hPct < settings.minPriceChange24hPct) {
+  if (token.priceChange24hPct < effectiveMinPriceChange24hPct) {
     reasons.push(
-      `24h price change ${token.priceChange24hPct.toFixed(2)}% < ${settings.minPriceChange24hPct}% (dump guard)`
+      `24h price change ${token.priceChange24hPct.toFixed(2)}% < ${effectiveMinPriceChange24hPct}% (dump guard)`
     );
   }
-  if (token.priceChange1hPct > settings.maxPriceChange1hPct) {
+  if (token.priceChange1hPct > effectiveMaxPriceChange1hPct) {
     reasons.push(
-      `Parabolic 1h move +${token.priceChange1hPct.toFixed(1)}% > +${settings.maxPriceChange1hPct}% cap`
+      `Parabolic 1h move +${token.priceChange1hPct.toFixed(1)}% > +${effectiveMaxPriceChange1hPct}% cap`
     );
   }
-  if (buyRatio < settings.minBuyRatio) {
-    reasons.push(`Buy ratio ${buyRatio.toFixed(2)} < ${settings.minBuyRatio.toFixed(2)} minimum`);
+  if (buyRatio < effectiveMinBuyRatio) {
+    reasons.push(`Buy ratio ${buyRatio.toFixed(2)} < ${effectiveMinBuyRatio.toFixed(2)} minimum`);
   }
 
   // 5. Planned trade price impact check
   if (plannedPriceImpactPct === null || !Number.isFinite(plannedPriceImpactPct)) {
     reasons.push('Planned buy quote price impact missing (fail closed)');
-  } else if (plannedPriceImpactPct >= settings.maxPlannedPriceImpactPct) {
+  } else if (plannedPriceImpactPct >= effectiveMaxPlannedPriceImpactPct) {
     reasons.push(
-      `Planned price impact ${plannedPriceImpactPct.toFixed(2)}% >= ${settings.maxPlannedPriceImpactPct}% limit`
+      `Planned price impact ${plannedPriceImpactPct.toFixed(2)}% >= ${effectiveMaxPlannedPriceImpactPct}% limit`
     );
   }
 
