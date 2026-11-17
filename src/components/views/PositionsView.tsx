@@ -251,7 +251,7 @@ export function PositionsView() {
                   </div>
                   <div>
                     <span className="text-[11px] text-slate-500 block">Current Price</span>
-                    <span className="font-mono text-xs font-semibold tabular-nums block text-teal-600 dark:text-teal-400">
+                    <span className={`font-mono text-xs font-semibold tabular-nums block ${pos.currentPriceUsd >= pos.entryPriceUsd ? 'text-teal-600 dark:text-teal-400' : 'text-rose-500'}`}>
                       {formatTokenPriceUsd(pos.currentPriceUsd)}
                     </span>
                   </div>
@@ -295,8 +295,7 @@ export function PositionsView() {
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block">Peak / SL / TP</span>
-                    +{pos.peakPnlPct.toFixed(1)}% / -{pos.exitParams.stopLossPct}% / +
-                    {pos.exitParams.takeProfitPct}%
+                    +{pos.peakPnlPct.toFixed(1)}% / {pos.exitParams.stopLossEnabled === false ? 'Disabled' : `-${pos.exitParams.stopLossPct}%`} / +{pos.exitParams.takeProfitPct}%
                   </div>
                 </div>
 

@@ -2,6 +2,24 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.13.0 — Slot-Filled Scanner Pausing, Auto-Startup .bat Script, Uniform Position Fonts & Quick-Profit Defaults
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Slot-Filled Scanner Pausing (`pipeline.ts`)**:
+  - The scanner and entry pipeline now automatically pauses scanning when active open position slots are full (`openPositions.length >= maxOpenPositions`), resuming scanning instantly once any position is sold/closed.
+- **Auto-Startup Batch Script (`start-bot.bat`)**:
+  - Added a double-clickable `start-bot.bat` script in the root directory to automatically run `npm install` and `npm run dev`.
+- **Uniform Position Card Typography & Color-Coded Prices (`PositionsView.tsx`)**:
+  - Standardized all position stat cards to uniform font sizing (`font-mono text-xs tabular-nums`).
+  - Current Price now dynamically turns **green** when in profit (`>= entry`) and **red** when in a loss (`< entry`), with clean `"Disabled"` display when stop-loss is turned off.
+- **Optimized Quick-Profit Default Settings (`defaults.ts`)**:
+  - Tuned default settings (`takeProfitPct: 25`, `stopLossPct: 5`, optimized momentum thresholds) for faster scalp entry and quick profit capture.
+- **Changelog & Version Tracking**: Updated version to `1.13.0` in `package.json` and documented all new features in `CHANGELOG.md`.
+
+---
+
 ## v1.12.0 — Scanner DexScreener Links, Profit/Loss Progress Bar Colors & Stop-Loss Explanations
 
 **Risk Warning: Trading can lose all of your money.**

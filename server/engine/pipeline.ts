@@ -536,6 +536,17 @@ export class BotOrchestrator {
 
     try {
       const settings = this.db.getSettings();
+      const openPositions = this.db.getPositions(this.mode, false);
+      if (openPositions.length >= settings.maxOpenPositions && !settings.allowSlotRotation) {
+        this.log(
+          'INFO',
+          'SCAN',
+          `Max open positions slots filled (${openPositions.length}/${settings.maxOpenPositions}). Scanner paused until a position is sold/closed.`
+        );
+        this.broadcastStatus();
+        return { evaluated: 0, bought: 0 };
+      }
+
       const solPriceUsd = await this.refreshSolPrice();
       if (!solPriceUsd) {
         this.log('WARN', 'PRICE', 'Live SOL/USD price unavailable from Jupiter & DexScreener; skipping buy pass.');
