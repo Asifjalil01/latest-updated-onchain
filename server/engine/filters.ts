@@ -1,13 +1,21 @@
+import { DEFAULT_SETTINGS } from '../config/defaults';
 import type { BotSettings, CandidateToken, HardFilterResult } from '../types';
 
-export function validateCandidateData(token: CandidateToken): { valid: boolean; reason?: string } {
+export function validateCandidateData(
+  token: CandidateToken,
+  settings: BotSettings = DEFAULT_SETTINGS
+): { valid: boolean; reason?: string } {
   if (!token.mint || token.mint.length < 32) {
     return { valid: false, reason: 'Missing or invalid mint address' };
   }
   if (!Number.isFinite(token.priceUsd) || token.priceUsd <= 0) {
     return { valid: false, reason: 'Missing or non-positive USD price' };
   }
-  if (!Number.isFinite(token.liquidityUsd) || token.liquidityUsd <= 0) {
+  const allowZeroLiquidity = settings.minLiquidityUsd <= 0;
+  if (
+    !Number.isFinite(token.liquidityUsd) ||
+    (allowZeroLiquidity ? token.liquidityUsd < 0 : token.liquidityUsd <= 0)
+  ) {
     return { valid: false, reason: 'Missing or non-positive liquidity' };
   }
   if (!Number.isFinite(token.poolCreatedAtMs) || token.poolCreatedAtMs <= 0) {
@@ -16,7 +24,13 @@ export function validateCandidateData(token: CandidateToken): { valid: boolean; 
   if (!Number.isFinite(token.volume24hUsd) || token.volume24hUsd < 0) {
     return { valid: false, reason: 'Missing 24h volume' };
   }
-  if (!Number.isFinite(token.priceChange1hPct) || !Number.isFinite(token.priceChange24hPct)) {
+  const allowMissingPriceChange =
+    settings.newLaunchOnlyEnabled ||
+    (settings.customAgeWindowEnabled && settings.customMaxPoolAgeMinutes <= 30);
+  if (
+    !allowMissingPriceChange &&
+    (!Number.isFinite(token.priceChange1hPct) || !Number.isFinite(token.priceChange24hPct))
+  ) {
     return { valid: false, reason: 'Missing 1h or 24h price change metrics' };
   }
   return { valid: true };
@@ -31,16 +45,30 @@ export function evaluateHardFilters(
   const reasons: string[] = [];
   const warnings: string[] = [];
 
-  const poolAgeMinutes = (nowMs - token.poolCreatedAtMs) / 60_000;
+  const poolAgeSeconds = (nowMs - token.poolCreatedAtMs) / 1000;
+  const poolAgeMinutes = poolAgeSeconds / 60;
   const poolAgeDays = poolAgeMinutes / (60 * 24);
-  const volumeLiquidityRatio = token.liquidityUsd > 0 ? token.volume24hUsd / token.liquidityUsd : Infinity;
+  const volumeLiquidityRatio =
+    token.liquidityUsd > 0 ? token.volume24hUsd / token.liquidityUsd : 0;
   const fdvLiquidityRatio =
     token.liquidityUsd > 0 && token.fdvUsd > 0 ? token.fdvUsd / token.liquidityUsd : 0;
   const totalBuySell = token.buys24h + token.sells24h;
   const buyRatio = totalBuySell > 0 ? token.buys24h / totalBuySell : 0;
+  const priceChange1hPct = Number.isFinite(token.priceChange1hPct) ? token.priceChange1hPct : 0;
+  const priceChange24hPct = Number.isFinite(token.priceChange24hPct) ? token.priceChange24hPct : 0;
 
-  // 1. Pool age check (custom timeframe window if enabled, otherwise default rules)
-  if (settings.customAgeWindowEnabled) {
+  // 1. Pool age check (New Launches Only > Custom Timeframe > Default rules)
+  if (settings.newLaunchOnlyEnabled) {
+    if (
+      !Number.isFinite(poolAgeSeconds) ||
+      poolAgeSeconds < settings.newLaunchMinAgeSeconds ||
+      poolAgeSeconds > settings.newLaunchMaxAgeSeconds
+    ) {
+      reasons.push(
+        `Pool age ${Math.max(0, Math.round(poolAgeSeconds))}s is outside New Launches Only ${settings.newLaunchMinAgeSeconds}s–${settings.newLaunchMaxAgeSeconds}s window`
+      );
+    }
+  } else if (settings.customAgeWindowEnabled) {
     if (
       !Number.isFinite(poolAgeMinutes) ||
       poolAgeMinutes < settings.customMinPoolAgeMinutes ||
@@ -63,18 +91,28 @@ export function evaluateHardFilters(
   }
 
   // 2. Liquidity, volume, tx count, unique traders
+  const isNewLaunchMode = settings.newLaunchOnlyEnabled;
   const isCustomMicroWindow =
-    settings.customAgeWindowEnabled &&
-    (settings.customMaxPoolAgeMinutes <= 60 || settings.minLiquidityUsd < 10_000);
-  const effectiveMinVolume24hUsd = isCustomMicroWindow
-    ? Math.min(settings.minVolume24hUsd, Math.max(50, settings.minLiquidityUsd))
-    : settings.minVolume24hUsd;
-  const effectiveMinTx24h = isCustomMicroWindow
-    ? Math.min(settings.minTx24h, 5)
-    : settings.minTx24h;
-  const effectiveMinUniqueTraders24h = isCustomMicroWindow
-    ? Math.min(settings.minUniqueTraders24h, 3)
-    : settings.minUniqueTraders24h;
+    isNewLaunchMode ||
+    (settings.customAgeWindowEnabled &&
+      (settings.customMaxPoolAgeMinutes <= 60 || settings.minLiquidityUsd < 10_000));
+  const isMicroLiquidityOverride = !isCustomMicroWindow && settings.minLiquidityUsd < 10_000;
+
+  const effectiveMinVolume24hUsd = isNewLaunchMode
+    ? 0
+    : isCustomMicroWindow || isMicroLiquidityOverride
+      ? Math.min(settings.minVolume24hUsd, Math.max(0, settings.minLiquidityUsd))
+      : settings.minVolume24hUsd;
+  const effectiveMinTx24h = isNewLaunchMode
+    ? 0
+    : isCustomMicroWindow || isMicroLiquidityOverride
+      ? Math.min(settings.minTx24h, 5)
+      : settings.minTx24h;
+  const effectiveMinUniqueTraders24h = isNewLaunchMode
+    ? 0
+    : isCustomMicroWindow || isMicroLiquidityOverride
+      ? Math.min(settings.minUniqueTraders24h, 3)
+      : settings.minUniqueTraders24h;
 
   if (token.liquidityUsd < settings.minLiquidityUsd) {
     reasons.push(
@@ -95,29 +133,42 @@ export function evaluateHardFilters(
     );
   }
 
-  const effectiveMaxFdvLiquidityRatio = isCustomMicroWindow
-    ? Math.max(settings.maxFdvLiquidityRatio, 500)
-    : settings.maxFdvLiquidityRatio;
-  const effectiveMinPriceChange1hPct = isCustomMicroWindow
-    ? Math.min(settings.minPriceChange1hPct, -25)
-    : settings.minPriceChange1hPct;
-  const effectiveMinPriceChange24hPct = isCustomMicroWindow
-    ? Math.min(settings.minPriceChange24hPct, -30)
-    : settings.minPriceChange24hPct;
-  const effectiveMaxPriceChange1hPct = isCustomMicroWindow
-    ? Math.max(settings.maxPriceChange1hPct, 2500)
-    : settings.maxPriceChange1hPct;
-  const effectiveMinBuyRatio = isCustomMicroWindow
-    ? Math.min(settings.minBuyRatio, 0.35)
-    : settings.minBuyRatio;
-  const effectiveMaxPlannedPriceImpactPct = isCustomMicroWindow
-    ? settings.minLiquidityUsd < 2_500
-      ? Math.max(settings.maxPlannedPriceImpactPct, 8.0)
-      : Math.max(settings.maxPlannedPriceImpactPct, 4.0)
-    : settings.maxPlannedPriceImpactPct;
+  const effectiveMaxFdvLiquidityRatio = isNewLaunchMode
+    ? Math.max(settings.maxFdvLiquidityRatio, 2000)
+    : isCustomMicroWindow
+      ? Math.max(settings.maxFdvLiquidityRatio, 500)
+      : settings.maxFdvLiquidityRatio;
+  const effectiveMinPriceChange1hPct = isNewLaunchMode
+    ? Math.min(settings.minPriceChange1hPct, -50)
+    : isCustomMicroWindow
+      ? Math.min(settings.minPriceChange1hPct, -25)
+      : settings.minPriceChange1hPct;
+  const effectiveMinPriceChange24hPct = isNewLaunchMode
+    ? Math.min(settings.minPriceChange24hPct, -50)
+    : isCustomMicroWindow
+      ? Math.min(settings.minPriceChange24hPct, -30)
+      : settings.minPriceChange24hPct;
+  const effectiveMaxPriceChange1hPct = isNewLaunchMode
+    ? Math.max(settings.maxPriceChange1hPct, 10000)
+    : isCustomMicroWindow
+      ? Math.max(settings.maxPriceChange1hPct, 2500)
+      : settings.maxPriceChange1hPct;
+  const effectiveMinBuyRatio = isNewLaunchMode
+    ? Math.min(settings.minBuyRatio, 0.2)
+    : isCustomMicroWindow
+      ? Math.min(settings.minBuyRatio, 0.35)
+      : settings.minBuyRatio;
+  const effectiveMaxPlannedPriceImpactPct = isNewLaunchMode
+    ? Math.max(settings.maxPlannedPriceImpactPct, 12.0)
+    : isCustomMicroWindow || isMicroLiquidityOverride
+      ? settings.minLiquidityUsd < 2_500
+        ? Math.max(settings.maxPlannedPriceImpactPct, 8.0)
+        : Math.max(settings.maxPlannedPriceImpactPct, 4.0)
+      : settings.maxPlannedPriceImpactPct;
 
   // 3. Wash-trading & FDV inflation checks
   if (
+    !isNewLaunchMode &&
     volumeLiquidityRatio > settings.maxVolumeLiquidityRatio &&
     token.uniqueTraders24h < effectiveMinUniqueTraders24h * 2
   ) {
@@ -127,29 +178,29 @@ export function evaluateHardFilters(
   }
   if (token.fdvUsd <= 0) {
     warnings.push('FDV unavailable; treating conservatively');
-  } else if (fdvLiquidityRatio > effectiveMaxFdvLiquidityRatio) {
+  } else if (!(isNewLaunchMode && token.liquidityUsd < 1_000) && fdvLiquidityRatio > effectiveMaxFdvLiquidityRatio) {
     reasons.push(
       `FDV/liquidity ratio ${fdvLiquidityRatio.toFixed(1)}x > ${effectiveMaxFdvLiquidityRatio}x limit`
     );
   }
 
   // 4. Momentum & anti-dump / anti-parabolic filters
-  if (token.priceChange1hPct < effectiveMinPriceChange1hPct) {
+  if (priceChange1hPct < effectiveMinPriceChange1hPct) {
     reasons.push(
-      `1h price change ${token.priceChange1hPct.toFixed(2)}% < ${effectiveMinPriceChange1hPct >= 0 ? '+' : ''}${effectiveMinPriceChange1hPct}%`
+      `1h price change ${priceChange1hPct.toFixed(2)}% < ${effectiveMinPriceChange1hPct >= 0 ? '+' : ''}${effectiveMinPriceChange1hPct}%`
     );
   }
-  if (token.priceChange24hPct < effectiveMinPriceChange24hPct) {
+  if (priceChange24hPct < effectiveMinPriceChange24hPct) {
     reasons.push(
-      `24h price change ${token.priceChange24hPct.toFixed(2)}% < ${effectiveMinPriceChange24hPct}% (dump guard)`
+      `24h price change ${priceChange24hPct.toFixed(2)}% < ${effectiveMinPriceChange24hPct}% (dump guard)`
     );
   }
-  if (token.priceChange1hPct > effectiveMaxPriceChange1hPct) {
+  if (priceChange1hPct > effectiveMaxPriceChange1hPct) {
     reasons.push(
-      `Parabolic 1h move +${token.priceChange1hPct.toFixed(1)}% > +${effectiveMaxPriceChange1hPct}% cap`
+      `Parabolic 1h move +${priceChange1hPct.toFixed(1)}% > +${effectiveMaxPriceChange1hPct}% cap`
     );
   }
-  if (buyRatio < effectiveMinBuyRatio) {
+  if ((!isNewLaunchMode || totalBuySell > 0) && buyRatio < effectiveMinBuyRatio) {
     reasons.push(`Buy ratio ${buyRatio.toFixed(2)} < ${effectiveMinBuyRatio.toFixed(2)} minimum`);
   }
 

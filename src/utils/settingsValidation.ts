@@ -90,7 +90,24 @@ export function validateSettingsDraft(draft: BotSettings): SettingsValidationRes
   }
 
   // Hard Filters & Security Thresholds
-  if (draft.customAgeWindowEnabled) {
+  if (draft.newLaunchOnlyEnabled) {
+    if (!Number.isFinite(draft.newLaunchMinAgeSeconds) || draft.newLaunchMinAgeSeconds < 0) {
+      addError('newLaunchMinAgeSeconds', 'Must be 0 seconds or greater.');
+    }
+    const minSec = Number.isFinite(draft.newLaunchMinAgeSeconds)
+      ? draft.newLaunchMinAgeSeconds
+      : 0;
+    if (
+      !Number.isFinite(draft.newLaunchMaxAgeSeconds) ||
+      draft.newLaunchMaxAgeSeconds < 1 ||
+      draft.newLaunchMaxAgeSeconds < minSec
+    ) {
+      addError(
+        'newLaunchMaxAgeSeconds',
+        `Must be at least 1s and >= Min Launch Age (${minSec}s).`
+      );
+    }
+  } else if (draft.customAgeWindowEnabled) {
     if (!Number.isFinite(draft.customMinPoolAgeMinutes) || draft.customMinPoolAgeMinutes < 0) {
       addError('customMinPoolAgeMinutes', 'Must be 0 minutes or greater.');
     }
@@ -111,38 +128,35 @@ export function validateSettingsDraft(draft: BotSettings): SettingsValidationRes
     if (!Number.isFinite(draft.minPoolAgeMinutes) || draft.minPoolAgeMinutes < 30) {
       addError(
         'minPoolAgeMinutes',
-        'Must be at least 30 minutes (or check "Use Custom Pool Age Timeframe" above for younger coins).'
+        'Must be at least 30 minutes (or enable New Launches Only / Custom Pool Age Timeframe above).'
       );
     }
   }
 
-  const requiredMinLiquidity = draft.customAgeWindowEnabled ? 50 : 10000;
-  if (!Number.isFinite(draft.minLiquidityUsd) || draft.minLiquidityUsd < requiredMinLiquidity) {
-    addError(
-      'minLiquidityUsd',
-      draft.customAgeWindowEnabled
-        ? 'Custom timeframe active: Min Liquidity ($) must be at least $50.'
-        : 'Must be at least $10,000 (or check "Use Custom Pool Age Timeframe" above for lower liquidity).'
-    );
+  if (!Number.isFinite(draft.minLiquidityUsd) || draft.minLiquidityUsd < 0) {
+    addError('minLiquidityUsd', 'Must be $0 or greater (no upper limit).');
   }
   if (
-    !Number.isFinite(draft.maxTop10HoldersPct) ||
-    draft.maxTop10HoldersPct < 1 ||
-    draft.maxTop10HoldersPct > 50
+    draft.enforceMaxTop10Holders &&
+    (!Number.isFinite(draft.maxTop10HoldersPct) ||
+      draft.maxTop10HoldersPct < 1 ||
+      draft.maxTop10HoldersPct > 50)
   ) {
     addError('maxTop10HoldersPct', 'Must be between 1% and 50%.');
   }
   if (
-    !Number.isFinite(draft.minQualityScore) ||
-    draft.minQualityScore < 50 ||
-    draft.minQualityScore > 100
+    draft.enforceMinScores &&
+    (!Number.isFinite(draft.minQualityScore) ||
+      draft.minQualityScore < 50 ||
+      draft.minQualityScore > 100)
   ) {
     addError('minQualityScore', 'Quality Score must be between 50 and 100.');
   }
   if (
-    !Number.isFinite(draft.minTradeScore) ||
-    draft.minTradeScore < 50 ||
-    draft.minTradeScore > 100
+    draft.enforceMinScores &&
+    (!Number.isFinite(draft.minTradeScore) ||
+      draft.minTradeScore < 50 ||
+      draft.minTradeScore > 100)
   ) {
     addError('minTradeScore', 'Trade Score must be between 50 and 100.');
   }

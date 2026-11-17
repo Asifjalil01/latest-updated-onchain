@@ -55,6 +55,9 @@ export interface BotSettings {
   customAgeWindowEnabled: boolean;
   customMinPoolAgeMinutes: number;
   customMaxPoolAgeMinutes: number;
+  newLaunchOnlyEnabled: boolean;
+  newLaunchMinAgeSeconds: number;
+  newLaunchMaxAgeSeconds: number;
   minLiquidityUsd: number;
   minVolume24hUsd: number;
   minTx24h: number;
@@ -70,11 +73,13 @@ export interface BotSettings {
   // Security
   maxRugCheckRiskScore: number;
   minLpLockedOrBurnedPct: number;
+  enforceMaxTop10Holders: boolean;
   maxTop10HoldersPct: number;
   maxSingleHolderPct: number;
   maxSellRouteImpactPct: number;
 
   // Scoring
+  enforceMinScores: boolean;
   minQualityScore: number;
   minTradeScore: number;
 

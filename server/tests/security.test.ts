@@ -126,3 +126,24 @@ test('security: uses RugCheck holder fallback when RPC getTokenLargestAccounts i
   assert.equal(withRugCheckHolders.passed, true, `Unexpected rejection: ${withRugCheckHolders.reasons.join('; ')}`);
 });
 
+test('security: skips top-10 non-pool holder limit when enforceMaxTop10Holders is unchecked', () => {
+  const concentrated: OnChainTokenInspection = {
+    ...makeCleanOnChain(),
+    top10HoldersPct: 41.2,
+  };
+  const bypassed = evaluateSecurityRules(
+    {
+      onChain: concentrated,
+      rugCheck: makeCleanRugCheck(),
+      sellRouteExists: true,
+      sellQuoteImpactPct: 0.8,
+    },
+    {
+      ...DEFAULT_SETTINGS,
+      enforceMaxTop10Holders: false,
+    }
+  );
+  assert.equal(bypassed.passed, true, `Unexpected rejection when top-10 rule disabled: ${bypassed.reasons.join('; ')}`);
+});
+
+

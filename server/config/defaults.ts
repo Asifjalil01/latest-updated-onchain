@@ -6,8 +6,8 @@ export const HARD_LIMITS = {
   maxSlippageBps: 1000,
   maxPriorityFeeSolCap: 0.05,
   minPoolAgeFloorMinutes: 30,
-  minLiquidityFloorUsd: 10000,
-  customMinLiquidityFloorUsd: 50,
+  minLiquidityFloorUsd: 0,
+  customMinLiquidityFloorUsd: 0,
   maxTop10HoldersCeilingPct: 50,
   maxSingleHolderCeilingPct: 20,
   maxOpenPositionsCeiling: 10,
@@ -36,6 +36,9 @@ export const DEFAULT_SETTINGS: BotSettings = {
   customAgeWindowEnabled: false,
   customMinPoolAgeMinutes: 5,
   customMaxPoolAgeMinutes: 30,
+  newLaunchOnlyEnabled: false,
+  newLaunchMinAgeSeconds: 5,
+  newLaunchMaxAgeSeconds: 300,
   minLiquidityUsd: 25000,
   minVolume24hUsd: 50000,
   minTx24h: 200,
@@ -51,11 +54,13 @@ export const DEFAULT_SETTINGS: BotSettings = {
   // Security
   maxRugCheckRiskScore: 30,
   minLpLockedOrBurnedPct: 80,
+  enforceMaxTop10Holders: true,
   maxTop10HoldersPct: 35,
   maxSingleHolderPct: 10,
   maxSellRouteImpactPct: 5,
 
   // Scoring
+  enforceMinScores: true,
   minQualityScore: 60,
   minTradeScore: 55,
 
@@ -274,7 +279,11 @@ export function validateSettingsUpdate(
       `Take-Profit (%) must be at least ${HARD_LIMITS.minTakeProfitPct}% (no upper limit).`
     );
   }
-  if (!Number.isFinite(merged.minPoolAgeMinutes) || merged.minPoolAgeMinutes < HARD_LIMITS.minPoolAgeFloorMinutes) {
+  if (
+    !merged.customAgeWindowEnabled &&
+    !merged.newLaunchOnlyEnabled &&
+    (!Number.isFinite(merged.minPoolAgeMinutes) || merged.minPoolAgeMinutes < HARD_LIMITS.minPoolAgeFloorMinutes)
+  ) {
     pushErr(
       'minPoolAgeMinutes',
       `Default Min Pool Age must be at least ${HARD_LIMITS.minPoolAgeFloorMinutes} minutes (or enable Custom Pool Age Timeframe above).`
@@ -293,21 +302,27 @@ export function validateSettingsUpdate(
       `Max Coin Age must be > 0 and at least ${Number.isFinite(merged.customMinPoolAgeMinutes) ? merged.customMinPoolAgeMinutes : 0} minutes.`
     );
   }
-  const requiredMinLiquidity = merged.customAgeWindowEnabled
-    ? HARD_LIMITS.customMinLiquidityFloorUsd
-    : HARD_LIMITS.minLiquidityFloorUsd;
-  if (!Number.isFinite(merged.minLiquidityUsd) || merged.minLiquidityUsd < requiredMinLiquidity) {
-    pushErr(
-      'minLiquidityUsd',
-      merged.customAgeWindowEnabled
-        ? `Custom timeframe active: Min Liquidity ($) must be at least $${HARD_LIMITS.customMinLiquidityFloorUsd}.`
-        : `Must be at least $${HARD_LIMITS.minLiquidityFloorUsd.toLocaleString()} (or check "Use Custom Pool Age Timeframe" above for lower liquidity).`
-    );
+  if (!Number.isFinite(merged.newLaunchMinAgeSeconds) || merged.newLaunchMinAgeSeconds < 0) {
+    pushErr('newLaunchMinAgeSeconds', 'Min Launch Age must be 0 seconds or greater.');
   }
   if (
-    !Number.isFinite(merged.maxTop10HoldersPct) ||
-    merged.maxTop10HoldersPct < 1 ||
-    merged.maxTop10HoldersPct > HARD_LIMITS.maxTop10HoldersCeilingPct
+    !Number.isFinite(merged.newLaunchMaxAgeSeconds) ||
+    merged.newLaunchMaxAgeSeconds < 1 ||
+    merged.newLaunchMaxAgeSeconds < merged.newLaunchMinAgeSeconds
+  ) {
+    pushErr(
+      'newLaunchMaxAgeSeconds',
+      `Max Launch Age must be >= 1s and >= ${Number.isFinite(merged.newLaunchMinAgeSeconds) ? merged.newLaunchMinAgeSeconds : 0}s.`
+    );
+  }
+  if (!Number.isFinite(merged.minLiquidityUsd) || merged.minLiquidityUsd < 0) {
+    pushErr('minLiquidityUsd', 'Min Liquidity ($) must be $0 or greater (no upper limit).');
+  }
+  if (
+    merged.enforceMaxTop10Holders &&
+    (!Number.isFinite(merged.maxTop10HoldersPct) ||
+      merged.maxTop10HoldersPct < 1 ||
+      merged.maxTop10HoldersPct > HARD_LIMITS.maxTop10HoldersCeilingPct)
   ) {
     pushErr(
       'maxTop10HoldersPct',
@@ -391,10 +406,16 @@ export function validateSettingsUpdate(
   if (!Number.isFinite(merged.paperCompetitionPenaltyPct) || merged.paperCompetitionPenaltyPct < 0 || merged.paperCompetitionPenaltyPct > 20) {
     pushErr('paperCompetitionPenaltyPct', '<24h Competition Penalty (%) must be between 0% and 20%.');
   }
-  if (!Number.isFinite(merged.minQualityScore) || merged.minQualityScore < 50 || merged.minQualityScore > 100) {
+  if (
+    merged.enforceMinScores &&
+    (!Number.isFinite(merged.minQualityScore) || merged.minQualityScore < 50 || merged.minQualityScore > 100)
+  ) {
     pushErr('minQualityScore', 'Min Quality Score must be between 50 and 100.');
   }
-  if (!Number.isFinite(merged.minTradeScore) || merged.minTradeScore < 50 || merged.minTradeScore > 100) {
+  if (
+    merged.enforceMinScores &&
+    (!Number.isFinite(merged.minTradeScore) || merged.minTradeScore < 50 || merged.minTradeScore > 100)
+  ) {
     pushErr('minTradeScore', 'Min Trade Score must be between 50 and 100.');
   }
   if (!Array.isArray(merged.trailingLadder) || merged.trailingLadder.length === 0) {

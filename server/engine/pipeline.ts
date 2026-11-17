@@ -449,7 +449,7 @@ export class BotOrchestrator {
       };
     }
 
-    const valid = validateCandidateData(candidate);
+    const valid = validateCandidateData(candidate, settings);
     if (!valid.valid) {
       return {
         candidate,
@@ -544,14 +544,21 @@ export class BotOrchestrator {
       }
 
       // Stage 1: DISCOVER
+      const preferNewPoolsOnly = settings.newLaunchOnlyEnabled;
       const preferYoungPools =
-        settings.customAgeWindowEnabled && settings.customMaxPoolAgeMinutes <= 60;
+        preferNewPoolsOnly ||
+        (settings.customAgeWindowEnabled && settings.customMaxPoolAgeMinutes <= 60);
       const [dsDisc, geckoPools, jupRecent] = await Promise.all([
         this.dexScreener.discoverMints(settings.enableDexScreenerBoosts),
-        this.geckoTerminal.discoverPools({ preferYoungPools }),
+        this.geckoTerminal.discoverPools({ preferYoungPools, preferNewPoolsOnly }),
         this.jupiter.fetchRecentTokens(),
       ]);
-      const pumpMints = settings.enablePumpPortalWs ? this.pumpPortal.drainRecentMints() : [];
+      const pumpMaxAgeMs = preferNewPoolsOnly
+        ? Math.max(90_000, settings.newLaunchMaxAgeSeconds * 1000 + 60_000)
+        : 45 * 60_000;
+      const pumpMints = settings.enablePumpPortalWs
+        ? this.pumpPortal.drainRecentMints(pumpMaxAgeMs)
+        : [];
 
       const nowMs = Date.now();
       const rawCandidates = new Map<string, CandidateToken>();
@@ -571,11 +578,18 @@ export class BotOrchestrator {
         }
       }
 
-      // Track newly seen young pools in a rolling watchlist so <5m launches get re-checked once they enter 5-30m+ windows
-      const watchMaxAgeMs = Math.max(75, (settings.customMaxPoolAgeMinutes || 30) + 15) * 60_000;
+      // Track newly seen young pools in a rolling watchlist so <5m launches get re-checked cleanly
+      const watchMaxAgeMs = preferNewPoolsOnly
+        ? Math.max(120_000, settings.newLaunchMaxAgeSeconds * 1000 + 90_000)
+        : Math.max(75, (settings.customMaxPoolAgeMinutes || 30) + 15) * 60_000;
       for (const [mint, createdAt] of this.youngPoolWatchlist.entries()) {
         if (nowMs - createdAt > watchMaxAgeMs) {
           this.youngPoolWatchlist.delete(mint);
+        }
+      }
+      for (const mint of pumpMints.slice(0, 80)) {
+        if (!this.youngPoolWatchlist.has(mint)) {
+          this.youngPoolWatchlist.set(mint, nowMs);
         }
       }
       for (const c of [...geckoPools, ...jupRecent, ...dsDisc.candidates]) {
@@ -593,18 +607,30 @@ export class BotOrchestrator {
         }
       }
 
-      // Prioritize mints needing DexScreener batch metrics (GeckoTerminal, PumpPortal migrations, Jupiter 5m/recent, maturing watchlist)
-      // ahead of unmigrated $0 token-profiles, and skip re-enriching pairs already returned by DexScreener search.
+      // Prioritize mints needing DexScreener batch metrics (PumpPortal launches, Gecko new pools, Jupiter 5m/recent, watchlist)
       const mintsToEnrich = new Set<string>();
-      for (const c of geckoPools) mintsToEnrich.add(c.mint);
-      for (const m of pumpMints) mintsToEnrich.add(m);
-      for (const c of jupRecent) mintsToEnrich.add(c.mint);
+      if (preferNewPoolsOnly) {
+        for (const m of pumpMints) mintsToEnrich.add(m);
+        for (const c of geckoPools) mintsToEnrich.add(c.mint);
+        for (const c of jupRecent) mintsToEnrich.add(c.mint);
+      } else {
+        for (const c of geckoPools) mintsToEnrich.add(c.mint);
+        for (const m of pumpMints) mintsToEnrich.add(m);
+        for (const c of jupRecent) mintsToEnrich.add(c.mint);
+      }
       for (const [mint, createdAt] of this.youngPoolWatchlist.entries()) {
-        const ageMin = (nowMs - createdAt) / 60_000;
-        const targetMin = settings.customAgeWindowEnabled ? settings.customMinPoolAgeMinutes : 30;
-        const targetMax = settings.customAgeWindowEnabled ? settings.customMaxPoolAgeMinutes : 75;
-        if (ageMin >= Math.max(0, targetMin - 1) && ageMin <= targetMax + 2) {
-          mintsToEnrich.add(mint);
+        if (preferNewPoolsOnly) {
+          const ageSec = (nowMs - createdAt) / 1000;
+          if (ageSec <= settings.newLaunchMaxAgeSeconds + 45) {
+            mintsToEnrich.add(mint);
+          }
+        } else {
+          const ageMin = (nowMs - createdAt) / 60_000;
+          const targetMin = settings.customAgeWindowEnabled ? settings.customMinPoolAgeMinutes : 30;
+          const targetMax = settings.customAgeWindowEnabled ? settings.customMaxPoolAgeMinutes : 75;
+          if (ageMin >= Math.max(0, targetMin - 1) && ageMin <= targetMax + 2) {
+            mintsToEnrich.add(mint);
+          }
         }
       }
       for (const m of dsDisc.mints) {
@@ -639,7 +665,7 @@ export class BotOrchestrator {
         evaluated += 1;
 
         // Stage 2: DATA VALIDATE
-        const valid = validateCandidateData(candidate);
+        const valid = validateCandidateData(candidate, settings);
         if (!valid.valid) {
           this.recordRejection(candidate, 'DATA_VALIDATE', valid.reason || 'Invalid data', 0, 0, {
             valid,

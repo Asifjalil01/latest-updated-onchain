@@ -25,7 +25,9 @@ export function classifyToken(
   if (token.liquidityUsd >= 75_000 && poolAgeMinutes >= 180) {
     return { tokenClass: 'early_stage', sizeMultiplier: 0.7 };
   }
-  const memeFloorUsd = allowCustomYoungAge ? Math.min(10_000, Math.max(50, customMinLiquidityUsd)) : 10_000;
+  const microOverride = customMinLiquidityUsd < 10_000;
+  const memeFloorUsd =
+    allowCustomYoungAge || microOverride ? Math.min(10_000, Math.max(0, customMinLiquidityUsd)) : 10_000;
   if (token.liquidityUsd >= memeFloorUsd && (poolAgeMinutes >= 30 || allowCustomYoungAge)) {
     return { tokenClass: 'meme', sizeMultiplier: 0.4 };
   }
@@ -42,10 +44,16 @@ export function scoreCandidate(params: {
   const { token, filterResult, securityReport, settings } = params;
   const nowMs = params.nowMs ?? Date.now();
   const poolAgeMinutes = filterResult.computed.poolAgeMinutes;
+  const poolAgeSeconds = poolAgeMinutes * 60;
+  const allowNewLaunchAge =
+    settings.newLaunchOnlyEnabled &&
+    poolAgeSeconds >= settings.newLaunchMinAgeSeconds &&
+    poolAgeSeconds <= settings.newLaunchMaxAgeSeconds;
   const allowCustomYoungAge =
-    settings.customAgeWindowEnabled &&
-    poolAgeMinutes >= settings.customMinPoolAgeMinutes &&
-    poolAgeMinutes <= settings.customMaxPoolAgeMinutes;
+    allowNewLaunchAge ||
+    (settings.customAgeWindowEnabled &&
+      poolAgeMinutes >= settings.customMinPoolAgeMinutes &&
+      poolAgeMinutes <= settings.customMaxPoolAgeMinutes);
   const { tokenClass, sizeMultiplier } = classifyToken(
     token,
     poolAgeMinutes,
@@ -57,9 +65,9 @@ export function scoreCandidate(params: {
   const safetyPts = securityReport.passed
     ? Math.max(0, 30 - (securityReport.rugCheckScore ?? 30) * 0.5)
     : 0;
-  const isMicroCustomWindow = allowCustomYoungAge && settings.minLiquidityUsd < 10_000;
+  const isMicroCustomWindow = (allowCustomYoungAge || settings.minLiquidityUsd < 10_000) && settings.minLiquidityUsd < 10_000;
   const baseLiqLog = Math.log10(
-    Math.max(50, allowCustomYoungAge ? Math.min(10_000, settings.minLiquidityUsd) : 10_000)
+    Math.max(1, allowCustomYoungAge || settings.minLiquidityUsd < 10_000 ? Math.min(10_000, settings.minLiquidityUsd) : 10_000)
   );
   const targetLiqLog = isMicroCustomWindow ? Math.max(baseLiqLog + 1.5, 4.5) : 6;
   const liqSpan = Math.max(1, targetLiqLog - baseLiqLog);
@@ -92,8 +100,10 @@ export function scoreCandidate(params: {
   );
 
   // Trade score components (max 100)
-  const mom1h = Math.max(0, Math.min(45, token.priceChange1hPct));
-  const momentumPts = Math.min(25, (mom1h / 25) * 20 + (token.priceChange24hPct > 0 ? 5 : 0));
+  const safe1h = Number.isFinite(token.priceChange1hPct) ? token.priceChange1hPct : 0;
+  const safe24h = Number.isFinite(token.priceChange24hPct) ? token.priceChange24hPct : 0;
+  const mom1h = Math.max(0, Math.min(45, safe1h));
+  const momentumPts = Math.min(25, (mom1h / 25) * 20 + (safe24h > 0 ? 5 : 0));
   const buyRatio = filterResult.computed.buyRatio;
   const buyPressurePts = Math.max(0, Math.min(25, ((buyRatio - 0.45) / 0.25) * 25));
   const volLiq = filterResult.computed.volumeLiquidityRatio;
@@ -101,12 +111,12 @@ export function scoreCandidate(params: {
   const breadthTarget = allowCustomYoungAge ? 100 : 500;
   const breadthPts = Math.min(15, (token.uniqueTraders24h / breadthTarget) * 15);
   const regimePts = allowCustomYoungAge
-    ? token.priceChange1hPct >= -10 && token.priceChange1hPct <= 300
+    ? safe1h >= -10 && safe1h <= 300
       ? 15
       : 10
-    : token.priceChange24hPct >= 0 && token.priceChange1hPct <= 60
+    : safe24h >= 0 && safe1h <= 60
       ? 15
-      : token.priceChange1hPct <= 100
+      : safe1h <= 100
         ? 10
         : 5;
 
@@ -128,23 +138,28 @@ export function scoreCandidate(params: {
   if (tokenClass === 'high_risk_micro') {
     reasons.push('Classified as high_risk_micro (always rejected)');
   }
-  if (qualityScore < settings.minQualityScore) {
-    reasons.push(`Quality score ${qualityScore} < ${settings.minQualityScore} threshold`);
-  }
-  if (tradeScore < settings.minTradeScore) {
-    reasons.push(`Trade score ${tradeScore} < ${settings.minTradeScore} threshold`);
+  if (settings.enforceMinScores) {
+    if (qualityScore < settings.minQualityScore) {
+      reasons.push(`Quality score ${qualityScore} < ${settings.minQualityScore} threshold`);
+    }
+    if (tradeScore < settings.minTradeScore) {
+      reasons.push(`Trade score ${tradeScore} < ${settings.minTradeScore} threshold`);
+    }
   }
   if (securityReport.criticalFlags.length > 0) {
     reasons.push(`Critical security flags present: ${securityReport.criticalFlags.join(', ')}`);
   }
+
+  const scoreGatePassed =
+    !settings.enforceMinScores ||
+    (qualityScore >= settings.minQualityScore && tradeScore >= settings.minTradeScore);
 
   const approved =
     filterResult.passed &&
     securityReport.passed &&
     securityReport.criticalFlags.length === 0 &&
     tokenClass !== 'high_risk_micro' &&
-    qualityScore >= settings.minQualityScore &&
-    tradeScore >= settings.minTradeScore;
+    scoreGatePassed;
 
   return {
     mint: token.mint,

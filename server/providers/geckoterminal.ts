@@ -81,44 +81,63 @@ export class GeckoTerminalProvider {
 
   async discoverPools(options?: {
     preferYoungPools?: boolean;
+    preferNewPoolsOnly?: boolean;
   }): Promise<CandidateToken[]> {
     const results: CandidateToken[] = [];
     this.cycleCount += 1;
 
-    // Limit to 2 endpoints per uncached cycle (with 65s cache) to stay safely under GeckoTerminal's public rate limit.
-    // `duration=5m` surfaces active 5-30m pools alongside 1h+ runners.
-    const endpoints = options?.preferYoungPools
+    // Limit to 2 endpoints per uncached cycle (with cooldown-safe cache) to stay under GeckoTerminal's public rate limit.
+    const endpoints: Array<{ url: string; tag: string; ttlMs: number }> = options?.preferNewPoolsOnly
       ? [
-          {
-            url: 'https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?duration=5m',
-            tag: 'gecko_trending_5m',
-          },
           {
             url: 'https://api.geckoterminal.com/api/v2/networks/solana/new_pools',
             tag: 'gecko_new',
+            ttlMs: 25_000,
+          },
+          {
+            url: 'https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?duration=5m',
+            tag: 'gecko_trending_5m',
+            ttlMs: 45_000,
           },
         ]
-      : this.cycleCount % 2 === 1
+      : options?.preferYoungPools
         ? [
-            {
-              url: 'https://api.geckoterminal.com/api/v2/networks/solana/trending_pools',
-              tag: 'gecko_trending',
-            },
             {
               url: 'https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?duration=5m',
               tag: 'gecko_trending_5m',
-            },
-          ]
-        : [
-            {
-              url: 'https://api.geckoterminal.com/api/v2/networks/solana/trending_pools',
-              tag: 'gecko_trending',
+              ttlMs: 65_000,
             },
             {
               url: 'https://api.geckoterminal.com/api/v2/networks/solana/new_pools',
               tag: 'gecko_new',
+              ttlMs: 65_000,
             },
-          ];
+          ]
+        : this.cycleCount % 2 === 1
+          ? [
+              {
+                url: 'https://api.geckoterminal.com/api/v2/networks/solana/trending_pools',
+                tag: 'gecko_trending',
+                ttlMs: 65_000,
+              },
+              {
+                url: 'https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?duration=5m',
+                tag: 'gecko_trending_5m',
+                ttlMs: 65_000,
+              },
+            ]
+          : [
+              {
+                url: 'https://api.geckoterminal.com/api/v2/networks/solana/trending_pools',
+                tag: 'gecko_trending',
+                ttlMs: 65_000,
+              },
+              {
+                url: 'https://api.geckoterminal.com/api/v2/networks/solana/new_pools',
+                tag: 'gecko_new',
+                ttlMs: 65_000,
+              },
+            ];
 
     for (const ep of endpoints) {
       if (this.http.isRateLimited()) break;
@@ -127,7 +146,7 @@ export class GeckoTerminalProvider {
           ep.url,
           undefined,
           ep.tag,
-          65_000
+          ep.ttlMs
         );
         for (const item of resp?.data ?? []) {
           const mapped = this.mapPool(item, ep.tag);

@@ -33,13 +33,51 @@ test('settingsValidation: accepts 90% SL with 25% TP and highlights specific inv
   });
   assert.equal(customMicroLiquidity.valid, true);
 
-  const defaultLiqTooLow = validateSettingsDraft({
+  const microLiquidityCases = [0, 1, 50, 2000, 1_000_000];
+  for (const liq of microLiquidityCases) {
+    const res = validateSettingsDraft({
+      ...DEFAULT_SETTINGS,
+      customAgeWindowEnabled: false,
+      newLaunchOnlyEnabled: false,
+      minLiquidityUsd: liq,
+    });
+    assert.equal(res.valid, true, `Expected minLiquidityUsd=$${liq} to be valid`);
+  }
+
+  const negativeLiq = validateSettingsDraft({
     ...DEFAULT_SETTINGS,
-    customAgeWindowEnabled: false,
-    minLiquidityUsd: 2000,
+    minLiquidityUsd: -1,
   });
-  assert.equal(defaultLiqTooLow.valid, false);
-  assert.match(defaultLiqTooLow.fieldErrors.minLiquidityUsd, /\$10,000/);
+  assert.equal(negativeLiq.valid, false);
+  assert.match(negativeLiq.fieldErrors.minLiquidityUsd, /\$0 or greater/);
+
+  const newLaunchValid = validateSettingsDraft({
+    ...DEFAULT_SETTINGS,
+    newLaunchOnlyEnabled: true,
+    newLaunchMinAgeSeconds: 5,
+    newLaunchMaxAgeSeconds: 300,
+    minLiquidityUsd: 0,
+  });
+  assert.equal(newLaunchValid.valid, true);
+
+  const newLaunchInvalidBounds = validateSettingsDraft({
+    ...DEFAULT_SETTINGS,
+    newLaunchOnlyEnabled: true,
+    newLaunchMinAgeSeconds: 120,
+    newLaunchMaxAgeSeconds: 60,
+  });
+  assert.equal(newLaunchInvalidBounds.valid, false);
+  assert.match(newLaunchInvalidBounds.fieldErrors.newLaunchMaxAgeSeconds, />= Min Launch Age/);
+
+  const uncheckedRulesPass = validateSettingsDraft({
+    ...DEFAULT_SETTINGS,
+    enforceMaxTop10Holders: false,
+    maxTop10HoldersPct: 99,
+    enforceMinScores: false,
+    minQualityScore: 10,
+    minTradeScore: 10,
+  });
+  assert.equal(uncheckedRulesPass.valid, true);
 
   assert.equal(invalidCase.valid, false);
   assert.match(invalidCase.fieldErrors.maxOpenPositions, /between 1 and 10/);

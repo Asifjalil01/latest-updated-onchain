@@ -254,3 +254,122 @@ test('filters & scoring: 5-30m custom timeframe + $300 minLiquidity accepts vola
   );
   assert.equal(strictDefault.passed, false);
 });
+
+test('filters, scoring & sizing: New Launches Only (5s-300s), unlimited $0/$1 liquidity, and optional Min Quality/Trade Score checkbox', async () => {
+  const { calculatePositionSize } = await import('../engine/sizing');
+  const now = 1_760_000_000_000;
+  const newLaunchSettings = {
+    ...DEFAULT_SETTINGS,
+    newLaunchOnlyEnabled: true,
+    newLaunchMinAgeSeconds: 5,
+    newLaunchMaxAgeSeconds: 300,
+    minLiquidityUsd: 0,
+    enforceMinScores: false,
+  };
+
+  const brandNew10s: CandidateToken = {
+    mint: 'NewLaunch10s1111111111111111111111111111111',
+    symbol: 'NEW10S',
+    name: 'Brand New 10s Launch',
+    source: 'pumpportal_ws',
+    dex: 'pumpfun',
+    pairAddress: 'PairNew10s1111111111111111111111111111111',
+    poolCreatedAtMs: now - 10_000, // 10s old
+    priceUsd: 0.000012,
+    priceSol: 0.00000016,
+    liquidityUsd: 0, // $0 initial pre-migration / unindexed liquidity
+    volume24hUsd: 0,
+    fdvUsd: 4_500,
+    txCount24h: 0,
+    buys24h: 0,
+    sells24h: 0,
+    uniqueTraders24h: 0,
+    priceChange1hPct: Number.NaN,
+    priceChange24hPct: Number.NaN,
+    rawUpdatedAtMs: now,
+  };
+
+  assert.equal(validateCandidateData(brandNew10s, newLaunchSettings).valid, true);
+  const filter10s = evaluateHardFilters(brandNew10s, newLaunchSettings, 0.5, now);
+  assert.equal(filter10s.passed, true, `Unexpected 10s rejection: ${filter10s.reasons.join('; ')}`);
+
+  // 60s old with $1 liquidity also passes
+  const brandNew60s: CandidateToken = {
+    ...brandNew10s,
+    mint: 'NewLaunch60s1111111111111111111111111111111',
+    poolCreatedAtMs: now - 60_000,
+    liquidityUsd: 1,
+  };
+  assert.equal(validateCandidateData(brandNew60s, { ...newLaunchSettings, minLiquidityUsd: 1 }).valid, true);
+  assert.equal(
+    evaluateHardFilters(brandNew60s, { ...newLaunchSettings, minLiquidityUsd: 1 }, 0.5, now).passed,
+    true
+  );
+
+  // 360s (6m) old is rejected because max launch age is 300s
+  const tooOld6m: CandidateToken = {
+    ...brandNew10s,
+    poolCreatedAtMs: now - 360_000,
+  };
+  const filter6m = evaluateHardFilters(tooOld6m, newLaunchSettings, 0.5, now);
+  assert.equal(filter6m.passed, false);
+  assert.ok(filter6m.reasons.some((r) => r.includes('New Launches Only')));
+
+  const cleanSec: SecurityReport = {
+    passed: true,
+    reasons: [],
+    warnings: [],
+    criticalFlags: [],
+    sourcesAgreed: 2,
+    mintAuthorityRevoked: true,
+    freezeAuthorityRevoked: true,
+    token2022DisallowedExtensions: [],
+    rugCheckScore: 10,
+    rugCheckRisks: [],
+    lpLockedOrBurnedPct: 95,
+    top10HoldersPct: 20,
+    singleMaxHolderPct: 5,
+    holders: [],
+    deployerFlagged: false,
+    sellRouteExists: true,
+    sellRouteImpactPct: 0.5,
+    sellTaxPct: 0,
+    tradingEnabled: true,
+  };
+
+  // enforceMinScores: false approves even low-score brand-new coin
+  const scoredBypass = scoreCandidate({
+    token: brandNew10s,
+    filterResult: filter10s,
+    securityReport: cleanSec,
+    settings: newLaunchSettings,
+    nowMs: now,
+  });
+  assert.equal(scoredBypass.decision, 'BUY', `Expected BUY with enforceMinScores=false, got: ${scoredBypass.reasons.join('; ')}`);
+
+  // enforceMinScores: true rejects when score thresholds are high
+  const scoredEnforced = scoreCandidate({
+    token: brandNew10s,
+    filterResult: filter10s,
+    securityReport: cleanSec,
+    settings: { ...newLaunchSettings, enforceMinScores: true, minQualityScore: 95, minTradeScore: 95 },
+    nowMs: now,
+  });
+  assert.equal(scoredEnforced.decision, 'REJECT');
+  assert.ok(scoredEnforced.reasons.some((r) => r.includes('Quality score') || r.includes('Trade score')));
+
+  // Sizing does not zero-cap when user explicitly sets minLiquidityUsd=$0 / $1
+  const sizing = calculatePositionSize({
+    settings: newLaunchSettings,
+    availableBalanceSol: 5,
+    currentExposureSol: 0,
+    openPositionsCount: 0,
+    dailyRealizedPnlSol: 0,
+    poolLiquidityUsd: 1,
+    solPriceUsd: 72,
+    tokenClassMultiplier: scoredBypass.sizeMultiplier,
+  });
+  assert.equal(sizing.approved, true, `Unexpected sizing block: ${sizing.reason}`);
+  assert.ok(sizing.solAmount > 0);
+});
+

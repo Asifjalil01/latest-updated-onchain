@@ -311,6 +311,8 @@ export function SettingsView() {
   );
   const stopLossHasError = hasErrorPrefix('stopLossEnabled', 'stopLossTiers');
   const filtersHasError = hasErrorPrefix(
+    'newLaunchMinAgeSeconds',
+    'newLaunchMaxAgeSeconds',
     'customMinPoolAgeMinutes',
     'customMaxPoolAgeMinutes',
     'minPoolAgeMinutes',
@@ -657,6 +659,91 @@ export function SettingsView() {
           <section className={sectionClass(filtersHasError)}>
             <h2 className="font-display text-sm font-bold">Hard Filters &amp; Security Thresholds</h2>
 
+            {/* New Launches Only (Brand-new coins: e.g. 5s, 10s, 1m up to 5m) */}
+            <div
+              className={`rounded-xl border p-3.5 space-y-3 text-xs ${
+                hasErrorPrefix('newLaunchMinAgeSeconds', 'newLaunchMaxAgeSeconds')
+                  ? 'border-rose-500/70 bg-rose-500/5'
+                  : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60'
+              }`}
+            >
+              <label className="inline-flex items-center gap-2 font-semibold text-slate-800 dark:text-slate-200 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={draft.newLaunchOnlyEnabled}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    updateField('newLaunchOnlyEnabled', checked);
+                    if (checked && draft.customAgeWindowEnabled) {
+                      updateField('customAgeWindowEnabled', false);
+                    }
+                    clearFieldError(
+                      'newLaunchMinAgeSeconds',
+                      'newLaunchMaxAgeSeconds',
+                      'customMinPoolAgeMinutes',
+                      'customMaxPoolAgeMinutes',
+                      'minPoolAgeMinutes'
+                    );
+                  }}
+                />
+                <span>New Launches Only (Brand-New Coins Window in Seconds)</span>
+              </label>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                {draft.newLaunchOnlyEnabled
+                  ? `Active: Bot searches & trades only newly launched coins between ${Number.isFinite(draft.newLaunchMinAgeSeconds) ? draft.newLaunchMinAgeSeconds : 0}s and ${Number.isFinite(draft.newLaunchMaxAgeSeconds) ? draft.newLaunchMaxAgeSeconds : 0}s (${safeFixed((Number.isFinite(draft.newLaunchMaxAgeSeconds) ? draft.newLaunchMaxAgeSeconds : 0) / 60, 1)}m) old.`
+                  : 'Unchecked: Bot uses Custom Pool Age Timeframe below (if checked) or Default Min Pool Age (>= 30m).'}
+              </p>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="space-y-1">
+                  <span className="text-slate-500 block">Min Launch Age (seconds)</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1"
+                    disabled={!draft.newLaunchOnlyEnabled}
+                    data-field-key="newLaunchMinAgeSeconds"
+                    aria-label="New launch min age seconds"
+                    value={inputValue(draft.newLaunchMinAgeSeconds)}
+                    onChange={(e) => updateField('newLaunchMinAgeSeconds', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'newLaunchMinAgeSeconds',
+                      'w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 disabled:opacity-50'
+                    )}
+                  />
+                  <FieldErrorPopup
+                    message={fieldErrors.newLaunchMinAgeSeconds}
+                    onDismiss={() => clearFieldError('newLaunchMinAgeSeconds')}
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-500 flex items-center justify-between">
+                    <span>Max Launch Age (seconds)</span>
+                    <span className="font-mono text-[11px] text-teal-600 dark:text-teal-400">
+                      = {safeFixed((Number.isFinite(draft.newLaunchMaxAgeSeconds) ? draft.newLaunchMaxAgeSeconds : 0) / 60, 1)}m
+                    </span>
+                  </span>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    disabled={!draft.newLaunchOnlyEnabled}
+                    data-field-key="newLaunchMaxAgeSeconds"
+                    aria-label="New launch max age seconds"
+                    value={inputValue(draft.newLaunchMaxAgeSeconds)}
+                    onChange={(e) => updateField('newLaunchMaxAgeSeconds', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'newLaunchMaxAgeSeconds',
+                      'w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 disabled:opacity-50'
+                    )}
+                  />
+                  <FieldErrorPopup
+                    message={fieldErrors.newLaunchMaxAgeSeconds}
+                    onDismiss={() => clearFieldError('newLaunchMaxAgeSeconds')}
+                  />
+                </label>
+              </div>
+            </div>
+
             {/* Custom Pool Age Timeframe Window */}
             <div
               className={`rounded-xl border p-3.5 space-y-3 text-xs ${
@@ -670,12 +757,17 @@ export function SettingsView() {
                   type="checkbox"
                   checked={draft.customAgeWindowEnabled}
                   onChange={(e) => {
-                    updateField('customAgeWindowEnabled', e.target.checked);
+                    const checked = e.target.checked;
+                    updateField('customAgeWindowEnabled', checked);
+                    if (checked && draft.newLaunchOnlyEnabled) {
+                      updateField('newLaunchOnlyEnabled', false);
+                    }
                     clearFieldError(
                       'customMinPoolAgeMinutes',
                       'customMaxPoolAgeMinutes',
-                      'minPoolAgeMinutes',
-                      'minLiquidityUsd'
+                      'newLaunchMinAgeSeconds',
+                      'newLaunchMaxAgeSeconds',
+                      'minPoolAgeMinutes'
                     );
                   }}
                 />
@@ -738,7 +830,7 @@ export function SettingsView() {
                 <input
                   type="number"
                   min="30"
-                  disabled={draft.customAgeWindowEnabled}
+                  disabled={draft.customAgeWindowEnabled || draft.newLaunchOnlyEnabled}
                   data-field-key="minPoolAgeMinutes"
                   value={inputValue(draft.minPoolAgeMinutes)}
                   onChange={(e) => updateField('minPoolAgeMinutes', parseNumInput(e.target.value))}
@@ -754,74 +846,109 @@ export function SettingsView() {
               </label>
 
               <label className="space-y-1">
-                <span className="text-slate-500 block">Min Liquidity ($)</span>
+                <span className="text-slate-500 block">Min Liquidity ($) · Unlimited</span>
                 <input
                   type="number"
-                  min={draft.customAgeWindowEnabled ? 50 : 10000}
-                  step={draft.customAgeWindowEnabled ? 50 : 1000}
+                  min="0"
+                  step="any"
                   data-field-key="minLiquidityUsd"
                   value={inputValue(draft.minLiquidityUsd)}
                   onChange={(e) => updateField('minLiquidityUsd', parseNumInput(e.target.value))}
                   className={inputClass('minLiquidityUsd')}
                 />
-                {draft.customAgeWindowEnabled && (
-                  <span className="text-[11px] text-teal-600 dark:text-teal-400 block">
-                    Custom timeframe active: min $50 (effective emergency floor auto-scales for micro-pools).
-                  </span>
-                )}
+                <span className="text-[11px] text-slate-400 block">
+                  Any amount from $0 (e.g. $0, $1, $300, $1,000,000); emergency floor auto-scales.
+                </span>
                 <FieldErrorPopup
                   message={fieldErrors.minLiquidityUsd}
                   onDismiss={() => clearFieldError('minLiquidityUsd')}
                 />
               </label>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 block">Max Top-10 Non-Pool Holders (%)</span>
+              <div className="space-y-1.5">
+                <label className="inline-flex items-center gap-2 text-slate-600 dark:text-slate-300 font-medium cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={draft.enforceMaxTop10Holders}
+                    onChange={(e) => {
+                      updateField('enforceMaxTop10Holders', e.target.checked);
+                      clearFieldError('maxTop10HoldersPct');
+                    }}
+                  />
+                  <span>Max Top-10 Non-Pool Holders (%)</span>
+                </label>
                 <input
                   type="number"
-                  min="5"
+                  min="1"
                   max="50"
+                  disabled={!draft.enforceMaxTop10Holders}
                   data-field-key="maxTop10HoldersPct"
+                  aria-label="Max Top-10 Non-Pool Holders (%)"
                   value={inputValue(draft.maxTop10HoldersPct)}
                   onChange={(e) => updateField('maxTop10HoldersPct', parseNumInput(e.target.value))}
-                  className={inputClass('maxTop10HoldersPct')}
+                  className={inputClass(
+                    'maxTop10HoldersPct',
+                    'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-50'
+                  )}
                 />
+                <span className="text-[11px] text-slate-400 block">
+                  {draft.enforceMaxTop10Holders
+                    ? 'Checked: Enforces Top-10 non-pool holder limit.'
+                    : 'Unchecked: Top-10 non-pool holder % rule is disabled.'}
+                </span>
                 <FieldErrorPopup
                   message={fieldErrors.maxTop10HoldersPct}
                   onDismiss={() => clearFieldError('maxTop10HoldersPct')}
                 />
-              </label>
+              </div>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 block">Min Quality / Trade Score</span>
+              <div className="space-y-1.5">
+                <label className="inline-flex items-center gap-2 text-slate-600 dark:text-slate-300 font-medium cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={draft.enforceMinScores}
+                    onChange={(e) => {
+                      updateField('enforceMinScores', e.target.checked);
+                      clearFieldError('minQualityScore', 'minTradeScore');
+                    }}
+                  />
+                  <span>Min Quality / Trade Score</span>
+                </label>
                 <div className="flex gap-2">
                   <input
                     type="number"
                     min="50"
                     max="100"
+                    disabled={!draft.enforceMinScores}
                     data-field-key="minQualityScore"
                     aria-label="Min Quality Score"
                     value={inputValue(draft.minQualityScore)}
                     onChange={(e) => updateField('minQualityScore', parseNumInput(e.target.value))}
                     className={inputClass(
                       'minQualityScore',
-                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-50'
                     )}
                   />
                   <input
                     type="number"
                     min="50"
                     max="100"
+                    disabled={!draft.enforceMinScores}
                     data-field-key="minTradeScore"
                     aria-label="Min Trade Score"
                     value={inputValue(draft.minTradeScore)}
                     onChange={(e) => updateField('minTradeScore', parseNumInput(e.target.value))}
                     className={inputClass(
                       'minTradeScore',
-                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-50'
                     )}
                   />
                 </div>
+                <span className="text-[11px] text-slate-400 block">
+                  {draft.enforceMinScores
+                    ? 'Checked: Enforces minimum Quality & Trade score thresholds.'
+                    : 'Unchecked: Minimum Quality / Trade score rule is disabled.'}
+                </span>
                 <FieldErrorPopup
                   message={fieldErrors.minQualityScore}
                   onDismiss={() => clearFieldError('minQualityScore')}
@@ -830,7 +957,7 @@ export function SettingsView() {
                   message={fieldErrors.minTradeScore}
                   onDismiss={() => clearFieldError('minTradeScore')}
                 />
-              </label>
+              </div>
             </div>
           </section>
         </div>

@@ -130,7 +130,7 @@ export function evaluateSecurityRules(
     reasons.push('Top holder concentration unavailable (fail closed)');
     criticalFlags.push('HOLDER_DATA_UNAVAILABLE');
   } else {
-    if (effectiveTop10Pct > settings.maxTop10HoldersPct) {
+    if (settings.enforceMaxTop10Holders && effectiveTop10Pct > settings.maxTop10HoldersPct) {
       reasons.push(
         `Top 10 non-pool holders own ${effectiveTop10Pct.toFixed(1)}% > ${settings.maxTop10HoldersPct}% limit`
       );

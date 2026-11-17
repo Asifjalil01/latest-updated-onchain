@@ -108,7 +108,7 @@ export function snapshotExitParams(settings: BotSettings, roundTripCostPct: numb
   const clampedSl = Math.max(0.5, settings.stopLossPct);
   const clampedTp = Math.max(1.5, settings.takeProfitPct);
   const effectiveEmergencyLiquidityFloorUsd =
-    settings.customAgeWindowEnabled && settings.minLiquidityUsd < settings.emergencyLiquidityFloorUsd
+    settings.minLiquidityUsd < settings.emergencyLiquidityFloorUsd
       ? Math.min(settings.emergencyLiquidityFloorUsd, Math.max(0, settings.minLiquidityUsd * 0.5))
       : settings.emergencyLiquidityFloorUsd;
   return {

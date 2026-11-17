@@ -130,12 +130,18 @@ export class PumpPortalWsProvider {
     }
   }
 
-  drainRecentMints(): string[] {
+  drainRecentMints(maxAgeMs = 45 * 60_000): string[] {
     const now = Date.now();
-    // Keep events from the last 45 minutes so enrichment can evaluate 5-30m+ migrated pools
-    const validMigrations = this.migrationBuffer.filter((e) => now - e.receivedAtMs <= 45 * 60_000);
-    const validNew = this.newTokenBuffer.filter((e) => now - e.receivedAtMs <= 45 * 60_000);
-    return Array.from(new Set([...validMigrations, ...validNew].map((e) => e.mint)));
+    // Reverse so brand-new 5s–5m launches are prioritized at the front of DexScreener batch enrichment
+    const validMigrations = this.migrationBuffer
+      .filter((e) => now - e.receivedAtMs <= maxAgeMs)
+      .slice()
+      .reverse();
+    const validNew = this.newTokenBuffer
+      .filter((e) => now - e.receivedAtMs <= maxAgeMs)
+      .slice()
+      .reverse();
+    return Array.from(new Set([...validNew, ...validMigrations].map((e) => e.mint)));
   }
 
   getHealth(): SourceHealthRecord {

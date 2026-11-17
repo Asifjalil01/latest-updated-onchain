@@ -75,8 +75,10 @@ export function calculatePositionSize(params: {
     { label: 'MAX_POSITION_SIZE', amount: settings.maxPositionSizeSol },
     { label: 'MAX_WALLET_EXPOSURE', amount: remainingExposure },
     { label: 'AVAILABLE_MINUS_GAS_RESERVE', amount: spendableBalance },
-    { label: 'TWO_PCT_POOL_LIQUIDITY', amount: twoPctLiquiditySol },
   ];
+  if (settings.minLiquidityUsd >= 500 || poolLiquidityUsd >= 2000) {
+    candidates.push({ label: 'TWO_PCT_POOL_LIQUIDITY', amount: twoPctLiquiditySol });
+  }
 
   candidates.sort((a, b) => a.amount - b.amount);
   const limiting = candidates[0];
