@@ -116,7 +116,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   shadowLiveSizeSol: 0.01,
 };
 
-export const SETTINGS_PRESETS: Record<'safe' | 'balanced' | 'aggressive', Partial<BotSettings>> = {
+export const SETTINGS_PRESETS: Record<'safe' | 'balanced' | 'aggressive' | 'quick_profit', Partial<BotSettings>> = {
   safe: {
     tradeSizeSol: 0.025,
     maxPositionSizeSol: 0.05,
@@ -157,6 +157,40 @@ export const SETTINGS_PRESETS: Record<'safe' | 'balanced' | 'aggressive', Partia
     ],
     takeProfitPct: 24,
     maxTop10HoldersPct: 35,
+  },
+  quick_profit: {
+    tradeSizeSol: 0.1,
+    maxPositionSizeSol: 0.2,
+    maxWalletExposureSol: 0.3,
+    dailyLossLimitSol: 0.2,
+    maxOpenPositions: 3,
+    minPoolAgeMinutes: 15,
+    customAgeWindowEnabled: false,
+    newLaunchOnlyEnabled: false,
+    minLiquidityUsd: 25000,
+    minVolume24hUsd: 75000,
+    minPriceChange1hPct: 2.0,
+    minBuyRatio: 0.58,
+    enforceMaxTop10Holders: true,
+    maxTop10HoldersPct: 30,
+    enforceMinScores: true,
+    minQualityScore: 75,
+    minTradeScore: 68,
+    stopLossEnabled: true,
+    stopLossPct: 4,
+    stopLossTiers: [
+      { triggerDropPct: 2.0, sellPct: 50 },
+      { triggerDropPct: 4.0, sellPct: 100 },
+    ],
+    takeProfitPct: 12,
+    trailingEnabled: true,
+    trailingLadder: [
+      { peakGainPct: 3.0, allowedDropPct: 0.8 },
+      { peakGainPct: 5.0, allowedDropPct: 1.0 },
+      { peakGainPct: 8.0, allowedDropPct: 1.5 },
+      { peakGainPct: 12.0, allowedDropPct: 2.0 },
+    ],
+    breakEvenRecoveryEnabled: true,
   },
 };
 

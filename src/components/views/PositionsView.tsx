@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ExternalLink, RefreshCw, ShieldAlert } from 'lucide-react';
+import { ExternalLink, RefreshCw, ShieldAlert, Sliders } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import { PnlText, SparklineSvg, formatSol, formatTokenPriceUsd, formatUsd, maskMint } from '../ui/Primitives';
 import type { PositionRecord } from '../../types';
@@ -10,8 +10,28 @@ export function PositionsView() {
   const [confirmSellId, setConfirmSellId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [reclaiming, setReclaiming] = useState(false);
+  const [syncingSettings, setSyncingSettings] = useState(false);
 
   const solUsd = status?.solPriceUsd ?? 0;
+
+  const handleSyncSettings = async () => {
+    setSyncingSettings(true);
+    try {
+      const res = await apiFetch<{ success: boolean; syncedCount: number }>('/api/positions/sync-settings', {
+        method: 'POST',
+      });
+      await refreshModeData();
+      pushToast({
+        kind: 'success',
+        title: 'Settings synced to active positions',
+        body: `Updated SL/TP/Trailing rules on ${res.syncedCount} open positions.`,
+      });
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Sync failed', body: err instanceof Error ? err.message : 'Error' });
+    } finally {
+      setSyncingSettings(false);
+    }
+  };
 
   const handleSell = async (pos: PositionRecord) => {
     setBusyId(pos.id);
@@ -90,6 +110,16 @@ export function PositionsView() {
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void handleSyncSettings()}
+            disabled={syncingSettings || positions.length === 0}
+            className="px-3 py-2 rounded-xl text-xs font-medium border border-teal-500/40 text-teal-600 dark:text-teal-400 hover:bg-teal-500/10 whitespace-nowrap shrink-0 flex items-center gap-1.5 disabled:opacity-40"
+          >
+            <Sliders className={`w-3.5 h-3.5 ${syncingSettings ? 'animate-spin' : ''}`} />
+            <span>Sync Settings to Open Positions</span>
+          </button>
+
           <button
             type="button"
             onClick={() => void handleReclaimRent()}
@@ -244,35 +274,39 @@ export function PositionsView() {
 
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-100 dark:border-slate-800/70">
                   <div>
-                    <span className="text-[11px] text-slate-500 block">Entry Price</span>
-                    <span className="font-mono text-xs font-semibold tabular-nums block text-slate-900 dark:text-slate-100">
+                    <span className="text-[11px] font-sans text-slate-500 block mb-1">Entry Price</span>
+                    <div className="text-xs font-semibold font-mono tabular-nums text-slate-900 dark:text-slate-100 flex items-center h-5">
                       {formatTokenPriceUsd(pos.entryPriceUsd)}
-                    </span>
+                    </div>
                   </div>
                   <div>
-                    <span className="text-[11px] text-slate-500 block">Current Price</span>
-                    <span className={`font-mono text-xs font-semibold tabular-nums block ${pos.currentPriceUsd >= pos.entryPriceUsd ? 'text-teal-600 dark:text-teal-400' : 'text-rose-500'}`}>
+                    <span className="text-[11px] font-sans text-slate-500 block mb-1">Current Price</span>
+                    <div className={`text-xs font-semibold font-mono tabular-nums flex items-center h-5 ${pos.currentPriceUsd >= pos.entryPriceUsd ? 'text-teal-600 dark:text-teal-400' : 'text-rose-500'}`}>
                       {formatTokenPriceUsd(pos.currentPriceUsd)}
-                    </span>
+                    </div>
                   </div>
                   <div>
-                    <span className="text-[11px] text-slate-500 block">Gross P&amp;L</span>
-                    <PnlText
-                      valueSol={grossPnlSol}
-                      valuePct={grossPct}
-                      colorBlindSafe={colorBlindSafe}
-                    />
+                    <span className="text-[11px] font-sans text-slate-500 block mb-1">Gross P&amp;L</span>
+                    <div className="text-xs font-semibold font-mono tabular-nums flex items-center h-5">
+                      <PnlText
+                        valueSol={grossPnlSol}
+                        valuePct={grossPct}
+                        colorBlindSafe={colorBlindSafe}
+                      />
+                    </div>
                   </div>
                   <div>
-                    <span className="text-[11px] text-slate-500 block">
+                    <span className="text-[11px] font-sans text-slate-500 block mb-1">
                       Net P&amp;L ({pos.confirmationLabel})
                     </span>
-                    <PnlText
-                      valueSol={netPnlSol}
-                      valuePct={netPct}
-                      label={pos.confirmationLabel}
-                      colorBlindSafe={colorBlindSafe}
-                    />
+                    <div className="text-xs font-semibold font-mono tabular-nums flex items-center h-5">
+                      <PnlText
+                        valueSol={netPnlSol}
+                        valuePct={netPct}
+                        label={pos.confirmationLabel}
+                        colorBlindSafe={colorBlindSafe}
+                      />
+                    </div>
                   </div>
                 </div>
 
@@ -289,9 +323,15 @@ export function PositionsView() {
                     <span className="text-[11px] font-sans text-slate-500 block">
                       Trailing Floor
                     </span>
-                    {pos.trailingArmed && pos.trailingFloorPct !== null
-                      ? `+${pos.trailingFloorPct.toFixed(2)}% (Armed)`
-                      : `Armed > +${(pos.exitParams.roundTripCostPct + 1).toFixed(1)}%`}
+                    {pos.trailingArmed && pos.trailingFloorPct !== null ? (
+                      <span className="text-teal-600 dark:text-teal-400 font-bold">
+                        +{pos.trailingFloorPct.toFixed(1)}% (Locked)
+                      </span>
+                    ) : (
+                      <span className="text-slate-500">
+                        Inactive (Arms at Tier #1)
+                      </span>
+                    )}
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block">Peak / SL / TP</span>
@@ -299,32 +339,94 @@ export function PositionsView() {
                   </div>
                 </div>
 
-                {/* Trailing Progress Bar */}
+                {/* Trailing Profit Lock System & Progress Bar */}
                 {(() => {
-                  const armingTargetPct = pos.exitParams.roundTripCostPct + 1.0;
-                  const progressPct = pos.trailingArmed
-                    ? Math.min(100, Math.max(0, ((grossPct - (pos.trailingFloorPct ?? 0)) / (pos.exitParams.takeProfitPct - (pos.trailingFloorPct ?? 0))) * 100))
-                    : Math.min(100, Math.max(0, (grossPct / armingTargetPct) * 100));
+                  const ladder = pos.exitParams?.trailingLadder || [];
+                  const firstTier = ladder[0];
+                  const firstTierPeak = firstTier ? firstTier.peakGainPct : 20;
+                  const firstTierFloor = firstTier ? (firstTier.peakGainPct - firstTier.allowedDropPct) : 17;
+                  const isArmed = pos.trailingArmed && pos.trailingFloorPct !== null;
+
+                  // Find active tier
+                  let activeTierIndex = -1;
+                  if (isArmed) {
+                    for (let i = ladder.length - 1; i >= 0; i--) {
+                      if (pos.peakPnlPct >= ladder[i].peakGainPct) {
+                        activeTierIndex = i;
+                        break;
+                      }
+                    }
+                  }
+                  const nextTier = activeTierIndex + 1 < ladder.length ? ladder[activeTierIndex + 1] : null;
+                  const targetPeak = isArmed
+                    ? (nextTier ? nextTier.peakGainPct : pos.exitParams.takeProfitPct)
+                    : firstTierPeak;
+
+                  const isLoss = grossPct < 0;
+                  const progressPct = isArmed
+                    ? Math.min(100, Math.max(0, ((grossPct - (pos.trailingFloorPct ?? 0)) / (targetPeak - (pos.trailingFloorPct ?? 0))) * 100))
+                    : Math.min(100, Math.max(0, (grossPct / targetPeak) * 100));
+
                   return (
-                    <div className="space-y-1.5 pt-2">
-                      <div className="flex justify-between text-[11px] text-slate-500 font-mono">
-                        <span>{pos.trailingArmed ? 'Trailing Ladder Active (Progress to TP)' : `Arming Progress (>+${armingTargetPct.toFixed(1)}%)`}</span>
-                        <span className={`font-semibold ${grossPct >= 0 ? 'text-teal-600 dark:text-teal-400' : 'text-rose-500'}`}>
-                          {grossPct >= 0 ? `+${grossPct.toFixed(2)}%` : `${grossPct.toFixed(2)}%`}
+                    <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800/70">
+                      <div className="flex flex-wrap items-center justify-between text-[11px] font-mono gap-1">
+                        <span className="text-slate-500 font-sans">
+                          {isArmed
+                            ? (nextTier ? `Trailing Active · Progress to Tier #${activeTierIndex + 2} Peak (+${nextTier.peakGainPct}%)` : `Trailing Active · Progress to TP (+${pos.exitParams.takeProfitPct}%)`)
+                            : `Progress to Profit Lock Tier #1 (Peak +${firstTierPeak}%)`}
+                        </span>
+                        <span className={`font-semibold ${isLoss ? 'text-rose-500' : 'text-teal-600 dark:text-teal-400'}`}>
+                          {grossPct >= 0 ? `+${grossPct.toFixed(2)}%` : `${grossPct.toFixed(2)}%`} (Target: +{targetPeak}%)
                         </span>
                       </div>
+
                       <div className="h-2 w-full rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
                         <div
                           className={`h-full rounded-full transition-all duration-500 ${
-                            grossPct < 0
+                            isLoss
                               ? 'bg-rose-500'
-                              : pos.trailingArmed
+                              : isArmed
                                 ? 'bg-gradient-to-r from-teal-500 to-emerald-400'
                                 : 'bg-sky-500'
                           }`}
-                          style={{ width: `${Math.max(4, progressPct)}%` }}
+                          style={{ width: `${isLoss ? Math.min(100, Math.max(4, Math.abs(grossPct) * 5)) : Math.max(4, progressPct)}%` }}
                         />
                       </div>
+
+                      {/* Display Custom Trailing Profit Lock System Tiers */}
+                      {ladder.length > 0 && (
+                        <div className="space-y-1 pt-1">
+                          <div className="flex items-center justify-between text-[10px] text-slate-500">
+                            <span className="font-semibold uppercase tracking-wider">Your Stepped Trailing Profit Lock System</span>
+                            <span className="font-mono text-teal-600 dark:text-teal-400 font-medium">
+                              {isArmed
+                                ? `Tier #${activeTierIndex + 1} Locked Floor: +${pos.trailingFloorPct?.toFixed(1)}%`
+                                : `Arms at Peak +${firstTierPeak}% ➔ Locks +${firstTierFloor.toFixed(1)}% Floor`}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {ladder.map((t, idx) => {
+                              const tierFloor = t.peakGainPct - t.allowedDropPct;
+                              const currentActive = idx === activeTierIndex;
+                              const passed = pos.peakPnlPct >= t.peakGainPct;
+                              return (
+                                <span
+                                  key={idx}
+                                  className={`px-2 py-0.5 rounded-md font-mono text-[10px] tabular-nums border ${
+                                    currentActive
+                                      ? 'bg-emerald-500/15 border-emerald-500 text-emerald-500 dark:text-emerald-300 font-bold ring-1 ring-emerald-500/30'
+                                      : passed
+                                        ? 'bg-slate-100 dark:bg-slate-800/80 border-slate-300 dark:border-slate-700 text-slate-400'
+                                        : 'bg-slate-50 dark:bg-slate-900/60 border-slate-200 dark:border-slate-800 text-slate-500'
+                                  }`}
+                                >
+                                  #{idx + 1}: +{t.peakGainPct}% ➔ Lock +{tierFloor.toFixed(1)}%
+                                </span>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   );
                 })()}

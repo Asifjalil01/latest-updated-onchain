@@ -52,6 +52,7 @@ export function SettingsView() {
   const { settings, settingsHistory, apiFetch, hydrateAll, pushToast, status } = useBotStore();
   const [draft, setDraft] = useState<BotSettings | null>(settings);
   const [saving, setSaving] = useState(false);
+  const [applyToOpenPositions, setApplyToOpenPositions] = useState(true);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const stopLossListRef = useRef<HTMLDivElement | null>(null);
@@ -231,13 +232,13 @@ export function SettingsView() {
     try {
       await apiFetch('/api/settings', {
         method: 'POST',
-        body: JSON.stringify(draft),
+        body: JSON.stringify({ ...draft, applyToOpenPositions }),
       });
       await hydrateAll();
       pushToast({
         kind: 'success',
         title: 'Settings saved',
-        body: 'Changes apply to new positions only.',
+        body: applyToOpenPositions ? 'Settings saved and synced to active positions.' : 'Changes apply to new positions only.',
       });
     } catch (err) {
       const typedErr = err as Error & { fieldErrors?: Record<string, string> };
@@ -253,17 +254,17 @@ export function SettingsView() {
     }
   };
 
-  const applyPreset = async (preset: 'safe' | 'balanced' | 'aggressive') => {
+  const applyPreset = async (preset: 'safe' | 'balanced' | 'aggressive' | 'quick_profit') => {
     setSaving(true);
     setValidationError(null);
     setFieldErrors({});
     try {
       await apiFetch('/api/settings/preset', {
         method: 'POST',
-        body: JSON.stringify({ preset }),
+        body: JSON.stringify({ preset, applyToOpenPositions }),
       });
       await hydrateAll();
-      pushToast({ kind: 'info', title: `Applied "${preset}" safety preset` });
+      pushToast({ kind: 'info', title: `Applied "${preset}" preset` });
     } catch (err) {
       pushToast({
         kind: 'error',
@@ -349,6 +350,14 @@ export function SettingsView() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() => void applyPreset('quick_profit')}
+            className="px-3 py-2 rounded-xl text-xs font-bold border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20"
+          >
+            ⚡ Quick Profit Scalper
+          </button>
           {(['safe', 'balanced', 'aggressive'] as const).map((preset) => (
             <button
               key={preset}
@@ -371,12 +380,23 @@ export function SettingsView() {
         </div>
       </div>
 
-      <div className="rounded-2xl border border-teal-500/30 bg-teal-500/5 p-3.5 flex items-center gap-2.5 text-xs text-slate-700 dark:text-slate-300">
-        <Info className="w-4 h-4 text-teal-500 shrink-0" />
-        <span>
-          <strong>Applies to new positions only:</strong> Every open position retains the exact
-          stop-loss, take-profit, and trailing ladder captured when it opened.
-        </span>
+      <div className="rounded-2xl border border-teal-500/30 bg-teal-500/5 p-3.5 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-700 dark:text-slate-300">
+        <div className="flex items-center gap-2.5">
+          <Info className="w-4 h-4 text-teal-500 shrink-0" />
+          <span>
+            {applyToOpenPositions
+              ? 'New exit rules (SL, TP, trailing ladder) will automatically sync to currently active open positions.'
+              : 'Applies to new positions only (active trades retain their entry rules).'}
+          </span>
+        </div>
+        <label className="flex items-center gap-2 cursor-pointer font-medium text-slate-800 dark:text-slate-200 bg-white/70 dark:bg-slate-900/70 px-2.5 py-1 rounded-lg border border-teal-500/30">
+          <input
+            type="checkbox"
+            checked={applyToOpenPositions}
+            onChange={(e) => setApplyToOpenPositions(e.target.checked)}
+          />
+          <span>Apply exit rules to active open positions on save</span>
+        </label>
       </div>
 
       {validationError && (

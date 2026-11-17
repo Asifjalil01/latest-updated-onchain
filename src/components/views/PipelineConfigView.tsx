@@ -45,7 +45,7 @@ export function PipelineConfigView() {
     }
   };
 
-  const handleApplyPreset = async (preset: 'safe' | 'balanced' | 'aggressive') => {
+  const handleApplyPreset = async (preset: 'safe' | 'balanced' | 'aggressive' | 'quick_profit') => {
     try {
       await apiFetch('/api/settings/preset', {
         method: 'POST',
@@ -85,7 +85,14 @@ export function PipelineConfigView() {
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void handleApplyPreset('quick_profit')}
+            className="px-3 py-1.5 rounded-xl text-xs font-bold border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20"
+          >
+            ⚡ Quick Profit Scalper
+          </button>
           <button
             type="button"
             onClick={() => void handleApplyPreset('safe')}

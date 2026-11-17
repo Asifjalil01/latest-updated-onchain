@@ -2,6 +2,27 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.14.0 — Trailing Profit Lock Badges, Active Position Settings Sync, Uniform Font Heights & Quick-Profit Preset
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Visual Trailing Profit Lock System Badges (`PositionsView.tsx`)**:
+  - Replaced ambiguous "Armed > +13.0%" label with real-time status: `Locked at +X%` (when active) or `Inactive (Arms at Tier #1)`.
+  - Added visual tier badges on every open position card displaying your exact stepped trailing profit lock system (`#1: +X% ➔ Lock +Y%`, `#2: ...`), highlighting the active locked tier in green.
+  - Aligned the progress bar to target the active tier peak gain and turn red during drawdowns or green during profit.
+- **Active Position Settings Sync (`PositionsView.tsx`, `SettingsView.tsx`, `api.ts`, `db.ts`)**:
+  - Added a **Sync Settings to Open Positions** button in the Open Positions header and an automatic sync checkbox on Settings Save.
+  - When Stop-Loss is disabled or exit rules are updated, open positions can be immediately synced to disable stop-loss (`Disabled`) and apply the new take-profit and trailing rules without waiting for new trades.
+- **Uniform Position Card Typography & Color Coding (`PositionsView.tsx`, `Primitives.tsx`)**:
+  - Unified font sizes across `Entry Price`, `Current Price`, `Gross P&L`, and `Net P&L` to identical `text-xs font-semibold font-mono tabular-nums` with a consistent 20px line height (`h-5`).
+  - Current Price turns green when `>= Entry Price` and red when `< Entry Price`.
+- **⚡ Quick Profit Scalper Preset (`defaults.ts`, `SettingsView.tsx`, `PipelineConfigView.tsx`)**:
+  - Added a 1-click **Quick Profit Scalper** preset button in Settings and Pipeline Rules configured for profitable momentum scalping: 0.1 SOL trade size (eliminating ATA rent fee drag), 15m+ pool age, $25,000+ liquidity, 60%+ buy ratio, tight 4% stop loss, 12% take-profit, and stepped trailing profit locks.
+- **Changelog & Version Bump**: Updated version to `1.14.0` in `package.json` and documented all improvements in `CHANGELOG.md`.
+
+---
+
 ## v1.13.0 — Slot-Filled Scanner Pausing, Auto-Startup .bat Script, Uniform Position Fonts & Quick-Profit Defaults
 
 **Risk Warning: Trading can lose all of your money.**

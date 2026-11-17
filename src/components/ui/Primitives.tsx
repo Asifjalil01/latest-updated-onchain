@@ -92,7 +92,7 @@ export function PnlText({
 
   return (
     <span
-      className={`inline-flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 font-mono tabular-nums rounded px-1 -mx-1 transition-colors duration-300 ${colorCls} ${flashBg}`}
+      className={`inline-flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 font-mono text-xs font-semibold tabular-nums rounded px-1 -mx-1 transition-colors duration-300 ${colorCls} ${flashBg}`}
     >
       {colorBlindSafe &&
         (isPos ? (

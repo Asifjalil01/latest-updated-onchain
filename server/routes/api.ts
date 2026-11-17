@@ -364,21 +364,43 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     }
 
     orchestrator.invalidateLiveConfirmationIfCriticalChanged(result.settings);
-    orchestrator.log(
-      'INFO',
-      'SETTINGS',
-      'Bot settings updated (applies to new positions only).'
-    );
+    if (req.body?.applyToOpenPositions === true) {
+      const mode = orchestrator.getStatusSnapshot().mode;
+      orchestrator.db.syncOpenPositionsExitParams(mode, result.settings);
+      orchestrator.log(
+        'INFO',
+        'SETTINGS',
+        'Bot settings updated and applied to active open positions.'
+      );
+    } else {
+      orchestrator.log(
+        'INFO',
+        'SETTINGS',
+        'Bot settings updated (applies to new positions only).'
+      );
+    }
     res.json({
       settings: result.settings,
       history: orchestrator.db.getSettingsHistory(100),
     });
   });
 
+  router.post('/positions/sync-settings', (_req: Request, res: Response) => {
+    const mode = orchestrator.getStatusSnapshot().mode;
+    const settings = orchestrator.db.getSettings();
+    const syncedCount = orchestrator.db.syncOpenPositionsExitParams(mode, settings);
+    orchestrator.log(
+      'INFO',
+      'SETTINGS',
+      `Synced updated exit rules (SL, TP, trailing ladder) to ${syncedCount} open positions.`
+    );
+    res.json({ success: true, syncedCount });
+  });
+
   router.post('/settings/preset', (req: Request, res: Response) => {
     const presetName = req.body?.preset as keyof typeof SETTINGS_PRESETS;
     if (!presetName || !(presetName in SETTINGS_PRESETS)) {
-      res.status(400).json({ error: 'Unknown preset (safe | balanced | aggressive)' });
+      res.status(400).json({ error: 'Unknown preset (safe | balanced | aggressive | quick_profit)' });
       return;
     }
     const result = orchestrator.db.updateSettings(SETTINGS_PRESETS[presetName]);
@@ -387,7 +409,11 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       return;
     }
     orchestrator.invalidateLiveConfirmationIfCriticalChanged(result.settings);
-    orchestrator.log('INFO', 'SETTINGS', `Applied "${presetName}" preset (new positions only).`);
+    if (req.body?.applyToOpenPositions === true) {
+      const mode = orchestrator.getStatusSnapshot().mode;
+      orchestrator.db.syncOpenPositionsExitParams(mode, result.settings);
+    }
+    orchestrator.log('INFO', 'SETTINGS', `Applied "${presetName}" preset.`);
     res.json({
       settings: result.settings,
       history: orchestrator.db.getSettingsHistory(100),

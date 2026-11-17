@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { DEFAULT_SETTINGS, validateSettingsUpdate } from '../config/defaults';
+import { snapshotExitParams } from '../engine/fees';
 import type {
   BotSettings,
   ExecutionMode,
@@ -486,6 +487,18 @@ export class BotDatabase {
       )
       .get(mode, mint) as Record<string, unknown> | undefined;
     return row ? this.mapPositionRow(row) : null;
+  }
+
+  syncOpenPositionsExitParams(mode: ExecutionMode, settings: BotSettings): number {
+    const openPositions = this.getPositions(mode, false);
+    let count = 0;
+    const stmt = this.db.prepare('UPDATE positions SET exit_params_json = ? WHERE id = ?');
+    for (const pos of openPositions) {
+      const snap = snapshotExitParams(settings, pos.exitParams?.roundTripCostPct ?? 1.5);
+      stmt.run(JSON.stringify(snap), pos.id);
+      count += 1;
+    }
+    return count;
   }
 
   insertTrade(trade: TradeRecord): void {
