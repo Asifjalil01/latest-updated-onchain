@@ -1,0 +1,6 @@
+{
+  "name": "Solana Spot Bot",
+  "description": "Safety-first Solana spot trading terminal with realistic paper shadow execution, fail-closed security pipeline, and multi-RPC live execution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
