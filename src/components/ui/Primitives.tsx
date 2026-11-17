@@ -20,6 +20,17 @@ export function formatUsd(val: number | null | undefined, compact = false): stri
   return `$${val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+export function formatTokenPriceUsd(val: number | null | undefined): string {
+  if (val === null || val === undefined || !Number.isFinite(val)) return '—';
+  const abs = Math.abs(val);
+  if (abs === 0) return '$0.00';
+  if (abs < 0.0001) return `$${val.toFixed(8)}`;
+  if (abs < 0.01) return `$${val.toFixed(6)}`;
+  if (abs < 1) return `$${val.toFixed(4)}`;
+  if (abs < 100) return `$${val.toFixed(3)}`;
+  return `$${val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 export function formatSignedUsd(val: number | null | undefined): string {
   if (val === null || val === undefined || !Number.isFinite(val)) return '—';
   const sign = val > 0 ? '+' : val < 0 ? '-' : '';

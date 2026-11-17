@@ -8,6 +8,7 @@ import {
   formatPct,
   formatSignedUsd,
   formatSol,
+  formatTokenPriceUsd,
   formatUsd,
 } from '../ui/Primitives';
 
@@ -38,7 +39,14 @@ export function DashboardView() {
     const val = solUsd && solUsd > 0 ? (p.quantity * p.currentPriceUsd) / solUsd : p.solIn;
     return s + val;
   }, 0);
-  const openPnlSol = openMarketSol - openCostSol - positions.reduce((s, p) => s + p.entryFeesSol, 0);
+  const estOpenRoundTripCostsSol = positions.reduce((s, p) => {
+    const roundTripCost =
+      p.exitParams?.roundTripCostPct > 0
+        ? Math.max(p.entryFeesSol + p.entryRentSol, p.solIn * (p.exitParams.roundTripCostPct / 100))
+        : p.entryFeesSol + p.entryRentSol;
+    return s + roundTripCost;
+  }, 0);
+  const openPnlSol = openMarketSol - openCostSol - estOpenRoundTripCostsSol;
   const totalValueSol = activeBalanceSol + openMarketSol;
   const realizedNetSol = analytics?.netPnlSol ?? 0;
   const todayPnlSol = status?.dailyRealizedPnlSol ?? 0;
@@ -402,11 +410,17 @@ export function DashboardView() {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {positions.slice(0, 6).map((pos) => {
-              const pnlPct =
-                pos.entryPriceUsd > 0
-                  ? ((pos.currentPriceUsd - pos.entryPriceUsd) / pos.entryPriceUsd) * 100
-                  : 0;
-              const estPnlSol = pos.solIn * (pnlPct / 100) - pos.entryFeesSol;
+              const currentSolVal =
+                solUsd && solUsd > 0 ? (pos.quantity * pos.currentPriceUsd) / solUsd : pos.solIn;
+              const roundTripCostSol =
+                pos.exitParams?.roundTripCostPct > 0
+                  ? Math.max(
+                      pos.entryFeesSol + pos.entryRentSol,
+                      pos.solIn * (pos.exitParams.roundTripCostPct / 100)
+                    )
+                  : pos.entryFeesSol + pos.entryRentSol;
+              const estPnlSol = currentSolVal - pos.solIn - roundTripCostSol;
+              const estNetPct = pos.solIn > 0 ? (estPnlSol / pos.solIn) * 100 : 0;
               return (
                 <div
                   key={pos.id}
@@ -427,12 +441,12 @@ export function DashboardView() {
                   </div>
                   <div className="flex items-baseline justify-between gap-2">
                     <span className="font-mono text-sm tabular-nums">
-                      {formatUsd(pos.currentPriceUsd)}
+                      {formatTokenPriceUsd(pos.currentPriceUsd)}
                     </span>
                     <div className="text-right">
                       <PnlText
                         valueSol={estPnlSol}
-                        valuePct={pnlPct}
+                        valuePct={estNetPct}
                         label={pos.confirmationLabel}
                         colorBlindSafe={colorBlindSafe}
                       />
@@ -452,7 +466,7 @@ export function DashboardView() {
                     </div>
                   </div>
                   <div className="flex items-center justify-between text-[11px] font-mono tabular-nums text-slate-500 pt-2 border-t border-slate-100 dark:border-slate-800/70">
-                    <span>BE: {formatUsd(pos.breakEvenPriceUsd)}</span>
+                    <span>BE: {formatTokenPriceUsd(pos.breakEvenPriceUsd)}</span>
                     <span>SL: -{pos.exitParams.stopLossPct}%</span>
                     <span>TP: +{pos.exitParams.takeProfitPct}%</span>
                   </div>

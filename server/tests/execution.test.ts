@@ -11,6 +11,11 @@ import { ServerSignerManager } from '../security/signer';
 import type { SolanaRpcPool } from '../providers/rpcPool';
 import type { JupiterProvider, JupiterQuoteResponse } from '../providers/jupiter';
 import { WSOL_MINT } from '../providers/jupiter';
+import { BotOrchestrator } from '../engine/pipeline';
+import type { DexScreenerProvider } from '../providers/dexscreener';
+import type { GeckoTerminalProvider } from '../providers/geckoterminal';
+import type { RugCheckProvider } from '../providers/rugcheck';
+import type { PumpPortalWsProvider } from '../providers/pumpportal';
 import type { CandidateToken, ExplanationRecord, PositionRecord } from '../types';
 
 test('execution: confirmation timeout followed by late success creates exactly one position and blocks second buy', async () => {
@@ -265,6 +270,153 @@ test('balance: one empty RPC read does not clear a position (requires 3 consecut
     agreedReturn = { agreed: false, balanceUi: null, readings: [0] };
     const disagreed = await engine.verifyBalanceAndExternalSell(pos);
     assert.equal(disagreed.status, 'OPEN');
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('execution: concurrent evaluateOpenPositionsTick and sellPosition calls execute only once', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssb-conc-sell-'));
+  const db = new BotDatabase(path.join(tmpDir, 'test.db'));
+  const signer = new ServerSignerManager(path.join(tmpDir, 'ks.json'));
+
+  try {
+    db.updateSettings({
+      paperDelayMinSec: 0.05,
+      paperDelayMaxSec: 0.05,
+      paperDefaultDelaySec: 0.05,
+      paperSellFailChancePct: 0,
+      applyMeasuredGapToPaper: false,
+    });
+    const startBalance = 1.0;
+    db.setModeBalanceSol('paper', startBalance);
+
+    const mockRpcPool = {
+      getHealth: () => [],
+    } as unknown as SolanaRpcPool;
+
+    const mockJupiter = {
+      getLiveSolPriceUsd: async () => 200,
+      getLivePricesUsd: async () => ({ MintConc111111111111111111111111111111111: 1.2 }),
+      getQuote: async () => ({
+        inputMint: 'MintConc111111111111111111111111111111111',
+        inAmount: '1000000',
+        outputMint: WSOL_MINT,
+        outAmount: '60000000',
+        slippageBps: 150,
+        priceImpactPct: '0.002',
+        routePlan: [],
+      }),
+    } as unknown as JupiterProvider;
+
+    const mockDex = {
+      getLiveSolPriceUsd: async () => 200,
+      enrichMintsBatch: async () =>
+        new Map([
+          [
+            'MintConc111111111111111111111111111111111',
+            { priceUsd: 1.2, liquidityUsd: 120_000 },
+          ],
+        ]),
+    } as unknown as DexScreenerProvider;
+
+    const orchestrator = new BotOrchestrator(
+      db,
+      signer,
+      mockRpcPool,
+      mockJupiter,
+      mockDex,
+      {} as GeckoTerminalProvider,
+      {} as RugCheckProvider,
+      { start: () => undefined, stop: () => undefined } as unknown as PumpPortalWsProvider
+    );
+
+    const pos: PositionRecord = {
+      id: 'paper_pos_conc_1',
+      mode: 'paper',
+      mint: 'MintConc111111111111111111111111111111111',
+      symbol: 'CLAUDIA',
+      name: 'Claudia Test',
+      source: 'dexscreener',
+      dex: 'raydium',
+      tokenClass: 'early_stage',
+      status: 'OPEN',
+      openedAtMs: Date.now() - 120_000,
+      updatedAtMs: Date.now() - 1_000,
+      tokenAgeAtEntryMin: 120,
+      decimals: 6,
+      quantity: 10,
+      entryPriceUsd: 1.0,
+      entryPriceSol: 0.005,
+      currentPriceUsd: 1.0,
+      currentPriceSol: 0.005,
+      breakEvenPriceUsd: 1.055,
+      breakEvenPriceSol: 0.005275,
+      entryLiquidityUsd: 120_000,
+      currentLiquidityUsd: 120_000,
+      solIn: 0.05,
+      entryFeesSol: 0.00025,
+      entryRentSol: 0.00203928,
+      solPriceUsdAtEntry: 200,
+      peakPriceUsd: 1.0,
+      peakPnlPct: 0,
+      trailingFloorPct: null,
+      trailingArmed: false,
+      gapDownTriggered: false,
+      exitParams: {
+        stopLossEnabled: true,
+        stopLossPct: 8,
+        stopLossTiers: DEFAULT_SETTINGS.stopLossTiers,
+        takeProfitPct: 18,
+        trailingEnabled: true,
+        trailingLadder: DEFAULT_SETTINGS.trailingLadder,
+        breakEvenRecoveryEnabled: true,
+        maxHoldMinutes: 240,
+        maxHoldStagnationEnabled: true,
+        stagnationMinGainPct: 2,
+        emergencyLiquidityFloorUsd: 10000,
+        emergencyLiquidityDrainPct: 40,
+        emergencyMaxSellTaxPct: 15,
+        roundTripCostPct: 5.5,
+      },
+      txBuy: 'sim_buy_conc',
+      confirmationLabel: 'simulated',
+      qualityScore: 80,
+      tradeScore: 80,
+      explanationJson: '{}',
+      sellAttempts: 0,
+      firstSellFailureAtMs: null,
+      lastSellError: null,
+      consecutiveZeroBalanceReads: 0,
+      reviewReason: null,
+      isStaleData: false,
+      priceHistory: [1.0],
+    };
+    db.upsertPosition(pos);
+
+    // Fire 5 overlapping sellPosition calls AND 3 overlapping exit ticks simultaneously
+    const sellPromises = [
+      orchestrator.sellPosition(pos.id, 'TRAILING_STOP'),
+      orchestrator.sellPosition(pos.id, 'TRAILING_STOP'),
+      orchestrator.sellPosition(pos.id, 'TRAILING_STOP'),
+      orchestrator.evaluateOpenPositionsTick(),
+      orchestrator.evaluateOpenPositionsTick(),
+      orchestrator.sellPosition(pos.id, 'MANUAL_SELL'),
+    ];
+    await Promise.all(sellPromises);
+
+    const trades = db.getTrades('paper');
+    assert.equal(trades.length, 1, `Expected exactly 1 trade record, found ${trades.length}`);
+    const loadedPos = db.getPositionById(pos.id);
+    assert.equal(loadedPos?.status, 'CLOSED');
+
+    // Balance should be credited only once (1.0 + solOut)
+    const endBalance = db.getModeBalanceSol('paper');
+    assert.ok(
+      Math.abs(endBalance - (startBalance + trades[0].solOut)) < 1e-6,
+      `Expected balance ${startBalance + trades[0].solOut}, got ${endBalance}`
+    );
   } finally {
     db.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

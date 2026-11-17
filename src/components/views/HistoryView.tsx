@@ -1,7 +1,15 @@
 import React, { useMemo, useState } from 'react';
 import { Download, ExternalLink, RotateCcw, X } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
-import { PnlText, formatSol, formatUsd, maskMint } from '../ui/Primitives';
+import {
+  PnlText,
+  formatPct,
+  formatSignedUsd,
+  formatSol,
+  formatTokenPriceUsd,
+  formatUsd,
+  maskMint,
+} from '../ui/Primitives';
 import type { ExecutionMode, TradeRecord } from '../../types';
 
 export function HistoryView() {
@@ -186,53 +194,109 @@ export function HistoryView() {
               <table className="w-full text-left border-collapse text-xs">
                 <thead>
                   <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
-                    <th className="py-2.5 px-3 font-medium">Closed</th>
-                    <th className="py-2.5 px-3 font-medium">Token</th>
-                    <th className="py-2.5 px-3 font-medium">Exit Reason</th>
-                    <th className="py-2.5 px-3 font-medium text-right">SOL In / Out</th>
-                    <th className="py-2.5 px-3 font-medium text-right">Fees + Rent</th>
-                    <th className="py-2.5 px-3 font-medium text-right">Net P&amp;L</th>
-                    <th className="py-2.5 px-3 font-medium text-right">Hold</th>
+                    <th className="py-2.5 px-2 font-medium">Closed</th>
+                    <th className="py-2.5 px-2 font-medium">Token</th>
+                    <th className="py-2.5 px-2 font-medium">Exit Reason</th>
+                    <th className="py-2.5 px-2 font-medium text-right">Buy → Sell Price</th>
+                    <th className="py-2.5 px-2 font-medium text-right">Used (Buy)</th>
+                    <th className="py-2.5 px-2 font-medium text-right">Returned (Sell)</th>
+                    <th className="py-2.5 px-2 font-medium text-right">Fees + Rent</th>
+                    <th className="py-2.5 px-2 font-medium text-right">Net P&amp;L</th>
+                    <th className="py-2.5 px-2 font-medium text-right">Hold</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70">
-                  {filteredTrades.map((t) => (
-                    <tr
-                      key={t.tradeId}
-                      onClick={() => setSelectedTrade(t)}
-                      className="cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-900/50"
-                    >
-                      <td className="py-2.5 px-3 font-mono text-slate-500 whitespace-nowrap">
-                        {new Date(t.closedAt).toLocaleString()}
-                      </td>
-                      <td className="py-2.5 px-3">
-                        <span className="font-semibold text-slate-900 dark:text-slate-100">
-                          {t.symbol}
-                        </span>{' '}
-                        <span className="text-slate-500">
-                          · {t.source} · {t.mode}
-                        </span>
-                      </td>
-                      <td className="py-2.5 px-3 font-mono">{t.exitReason}</td>
-                      <td className="py-2.5 px-3 text-right font-mono tabular-nums">
-                        {t.solIn.toFixed(4)} → {t.solOut.toFixed(4)}
-                      </td>
-                      <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-500">
-                        {(t.feesSol + t.rentSol).toFixed(5)}
-                      </td>
-                      <td className="py-2.5 px-3 text-right">
-                        <PnlText
-                          valueSol={t.pnlSol}
-                          valuePct={t.pnlPct}
-                          label={t.confirmed}
-                          colorBlindSafe={colorBlindSafe}
-                        />
-                      </td>
-                      <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-500">
-                        {t.holdSeconds}s
-                      </td>
-                    </tr>
-                  ))}
+                  {filteredTrades.map((t) => {
+                    const closedDate = new Date(t.closedAt);
+                    const usedUsd = t.solPriceUsd > 0 ? t.solIn * t.solPriceUsd : null;
+                    const returnedUsd = t.solPriceUsd > 0 ? t.solOut * t.solPriceUsd : null;
+                    const feesUsd = t.solPriceUsd > 0 ? (t.feesSol + t.rentSol) * t.solPriceUsd : null;
+                    const priceDeltaPct =
+                      t.entryPrice > 0 ? ((t.exitPrice - t.entryPrice) / t.entryPrice) * 100 : 0;
+
+                    return (
+                      <tr
+                        key={t.tradeId}
+                        onClick={() => setSelectedTrade(t)}
+                        className="cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-900/50"
+                      >
+                        <td className="py-2.5 px-2 font-mono text-slate-500 whitespace-nowrap">
+                          <div>{closedDate.toLocaleDateString()}</div>
+                          <div className="text-[11px]">{closedDate.toLocaleTimeString()}</div>
+                        </td>
+                        <td className="py-2.5 px-2">
+                          <div className="font-semibold text-slate-900 dark:text-slate-100">
+                            {t.symbol}
+                          </div>
+                          <div
+                            className="text-[11px] text-slate-500 max-w-[140px] truncate"
+                            title={`${t.source} · ${t.mode}`}
+                          >
+                            {t.source} · {t.mode}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-2 font-mono text-[11px] whitespace-nowrap">
+                          {t.exitReason}
+                        </td>
+                        <td className="py-2.5 px-2 text-right font-mono tabular-nums whitespace-nowrap">
+                          <div>
+                            {formatTokenPriceUsd(t.entryPrice)} → {formatTokenPriceUsd(t.exitPrice)}
+                          </div>
+                          <div
+                            className={`text-[11px] ${
+                              priceDeltaPct > 0
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : priceDeltaPct < 0
+                                  ? 'text-rose-600 dark:text-rose-400'
+                                  : 'text-slate-500'
+                            }`}
+                          >
+                            {formatPct(priceDeltaPct)} price
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-2 text-right font-mono tabular-nums whitespace-nowrap">
+                          <div>{t.solIn.toFixed(4)} SOL</div>
+                          <div className="text-[11px] text-slate-500">
+                            {usedUsd !== null ? formatUsd(usedUsd) : '—'}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-2 text-right font-mono tabular-nums whitespace-nowrap">
+                          <div>{t.solOut.toFixed(4)} SOL</div>
+                          <div className="text-[11px] text-slate-500">
+                            {returnedUsd !== null ? formatUsd(returnedUsd) : '—'}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-2 text-right font-mono tabular-nums text-slate-500 whitespace-nowrap">
+                          <div>{(t.feesSol + t.rentSol).toFixed(5)}</div>
+                          <div className="text-[11px]">
+                            {feesUsd !== null ? formatUsd(feesUsd) : '—'}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-2 text-right whitespace-nowrap">
+                          <PnlText
+                            valueSol={t.pnlSol}
+                            valuePct={t.pnlPct}
+                            label={t.confirmed}
+                            colorBlindSafe={colorBlindSafe}
+                          />
+                          <div
+                            className={`text-[11px] font-mono tabular-nums ${
+                              t.pnlUsd > 0
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : t.pnlUsd < 0
+                                  ? 'text-rose-600 dark:text-rose-400'
+                                  : 'text-slate-500'
+                            }`}
+                          >
+                            {formatSignedUsd(t.pnlUsd)}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-2 text-right font-mono tabular-nums text-slate-500 whitespace-nowrap">
+                          {t.holdSeconds}s
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -346,12 +410,30 @@ export function HistoryView() {
 
             <div className="grid grid-cols-2 gap-3 text-xs font-mono tabular-nums pt-3 border-t border-slate-200 dark:border-slate-800">
               <div>
-                <span className="font-sans text-slate-500 block">Entry Price</span>
-                {formatUsd(selectedTrade.entryPrice)}
+                <span className="font-sans text-slate-500 block">Buy Price</span>
+                {formatTokenPriceUsd(selectedTrade.entryPrice)}
               </div>
               <div>
-                <span className="font-sans text-slate-500 block">Exit Price</span>
-                {formatUsd(selectedTrade.exitPrice)}
+                <span className="font-sans text-slate-500 block">Sell Price</span>
+                {formatTokenPriceUsd(selectedTrade.exitPrice)}
+              </div>
+              <div>
+                <span className="font-sans text-slate-500 block">Used to Buy</span>
+                <div>{selectedTrade.solIn.toFixed(4)} SOL</div>
+                <div className="text-slate-500">
+                  {selectedTrade.solPriceUsd > 0
+                    ? formatUsd(selectedTrade.solIn * selectedTrade.solPriceUsd)
+                    : '—'}
+                </div>
+              </div>
+              <div>
+                <span className="font-sans text-slate-500 block">Returned After Sell</span>
+                <div>{selectedTrade.solOut.toFixed(4)} SOL</div>
+                <div className="text-slate-500">
+                  {selectedTrade.solPriceUsd > 0
+                    ? formatUsd(selectedTrade.solOut * selectedTrade.solPriceUsd)
+                    : '—'}
+                </div>
               </div>
               <div>
                 <span className="font-sans text-slate-500 block">Gross P&amp;L</span>
@@ -366,14 +448,25 @@ export function HistoryView() {
                   valuePct={selectedTrade.pnlPct}
                   colorBlindSafe={colorBlindSafe}
                 />
+                <div className="text-slate-500 mt-0.5">{formatSignedUsd(selectedTrade.pnlUsd)}</div>
               </div>
               <div>
                 <span className="font-sans text-slate-500 block">Total Fees</span>
                 {selectedTrade.feesSol.toFixed(6)} SOL
+                {selectedTrade.solPriceUsd > 0 && (
+                  <span className="block text-slate-500">
+                    {formatUsd(selectedTrade.feesSol * selectedTrade.solPriceUsd)}
+                  </span>
+                )}
               </div>
               <div>
                 <span className="font-sans text-slate-500 block">ATA Rent</span>
                 {selectedTrade.rentSol.toFixed(6)} SOL
+                {selectedTrade.solPriceUsd > 0 && (
+                  <span className="block text-slate-500">
+                    {formatUsd(selectedTrade.rentSol * selectedTrade.solPriceUsd)}
+                  </span>
+                )}
               </div>
             </div>
 

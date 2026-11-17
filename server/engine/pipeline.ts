@@ -73,6 +73,8 @@ export class BotOrchestrator {
   private scanTimer: NodeJS.Timeout | null = null;
   private exitTimer: NodeJS.Timeout | null = null;
   private scanInFlight = false;
+  private exitTickInFlight = false;
+  private readonly sellingPositionIds = new Set<string>();
   private readonly liveEngine: LiveExecutionEngine;
 
   constructor(
@@ -910,85 +912,96 @@ export class BotOrchestrator {
   }
 
   async evaluateOpenPositionsTick(): Promise<void> {
-    const openPositions = this.db.getPositions(this.mode, false).filter((p) => p.status === 'OPEN');
-    if (openPositions.length === 0) return;
+    if (this.exitTickInFlight) return;
+    this.exitTickInFlight = true;
+    try {
+      const openPositions = this.db
+        .getPositions(this.mode, false)
+        .filter((p) => p.status === 'OPEN' && !this.sellingPositionIds.has(p.id));
+      if (openPositions.length === 0) return;
 
-    const solPriceUsd = this.solPriceUsd ?? (await this.refreshSolPrice());
-    if (!solPriceUsd) return;
+      const solPriceUsd = this.solPriceUsd ?? (await this.refreshSolPrice());
+      if (!solPriceUsd) return;
 
-    const mints = openPositions.map((p) => p.mint);
-    const [jupPrices, dsMap] = await Promise.all([
-      this.jupiter.getLivePricesUsd(mints),
-      this.dexScreener.enrichMintsBatch(mints),
-    ]);
+      const mints = openPositions.map((p) => p.mint);
+      const [jupPrices, dsMap] = await Promise.all([
+        this.jupiter.getLivePricesUsd(mints),
+        this.dexScreener.enrichMintsBatch(mints),
+      ]);
 
-    const deltas: Array<{
-      id: string;
-      currentPriceUsd: number;
-      currentLiquidityUsd: number;
-      peakPnlPct: number;
-      trailingArmed: boolean;
-      trailingFloorPct: number | null;
-      isStaleData: boolean;
-    }> = [];
+      const deltas: Array<{
+        id: string;
+        currentPriceUsd: number;
+        currentLiquidityUsd: number;
+        peakPnlPct: number;
+        trailingArmed: boolean;
+        trailingFloorPct: number | null;
+        isStaleData: boolean;
+      }> = [];
 
-    for (const pos of openPositions) {
-      if (this.mode === 'live') {
-        const reconciled = await this.liveEngine.verifyBalanceAndExternalSell(pos);
-        if (reconciled.status !== 'OPEN') continue;
+      for (const pos of openPositions) {
+        if (this.runState === 'killing') break;
+        if (this.sellingPositionIds.has(pos.id)) continue;
+
+        if (this.mode === 'live') {
+          const reconciled = await this.liveEngine.verifyBalanceAndExternalSell(pos);
+          if (reconciled.status !== 'OPEN') continue;
+        }
+
+        const ds = dsMap.get(pos.mint);
+        const livePrice = jupPrices[pos.mint] ?? ds?.priceUsd ?? pos.currentPriceUsd;
+        const liveLiquidity = ds?.liquidityUsd ?? pos.currentLiquidityUsd;
+        const isStale = !jupPrices[pos.mint] && !ds;
+
+        const evalExit = evaluatePositionExit(pos, {
+          currentPriceUsd: livePrice,
+          currentLiquidityUsd: liveLiquidity,
+        });
+
+        const nextHistory = [...pos.priceHistory, livePrice].slice(-60);
+        const updatedPos: PositionRecord = {
+          ...pos,
+          currentPriceUsd: livePrice,
+          currentPriceSol: livePrice / solPriceUsd,
+          currentLiquidityUsd: liveLiquidity,
+          peakPriceUsd: evalExit.updatedPeakPriceUsd,
+          peakPnlPct: evalExit.updatedPeakPnlPct,
+          trailingArmed: evalExit.updatedTrailingArmed,
+          trailingFloorPct: evalExit.updatedTrailingFloorPct,
+          gapDownTriggered: evalExit.updatedGapDownTriggered,
+          isStaleData: isStale,
+          updatedAtMs: Date.now(),
+          priceHistory: nextHistory,
+        };
+        this.db.upsertPosition(updatedPos);
+
+        deltas.push({
+          id: pos.id,
+          currentPriceUsd: livePrice,
+          currentLiquidityUsd: liveLiquidity,
+          peakPnlPct: evalExit.updatedPeakPnlPct,
+          trailingArmed: evalExit.updatedTrailingArmed,
+          trailingFloorPct: evalExit.updatedTrailingFloorPct,
+          isStaleData: isStale,
+        });
+
+        if (evalExit.shouldExit && evalExit.reason) {
+          this.log('INFO', 'EXIT_SIGNAL', `${pos.symbol}: ${evalExit.message || evalExit.reason}`);
+          await this.sellPosition(
+            pos.id,
+            evalExit.reason,
+            evalExit.isEmergency,
+            evalExit.sellFraction ?? 1,
+            evalExit.triggeredStopLossTier
+          );
+        }
       }
 
-      const ds = dsMap.get(pos.mint);
-      const livePrice = jupPrices[pos.mint] ?? ds?.priceUsd ?? pos.currentPriceUsd;
-      const liveLiquidity = ds?.liquidityUsd ?? pos.currentLiquidityUsd;
-      const isStale = !jupPrices[pos.mint] && !ds;
-
-      const evalExit = evaluatePositionExit(pos, {
-        currentPriceUsd: livePrice,
-        currentLiquidityUsd: liveLiquidity,
-      });
-
-      const nextHistory = [...pos.priceHistory, livePrice].slice(-60);
-      const updatedPos: PositionRecord = {
-        ...pos,
-        currentPriceUsd: livePrice,
-        currentPriceSol: livePrice / solPriceUsd,
-        currentLiquidityUsd: liveLiquidity,
-        peakPriceUsd: evalExit.updatedPeakPriceUsd,
-        peakPnlPct: evalExit.updatedPeakPnlPct,
-        trailingArmed: evalExit.updatedTrailingArmed,
-        trailingFloorPct: evalExit.updatedTrailingFloorPct,
-        gapDownTriggered: evalExit.updatedGapDownTriggered,
-        isStaleData: isStale,
-        updatedAtMs: Date.now(),
-        priceHistory: nextHistory,
-      };
-      this.db.upsertPosition(updatedPos);
-
-      deltas.push({
-        id: pos.id,
-        currentPriceUsd: livePrice,
-        currentLiquidityUsd: liveLiquidity,
-        peakPnlPct: evalExit.updatedPeakPnlPct,
-        trailingArmed: evalExit.updatedTrailingArmed,
-        trailingFloorPct: evalExit.updatedTrailingFloorPct,
-        isStaleData: isStale,
-      });
-
-      if (evalExit.shouldExit && evalExit.reason) {
-        this.log('INFO', 'EXIT_SIGNAL', `${pos.symbol}: ${evalExit.message || evalExit.reason}`);
-        await this.sellPosition(
-          pos.id,
-          evalExit.reason,
-          evalExit.isEmergency,
-          evalExit.sellFraction ?? 1,
-          evalExit.triggeredStopLossTier
-        );
+      if (deltas.length > 0) {
+        this.broadcast({ type: 'positions_batch_update', data: deltas });
       }
-    }
-
-    if (deltas.length > 0) {
-      this.broadcast({ type: 'positions_batch_update', data: deltas });
+    } finally {
+      this.exitTickInFlight = false;
     }
   }
 
@@ -999,153 +1012,161 @@ export class BotOrchestrator {
     sellFraction = 1,
     triggeredStopLossTier?: number
   ): Promise<{ ok: boolean; trade?: TradeRecord; error?: string }> {
-    const pos = this.db.getPositionById(positionId);
-    if (!pos || pos.status === 'CLOSED') {
-      return { ok: false, error: 'Position not found or already closed' };
+    if (this.sellingPositionIds.has(positionId)) {
+      return { ok: false, error: 'Sell already in progress for position' };
     }
+    this.sellingPositionIds.add(positionId);
+    try {
+      const pos = this.db.getPositionById(positionId);
+      if (!pos || pos.status === 'CLOSED') {
+        return { ok: false, error: 'Position not found or already closed' };
+      }
 
-    const solPriceUsd = this.solPriceUsd ?? (await this.refreshSolPrice());
-    if (!solPriceUsd) {
-      return { ok: false, error: 'Live SOL price unavailable; cannot value exit' };
-    }
+      const solPriceUsd = this.solPriceUsd ?? (await this.refreshSolPrice());
+      if (!solPriceUsd) {
+        return { ok: false, error: 'Live SOL price unavailable; cannot value exit' };
+      }
 
-    const settings = this.db.getSettings();
-    const clampedFraction = Math.min(1, Math.max(0.01, sellFraction));
-    const isPartial = clampedFraction < 0.999;
+      const settings = this.db.getSettings();
+      const clampedFraction = Math.min(1, Math.max(0.01, sellFraction));
+      const isPartial = clampedFraction < 0.999;
 
-    if (pos.mode === 'live') {
-      const dsMap = await this.dexScreener.enrichMintsBatch([pos.mint]);
-      const dsLiq = dsMap.get(pos.mint)?.liquidityUsd ?? null;
-      const res = await this.liveEngine.executeLiveSell({
-        position: pos,
+      if (pos.mode === 'live') {
+        const dsMap = await this.dexScreener.enrichMintsBatch([pos.mint]);
+        const dsLiq = dsMap.get(pos.mint)?.liquidityUsd ?? null;
+        const res = await this.liveEngine.executeLiveSell({
+          position: pos,
+          exitReason: reason,
+          solPriceUsd,
+          settings,
+          isEmergency,
+          sellFraction: clampedFraction,
+          triggeredStopLossTier,
+          liquiditySource1Usd: dsLiq,
+          liquiditySource2Usd: pos.currentLiquidityUsd,
+        });
+        if (res.ok && res.trade) {
+          this.broadcast({ type: 'trade_event', data: { kind: 'SELL', trade: res.trade } });
+          this.broadcastStatus();
+        }
+        return { ok: res.ok, trade: res.trade, error: res.error };
+      }
+
+      const sellPos: PositionRecord = isPartial
+        ? {
+            ...pos,
+            quantity: pos.quantity * clampedFraction,
+            solIn: pos.solIn * clampedFraction,
+            entryFeesSol: pos.entryFeesSol * clampedFraction,
+            entryRentSol: 0,
+          }
+        : pos;
+
+      // Paper or Testnet simulated realistic exit
+      const res = await executeRealisticPaperSell({
+        position: sellPos,
         exitReason: reason,
         solPriceUsd,
         settings,
-        isEmergency,
-        sellFraction: clampedFraction,
-        triggeredStopLossTier,
-        liquiditySource1Usd: dsLiq,
-        liquiditySource2Usd: pos.currentLiquidityUsd,
+        measuredLiveGapPct: this.db.getAveragePaperLiveGapPct(),
+        jupiterProvider: this.jupiter,
+        hooks: {
+          sampleSellWindow: async (p) => {
+            const fresh = await this.dexScreener.enrichMintsBatch([p.mint]);
+            const f = fresh.get(p.mint);
+            const rawUnits = Math.max(1, Math.floor(p.quantity * 10 ** p.decimals));
+            const q = await this.jupiter.getQuote({
+              inputMint: p.mint,
+              outputMint: WSOL_MINT,
+              amountRaw: String(rawUnits),
+              slippageBps: settings.slippageBps,
+            });
+            return {
+              priceUsd: f?.priceUsd ?? p.currentPriceUsd,
+              liquidityUsd: f?.liquidityUsd ?? p.currentLiquidityUsd,
+              quote: q,
+            };
+          },
+        },
       });
-      if (res.ok && res.trade) {
+
+      if (!res.executed || !res.trade) {
+        const failedPos: PositionRecord = {
+          ...pos,
+          sellAttempts: pos.sellAttempts + 1,
+          firstSellFailureAtMs: pos.firstSellFailureAtMs ?? Date.now(),
+          lastSellError: res.failureReason || 'Simulated sell failed',
+          updatedAtMs: Date.now(),
+        };
+        this.db.upsertPosition(failedPos);
+        this.log(
+          'WARN',
+          'PAPER_SELL_FAIL',
+          `${pos.symbol} simulated sell failed (${failedPos.lastSellError}); position remains OPEN.`
+        );
+        return { ok: false, error: failedPos.lastSellError ?? 'Sell failed' };
+      }
+
+      const nextTriggeredTiers =
+        triggeredStopLossTier !== undefined
+          ? Array.from(new Set([...(pos.triggeredStopLossTiers ?? []), triggeredStopLossTier]))
+          : pos.triggeredStopLossTiers;
+
+      const remainingQty = Math.max(0, pos.quantity - sellPos.quantity);
+      if (isPartial && remainingQty > 0) {
+        const partialPos: PositionRecord = {
+          ...pos,
+          status: 'OPEN',
+          quantity: remainingQty,
+          solIn: Math.max(0, pos.solIn - sellPos.solIn),
+          entryFeesSol: Math.max(0, pos.entryFeesSol - sellPos.entryFeesSol),
+          triggeredStopLossTiers: nextTriggeredTiers,
+          currentPriceUsd: res.trade.exitPrice,
+          currentPriceSol: res.trade.exitPrice / solPriceUsd,
+          updatedAtMs: Date.now(),
+        };
+        this.db.upsertPosition(partialPos);
+        this.db.insertTrade(res.trade);
+
+        const curBal = this.db.getModeBalanceSol(pos.mode);
+        this.db.setModeBalanceSol(pos.mode, curBal + res.solReturnedNet);
+
+        this.log(
+          'INFO',
+          'PAPER_PARTIAL_SELL',
+          `Simulated partial sell ${pos.symbol} (${Math.round(clampedFraction * 100)}%, ${reason}): net ${res.trade.pnlSol >= 0 ? '+' : ''}${res.trade.pnlSol.toFixed(4)} SOL`
+        );
         this.broadcast({ type: 'trade_event', data: { kind: 'SELL', trade: res.trade } });
         this.broadcastStatus();
+        return { ok: true, trade: res.trade };
       }
-      return { ok: res.ok, trade: res.trade, error: res.error };
-    }
 
-    const sellPos: PositionRecord = isPartial
-      ? {
-          ...pos,
-          quantity: pos.quantity * clampedFraction,
-          solIn: pos.solIn * clampedFraction,
-          entryFeesSol: pos.entryFeesSol * clampedFraction,
-          entryRentSol: 0,
-        }
-      : pos;
-
-    // Paper or Testnet simulated realistic exit
-    const res = await executeRealisticPaperSell({
-      position: sellPos,
-      exitReason: reason,
-      solPriceUsd,
-      settings,
-      measuredLiveGapPct: this.db.getAveragePaperLiveGapPct(),
-      jupiterProvider: this.jupiter,
-      hooks: {
-        sampleSellWindow: async (p) => {
-          const fresh = await this.dexScreener.enrichMintsBatch([p.mint]);
-          const f = fresh.get(p.mint);
-          const rawUnits = Math.max(1, Math.floor(p.quantity * 10 ** p.decimals));
-          const q = await this.jupiter.getQuote({
-            inputMint: p.mint,
-            outputMint: WSOL_MINT,
-            amountRaw: String(rawUnits),
-            slippageBps: settings.slippageBps,
-          });
-          return {
-            priceUsd: f?.priceUsd ?? p.currentPriceUsd,
-            liquidityUsd: f?.liquidityUsd ?? p.currentLiquidityUsd,
-            quote: q,
-          };
-        },
-      },
-    });
-
-    if (!res.executed || !res.trade) {
-      const failedPos: PositionRecord = {
+      const closedPos: PositionRecord = {
         ...pos,
-        sellAttempts: pos.sellAttempts + 1,
-        firstSellFailureAtMs: pos.firstSellFailureAtMs ?? Date.now(),
-        lastSellError: res.failureReason || 'Simulated sell failed',
-        updatedAtMs: Date.now(),
-      };
-      this.db.upsertPosition(failedPos);
-      this.log(
-        'WARN',
-        'PAPER_SELL_FAIL',
-        `${pos.symbol} simulated sell failed (${failedPos.lastSellError}); position remains OPEN.`
-      );
-      return { ok: false, error: failedPos.lastSellError ?? 'Sell failed' };
-    }
-
-    const nextTriggeredTiers =
-      triggeredStopLossTier !== undefined
-        ? Array.from(new Set([...(pos.triggeredStopLossTiers ?? []), triggeredStopLossTier]))
-        : pos.triggeredStopLossTiers;
-
-    const remainingQty = Math.max(0, pos.quantity - sellPos.quantity);
-    if (isPartial && remainingQty > 0) {
-      const partialPos: PositionRecord = {
-        ...pos,
-        status: 'OPEN',
-        quantity: remainingQty,
-        solIn: Math.max(0, pos.solIn - sellPos.solIn),
-        entryFeesSol: Math.max(0, pos.entryFeesSol - sellPos.entryFeesSol),
+        status: 'CLOSED',
         triggeredStopLossTiers: nextTriggeredTiers,
         currentPriceUsd: res.trade.exitPrice,
         currentPriceSol: res.trade.exitPrice / solPriceUsd,
         updatedAtMs: Date.now(),
       };
-      this.db.upsertPosition(partialPos);
+      this.db.upsertPosition(closedPos);
       this.db.insertTrade(res.trade);
+      this.db.setCooldown(pos.mint, pos.mode, settings.cooldownMinutes);
 
       const curBal = this.db.getModeBalanceSol(pos.mode);
       this.db.setModeBalanceSol(pos.mode, curBal + res.solReturnedNet);
 
       this.log(
         'INFO',
-        'PAPER_PARTIAL_SELL',
-        `Simulated partial sell ${pos.symbol} (${Math.round(clampedFraction * 100)}%, ${reason}): net ${res.trade.pnlSol >= 0 ? '+' : ''}${res.trade.pnlSol.toFixed(4)} SOL`
+        'PAPER_SELL',
+        `Simulated sell ${pos.symbol} (${reason}): net ${res.trade.pnlSol >= 0 ? '+' : ''}${res.trade.pnlSol.toFixed(4)} SOL`
       );
       this.broadcast({ type: 'trade_event', data: { kind: 'SELL', trade: res.trade } });
       this.broadcastStatus();
       return { ok: true, trade: res.trade };
+    } finally {
+      this.sellingPositionIds.delete(positionId);
     }
-
-    const closedPos: PositionRecord = {
-      ...pos,
-      status: 'CLOSED',
-      triggeredStopLossTiers: nextTriggeredTiers,
-      currentPriceUsd: res.trade.exitPrice,
-      currentPriceSol: res.trade.exitPrice / solPriceUsd,
-      updatedAtMs: Date.now(),
-    };
-    this.db.upsertPosition(closedPos);
-    this.db.insertTrade(res.trade);
-    this.db.setCooldown(pos.mint, pos.mode, settings.cooldownMinutes);
-
-    const curBal = this.db.getModeBalanceSol(pos.mode);
-    this.db.setModeBalanceSol(pos.mode, curBal + res.solReturnedNet);
-
-    this.log(
-      'INFO',
-      'PAPER_SELL',
-      `Simulated sell ${pos.symbol} (${reason}): net ${res.trade.pnlSol >= 0 ? '+' : ''}${res.trade.pnlSol.toFixed(4)} SOL`
-    );
-    this.broadcast({ type: 'trade_event', data: { kind: 'SELL', trade: res.trade } });
-    this.broadcastStatus();
-    return { ok: true, trade: res.trade };
   }
 
   async sellAll(reason: ExitReason = 'MANUAL_SELL'): Promise<{ closed: number; errors: string[] }> {

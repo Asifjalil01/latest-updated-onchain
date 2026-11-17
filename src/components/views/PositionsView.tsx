@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { ExternalLink, RefreshCw, ShieldAlert } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
-import { PnlText, SparklineSvg, formatSol, formatUsd, maskMint } from '../ui/Primitives';
+import { PnlText, SparklineSvg, formatSol, formatTokenPriceUsd, maskMint } from '../ui/Primitives';
 import type { PositionRecord } from '../../types';
 
 export function PositionsView() {
@@ -154,7 +154,14 @@ export function PositionsView() {
             const currentSolVal =
               solUsd > 0 ? (pos.quantity * pos.currentPriceUsd) / solUsd : pos.solIn;
             const grossPnlSol = currentSolVal - pos.solIn;
-            const netPnlSol = grossPnlSol - pos.entryFeesSol - pos.entryRentSol;
+            const estRoundTripCostSol =
+              pos.exitParams?.roundTripCostPct > 0
+                ? Math.max(
+                    pos.entryFeesSol + pos.entryRentSol,
+                    pos.solIn * (pos.exitParams.roundTripCostPct / 100)
+                  )
+                : pos.entryFeesSol + pos.entryRentSol;
+            const netPnlSol = grossPnlSol - estRoundTripCostSol;
             const netPct = pos.solIn > 0 ? (netPnlSol / pos.solIn) * 100 : 0;
 
             return (
@@ -239,10 +246,10 @@ export function PositionsView() {
                   <div>
                     <span className="text-[11px] text-slate-500 block">Entry / Current</span>
                     <span className="font-mono text-xs tabular-nums block">
-                      {formatUsd(pos.entryPriceUsd)}
+                      {formatTokenPriceUsd(pos.entryPriceUsd)}
                     </span>
                     <span className="font-mono text-sm font-semibold tabular-nums">
-                      {formatUsd(pos.currentPriceUsd)}
+                      {formatTokenPriceUsd(pos.currentPriceUsd)}
                     </span>
                   </div>
                   <div>
@@ -281,7 +288,7 @@ export function PositionsView() {
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block">Break-Even</span>
-                    {formatUsd(pos.breakEvenPriceUsd)}
+                    {formatTokenPriceUsd(pos.breakEvenPriceUsd)}
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block">
@@ -289,7 +296,7 @@ export function PositionsView() {
                     </span>
                     {pos.trailingArmed && pos.trailingFloorPct !== null
                       ? `+${pos.trailingFloorPct.toFixed(2)}% (Armed)`
-                      : `Armed > +${pos.exitParams.roundTripCostPct.toFixed(1)}%`}
+                      : `Armed > +${(pos.exitParams.roundTripCostPct + 1).toFixed(1)}%`}
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block">Peak / SL / TP</span>
@@ -355,7 +362,14 @@ export function PositionsView() {
               {positions.map((pos) => {
                 const currentSolVal =
                   solUsd > 0 ? (pos.quantity * pos.currentPriceUsd) / solUsd : pos.solIn;
-                const netPnlSol = currentSolVal - pos.solIn - pos.entryFeesSol - pos.entryRentSol;
+                const estRoundTripCostSol =
+                  pos.exitParams?.roundTripCostPct > 0
+                    ? Math.max(
+                        pos.entryFeesSol + pos.entryRentSol,
+                        pos.solIn * (pos.exitParams.roundTripCostPct / 100)
+                      )
+                    : pos.entryFeesSol + pos.entryRentSol;
+                const netPnlSol = currentSolVal - pos.solIn - estRoundTripCostSol;
                 const netPct = pos.solIn > 0 ? (netPnlSol / pos.solIn) * 100 : 0;
                 return (
                   <tr key={pos.id} className="hover:bg-slate-50 dark:hover:bg-slate-900/40">
@@ -368,13 +382,13 @@ export function PositionsView() {
                       </span>
                     </td>
                     <td className="py-3 px-4 text-right font-mono tabular-nums">
-                      {formatUsd(pos.entryPriceUsd)}
+                      {formatTokenPriceUsd(pos.entryPriceUsd)}
                     </td>
                     <td className="py-3 px-4 text-right font-mono tabular-nums">
-                      {formatUsd(pos.currentPriceUsd)}
+                      {formatTokenPriceUsd(pos.currentPriceUsd)}
                     </td>
                     <td className="py-3 px-4 text-right font-mono tabular-nums">
-                      {formatUsd(pos.breakEvenPriceUsd)}
+                      {formatTokenPriceUsd(pos.breakEvenPriceUsd)}
                     </td>
                     <td className="py-3 px-4 text-right">
                       <PnlText

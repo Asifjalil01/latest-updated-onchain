@@ -65,17 +65,19 @@ export function evaluatePositionExit(
     updatedGapDownTriggered = true;
   }
 
-  // Trailing arming: armed ONLY after clearing all round-trip costs + first ladder tier
+  // Trailing arming: armed ONLY after clearing all round-trip costs + 1.0% buffer + first ladder tier
   let updatedTrailingArmed = position.trailingArmed;
   let updatedTrailingFloorPct = position.trailingFloorPct;
 
   if (params.trailingEnabled) {
     const allowedDrop = resolveTrailingAllowedDrop(updatedPeakPnlPct, params.trailingLadder);
-    if (allowedDrop !== null && updatedPeakPnlPct > params.roundTripCostPct) {
+    const minArmGainPct = params.roundTripCostPct + 1.0;
+    const minBreakEvenFloorPct = params.roundTripCostPct + 0.5;
+    if (allowedDrop !== null && updatedPeakPnlPct >= minArmGainPct) {
       updatedTrailingArmed = true;
       const candidateFloor = updatedPeakPnlPct - allowedDrop;
-      // Only lock trailing floor above round-trip break-even once armed
-      const safeFloor = Math.max(params.roundTripCostPct * 0.5, candidateFloor);
+      // Never lock a trailing floor below round-trip break-even (+0.5% slippage buffer)
+      const safeFloor = Math.max(minBreakEvenFloorPct, candidateFloor);
       updatedTrailingFloorPct =
         updatedTrailingFloorPct === null ? safeFloor : Math.max(updatedTrailingFloorPct, safeFloor);
     }

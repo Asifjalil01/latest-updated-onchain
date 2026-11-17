@@ -217,3 +217,57 @@ test('exits: validateSettingsUpdate syncs stopLossPct from stopLossTiers and enf
   });
   assert.equal(invalidMaxCap.valid, false);
 });
+
+test('exits: trailing stop never arms or locks floor below round-trip break-even costs', () => {
+  // Simulate 0.045 SOL trade with 5.51% round-trip cost (fees + ATA rent + est exit fees)
+  let pos = makePosition({
+    solIn: 0.045,
+    exitParams: {
+      ...snapshotExitParams(DEFAULT_SETTINGS, 5.51),
+      trailingLadder: [
+        { peakGainPct: 4, allowedDropPct: 2.5 },
+        { peakGainPct: 8, allowedDropPct: 3.0 },
+      ],
+    },
+  });
+
+  // Peak at +5.8% exceeds roundTripCostPct (5.51%) slightly, but is below +6.51% arm threshold
+  const tooEarly = evaluatePositionExit(pos, {
+    currentPriceUsd: 1.058,
+    currentLiquidityUsd: 100_000,
+    nowMs: pos.openedAtMs + 60_000,
+  });
+  assert.equal(tooEarly.updatedTrailingArmed, false);
+  assert.equal(tooEarly.updatedTrailingFloorPct, null);
+  assert.equal(tooEarly.shouldExit, false);
+
+  // Peak reaches +6.6% (>= 5.51 + 1.0 = 6.51%) -> arms and locks floor >= 5.51 + 0.5 = 6.01%
+  const armed = evaluatePositionExit(pos, {
+    currentPriceUsd: 1.066,
+    currentLiquidityUsd: 100_000,
+    nowMs: pos.openedAtMs + 70_000,
+  });
+  assert.equal(armed.updatedTrailingArmed, true);
+  assert.ok(
+    armed.updatedTrailingFloorPct !== null && armed.updatedTrailingFloorPct >= 6.0,
+    `Expected trailing floor >= 6.01%, got ${armed.updatedTrailingFloorPct}`
+  );
+  assert.equal(armed.shouldExit, false);
+
+  // Pullback to +5.9% triggers TRAILING_STOP above true round-trip break-even (5.51%)
+  pos = {
+    ...pos,
+    peakPriceUsd: armed.updatedPeakPriceUsd,
+    peakPnlPct: armed.updatedPeakPnlPct,
+    trailingArmed: armed.updatedTrailingArmed,
+    trailingFloorPct: armed.updatedTrailingFloorPct,
+  };
+  const exitRes = evaluatePositionExit(pos, {
+    currentPriceUsd: 1.059,
+    currentLiquidityUsd: 100_000,
+    nowMs: pos.openedAtMs + 80_000,
+  });
+  assert.equal(exitRes.shouldExit, true);
+  assert.equal(exitRes.reason, 'TRAILING_STOP');
+  assert.ok(exitRes.netPnlPctEstimate > 0);
+});
