@@ -2,6 +2,21 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.12.0 — Scanner DexScreener Links, Profit/Loss Progress Bar Colors & Stop-Loss Explanations
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Scanner DexScreener Direct Links (`ScannerView.tsx`)**:
+  - Added a direct **DexScreener** link button column on every token row in the Scanner & Entry Pipeline table for instant one-click analysis.
+- **Dynamic Profit / Loss Progress Bar Colors (`PositionsView.tsx`)**:
+  - The trailing progress bar and percentage display now dynamically turn **red** (`bg-rose-500`, `text-rose-500`) when a position is in a loss, and **green/teal** (`bg-emerald-500`, `text-teal-400`) when in profit.
+- **Stop-Loss Tier & Trailing Ladder Clarifications**:
+  - Explained that the Stepped Trailing Ladder operates on **Gross P&L percentage** (price movement from entry) while guaranteeing take-home Net P&L protection by never arming or locking a floor below round-trip break-even costs.
+  - Confirmed that unchecking the **Enabled** checkbox on Custom Stop-Loss Tiers completely disables stop-loss across the bot.
+
+---
+
 ## v1.11.0 — Scanner Pagination, Clear Logs, Position USD Sizing, Separated Entry/Current & Trailing Progress Bar
 
 **Risk Warning: Trading can lose all of your money.**

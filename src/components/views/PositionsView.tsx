@@ -310,12 +310,18 @@ export function PositionsView() {
                     <div className="space-y-1.5 pt-2">
                       <div className="flex justify-between text-[11px] text-slate-500 font-mono">
                         <span>{pos.trailingArmed ? 'Trailing Ladder Active (Progress to TP)' : `Arming Progress (>+${armingTargetPct.toFixed(1)}%)`}</span>
-                        <span className="font-semibold text-teal-600 dark:text-teal-400">{grossPct >= 0 ? `+${grossPct.toFixed(2)}%` : `${grossPct.toFixed(2)}%`}</span>
+                        <span className={`font-semibold ${grossPct >= 0 ? 'text-teal-600 dark:text-teal-400' : 'text-rose-500'}`}>
+                          {grossPct >= 0 ? `+${grossPct.toFixed(2)}%` : `${grossPct.toFixed(2)}%`}
+                        </span>
                       </div>
                       <div className="h-2 w-full rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
                         <div
                           className={`h-full rounded-full transition-all duration-500 ${
-                            pos.trailingArmed ? 'bg-gradient-to-r from-teal-500 to-emerald-400' : 'bg-sky-500'
+                            grossPct < 0
+                              ? 'bg-rose-500'
+                              : pos.trailingArmed
+                                ? 'bg-gradient-to-r from-teal-500 to-emerald-400'
+                                : 'bg-sky-500'
                           }`}
                           style={{ width: `${Math.max(4, progressPct)}%` }}
                         />

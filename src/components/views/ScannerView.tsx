@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { RotateCcw, Search, X } from 'lucide-react';
+import { ExternalLink, RotateCcw, Search, X } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import { SemanticStatusText, formatUsd, maskMint } from '../ui/Primitives';
 import type { ExplanationRecord, SecurityReport, SeenTokenRecord } from '../../types';
@@ -400,6 +400,7 @@ export function ScannerView() {
                     <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">Scores (Q / T)</th>
                     <th className="py-2.5 px-3 font-medium whitespace-nowrap">Decision</th>
                     <th className="py-2.5 px-3 font-medium whitespace-nowrap">Reason</th>
+                    <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">Link</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70">
@@ -433,6 +434,17 @@ export function ScannerView() {
                       </td>
                       <td className="py-2.5 px-3 text-slate-600 dark:text-slate-300 max-w-md truncate">
                         {t.lastReason}
+                      </td>
+                      <td className="py-2.5 px-3 text-right" onClick={(e) => e.stopPropagation()}>
+                        <a
+                          href={`https://dexscreener.com/solana/${t.mint}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium bg-teal-500/10 text-teal-600 dark:text-teal-400 hover:bg-teal-500/20 whitespace-nowrap"
+                        >
+                          <span>DexScreener</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
                       </td>
                     </tr>
                   ))}
