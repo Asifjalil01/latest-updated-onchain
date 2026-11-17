@@ -1,5 +1,38 @@
 # Changelog
 
+All notable changes to **Solana Spot Bot** are documented in this file.
+
+## v1.3.0 — Dashboard USD Equivalents, Custom Stop-Loss Tiers & `npm install` Fix
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Dashboard `$` USD Equivalents**: Added live signed USD (`$`) values alongside SOL amounts across Dashboard KPI cards (`Open P&L`, `Today Realized`, `Net Realized P&L`, `Expectancy`), `Max Drawdown`, `Wallet Exposure`, `Daily Loss Budget Used`, `Gas Reserve`, and Active Positions preview cards (`formatSignedUsd` helper).
+- **Custom Stop-Loss Tiers (End-to-End Execution & Settings Layout)**:
+  - Moved **Custom Stop-Loss Tiers** directly below **Position Sizing & Risk Caps** in Settings and removed the redundant standalone `Stop-Loss (%) — Max 20%` input from **Exit Rules**.
+  - Added `+ Add Stop Loss Tier`, `Delete`, and editable `Trigger Drop %` / `Sell %` controls, automatically syncing `stopLossPct` to the highest tier while enforcing the `20%` hard cap and `TP >= 1.5x Max SL` rule.
+  - Wired `stopLossTiers` through `/api/settings` validation, SQLite (`triggered_sl_tiers_json`), and partial/full sell execution across Paper and Live engines.
+- **Fixed `npm install` Peer Dependency Conflict (`ERESOLVE`)**:
+  - Added npm `overrides` in `package.json` for `@solana/web3.js` and `esbuild` so `npm install` resolves cleanly without `--legacy-peer-deps`.
+  - Fixed HTML5 number input `step`/`min` mismatches on Settings tiers so `Save Settings` always submits cleanly.
+
+---
+
+## v1.2.0 — Custom Stepped Trailing Exit Tiers & Live USD/Position Telemetry
+
+### Added & Improved
+- **Custom Stepped Trailing Exit Tiers**: Added user-editable trailing profit tiers (`+ Add Tier` / `Delete`) in Settings alongside `Take-Profit (%)` and `Break-Even Recovery Watch`.
+- **USD (`$`) Values & Live 1s Position Pricing**: Added `$` USD equivalents in Settings & Positions, clearer Gross vs Net P&L breakdown, and 1-second Entry Price / Current Price updates on open positions.
+
+---
+
+## v1.1.0 — Scanner & Candidate Entry Pipeline Tuning
+
+### Fixed
+- Resolved candidate filtering/execution edge cases where discovered/scored coins were not executing entries in Paper mode.
+
+---
+
 ## v1.0.0 — Ground-Up Safety-First Rebuild
 
 **Risk Warning: Trading can lose all of your money.**
