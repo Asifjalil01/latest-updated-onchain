@@ -39,15 +39,27 @@ export function evaluateHardFilters(
   const totalBuySell = token.buys24h + token.sells24h;
   const buyRatio = totalBuySell > 0 ? token.buys24h / totalBuySell : 0;
 
-  // 1. Pool age check (strict: no ultra-early bypass, no grace window)
-  const effectiveMinAge = Math.max(30, settings.minPoolAgeMinutes);
-  if (!Number.isFinite(poolAgeMinutes) || poolAgeMinutes < effectiveMinAge) {
-    reasons.push(
-      `Pool age ${Math.max(0, poolAgeMinutes).toFixed(1)}m is below ${effectiveMinAge}m minimum`
-    );
-  }
-  if (poolAgeDays > settings.maxPoolAgeDays) {
-    reasons.push(`Pool age ${poolAgeDays.toFixed(1)}d exceeds ${settings.maxPoolAgeDays}d maximum`);
+  // 1. Pool age check (custom timeframe window if enabled, otherwise default rules)
+  if (settings.customAgeWindowEnabled) {
+    if (
+      !Number.isFinite(poolAgeMinutes) ||
+      poolAgeMinutes < settings.customMinPoolAgeMinutes ||
+      poolAgeMinutes > settings.customMaxPoolAgeMinutes
+    ) {
+      reasons.push(
+        `Pool age ${Math.max(0, poolAgeMinutes).toFixed(1)}m is outside custom ${settings.customMinPoolAgeMinutes}m–${settings.customMaxPoolAgeMinutes}m timeframe`
+      );
+    }
+  } else {
+    const effectiveMinAge = Math.max(30, settings.minPoolAgeMinutes);
+    if (!Number.isFinite(poolAgeMinutes) || poolAgeMinutes < effectiveMinAge) {
+      reasons.push(
+        `Pool age ${Math.max(0, poolAgeMinutes).toFixed(1)}m is below ${effectiveMinAge}m minimum`
+      );
+    }
+    if (poolAgeDays > settings.maxPoolAgeDays) {
+      reasons.push(`Pool age ${poolAgeDays.toFixed(1)}d exceeds ${settings.maxPoolAgeDays}d maximum`);
+    }
   }
 
   // 2. Liquidity, volume, tx count, unique traders

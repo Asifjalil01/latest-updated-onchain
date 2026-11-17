@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULT_SETTINGS } from '../config/defaults';
 import { evaluateHardFilters, validateCandidateData } from '../engine/filters';
-import type { CandidateToken } from '../types';
+import { scoreCandidate } from '../engine/scoring';
+import type { CandidateToken, SecurityReport } from '../types';
 
 function makeMatureCleanToken(nowMs: number): CandidateToken {
   return {
@@ -56,4 +57,58 @@ test('filters: accepts a clean mature coin', () => {
   assert.equal(validateCandidateData(clean).valid, true);
   const res = evaluateHardFilters(clean, DEFAULT_SETTINGS, 0.35, now);
   assert.equal(res.passed, true, `Unexpected rejection: ${res.reasons.join('; ')}`);
+});
+
+test('filters: custom pool age timeframe filters strictly between min and max minutes when checked, and falls back when unchecked', () => {
+  const now = 1_760_000_000_000;
+  const customSettings = {
+    ...DEFAULT_SETTINGS,
+    customAgeWindowEnabled: true,
+    customMinPoolAgeMinutes: 5,
+    customMaxPoolAgeMinutes: 30,
+  };
+
+  const tooNew = { ...makeMatureCleanToken(now), poolCreatedAtMs: now - 3 * 60_000 };
+  const inWindow = { ...makeMatureCleanToken(now), poolCreatedAtMs: now - 15 * 60_000 };
+  const tooOld = { ...makeMatureCleanToken(now), poolCreatedAtMs: now - 45 * 60_000 };
+
+  assert.equal(evaluateHardFilters(tooNew, customSettings, 0.3, now).passed, false);
+  const inWindowFilter = evaluateHardFilters(inWindow, customSettings, 0.3, now);
+  assert.equal(inWindowFilter.passed, true);
+  assert.equal(evaluateHardFilters(tooOld, customSettings, 0.3, now).passed, false);
+
+  // Scoring should not reject 15m token as high_risk_micro when custom window is enabled
+  const cleanSec: SecurityReport = {
+    passed: true,
+    reasons: [],
+    warnings: [],
+    criticalFlags: [],
+    sourcesAgreed: 2,
+    mintAuthorityRevoked: true,
+    freezeAuthorityRevoked: true,
+    token2022DisallowedExtensions: [],
+    rugCheckScore: 10,
+    rugCheckRisks: [],
+    lpLockedOrBurnedPct: 95,
+    top10HoldersPct: 20,
+    singleMaxHolderPct: 5,
+    holders: [],
+    deployerFlagged: false,
+    sellRouteExists: true,
+    sellRouteImpactPct: 0.4,
+    sellTaxPct: 0,
+    tradingEnabled: true,
+  };
+  const scored = scoreCandidate({
+    token: inWindow,
+    filterResult: inWindowFilter,
+    securityReport: cleanSec,
+    settings: customSettings,
+    nowMs: now,
+  });
+  assert.notEqual(scored.tokenClass, 'high_risk_micro');
+
+  // Unchecked -> uses default 30m minimum and rejects the 15m token
+  const defaultSettings = { ...customSettings, customAgeWindowEnabled: false };
+  assert.equal(evaluateHardFilters(inWindow, defaultSettings, 0.3, now).passed, false);
 });

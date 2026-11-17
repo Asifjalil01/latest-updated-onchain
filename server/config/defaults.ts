@@ -1,8 +1,7 @@
 import type { BotSettings, WalletFeeProfile } from '../types';
 
 export const HARD_LIMITS = {
-  maxStopLossPct: 20,
-  minStopLossPct: 1,
+  minStopLossPct: 0.5,
   minTakeProfitToStopLossRatio: 1.5,
   maxSlippageBps: 1000,
   maxPriorityFeeSolCap: 0.05,
@@ -33,6 +32,9 @@ export const DEFAULT_SETTINGS: BotSettings = {
   // Hard Filters
   minPoolAgeMinutes: 30,
   maxPoolAgeDays: 365,
+  customAgeWindowEnabled: false,
+  customMinPoolAgeMinutes: 5,
+  customMaxPoolAgeMinutes: 30,
   minLiquidityUsd: 25000,
   minVolume24hUsd: 50000,
   minTx24h: 200,
@@ -232,13 +234,9 @@ export function validateSettingsUpdate(
       errors.push('At least one Stop-Loss tier is required when Stop-Loss is enabled.');
     }
     for (const tier of merged.stopLossTiers) {
-      if (
-        !Number.isFinite(tier.triggerDropPct) ||
-        tier.triggerDropPct < 0.5 ||
-        tier.triggerDropPct > HARD_LIMITS.maxStopLossPct
-      ) {
+      if (!Number.isFinite(tier.triggerDropPct) || tier.triggerDropPct < HARD_LIMITS.minStopLossPct) {
         errors.push(
-          `Every Stop-Loss tier trigger drop must be between 0.5% and ${HARD_LIMITS.maxStopLossPct}%.`
+          `Every Stop-Loss tier trigger drop must be at least ${HARD_LIMITS.minStopLossPct}%.`
         );
         break;
       }
@@ -253,23 +251,30 @@ export function validateSettingsUpdate(
       (patch.stopLossPct === undefined || patch.stopLossPct === current.stopLossPct)
     ) {
       const maxTierDrop = Math.max(...merged.stopLossTiers.map((t) => t.triggerDropPct));
-      merged.stopLossPct = Math.min(
-        HARD_LIMITS.maxStopLossPct,
-        Math.max(HARD_LIMITS.minStopLossPct, maxTierDrop)
-      );
+      merged.stopLossPct = Math.max(HARD_LIMITS.minStopLossPct, maxTierDrop);
     }
   }
 
-  if (merged.stopLossPct < HARD_LIMITS.minStopLossPct || merged.stopLossPct > HARD_LIMITS.maxStopLossPct) {
-    errors.push(`Stop-loss must be between ${HARD_LIMITS.minStopLossPct}% and ${HARD_LIMITS.maxStopLossPct}%.`);
+  if (!Number.isFinite(merged.stopLossPct) || merged.stopLossPct < HARD_LIMITS.minStopLossPct) {
+    errors.push(`Stop-loss must be at least ${HARD_LIMITS.minStopLossPct}%.`);
   }
-  if (merged.takeProfitPct < merged.stopLossPct * HARD_LIMITS.minTakeProfitToStopLossRatio) {
+  if (!Number.isFinite(merged.takeProfitPct) || merged.takeProfitPct < merged.stopLossPct * HARD_LIMITS.minTakeProfitToStopLossRatio) {
     errors.push(
       `Take-profit (${merged.takeProfitPct}%) must be at least ${HARD_LIMITS.minTakeProfitToStopLossRatio}x the max stop-loss (${(merged.stopLossPct * HARD_LIMITS.minTakeProfitToStopLossRatio).toFixed(1)}%).`
     );
   }
   if (merged.minPoolAgeMinutes < HARD_LIMITS.minPoolAgeFloorMinutes) {
     errors.push(`Minimum pool age cannot be lower than ${HARD_LIMITS.minPoolAgeFloorMinutes} minutes.`);
+  }
+  if (!Number.isFinite(merged.customMinPoolAgeMinutes) || merged.customMinPoolAgeMinutes < 0) {
+    errors.push('Custom timeframe min age must be >= 0 minutes.');
+  }
+  if (
+    !Number.isFinite(merged.customMaxPoolAgeMinutes) ||
+    merged.customMaxPoolAgeMinutes <= 0 ||
+    merged.customMaxPoolAgeMinutes < merged.customMinPoolAgeMinutes
+  ) {
+    errors.push('Custom timeframe max age must be > 0 and >= min age.');
   }
   if (merged.minLiquidityUsd < HARD_LIMITS.minLiquidityFloorUsd) {
     errors.push(`Minimum liquidity cannot be lower than $${HARD_LIMITS.minLiquidityFloorUsd}.`);

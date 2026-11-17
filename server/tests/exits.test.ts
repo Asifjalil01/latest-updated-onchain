@@ -60,20 +60,54 @@ function makePosition(overrides: Partial<PositionRecord> = {}): PositionRecord {
   };
 }
 
-test('exits: enforces 20% hard maximum stop-loss', () => {
-  const validation = validateSettingsUpdate(DEFAULT_SETTINGS, { stopLossPct: 25, takeProfitPct: 50 });
-  assert.equal(validation.valid, false);
+test('exits: allows custom stop-loss above 20% and unlimited take-profit while rejecting < 0.5% SL', () => {
+  const invalidLowSl = validateSettingsUpdate(DEFAULT_SETTINGS, { stopLossPct: 0.2, takeProfitPct: 50 });
+  assert.equal(invalidLowSl.valid, false);
 
-  // Even if exitParams somehow had 35%, evaluator enforces hard 20% cap
-  const pos = makePosition({
-    exitParams: { ...snapshotExitParams(DEFAULT_SETTINGS, 1.5), stopLossPct: 35 },
+  const highSlAndTp = validateSettingsUpdate(DEFAULT_SETTINGS, {
+    stopLossTiers: [{ triggerDropPct: 35, sellPct: 100 }],
+    takeProfitPct: 1000,
   });
-  const res = evaluatePositionExit(pos, {
+  assert.equal(highSlAndTp.valid, true);
+  assert.equal(highSlAndTp.merged.stopLossPct, 35);
+  assert.equal(highSlAndTp.merged.takeProfitPct, 1000);
+
+  // Position with 35% stop-loss should NOT stop out early at -21%, and SHOULD exit at -36%
+  const customSettings = { ...DEFAULT_SETTINGS, stopLossPct: 35, stopLossTiers: [{ triggerDropPct: 35, sellPct: 100 }], takeProfitPct: 1000 };
+  const pos = makePosition({
+    exitParams: snapshotExitParams(customSettings, 1.5),
+  });
+  const evalTime = pos.openedAtMs + 60_000;
+  const atMinus21 = evaluatePositionExit(pos, {
     currentPriceUsd: 0.79, // -21%
     currentLiquidityUsd: 100_000,
+    nowMs: evalTime,
   });
-  assert.equal(res.shouldExit, true);
-  assert.equal(res.reason, 'STOP_LOSS');
+  assert.equal(atMinus21.shouldExit, false);
+
+  const atMinus36 = evaluatePositionExit(pos, {
+    currentPriceUsd: 0.64, // -36%
+    currentLiquidityUsd: 100_000,
+    nowMs: evalTime + 5_000,
+  });
+  assert.equal(atMinus36.shouldExit, true);
+  assert.equal(atMinus36.reason, 'STOP_LOSS');
+
+  // Rising past all trailing tiers (+500%) holds while still climbing, then exits at +1000% TP
+  const atPlus500 = evaluatePositionExit(pos, {
+    currentPriceUsd: 6.0, // +500%
+    currentLiquidityUsd: 100_000,
+    nowMs: evalTime + 10_000,
+  });
+  assert.equal(atPlus500.shouldExit, false);
+
+  const atPlus1000 = evaluatePositionExit(pos, {
+    currentPriceUsd: 11.0, // +1000%
+    currentLiquidityUsd: 100_000,
+    nowMs: evalTime + 15_000,
+  });
+  assert.equal(atPlus1000.shouldExit, true);
+  assert.equal(atPlus1000.reason, 'TAKE_PROFIT');
 });
 
 test('exits: settings update does not alter an open position exit parameters', () => {
@@ -211,11 +245,23 @@ test('exits: validateSettingsUpdate syncs stopLossPct from stopLossTiers and enf
   assert.equal(invalidTp.valid, false);
   assert.ok(invalidTp.errors.some((e) => e.includes('Take-profit')));
 
-  const invalidMaxCap = validateSettingsUpdate(DEFAULT_SETTINGS, {
-    stopLossTiers: [{ triggerDropPct: 22, sellPct: 100 }],
+  const validUnlimited = validateSettingsUpdate(DEFAULT_SETTINGS, {
+    stopLossTiers: [{ triggerDropPct: 45, sellPct: 100 }],
+    takeProfitPct: 1000,
+    trailingLadder: Array.from({ length: 20 }, (_, i) => ({
+      peakGainPct: (i + 1) * 5,
+      allowedDropPct: 2,
+    })),
+  });
+  assert.equal(validUnlimited.valid, true);
+  assert.equal(validUnlimited.merged.stopLossPct, 45);
+  assert.equal(validUnlimited.merged.trailingLadder.length, 20);
+
+  const invalidBelowMin = validateSettingsUpdate(DEFAULT_SETTINGS, {
+    stopLossTiers: [{ triggerDropPct: 0.2, sellPct: 100 }],
     takeProfitPct: 40,
   });
-  assert.equal(invalidMaxCap.valid, false);
+  assert.equal(invalidBelowMin.valid, false);
 });
 
 test('exits: trailing stop never arms or locks floor below round-trip break-even costs', () => {

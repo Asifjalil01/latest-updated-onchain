@@ -61,7 +61,7 @@ export function evaluatePositionExit(
 
   // Gap-down tracking for break-even recovery watch
   let updatedGapDownTriggered = position.gapDownTriggered;
-  if (grossPnlPct <= -Math.min(20, params.stopLossPct) * 0.75) {
+  if (grossPnlPct <= -Math.max(0.5, params.stopLossPct) * 0.75) {
     updatedGapDownTriggered = true;
   }
 
@@ -151,9 +151,9 @@ export function evaluatePositionExit(
     }
   }
 
-  // 2. Hard stop-loss & tiered stop-loss rules (enforced max 20% even if corrupted state)
+  // 2. Hard stop-loss & tiered stop-loss rules
   if (params.stopLossEnabled) {
-    const hardClampedStop = Math.min(20, params.stopLossPct);
+    const hardClampedStop = Math.max(0.5, params.stopLossPct);
     if (grossPnlPct <= -hardClampedStop) {
       return {
         ...baseResult,
@@ -171,7 +171,7 @@ export function evaluatePositionExit(
     const alreadyTriggered = new Set(position.triggeredStopLossTiers ?? []);
     for (const tier of tiers) {
       if (alreadyTriggered.has(tier.triggerDropPct)) continue;
-      const clampedTierDrop = Math.min(20, Math.max(0.5, tier.triggerDropPct));
+      const clampedTierDrop = Math.max(0.5, tier.triggerDropPct);
       if (grossPnlPct <= -clampedTierDrop) {
         const sellFraction = Math.min(1, Math.max(0.01, tier.sellPct / 100));
         return {

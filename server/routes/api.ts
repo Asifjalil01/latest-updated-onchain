@@ -24,6 +24,9 @@ const settingsPatchSchema = z
     slippageBps: z.number().int().min(10).max(1000).optional(),
     minPoolAgeMinutes: z.number().min(30).optional(),
     maxPoolAgeDays: z.number().min(1).max(3650).optional(),
+    customAgeWindowEnabled: z.boolean().optional(),
+    customMinPoolAgeMinutes: z.number().min(0).optional(),
+    customMaxPoolAgeMinutes: z.number().positive().optional(),
     minLiquidityUsd: z.number().min(10000).optional(),
     minVolume24hUsd: z.number().min(0).optional(),
     minTx24h: z.number().int().min(0).optional(),
@@ -46,16 +49,16 @@ const settingsPatchSchema = z
     enablePumpPortalWs: z.boolean().optional(),
     scanIntervalSeconds: z.number().int().min(10).max(600).optional(),
     stopLossEnabled: z.boolean().optional(),
-    stopLossPct: z.number().min(0.5).max(20).optional(),
+    stopLossPct: z.number().min(0.5).optional(),
     stopLossTiers: z
       .array(
         z.object({
-          triggerDropPct: z.number().min(0.5).max(20),
+          triggerDropPct: z.number().min(0.5),
           sellPct: z.number().min(1).max(100),
         })
       )
       .optional(),
-    takeProfitPct: z.number().min(1.5).max(500).optional(),
+    takeProfitPct: z.number().min(1.5).optional(),
     trailingEnabled: z.boolean().optional(),
     trailingLadder: z
       .array(z.object({ peakGainPct: z.number().positive(), allowedDropPct: z.number().positive() }))

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Info, Save } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import type { BotSettings, StopLossTier } from '../../types';
@@ -8,6 +8,8 @@ export function SettingsView() {
   const [draft, setDraft] = useState<BotSettings | null>(settings);
   const [saving, setSaving] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const stopLossListRef = useRef<HTMLDivElement | null>(null);
+  const trailingListRef = useRef<HTMLDivElement | null>(null);
 
   const solUsd = status?.solPriceUsd ?? 72.21;
 
@@ -29,8 +31,13 @@ export function SettingsView() {
     const current = draft.trailingLadder || [];
     const lastPeak = current.length > 0 ? current[current.length - 1].peakGainPct : 1.0;
     const nextPeak = Number((lastPeak + 1.0).toFixed(1));
-    const nextDrop = 0.25;
+    const nextDrop = Math.min(0.25, Number((nextPeak * 0.5).toFixed(2)));
     updateField('trailingLadder', [...current, { peakGainPct: nextPeak, allowedDropPct: nextDrop }]);
+    setTimeout(() => {
+      if (trailingListRef.current) {
+        trailingListRef.current.scrollTop = trailingListRef.current.scrollHeight;
+      }
+    }, 0);
   };
 
   const removeTrailingTier = (idx: number) => {
@@ -53,7 +60,7 @@ export function SettingsView() {
         .map((t) => t.triggerDropPct)
         .filter((d) => Number.isFinite(d) && d > 0);
       const maxDrop = validDrops.length > 0 ? Math.max(...validDrops) : prev.stopLossPct;
-      const syncedStopLossPct = Math.min(20, Math.max(1, maxDrop));
+      const syncedStopLossPct = Math.max(0.5, maxDrop);
       return {
         ...prev,
         stopLossTiers: nextTiers,
@@ -67,9 +74,14 @@ export function SettingsView() {
     if (!draft) return;
     const current = draft.stopLossTiers || [];
     const lastDrop = current.length > 0 ? current[current.length - 1].triggerDropPct : 2.0;
-    const nextDrop = Math.min(20, Number((lastDrop + 2.0).toFixed(1)));
+    const nextDrop = Number((lastDrop + 2.0).toFixed(1));
     const nextSell = 50;
     syncStopLossTiers([...current, { triggerDropPct: nextDrop, sellPct: nextSell }]);
+    setTimeout(() => {
+      if (stopLossListRef.current) {
+        stopLossListRef.current.scrollTop = stopLossListRef.current.scrollHeight;
+      }
+    }, 0);
   };
 
   const removeStopLossTier = (idx: number) => {
@@ -132,14 +144,11 @@ export function SettingsView() {
 
   const effectiveMaxSl =
     (draft.stopLossTiers?.length ?? 0) > 0
-      ? Math.min(
-          20,
-          Math.max(
-            1,
-            ...draft.stopLossTiers.map((t) => (Number.isFinite(t.triggerDropPct) ? t.triggerDropPct : 0))
-          )
+      ? Math.max(
+          0.5,
+          ...draft.stopLossTiers.map((t) => (Number.isFinite(t.triggerDropPct) ? t.triggerDropPct : 0))
         )
-      : Math.min(20, Math.max(1, draft.stopLossPct));
+      : Math.max(0.5, draft.stopLossPct);
 
   return (
     <form onSubmit={(e) => void handleSave(e)} noValidate className="space-y-6">
@@ -287,10 +296,10 @@ export function SettingsView() {
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h2 className="font-display text-sm font-bold">
-                  Custom Stop-Loss Tiers ({draft.stopLossTiers?.length || 0} Tiers)
+                  Custom Stop-Loss Tiers ({draft.stopLossTiers?.length || 0} Tiers · Unlimited)
                 </h2>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Max Stop: <span className="font-mono text-rose-500">-{effectiveMaxSl.toFixed(1)}%</span> · Hard safety cap 20%
+                  Max Stop: <span className="font-mono text-rose-500">-{effectiveMaxSl.toFixed(1)}%</span> · Unlimited Trigger Drop % (no upper cap)
                 </p>
               </div>
               <div className="flex items-center gap-3">
@@ -315,7 +324,7 @@ export function SettingsView() {
             </div>
 
             {draft.stopLossEnabled ? (
-              <div className="space-y-2 max-h-60 overflow-y-auto">
+              <div ref={stopLossListRef} className="space-y-2 max-h-80 overflow-y-auto">
                 {(draft.stopLossTiers || []).map((tier, idx) => (
                   <div
                     key={idx}
@@ -329,7 +338,6 @@ export function SettingsView() {
                           type="number"
                           step="0.1"
                           min="0.5"
-                          max="20"
                           aria-label={`Stop-loss tier ${idx + 1} trigger drop percent`}
                           value={tier.triggerDropPct}
                           onChange={(e) => updateStopLossTierField(idx, 'triggerDropPct', Number(e.target.value))}
@@ -377,15 +385,62 @@ export function SettingsView() {
           {/* Hard Filters & Security */}
           <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4">
             <h2 className="font-display text-sm font-bold">Hard Filters &amp; Security Thresholds</h2>
+
+            {/* Custom Pool Age Timeframe Window */}
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60 p-3.5 space-y-3 text-xs">
+              <label className="inline-flex items-center gap-2 font-semibold text-slate-800 dark:text-slate-200 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={draft.customAgeWindowEnabled}
+                  onChange={(e) => updateField('customAgeWindowEnabled', e.target.checked)}
+                />
+                <span>Use Custom Pool Age Timeframe (Min–Max Minutes)</span>
+              </label>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                {draft.customAgeWindowEnabled
+                  ? `Active: Bot will only search & trade coins between ${draft.customMinPoolAgeMinutes}m and ${draft.customMaxPoolAgeMinutes}m old (not newer or older).`
+                  : 'Unchecked: Bot uses its default age filter (Min Pool Age >= 30m below).'}
+              </p>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="space-y-1">
+                  <span className="text-slate-500 block">Min Coin Age (minutes)</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1"
+                    disabled={!draft.customAgeWindowEnabled}
+                    aria-label="Custom min pool age minutes"
+                    value={draft.customMinPoolAgeMinutes}
+                    onChange={(e) => updateField('customMinPoolAgeMinutes', Number(e.target.value))}
+                    className="w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 disabled:opacity-50"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-slate-500 block">Max Coin Age (minutes)</span>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    disabled={!draft.customAgeWindowEnabled}
+                    aria-label="Custom max pool age minutes"
+                    value={draft.customMaxPoolAgeMinutes}
+                    onChange={(e) => updateField('customMaxPoolAgeMinutes', Number(e.target.value))}
+                    className="w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 disabled:opacity-50"
+                  />
+                </label>
+              </div>
+            </div>
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
               <label className="space-y-1">
-                <span className="text-slate-500 block">Min Pool Age (min, &ge; 30m)</span>
+                <span className="text-slate-500 block">Default Min Pool Age (min, &ge; 30m)</span>
                 <input
                   type="number"
                   min="30"
+                  disabled={draft.customAgeWindowEnabled}
                   value={draft.minPoolAgeMinutes}
                   onChange={(e) => updateField('minPoolAgeMinutes', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 disabled:opacity-50"
                 />
               </label>
               <label className="space-y-1">
@@ -440,11 +495,11 @@ export function SettingsView() {
           {/* Exits */}
           <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4">
             <h2 className="font-display text-sm font-bold">
-              Exit Rules (TP &ge; 1.5x Max SL, SL &le; 20%)
+              Exit Rules (TP &ge; 1.5x Max SL)
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
               <label className="space-y-1">
-                <span className="text-slate-500 block">Take-Profit (%)</span>
+                <span className="text-slate-500 block">Take-Profit (%) · Unlimited</span>
                 <input
                   type="number"
                   min="1.5"
@@ -453,6 +508,9 @@ export function SettingsView() {
                   onChange={(e) => updateField('takeProfitPct', Number(e.target.value))}
                   className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
                 />
+                <span className="text-[11px] text-slate-400 block">
+                  Waits here if price clears all trailing tiers.
+                </span>
               </label>
               <label className="space-y-1">
                 <span className="text-slate-500 block">Max Hold Time (minutes)</span>
@@ -506,7 +564,7 @@ export function SettingsView() {
             {draft.trailingEnabled && (
               <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60 p-4 space-y-3">
                 <div className="flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300">
-                  <span>Custom Stepped Trailing Exit Tiers ({draft.trailingLadder?.length || 0} Tiers)</span>
+                  <span>Custom Stepped Trailing Exit Tiers ({draft.trailingLadder?.length || 0} Tiers · Unlimited)</span>
                   <button
                     type="button"
                     onClick={addTrailingTier}
@@ -515,7 +573,7 @@ export function SettingsView() {
                     + Add Tier
                   </button>
                 </div>
-                <div className="space-y-2 max-h-56 overflow-y-auto">
+                <div ref={trailingListRef} className="space-y-2 max-h-96 overflow-y-auto">
                   {(draft.trailingLadder || []).map((tier, idx) => {
                     const lockedFloor = tier.peakGainPct - tier.allowedDropPct;
                     return (

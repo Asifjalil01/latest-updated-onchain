@@ -52,6 +52,9 @@ export interface BotSettings {
   // Hard Filters
   minPoolAgeMinutes: number;
   maxPoolAgeDays: number;
+  customAgeWindowEnabled: boolean;
+  customMinPoolAgeMinutes: number;
+  customMaxPoolAgeMinutes: number;
   minLiquidityUsd: number;
   minVolume24hUsd: number;
   minTx24h: number;

@@ -7,7 +7,11 @@ import type {
   TokenClass,
 } from '../types';
 
-export function classifyToken(token: CandidateToken, poolAgeMinutes: number): {
+export function classifyToken(
+  token: CandidateToken,
+  poolAgeMinutes: number,
+  allowCustomYoungAge = false
+): {
   tokenClass: TokenClass;
   sizeMultiplier: number;
 } {
@@ -20,7 +24,7 @@ export function classifyToken(token: CandidateToken, poolAgeMinutes: number): {
   if (token.liquidityUsd >= 75_000 && poolAgeMinutes >= 180) {
     return { tokenClass: 'early_stage', sizeMultiplier: 0.7 };
   }
-  if (token.liquidityUsd >= 10_000 && poolAgeMinutes >= 30) {
+  if (token.liquidityUsd >= 10_000 && (poolAgeMinutes >= 30 || allowCustomYoungAge)) {
     return { tokenClass: 'meme', sizeMultiplier: 0.4 };
   }
   return { tokenClass: 'high_risk_micro', sizeMultiplier: 0 };
@@ -36,7 +40,11 @@ export function scoreCandidate(params: {
   const { token, filterResult, securityReport, settings } = params;
   const nowMs = params.nowMs ?? Date.now();
   const poolAgeMinutes = filterResult.computed.poolAgeMinutes;
-  const { tokenClass, sizeMultiplier } = classifyToken(token, poolAgeMinutes);
+  const allowCustomYoungAge =
+    settings.customAgeWindowEnabled &&
+    poolAgeMinutes >= settings.customMinPoolAgeMinutes &&
+    poolAgeMinutes <= settings.customMaxPoolAgeMinutes;
+  const { tokenClass, sizeMultiplier } = classifyToken(token, poolAgeMinutes, allowCustomYoungAge);
 
   // Quality score components (max 100)
   const safetyPts = securityReport.passed
