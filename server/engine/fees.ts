@@ -106,8 +106,7 @@ export function computeBreakEvenPrices(params: {
 
 export function snapshotExitParams(settings: BotSettings, roundTripCostPct: number): PositionExitSnapshot {
   const clampedSl = Math.max(0.5, settings.stopLossPct);
-  const minTp = clampedSl * 1.5;
-  const clampedTp = Math.max(minTp, settings.takeProfitPct);
+  const clampedTp = Math.max(1.5, settings.takeProfitPct);
   return {
     stopLossEnabled: settings.stopLossEnabled,
     stopLossPct: clampedSl,

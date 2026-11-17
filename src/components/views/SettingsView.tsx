@@ -1,13 +1,59 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Info, Save } from 'lucide-react';
+import { AlertCircle, Info, Save } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import type { BotSettings, StopLossTier } from '../../types';
+import { validateSettingsDraft } from '../../utils/settingsValidation';
+
+function parseNumInput(raw: string): number {
+  if (raw.trim() === '') return Number.NaN;
+  return Number(raw);
+}
+
+function inputValue(val: number): string | number {
+  return Number.isFinite(val) ? val : '';
+}
+
+function safeFixed(val: number, digits = 2): string {
+  return (Number.isFinite(val) ? val : 0).toFixed(digits);
+}
+
+function FieldErrorPopup({
+  message,
+  onDismiss,
+}: {
+  message?: string;
+  onDismiss?: () => void;
+}) {
+  if (!message) return null;
+  return (
+    <div
+      role="tooltip"
+      className="mt-1.5 relative z-20 rounded-xl border border-rose-500/80 bg-rose-950/95 text-rose-100 px-3 py-2 text-[11px] leading-snug shadow-lg shadow-rose-950/40 flex items-start justify-between gap-2"
+    >
+      <span className="inline-flex items-start gap-1.5">
+        <AlertCircle className="w-3.5 h-3.5 text-rose-400 shrink-0 mt-0.5" />
+        <span>{message}</span>
+      </span>
+      {onDismiss && (
+        <button
+          type="button"
+          aria-label="Dismiss field error"
+          onClick={onDismiss}
+          className="text-rose-300 hover:text-white shrink-0 font-bold leading-none px-0.5"
+        >
+          ×
+        </button>
+      )}
+    </div>
+  );
+}
 
 export function SettingsView() {
   const { settings, settingsHistory, apiFetch, hydrateAll, pushToast, status } = useBotStore();
   const [draft, setDraft] = useState<BotSettings | null>(settings);
   const [saving, setSaving] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const stopLossListRef = useRef<HTMLDivElement | null>(null);
   const trailingListRef = useRef<HTMLDivElement | null>(null);
 
@@ -21,18 +67,64 @@ export function SettingsView() {
     return <div className="text-xs text-slate-500">Loading settings…</div>;
   }
 
+  const clearFieldError = (...keys: string[]) => {
+    setFieldErrors((prev) => {
+      if (Object.keys(prev).length === 0) return prev;
+      const next = { ...prev };
+      let changed = false;
+      for (const k of keys) {
+        if (k in next) {
+          delete next[k];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  };
+
+  const focusFirstInvalidField = (errs: Record<string, string>) => {
+    const firstKey = Object.keys(errs)[0];
+    if (!firstKey) return;
+    setTimeout(() => {
+      const escaped = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(firstKey) : firstKey;
+      const el = document.querySelector<HTMLElement>(`[data-field-key="${escaped}"]`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.focus?.();
+      }
+    }, 30);
+  };
+
   const updateField = <K extends keyof BotSettings>(key: K, value: BotSettings[K]) => {
-    setDraft((prev) => (prev ? { ...prev, [key]: value } : prev));
+    setDraft((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev, [key]: value };
+      // Keep hidden maxPositionSizeSol aligned with editable Trade Size & Max Wallet Exposure
+      if (key === 'tradeSizeSol' || key === 'maxWalletExposureSol') {
+        const tradeSize = Number.isFinite(next.tradeSizeSol) ? next.tradeSizeSol : prev.tradeSizeSol;
+        const maxExp = Number.isFinite(next.maxWalletExposureSol)
+          ? next.maxWalletExposureSol
+          : prev.maxWalletExposureSol;
+        if (maxExp > 0 && tradeSize > 0) {
+          next.maxPositionSizeSol = Math.min(maxExp, Math.max(tradeSize, prev.maxPositionSizeSol));
+        }
+      }
+      return next;
+    });
     setValidationError(null);
+    clearFieldError(String(key));
   };
 
   const addTrailingTier = () => {
     if (!draft) return;
     const current = draft.trailingLadder || [];
-    const lastPeak = current.length > 0 ? current[current.length - 1].peakGainPct : 1.0;
+    const lastPeak = current.length > 0 && Number.isFinite(current[current.length - 1].peakGainPct)
+      ? current[current.length - 1].peakGainPct
+      : 1.0;
     const nextPeak = Number((lastPeak + 1.0).toFixed(1));
     const nextDrop = Math.min(0.25, Number((nextPeak * 0.5).toFixed(2)));
     updateField('trailingLadder', [...current, { peakGainPct: nextPeak, allowedDropPct: nextDrop }]);
+    clearFieldError('trailingEnabled');
     setTimeout(() => {
       if (trailingListRef.current) {
         trailingListRef.current.scrollTop = trailingListRef.current.scrollHeight;
@@ -44,6 +136,13 @@ export function SettingsView() {
     if (!draft) return;
     const current = draft.trailingLadder || [];
     updateField('trailingLadder', current.filter((_, i) => i !== idx));
+    setFieldErrors((prev) => {
+      const next: Record<string, string> = {};
+      for (const [k, v] of Object.entries(prev)) {
+        if (!k.startsWith('trailingLadder.')) next[k] = v;
+      }
+      return next;
+    });
   };
 
   const updateTrailingTierField = (idx: number, field: 'peakGainPct' | 'allowedDropPct', val: number) => {
@@ -51,6 +150,7 @@ export function SettingsView() {
     const current = [...(draft.trailingLadder || [])];
     current[idx] = { ...current[idx], [field]: val };
     updateField('trailingLadder', current);
+    clearFieldError(`trailingLadder.${idx}.peakGainPct`, `trailingLadder.${idx}.allowedDropPct`);
   };
 
   const syncStopLossTiers = (nextTiers: StopLossTier[]) => {
@@ -73,10 +173,13 @@ export function SettingsView() {
   const addStopLossTier = () => {
     if (!draft) return;
     const current = draft.stopLossTiers || [];
-    const lastDrop = current.length > 0 ? current[current.length - 1].triggerDropPct : 2.0;
+    const lastDrop = current.length > 0 && Number.isFinite(current[current.length - 1].triggerDropPct)
+      ? current[current.length - 1].triggerDropPct
+      : 2.0;
     const nextDrop = Number((lastDrop + 2.0).toFixed(1));
     const nextSell = 50;
     syncStopLossTiers([...current, { triggerDropPct: nextDrop, sellPct: nextSell }]);
+    clearFieldError('stopLossEnabled');
     setTimeout(() => {
       if (stopLossListRef.current) {
         stopLossListRef.current.scrollTop = stopLossListRef.current.scrollHeight;
@@ -88,6 +191,13 @@ export function SettingsView() {
     if (!draft) return;
     const current = draft.stopLossTiers || [];
     syncStopLossTiers(current.filter((_, i) => i !== idx));
+    setFieldErrors((prev) => {
+      const next: Record<string, string> = {};
+      for (const [k, v] of Object.entries(prev)) {
+        if (!k.startsWith('stopLossTiers.')) next[k] = v;
+      }
+      return next;
+    });
   };
 
   const updateStopLossTierField = (idx: number, field: 'triggerDropPct' | 'sellPct', val: number) => {
@@ -95,12 +205,29 @@ export function SettingsView() {
     const current = [...(draft.stopLossTiers || [])];
     current[idx] = { ...current[idx], [field]: val };
     syncStopLossTiers(current);
+    clearFieldError(`stopLossTiers.${idx}.${field}`);
   };
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    const clientValidation = validateSettingsDraft(draft);
+    if (!clientValidation.valid) {
+      setFieldErrors(clientValidation.fieldErrors);
+      const count = Object.keys(clientValidation.fieldErrors).length;
+      const summary = `${count} setting${count === 1 ? '' : 's'} need attention — see the highlighted box${count === 1 ? '' : 'es'} below.`;
+      setValidationError(summary);
+      pushToast({
+        kind: 'error',
+        title: 'Please fix highlighted settings',
+        body: clientValidation.errors[0],
+      });
+      focusFirstInvalidField(clientValidation.fieldErrors);
+      return;
+    }
+
     setSaving(true);
     setValidationError(null);
+    setFieldErrors({});
     try {
       await apiFetch('/api/settings', {
         method: 'POST',
@@ -113,8 +240,13 @@ export function SettingsView() {
         body: 'Changes apply to new positions only.',
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Validation failed';
+      const typedErr = err as Error & { fieldErrors?: Record<string, string> };
+      const msg = typedErr instanceof Error ? typedErr.message : 'Validation failed';
       setValidationError(msg);
+      if (typedErr.fieldErrors && Object.keys(typedErr.fieldErrors).length > 0) {
+        setFieldErrors(typedErr.fieldErrors);
+        focusFirstInvalidField(typedErr.fieldErrors);
+      }
       pushToast({ kind: 'error', title: 'Invalid settings', body: msg });
     } finally {
       setSaving(false);
@@ -124,6 +256,7 @@ export function SettingsView() {
   const applyPreset = async (preset: 'safe' | 'balanced' | 'aggressive') => {
     setSaving(true);
     setValidationError(null);
+    setFieldErrors({});
     try {
       await apiFetch('/api/settings/preset', {
         method: 'POST',
@@ -142,13 +275,64 @@ export function SettingsView() {
     }
   };
 
+  const inputClass = (fieldKey: string, extra = 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900') =>
+    fieldErrors[fieldKey]
+      ? `${extra} border-2 border-rose-500 ring-2 ring-rose-500/35 bg-rose-500/10 dark:bg-rose-950/30 text-rose-700 dark:text-rose-200 focus:outline-none`
+      : `${extra} border border-slate-200 dark:border-slate-800`;
+
+  const tierInputClass = (fieldKey: string, extra = 'w-20 px-2 py-1 rounded-lg font-mono') =>
+    fieldErrors[fieldKey]
+      ? `${extra} bg-rose-500/10 dark:bg-rose-950/40 border-2 border-rose-500 ring-2 ring-rose-500/35 text-rose-700 dark:text-rose-200 focus:outline-none`
+      : `${extra} bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700`;
+
+  const hasErrorPrefix = (...prefixes: string[]) =>
+    Object.keys(fieldErrors).some((k) => prefixes.some((p) => k === p || k.startsWith(`${p}.`)));
+
+  const sectionClass = (hasErr: boolean) =>
+    hasErr
+      ? 'rounded-2xl border-2 border-rose-500/60 bg-white dark:bg-[#0D131F] p-5 space-y-4 shadow-sm shadow-rose-500/10'
+      : 'rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4';
+
   const effectiveMaxSl =
     (draft.stopLossTiers?.length ?? 0) > 0
       ? Math.max(
           0.5,
           ...draft.stopLossTiers.map((t) => (Number.isFinite(t.triggerDropPct) ? t.triggerDropPct : 0))
         )
-      : Math.max(0.5, draft.stopLossPct);
+      : Math.max(0.5, Number.isFinite(draft.stopLossPct) ? draft.stopLossPct : 0.5);
+
+  const sizingHasError = hasErrorPrefix(
+    'tradeSizeSol',
+    'maxWalletExposureSol',
+    'dailyLossLimitSol',
+    'gasReserveSol',
+    'maxOpenPositions',
+    'cooldownMinutes'
+  );
+  const stopLossHasError = hasErrorPrefix('stopLossEnabled', 'stopLossTiers');
+  const filtersHasError = hasErrorPrefix(
+    'customMinPoolAgeMinutes',
+    'customMaxPoolAgeMinutes',
+    'minPoolAgeMinutes',
+    'minLiquidityUsd',
+    'maxTop10HoldersPct',
+    'minQualityScore',
+    'minTradeScore'
+  );
+  const exitsHasError = hasErrorPrefix(
+    'takeProfitPct',
+    'maxHoldMinutes',
+    'emergencyLiquidityFloorUsd',
+    'trailingEnabled',
+    'trailingLadder'
+  );
+  const paperHasError = hasErrorPrefix(
+    'paperDelayMinSec',
+    'paperDelayMaxSec',
+    'paperBuyFailChancePct',
+    'paperSellFailChancePct',
+    'paperCompetitionPenaltyPct'
+  );
 
   return (
     <form onSubmit={(e) => void handleSave(e)} noValidate className="space-y-6">
@@ -194,8 +378,23 @@ export function SettingsView() {
       </div>
 
       {validationError && (
-        <div role="alert" className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-500 font-medium">
-          {validationError}
+        <div
+          role="alert"
+          className="rounded-xl border border-rose-500/60 bg-rose-500/10 p-3.5 text-xs text-rose-600 dark:text-rose-300 font-medium flex items-center justify-between gap-3"
+        >
+          <span className="inline-flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
+            <span>{validationError}</span>
+          </span>
+          {Object.keys(fieldErrors).length > 0 && (
+            <button
+              type="button"
+              onClick={() => focusFirstInvalidField(fieldErrors)}
+              className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[11px] font-semibold shrink-0"
+            >
+              Jump to First Error
+            </button>
+          )}
         </div>
       )}
 
@@ -203,107 +402,150 @@ export function SettingsView() {
         {/* Left Column: Sizing -> Custom Stop-Loss Tiers -> Hard Filters */}
         <div className="space-y-6">
           {/* Risk & Sizing */}
-          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4">
+          <section className={sectionClass(sizingHasError)}>
             <h2 className="font-display text-sm font-bold">Position Sizing &amp; Risk Caps</h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
               <label className="space-y-1">
                 <span className="text-slate-500 flex items-center justify-between">
                   <span>Trade Size (SOL)</span>
                   <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
-                    ≈ ${(draft.tradeSizeSol * solUsd).toFixed(2)} USD
+                    ≈ ${safeFixed((Number.isFinite(draft.tradeSizeSol) ? draft.tradeSizeSol : 0) * solUsd)} USD
                   </span>
                 </span>
                 <input
                   type="number"
                   step="0.005"
-                  value={draft.tradeSizeSol}
-                  onChange={(e) => updateField('tradeSizeSol', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="tradeSizeSol"
+                  value={inputValue(draft.tradeSizeSol)}
+                  onChange={(e) => updateField('tradeSizeSol', parseNumInput(e.target.value))}
+                  className={inputClass('tradeSizeSol')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.tradeSizeSol}
+                  onDismiss={() => clearFieldError('tradeSizeSol')}
                 />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 flex items-center justify-between">
                   <span>Max Wallet Exposure (SOL)</span>
                   <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
-                    ≈ ${(draft.maxWalletExposureSol * solUsd).toFixed(2)} USD
+                    ≈ ${safeFixed((Number.isFinite(draft.maxWalletExposureSol) ? draft.maxWalletExposureSol : 0) * solUsd)} USD
                   </span>
                 </span>
                 <input
                   type="number"
                   step="0.01"
-                  value={draft.maxWalletExposureSol}
-                  onChange={(e) => updateField('maxWalletExposureSol', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="maxWalletExposureSol"
+                  value={inputValue(draft.maxWalletExposureSol)}
+                  onChange={(e) => updateField('maxWalletExposureSol', parseNumInput(e.target.value))}
+                  className={inputClass('maxWalletExposureSol')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.maxWalletExposureSol}
+                  onDismiss={() => clearFieldError('maxWalletExposureSol')}
                 />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 flex items-center justify-between">
                   <span>Daily Loss Limit (SOL)</span>
                   <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
-                    ≈ ${(draft.dailyLossLimitSol * solUsd).toFixed(2)} USD
+                    ≈ ${safeFixed((Number.isFinite(draft.dailyLossLimitSol) ? draft.dailyLossLimitSol : 0) * solUsd)} USD
                   </span>
                 </span>
                 <input
                   type="number"
                   step="0.01"
-                  value={draft.dailyLossLimitSol}
-                  onChange={(e) => updateField('dailyLossLimitSol', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="dailyLossLimitSol"
+                  value={inputValue(draft.dailyLossLimitSol)}
+                  onChange={(e) => updateField('dailyLossLimitSol', parseNumInput(e.target.value))}
+                  className={inputClass('dailyLossLimitSol')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.dailyLossLimitSol}
+                  onDismiss={() => clearFieldError('dailyLossLimitSol')}
                 />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 flex items-center justify-between">
                   <span>Gas Reserve (SOL)</span>
                   <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
-                    ≈ ${(draft.gasReserveSol * solUsd).toFixed(2)} USD
+                    ≈ ${safeFixed((Number.isFinite(draft.gasReserveSol) ? draft.gasReserveSol : 0) * solUsd)} USD
                   </span>
                 </span>
                 <input
                   type="number"
                   step="0.005"
                   min="0.01"
-                  value={draft.gasReserveSol}
-                  onChange={(e) => updateField('gasReserveSol', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="gasReserveSol"
+                  value={inputValue(draft.gasReserveSol)}
+                  onChange={(e) => updateField('gasReserveSol', parseNumInput(e.target.value))}
+                  className={inputClass('gasReserveSol')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.gasReserveSol}
+                  onDismiss={() => clearFieldError('gasReserveSol')}
                 />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 block">Max Open Positions</span>
                 <input
                   type="number"
                   min="1"
                   max="10"
-                  value={draft.maxOpenPositions}
-                  onChange={(e) => updateField('maxOpenPositions', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="maxOpenPositions"
+                  value={inputValue(draft.maxOpenPositions)}
+                  onChange={(e) => updateField('maxOpenPositions', parseNumInput(e.target.value))}
+                  className={inputClass('maxOpenPositions')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.maxOpenPositions}
+                  onDismiss={() => clearFieldError('maxOpenPositions')}
                 />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 block">Re-entry Cooldown (min)</span>
                 <input
                   type="number"
                   min="0"
-                  value={draft.cooldownMinutes}
-                  onChange={(e) => updateField('cooldownMinutes', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="cooldownMinutes"
+                  value={inputValue(draft.cooldownMinutes)}
+                  onChange={(e) => updateField('cooldownMinutes', parseNumInput(e.target.value))}
+                  className={inputClass('cooldownMinutes')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.cooldownMinutes}
+                  onDismiss={() => clearFieldError('cooldownMinutes')}
                 />
               </label>
             </div>
           </section>
 
           {/* Custom Stop-Loss Tiers (directly after Position Sizing & Risk Caps) */}
-          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4">
+          <section className={sectionClass(stopLossHasError)}>
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h2 className="font-display text-sm font-bold">
                   Custom Stop-Loss Tiers ({draft.stopLossTiers?.length || 0} Tiers · Unlimited)
                 </h2>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Max Stop: <span className="font-mono text-rose-500">-{effectiveMaxSl.toFixed(1)}%</span> · Unlimited Trigger Drop % (no upper cap)
+                  Max Stop: <span className="font-mono text-rose-500">-{safeFixed(effectiveMaxSl, 1)}%</span> · Unlimited Trigger Drop % (no upper cap)
                 </p>
               </div>
               <div className="flex items-center gap-3">
-                <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300">
+                <label
+                  data-field-key="stopLossEnabled"
+                  tabIndex={fieldErrors.stopLossEnabled ? -1 : undefined}
+                  className={`inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded-lg ${
+                    fieldErrors.stopLossEnabled
+                      ? 'border-2 border-rose-500 ring-2 ring-rose-500/35 bg-rose-500/10 text-rose-300'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }`}
+                >
                   <input
                     type="checkbox"
                     checked={draft.stopLossEnabled}
@@ -322,58 +564,87 @@ export function SettingsView() {
                 )}
               </div>
             </div>
+            <FieldErrorPopup
+              message={fieldErrors.stopLossEnabled}
+              onDismiss={() => clearFieldError('stopLossEnabled')}
+            />
 
             {draft.stopLossEnabled ? (
               <div ref={stopLossListRef} className="space-y-2 max-h-80 overflow-y-auto">
-                {(draft.stopLossTiers || []).map((tier, idx) => (
-                  <div
-                    key={idx}
-                    className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs"
-                  >
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-slate-500 font-mono">#{idx + 1}</span>
-                      <label className="flex items-center gap-1">
-                        <span className="text-slate-400">Trigger Drop %:</span>
-                        <input
-                          type="number"
-                          step="0.1"
-                          min="0.5"
-                          aria-label={`Stop-loss tier ${idx + 1} trigger drop percent`}
-                          value={tier.triggerDropPct}
-                          onChange={(e) => updateStopLossTierField(idx, 'triggerDropPct', Number(e.target.value))}
-                          className="w-20 px-2 py-1 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
-                        />
-                      </label>
-                      <label className="flex items-center gap-1">
-                        <span className="text-slate-400">Sell %:</span>
-                        <input
-                          type="number"
-                          step="1"
-                          min="1"
-                          max="100"
-                          aria-label={`Stop-loss tier ${idx + 1} sell percent`}
-                          value={tier.sellPct}
-                          onChange={(e) => updateStopLossTierField(idx, 'sellPct', Number(e.target.value))}
-                          className="w-20 px-2 py-1 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
-                        />
-                      </label>
+                {(draft.stopLossTiers || []).map((tier, idx) => {
+                  const dropKey = `stopLossTiers.${idx}.triggerDropPct`;
+                  const sellKey = `stopLossTiers.${idx}.sellPct`;
+                  const rowHasError = Boolean(fieldErrors[dropKey] || fieldErrors[sellKey]);
+                  return (
+                    <div
+                      key={idx}
+                      className={`p-2.5 rounded-xl border text-xs space-y-1.5 ${
+                        rowHasError
+                          ? 'bg-rose-500/5 border-rose-500/70'
+                          : 'bg-slate-50 dark:bg-slate-900/60 border-slate-200 dark:border-slate-800'
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-slate-500 font-mono">#{idx + 1}</span>
+                          <label className="flex items-center gap-1">
+                            <span className="text-slate-400">Trigger Drop %:</span>
+                            <input
+                              type="number"
+                              step="0.1"
+                              min="0.5"
+                              data-field-key={dropKey}
+                              aria-label={`Stop-loss tier ${idx + 1} trigger drop percent`}
+                              value={inputValue(tier.triggerDropPct)}
+                              onChange={(e) =>
+                                updateStopLossTierField(idx, 'triggerDropPct', parseNumInput(e.target.value))
+                              }
+                              className={tierInputClass(dropKey)}
+                            />
+                          </label>
+                          <label className="flex items-center gap-1">
+                            <span className="text-slate-400">Sell %:</span>
+                            <input
+                              type="number"
+                              step="1"
+                              min="1"
+                              max="100"
+                              data-field-key={sellKey}
+                              aria-label={`Stop-loss tier ${idx + 1} sell percent`}
+                              value={inputValue(tier.sellPct)}
+                              onChange={(e) =>
+                                updateStopLossTierField(idx, 'sellPct', parseNumInput(e.target.value))
+                              }
+                              className={tierInputClass(sellKey)}
+                            />
+                          </label>
+                        </div>
+                        <div className="flex items-center gap-3 font-mono">
+                          <span className="text-rose-600 dark:text-rose-400">
+                            Sell {Number.isFinite(tier.sellPct) ? tier.sellPct : 0}% at -{safeFixed(tier.triggerDropPct, 1)}% drop
+                          </span>
+                          <button
+                            type="button"
+                            aria-label={`Delete stop-loss tier ${idx + 1}`}
+                            disabled={(draft.stopLossTiers?.length || 0) <= 1}
+                            onClick={() => removeStopLossTier(idx)}
+                            className="px-2 py-1 rounded-lg text-rose-500 hover:bg-rose-500/10 disabled:opacity-40 disabled:cursor-not-allowed font-sans"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                      <FieldErrorPopup
+                        message={fieldErrors[dropKey]}
+                        onDismiss={() => clearFieldError(dropKey)}
+                      />
+                      <FieldErrorPopup
+                        message={fieldErrors[sellKey]}
+                        onDismiss={() => clearFieldError(sellKey)}
+                      />
                     </div>
-                    <div className="flex items-center gap-3 font-mono">
-                      <span className="text-rose-600 dark:text-rose-400">
-                        Sell {tier.sellPct}% at -{tier.triggerDropPct.toFixed(1)}% drop
-                      </span>
-                      <button
-                        type="button"
-                        aria-label={`Delete stop-loss tier ${idx + 1}`}
-                        disabled={(draft.stopLossTiers?.length || 0) <= 1}
-                        onClick={() => removeStopLossTier(idx)}
-                        className="px-2 py-1 rounded-lg text-rose-500 hover:bg-rose-500/10 disabled:opacity-40 disabled:cursor-not-allowed font-sans"
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <p className="text-xs text-amber-500">
@@ -383,22 +654,31 @@ export function SettingsView() {
           </section>
 
           {/* Hard Filters & Security */}
-          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4">
+          <section className={sectionClass(filtersHasError)}>
             <h2 className="font-display text-sm font-bold">Hard Filters &amp; Security Thresholds</h2>
 
             {/* Custom Pool Age Timeframe Window */}
-            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60 p-3.5 space-y-3 text-xs">
+            <div
+              className={`rounded-xl border p-3.5 space-y-3 text-xs ${
+                hasErrorPrefix('customMinPoolAgeMinutes', 'customMaxPoolAgeMinutes')
+                  ? 'border-rose-500/70 bg-rose-500/5'
+                  : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60'
+              }`}
+            >
               <label className="inline-flex items-center gap-2 font-semibold text-slate-800 dark:text-slate-200 cursor-pointer">
                 <input
                   type="checkbox"
                   checked={draft.customAgeWindowEnabled}
-                  onChange={(e) => updateField('customAgeWindowEnabled', e.target.checked)}
+                  onChange={(e) => {
+                    updateField('customAgeWindowEnabled', e.target.checked);
+                    clearFieldError('customMinPoolAgeMinutes', 'customMaxPoolAgeMinutes', 'minPoolAgeMinutes');
+                  }}
                 />
                 <span>Use Custom Pool Age Timeframe (Min–Max Minutes)</span>
               </label>
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
                 {draft.customAgeWindowEnabled
-                  ? `Active: Bot will only search & trade coins between ${draft.customMinPoolAgeMinutes}m and ${draft.customMaxPoolAgeMinutes}m old (not newer or older).`
+                  ? `Active: Bot will only search & trade coins between ${Number.isFinite(draft.customMinPoolAgeMinutes) ? draft.customMinPoolAgeMinutes : 0}m and ${Number.isFinite(draft.customMaxPoolAgeMinutes) ? draft.customMaxPoolAgeMinutes : 0}m old (not newer or older).`
                   : 'Unchecked: Bot uses its default age filter (Min Pool Age >= 30m below).'}
               </p>
               <div className="grid grid-cols-2 gap-3">
@@ -409,10 +689,18 @@ export function SettingsView() {
                     min="0"
                     step="1"
                     disabled={!draft.customAgeWindowEnabled}
+                    data-field-key="customMinPoolAgeMinutes"
                     aria-label="Custom min pool age minutes"
-                    value={draft.customMinPoolAgeMinutes}
-                    onChange={(e) => updateField('customMinPoolAgeMinutes', Number(e.target.value))}
-                    className="w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 disabled:opacity-50"
+                    value={inputValue(draft.customMinPoolAgeMinutes)}
+                    onChange={(e) => updateField('customMinPoolAgeMinutes', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'customMinPoolAgeMinutes',
+                      'w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 disabled:opacity-50'
+                    )}
+                  />
+                  <FieldErrorPopup
+                    message={fieldErrors.customMinPoolAgeMinutes}
+                    onDismiss={() => clearFieldError('customMinPoolAgeMinutes')}
                   />
                 </label>
                 <label className="space-y-1">
@@ -422,10 +710,18 @@ export function SettingsView() {
                     min="1"
                     step="1"
                     disabled={!draft.customAgeWindowEnabled}
+                    data-field-key="customMaxPoolAgeMinutes"
                     aria-label="Custom max pool age minutes"
-                    value={draft.customMaxPoolAgeMinutes}
-                    onChange={(e) => updateField('customMaxPoolAgeMinutes', Number(e.target.value))}
-                    className="w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 disabled:opacity-50"
+                    value={inputValue(draft.customMaxPoolAgeMinutes)}
+                    onChange={(e) => updateField('customMaxPoolAgeMinutes', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'customMaxPoolAgeMinutes',
+                      'w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 disabled:opacity-50'
+                    )}
+                  />
+                  <FieldErrorPopup
+                    message={fieldErrors.customMaxPoolAgeMinutes}
+                    onDismiss={() => clearFieldError('customMaxPoolAgeMinutes')}
                   />
                 </label>
               </div>
@@ -438,33 +734,54 @@ export function SettingsView() {
                   type="number"
                   min="30"
                   disabled={draft.customAgeWindowEnabled}
-                  value={draft.minPoolAgeMinutes}
-                  onChange={(e) => updateField('minPoolAgeMinutes', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 disabled:opacity-50"
+                  data-field-key="minPoolAgeMinutes"
+                  value={inputValue(draft.minPoolAgeMinutes)}
+                  onChange={(e) => updateField('minPoolAgeMinutes', parseNumInput(e.target.value))}
+                  className={inputClass(
+                    'minPoolAgeMinutes',
+                    'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-50'
+                  )}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.minPoolAgeMinutes}
+                  onDismiss={() => clearFieldError('minPoolAgeMinutes')}
                 />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 block">Min Liquidity ($)</span>
                 <input
                   type="number"
                   min="10000"
                   step="1000"
-                  value={draft.minLiquidityUsd}
-                  onChange={(e) => updateField('minLiquidityUsd', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="minLiquidityUsd"
+                  value={inputValue(draft.minLiquidityUsd)}
+                  onChange={(e) => updateField('minLiquidityUsd', parseNumInput(e.target.value))}
+                  className={inputClass('minLiquidityUsd')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.minLiquidityUsd}
+                  onDismiss={() => clearFieldError('minLiquidityUsd')}
                 />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 block">Max Top-10 Non-Pool Holders (%)</span>
                 <input
                   type="number"
                   min="5"
                   max="50"
-                  value={draft.maxTop10HoldersPct}
-                  onChange={(e) => updateField('maxTop10HoldersPct', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="maxTop10HoldersPct"
+                  value={inputValue(draft.maxTop10HoldersPct)}
+                  onChange={(e) => updateField('maxTop10HoldersPct', parseNumInput(e.target.value))}
+                  className={inputClass('maxTop10HoldersPct')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.maxTop10HoldersPct}
+                  onDismiss={() => clearFieldError('maxTop10HoldersPct')}
                 />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 block">Min Quality / Trade Score</span>
                 <div className="flex gap-2">
@@ -472,19 +789,37 @@ export function SettingsView() {
                     type="number"
                     min="50"
                     max="100"
-                    value={draft.minQualityScore}
-                    onChange={(e) => updateField('minQualityScore', Number(e.target.value))}
-                    className="w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                    data-field-key="minQualityScore"
+                    aria-label="Min Quality Score"
+                    value={inputValue(draft.minQualityScore)}
+                    onChange={(e) => updateField('minQualityScore', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'minQualityScore',
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                    )}
                   />
                   <input
                     type="number"
                     min="50"
                     max="100"
-                    value={draft.minTradeScore}
-                    onChange={(e) => updateField('minTradeScore', Number(e.target.value))}
-                    className="w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                    data-field-key="minTradeScore"
+                    aria-label="Min Trade Score"
+                    value={inputValue(draft.minTradeScore)}
+                    onChange={(e) => updateField('minTradeScore', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'minTradeScore',
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                    )}
                   />
                 </div>
+                <FieldErrorPopup
+                  message={fieldErrors.minQualityScore}
+                  onDismiss={() => clearFieldError('minQualityScore')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.minTradeScore}
+                  onDismiss={() => clearFieldError('minTradeScore')}
+                />
               </label>
             </div>
           </section>
@@ -493,9 +828,9 @@ export function SettingsView() {
         {/* Right Column: Exit Rules -> Paper Shadow Simulation Realism */}
         <div className="space-y-6">
           {/* Exits */}
-          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4">
+          <section className={sectionClass(exitsHasError)}>
             <h2 className="font-display text-sm font-bold">
-              Exit Rules (TP &ge; 1.5x Max SL)
+              Exit Rules
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
               <label className="space-y-1">
@@ -504,38 +839,64 @@ export function SettingsView() {
                   type="number"
                   min="1.5"
                   step="0.5"
-                  value={draft.takeProfitPct}
-                  onChange={(e) => updateField('takeProfitPct', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="takeProfitPct"
+                  value={inputValue(draft.takeProfitPct)}
+                  onChange={(e) => updateField('takeProfitPct', parseNumInput(e.target.value))}
+                  className={inputClass('takeProfitPct')}
                 />
                 <span className="text-[11px] text-slate-400 block">
                   Waits here if price clears all trailing tiers.
                 </span>
+                <FieldErrorPopup
+                  message={fieldErrors.takeProfitPct}
+                  onDismiss={() => clearFieldError('takeProfitPct')}
+                />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 block">Max Hold Time (minutes)</span>
                 <input
                   type="number"
                   min="5"
-                  value={draft.maxHoldMinutes}
-                  onChange={(e) => updateField('maxHoldMinutes', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="maxHoldMinutes"
+                  value={inputValue(draft.maxHoldMinutes)}
+                  onChange={(e) => updateField('maxHoldMinutes', parseNumInput(e.target.value))}
+                  className={inputClass('maxHoldMinutes')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.maxHoldMinutes}
+                  onDismiss={() => clearFieldError('maxHoldMinutes')}
                 />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 block">Emergency Liquidity Floor ($)</span>
                 <input
                   type="number"
                   min="1000"
                   step="1000"
-                  value={draft.emergencyLiquidityFloorUsd}
-                  onChange={(e) => updateField('emergencyLiquidityFloorUsd', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="emergencyLiquidityFloorUsd"
+                  value={inputValue(draft.emergencyLiquidityFloorUsd)}
+                  onChange={(e) => updateField('emergencyLiquidityFloorUsd', parseNumInput(e.target.value))}
+                  className={inputClass('emergencyLiquidityFloorUsd')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.emergencyLiquidityFloorUsd}
+                  onDismiss={() => clearFieldError('emergencyLiquidityFloorUsd')}
                 />
               </label>
             </div>
+
             <div className="flex flex-wrap gap-4 pt-1 text-xs">
-              <label className="inline-flex items-center gap-2">
+              <label
+                data-field-key="trailingEnabled"
+                tabIndex={fieldErrors.trailingEnabled ? -1 : undefined}
+                className={`inline-flex items-center gap-2 px-2 py-1 rounded-lg ${
+                  fieldErrors.trailingEnabled
+                    ? 'border-2 border-rose-500 ring-2 ring-rose-500/35 bg-rose-500/10 text-rose-300'
+                    : ''
+                }`}
+              >
                 <input
                   type="checkbox"
                   checked={draft.trailingEnabled}
@@ -543,7 +904,7 @@ export function SettingsView() {
                 />
                 <span>Stepped Trailing Ladder</span>
               </label>
-              <label className="inline-flex items-center gap-2">
+              <label className="inline-flex items-center gap-2 py-1">
                 <input
                   type="checkbox"
                   checked={draft.breakEvenRecoveryEnabled}
@@ -551,7 +912,7 @@ export function SettingsView() {
                 />
                 <span>Break-Even Recovery Watch</span>
               </label>
-              <label className="inline-flex items-center gap-2">
+              <label className="inline-flex items-center gap-2 py-1">
                 <input
                   type="checkbox"
                   checked={draft.allowSlotRotation}
@@ -560,6 +921,10 @@ export function SettingsView() {
                 <span>Slot Rotation</span>
               </label>
             </div>
+            <FieldErrorPopup
+              message={fieldErrors.trailingEnabled}
+              onDismiss={() => clearFieldError('trailingEnabled')}
+            />
 
             {draft.trailingEnabled && (
               <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60 p-4 space-y-3">
@@ -575,53 +940,84 @@ export function SettingsView() {
                 </div>
                 <div ref={trailingListRef} className="space-y-2 max-h-96 overflow-y-auto">
                   {(draft.trailingLadder || []).map((tier, idx) => {
-                    const lockedFloor = tier.peakGainPct - tier.allowedDropPct;
+                    const peakKey = `trailingLadder.${idx}.peakGainPct`;
+                    const dropKey = `trailingLadder.${idx}.allowedDropPct`;
+                    const rowHasError = Boolean(fieldErrors[peakKey] || fieldErrors[dropKey]);
+                    const lockedFloor =
+                      (Number.isFinite(tier.peakGainPct) ? tier.peakGainPct : 0) -
+                      (Number.isFinite(tier.allowedDropPct) ? tier.allowedDropPct : 0);
                     return (
                       <div
                         key={idx}
-                        className="p-2.5 rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-3 text-xs"
+                        className={`p-2.5 rounded-xl border text-xs space-y-1.5 ${
+                          rowHasError
+                            ? 'bg-rose-500/5 dark:bg-rose-950/20 border-rose-500/70'
+                            : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700'
+                        }`}
                       >
-                        <div className="flex items-center gap-2">
-                          <span className="text-slate-500 font-mono">#{idx + 1}</span>
-                          <label className="flex items-center gap-1">
-                            <span className="text-slate-400">Peak %:</span>
-                            <input
-                              type="number"
-                              step="0.1"
-                              min="0.1"
-                              aria-label={`Trailing tier ${idx + 1} peak percent`}
-                              value={tier.peakGainPct}
-                              onChange={(e) => updateTrailingTierField(idx, 'peakGainPct', Number(e.target.value))}
-                              className="w-20 px-2 py-1 rounded-lg font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
-                            />
-                          </label>
-                          <label className="flex items-center gap-1">
-                            <span className="text-slate-400">Allowed Drop %:</span>
-                            <input
-                              type="number"
-                              step="0.01"
-                              min="0.01"
-                              aria-label={`Trailing tier ${idx + 1} allowed drop percent`}
-                              value={tier.allowedDropPct}
-                              onChange={(e) => updateTrailingTierField(idx, 'allowedDropPct', Number(e.target.value))}
-                              className="w-20 px-2 py-1 rounded-lg font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
-                            />
-                          </label>
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div className="flex items-center gap-2">
+                            <span className="text-slate-500 font-mono">#{idx + 1}</span>
+                            <label className="flex items-center gap-1">
+                              <span className="text-slate-400">Peak %:</span>
+                              <input
+                                type="number"
+                                step="0.1"
+                                min="0.1"
+                                data-field-key={peakKey}
+                                aria-label={`Trailing tier ${idx + 1} peak percent`}
+                                value={inputValue(tier.peakGainPct)}
+                                onChange={(e) =>
+                                  updateTrailingTierField(idx, 'peakGainPct', parseNumInput(e.target.value))
+                                }
+                                className={tierInputClass(
+                                  peakKey,
+                                  'w-20 px-2 py-1 rounded-lg font-mono'
+                                )}
+                              />
+                            </label>
+                            <label className="flex items-center gap-1">
+                              <span className="text-slate-400">Allowed Drop %:</span>
+                              <input
+                                type="number"
+                                step="0.01"
+                                min="0.01"
+                                data-field-key={dropKey}
+                                aria-label={`Trailing tier ${idx + 1} allowed drop percent`}
+                                value={inputValue(tier.allowedDropPct)}
+                                onChange={(e) =>
+                                  updateTrailingTierField(idx, 'allowedDropPct', parseNumInput(e.target.value))
+                                }
+                                className={tierInputClass(
+                                  dropKey,
+                                  'w-20 px-2 py-1 rounded-lg font-mono'
+                                )}
+                              />
+                            </label>
+                          </div>
+                          <div className="flex items-center gap-3 font-mono">
+                            <span className="text-teal-600 dark:text-teal-400">
+                              Floor: +{safeFixed(lockedFloor, 2)}%
+                            </span>
+                            <button
+                              type="button"
+                              aria-label={`Delete trailing tier ${idx + 1}`}
+                              disabled={(draft.trailingLadder?.length || 0) <= 1}
+                              onClick={() => removeTrailingTier(idx)}
+                              className="px-2 py-1 rounded-lg text-rose-500 hover:bg-rose-500/10 disabled:opacity-40 disabled:cursor-not-allowed font-sans"
+                            >
+                              Delete
+                            </button>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-3 font-mono">
-                          <span className="text-teal-600 dark:text-teal-400">
-                            Floor: +{lockedFloor.toFixed(2)}%
-                          </span>
-                          <button
-                            type="button"
-                            aria-label={`Delete trailing tier ${idx + 1}`}
-                            disabled={(draft.trailingLadder?.length || 0) <= 1}
-                            onClick={() => removeTrailingTier(idx)}
-                            className="px-2 py-1 rounded-lg text-rose-500 hover:bg-rose-500/10 disabled:opacity-40 disabled:cursor-not-allowed font-sans"
-                          >
-                            Delete
-                          </button>
-                        </div>
+                        <FieldErrorPopup
+                          message={fieldErrors[peakKey]}
+                          onDismiss={() => clearFieldError(peakKey)}
+                        />
+                        <FieldErrorPopup
+                          message={fieldErrors[dropKey]}
+                          onDismiss={() => clearFieldError(dropKey)}
+                        />
                       </div>
                     );
                   })}
@@ -631,7 +1027,7 @@ export function SettingsView() {
           </section>
 
           {/* Paper Realism */}
-          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4">
+          <section className={sectionClass(paperHasError)}>
             <h2 className="font-display text-sm font-bold">Paper Shadow Simulation Realism</h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
               <label className="space-y-1">
@@ -640,19 +1036,38 @@ export function SettingsView() {
                   <input
                     type="number"
                     min="0"
-                    value={draft.paperDelayMinSec}
-                    onChange={(e) => updateField('paperDelayMinSec', Number(e.target.value))}
-                    className="w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                    data-field-key="paperDelayMinSec"
+                    aria-label="Paper delay min seconds"
+                    value={inputValue(draft.paperDelayMinSec)}
+                    onChange={(e) => updateField('paperDelayMinSec', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'paperDelayMinSec',
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                    )}
                   />
                   <input
                     type="number"
                     min="0"
-                    value={draft.paperDelayMaxSec}
-                    onChange={(e) => updateField('paperDelayMaxSec', Number(e.target.value))}
-                    className="w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                    data-field-key="paperDelayMaxSec"
+                    aria-label="Paper delay max seconds"
+                    value={inputValue(draft.paperDelayMaxSec)}
+                    onChange={(e) => updateField('paperDelayMaxSec', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'paperDelayMaxSec',
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                    )}
                   />
                 </div>
+                <FieldErrorPopup
+                  message={fieldErrors.paperDelayMinSec}
+                  onDismiss={() => clearFieldError('paperDelayMinSec')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.paperDelayMaxSec}
+                  onDismiss={() => clearFieldError('paperDelayMaxSec')}
+                />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 block">Buy / Sell Failure Chance (%)</span>
                 <div className="flex gap-2">
@@ -660,31 +1075,56 @@ export function SettingsView() {
                     type="number"
                     min="0"
                     max="100"
-                    value={draft.paperBuyFailChancePct}
-                    onChange={(e) => updateField('paperBuyFailChancePct', Number(e.target.value))}
-                    className="w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                    data-field-key="paperBuyFailChancePct"
+                    aria-label="Paper buy failure chance percent"
+                    value={inputValue(draft.paperBuyFailChancePct)}
+                    onChange={(e) => updateField('paperBuyFailChancePct', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'paperBuyFailChancePct',
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                    )}
                   />
                   <input
                     type="number"
                     min="0"
                     max="100"
-                    value={draft.paperSellFailChancePct}
-                    onChange={(e) => updateField('paperSellFailChancePct', Number(e.target.value))}
-                    className="w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                    data-field-key="paperSellFailChancePct"
+                    aria-label="Paper sell failure chance percent"
+                    value={inputValue(draft.paperSellFailChancePct)}
+                    onChange={(e) => updateField('paperSellFailChancePct', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'paperSellFailChancePct',
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                    )}
                   />
                 </div>
+                <FieldErrorPopup
+                  message={fieldErrors.paperBuyFailChancePct}
+                  onDismiss={() => clearFieldError('paperBuyFailChancePct')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.paperSellFailChancePct}
+                  onDismiss={() => clearFieldError('paperSellFailChancePct')}
+                />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 block">&lt;24h Competition Penalty (%)</span>
                 <input
                   type="number"
                   min="0"
                   step="0.25"
-                  value={draft.paperCompetitionPenaltyPct}
-                  onChange={(e) => updateField('paperCompetitionPenaltyPct', Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  data-field-key="paperCompetitionPenaltyPct"
+                  value={inputValue(draft.paperCompetitionPenaltyPct)}
+                  onChange={(e) => updateField('paperCompetitionPenaltyPct', parseNumInput(e.target.value))}
+                  className={inputClass('paperCompetitionPenaltyPct')}
+                />
+                <FieldErrorPopup
+                  message={fieldErrors.paperCompetitionPenaltyPct}
+                  onDismiss={() => clearFieldError('paperCompetitionPenaltyPct')}
                 />
               </label>
+
               <label className="space-y-1">
                 <span className="text-slate-500 block">Priority Fee Preset</span>
                 <select

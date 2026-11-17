@@ -324,16 +324,31 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
   router.post('/settings', (req: Request, res: Response) => {
     const parsed = settingsPatchSchema.safeParse(req.body);
     if (!parsed.success) {
+      const fieldErrors: Record<string, string> = {};
+      const details: string[] = [];
+      for (const issue of parsed.error.issues) {
+        const key = issue.path.join('.');
+        const msg = issue.message;
+        details.push(key ? `${key}: ${msg}` : msg);
+        if (key && !fieldErrors[key]) {
+          fieldErrors[key] = msg;
+        }
+      }
       res.status(400).json({
         error: 'Invalid settings schema',
-        details: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
+        details,
+        fieldErrors,
       });
       return;
     }
 
     const result = orchestrator.db.updateSettings(parsed.data as Partial<BotSettings>);
     if (!result.valid) {
-      res.status(400).json({ error: 'Settings validation failed', errors: result.errors });
+      res.status(400).json({
+        error: 'Settings validation failed',
+        errors: result.errors,
+        fieldErrors: result.fieldErrors,
+      });
       return;
     }
 

@@ -227,7 +227,7 @@ test('exits: custom stop-loss tiers trigger partial sell then skip triggered tie
   assert.equal(finalStop.sellFraction, 1);
 });
 
-test('exits: validateSettingsUpdate syncs stopLossPct from stopLossTiers and enforces TP >= 1.5x max SL', () => {
+test('exits: validateSettingsUpdate syncs stopLossPct from stopLossTiers and allows independent wide SL with lower TP', () => {
   const valid = validateSettingsUpdate(DEFAULT_SETTINGS, {
     stopLossTiers: [
       { triggerDropPct: 5, sellPct: 40 },
@@ -238,12 +238,25 @@ test('exits: validateSettingsUpdate syncs stopLossPct from stopLossTiers and enf
   assert.equal(valid.valid, true);
   assert.equal(valid.merged.stopLossPct, 10);
 
-  const invalidTp = validateSettingsUpdate(DEFAULT_SETTINGS, {
-    stopLossTiers: [{ triggerDropPct: 15, sellPct: 100 }],
-    takeProfitPct: 18,
+  // User case: wide 90% stop-loss paired with 25% take-profit should save & execute TP at +25%
+  const wideSlLowTp = validateSettingsUpdate(DEFAULT_SETTINGS, {
+    stopLossTiers: [{ triggerDropPct: 90, sellPct: 100 }],
+    takeProfitPct: 25,
   });
-  assert.equal(invalidTp.valid, false);
-  assert.ok(invalidTp.errors.some((e) => e.includes('Take-profit')));
+  assert.equal(wideSlLowTp.valid, true);
+  assert.equal(wideSlLowTp.merged.stopLossPct, 90);
+  assert.equal(wideSlLowTp.merged.takeProfitPct, 25);
+
+  const snap = snapshotExitParams(wideSlLowTp.merged, 1.5);
+  assert.equal(snap.takeProfitPct, 25);
+  const pos = makePosition({ exitParams: snap });
+  const atTp = evaluatePositionExit(pos, {
+    currentPriceUsd: 1.25, // +25%
+    currentLiquidityUsd: 100_000,
+    nowMs: pos.openedAtMs + 60_000,
+  });
+  assert.equal(atTp.shouldExit, true);
+  assert.equal(atTp.reason, 'TAKE_PROFIT');
 
   const validUnlimited = validateSettingsUpdate(DEFAULT_SETTINGS, {
     stopLossTiers: [{ triggerDropPct: 45, sellPct: 100 }],
@@ -262,6 +275,7 @@ test('exits: validateSettingsUpdate syncs stopLossPct from stopLossTiers and enf
     takeProfitPct: 40,
   });
   assert.equal(invalidBelowMin.valid, false);
+  assert.ok(invalidBelowMin.fieldErrors['stopLossTiers.0.triggerDropPct']);
 });
 
 test('exits: trailing stop never arms or locks floor below round-trip break-even costs', () => {

@@ -296,11 +296,11 @@ export class BotDatabase {
     }
   }
 
-  updateSettings(patch: Partial<BotSettings>): { valid: boolean; errors: string[]; settings: BotSettings } {
+  updateSettings(patch: Partial<BotSettings>): { valid: boolean; errors: string[]; fieldErrors: Record<string, string>; settings: BotSettings } {
     const current = this.getSettings();
     const validation = validateSettingsUpdate(current, patch);
     if (!validation.valid) {
-      return { valid: false, errors: validation.errors, settings: current };
+      return { valid: false, errors: validation.errors, fieldErrors: validation.fieldErrors, settings: current };
     }
 
     const now = Date.now();
@@ -322,7 +322,7 @@ export class BotDatabase {
     });
 
     tx();
-    return { valid: true, errors: [], settings: validation.merged };
+    return { valid: true, errors: [], fieldErrors: {}, settings: validation.merged };
   }
 
   getSettingsHistory(limit = 100): SettingsHistoryEntry[] {

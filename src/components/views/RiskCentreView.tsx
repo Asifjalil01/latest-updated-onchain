@@ -135,8 +135,11 @@ export function RiskCentreView() {
           <div className="pt-2 border-t border-slate-200 dark:border-slate-800 flex items-center gap-2 text-xs text-slate-500">
             <ShieldCheck className="w-4 h-4 text-teal-500 shrink-0" />
             <span>
-              Active Hard Caps: SL max 20% · TP &ge; 1.5x SL · Pool age &ge; 30m · Exposure max{' '}
-              {settings?.maxWalletExposureSol ?? 0.1} SOL · Daily loss cap{' '}
+              Active Limits: SL &ge; 0.5% (unlimited tiers) · TP &ge; 1.5% (unlimited) · Pool age{' '}
+              {settings?.customAgeWindowEnabled
+                ? `${settings.customMinPoolAgeMinutes}–${settings.customMaxPoolAgeMinutes}m`
+                : `>= ${settings?.minPoolAgeMinutes ?? 30}m`}{' '}
+              · Exposure max {settings?.maxWalletExposureSol ?? 0.1} SOL · Daily loss cap{' '}
               {settings?.dailyLossLimitSol ?? 0.15} SOL.
             </span>
           </div>

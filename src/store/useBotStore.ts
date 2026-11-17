@@ -218,10 +218,23 @@ export const useBotStore = create<BotStoreState>((set, get) => ({
       get().setApiToken(null);
       throw new Error('Unauthorized: API token invalid or missing.');
     }
-    const body = (await res.json()) as T & { error?: string; errors?: string[] };
+    const body = (await res.json()) as T & {
+      error?: string;
+      errors?: string[];
+      details?: string[];
+      fieldErrors?: Record<string, string>;
+    };
     if (!res.ok) {
-      const msg = body.errors?.join('; ') || body.error || `HTTP ${res.status}`;
-      throw new Error(msg);
+      const msg =
+        body.errors?.join('; ') ||
+        body.details?.join('; ') ||
+        body.error ||
+        `HTTP ${res.status}`;
+      const err = new Error(msg) as Error & { fieldErrors?: Record<string, string> };
+      if (body.fieldErrors) {
+        err.fieldErrors = body.fieldErrors;
+      }
+      throw err;
     }
     return body;
   },
