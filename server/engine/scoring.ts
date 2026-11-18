@@ -100,12 +100,33 @@ export function scoreCandidate(params: {
   );
 
   // Trade score components (max 100)
+  const safe5m =
+    token.priceChange5mPct !== undefined && Number.isFinite(token.priceChange5mPct)
+      ? token.priceChange5mPct
+      : null;
   const safe1h = Number.isFinite(token.priceChange1hPct) ? token.priceChange1hPct : 0;
   const safe24h = Number.isFinite(token.priceChange24hPct) ? token.priceChange24hPct : 0;
   const mom1h = Math.max(0, Math.min(45, safe1h));
-  const momentumPts = Math.min(25, (mom1h / 25) * 20 + (safe24h > 0 ? 5 : 0));
-  const buyRatio = filterResult.computed.buyRatio;
-  const buyPressurePts = Math.max(0, Math.min(25, ((buyRatio - 0.45) / 0.25) * 25));
+  const mom5mBonus = safe5m === null ? 0 : safe5m >= 0 ? Math.min(5, safe5m * 0.6) : Math.max(-8, safe5m * 1.5);
+  const momentumPts = Math.max(
+    0,
+    Math.min(25, (mom1h / 25) * 20 + (safe24h > 0 ? 5 : 0) + mom5mBonus)
+  );
+  const total5mTx =
+    token.buys5m !== undefined && token.sells5m !== undefined ? token.buys5m + token.sells5m : 0;
+  const total1hTx =
+    token.buys1h !== undefined && token.sells1h !== undefined ? token.buys1h + token.sells1h : 0;
+  const recentBuyRatio =
+    total5mTx >= 8 && token.buys5m !== undefined
+      ? token.buys5m / total5mTx
+      : total1hTx >= 15 && token.buys1h !== undefined
+        ? token.buys1h / total1hTx
+        : filterResult.computed.buyRatio;
+  const effectiveBuyFlow =
+    total5mTx >= 8 || total1hTx >= 15
+      ? recentBuyRatio * 0.65 + filterResult.computed.buyRatio * 0.35
+      : filterResult.computed.buyRatio;
+  const buyPressurePts = Math.max(0, Math.min(25, ((effectiveBuyFlow - 0.45) / 0.25) * 25));
   const volLiq = filterResult.computed.volumeLiquidityRatio;
   const depthPts = volLiq >= 0.5 && volLiq <= 15 ? 20 : volLiq > 15 ? 12 : 8;
   const breadthTarget = allowCustomYoungAge ? 100 : 500;
@@ -114,7 +135,7 @@ export function scoreCandidate(params: {
     ? safe1h >= -10 && safe1h <= 300
       ? 15
       : 10
-    : safe24h >= 0 && safe1h <= 60
+    : safe24h >= 0 && safe1h <= 60 && (safe5m === null || safe5m >= -1)
       ? 15
       : safe1h <= 100
         ? 10

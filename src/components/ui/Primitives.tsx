@@ -1,7 +1,88 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { createChart, ColorType, AreaSeries } from 'lightweight-charts';
-import { ArrowDownRight, ArrowUpRight, AlertTriangle, CheckCircle2, Minus } from 'lucide-react';
+import { ArrowDownRight, ArrowUpRight, AlertTriangle, CheckCircle2, HelpCircle, Minus } from 'lucide-react';
 import type { ConfirmationLabel } from '../../types';
+
+export function HoverTip({
+  text,
+  children,
+  className = '',
+  block = false,
+}: {
+  text: string;
+  children: React.ReactNode;
+  className?: string;
+  block?: boolean;
+}) {
+  const triggerRef = useRef<HTMLSpanElement | null>(null);
+  const [coords, setCoords] = useState<{ left: number; top: number; placement: 'top' | 'bottom' } | null>(null);
+
+  const show = () => {
+    const el = triggerRef.current;
+    if (!el || typeof window === 'undefined') return;
+    const rect = el.getBoundingClientRect();
+    const tooltipWidth = 268;
+    const center = rect.left + rect.width / 2;
+    const left = Math.max(12, Math.min(window.innerWidth - tooltipWidth - 12, center - tooltipWidth / 2));
+    const showBelow = rect.top < 110;
+    const top = showBelow ? rect.bottom + 8 : rect.top - 8;
+    setCoords({ left, top, placement: showBelow ? 'bottom' : 'top' });
+  };
+
+  const hide = () => setCoords(null);
+
+  return (
+    <span
+      ref={triggerRef}
+      onMouseEnter={show}
+      onMouseLeave={hide}
+      onFocus={show}
+      onBlur={hide}
+      className={`${block ? 'block' : 'inline-flex items-center'} ${className}`}
+    >
+      {children}
+      {coords &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            role="tooltip"
+            style={{
+              left: `${coords.left}px`,
+              top: `${coords.top}px`,
+              transform: coords.placement === 'top' ? 'translateY(-100%)' : 'none',
+            }}
+            className="fixed z-[100] w-[268px] pointer-events-none rounded-xl border border-slate-700/90 bg-slate-900/95 text-slate-100 px-3 py-2 text-[11px] font-sans font-normal normal-case tracking-normal leading-relaxed shadow-2xl shadow-black/40 backdrop-blur-sm"
+          >
+            {text}
+          </div>,
+          document.body
+        )}
+    </span>
+  );
+}
+
+export function InfoTooltip({
+  text,
+  label = 'More info',
+  className = '',
+}: {
+  text: string;
+  label?: string;
+  className?: string;
+}) {
+  return (
+    <HoverTip text={text} className={`ml-1 align-middle ${className}`}>
+      <span
+        tabIndex={0}
+        aria-label={label}
+        className="inline-flex items-center justify-center text-slate-400 hover:text-teal-500 focus:text-teal-500 cursor-help transition-colors focus:outline-none"
+      >
+        <HelpCircle className="w-3.5 h-3.5" aria-hidden="true" />
+      </span>
+    </HoverTip>
+  );
+}
 
 export function formatSol(val: number | null | undefined, digits = 4): string {
   if (val === null || val === undefined || !Number.isFinite(val)) return '—';

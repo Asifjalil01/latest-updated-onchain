@@ -3,6 +3,8 @@ import { AlertTriangle, ArrowRight } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import {
   EquityCurveChart,
+  HoverTip,
+  InfoTooltip,
   PnlText,
   SparklineSvg,
   formatPct,
@@ -125,7 +127,10 @@ export function DashboardView() {
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6 gap-4">
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-4 space-y-2">
           <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-            <span>Wallet Balance</span>
+            <span className="inline-flex items-center">
+              Wallet Balance
+              <InfoTooltip text="Liquid SOL currently uninvested and available in the active trading mode (Paper, Testnet, or Live)." />
+            </span>
             <span className="uppercase">{mode}</span>
           </div>
           <div className="font-mono text-xl font-bold tabular-nums text-slate-900 dark:text-slate-100">
@@ -138,7 +143,10 @@ export function DashboardView() {
 
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-4 space-y-2">
           <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-            <span>Total Portfolio Value</span>
+            <span className="inline-flex items-center">
+              Total Portfolio Value
+              <InfoTooltip text="Liquid wallet SOL plus the current mark-to-market SOL value of all open token positions." />
+            </span>
             <span>{confirmationTag}</span>
           </div>
           <div className="font-mono text-xl font-bold tabular-nums text-slate-900 dark:text-slate-100">
@@ -151,7 +159,10 @@ export function DashboardView() {
 
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-4 space-y-2">
           <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-            <span>Open P&amp;L</span>
+            <span className="inline-flex items-center">
+              Open P&amp;L
+              <InfoTooltip text="Estimated take-home profit/loss across all open positions after subtracting entry/exit fees, priority tips, and un-reclaimed ATA rent." />
+            </span>
             <span>{positions.length} open</span>
           </div>
           <div className="text-lg font-bold">
@@ -182,7 +193,10 @@ export function DashboardView() {
 
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-4 space-y-2">
           <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-            <span>Today Realized</span>
+            <span className="inline-flex items-center">
+              Today Realized
+              <InfoTooltip text="Closed-trade net profit/loss since UTC midnight. Enforces your Daily Loss Limit circuit breaker." />
+            </span>
             <span>{confirmationTag}</span>
           </div>
           <div className="text-lg font-bold">
@@ -213,7 +227,10 @@ export function DashboardView() {
 
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-4 space-y-2">
           <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-            <span>Net Realized P&amp;L</span>
+            <span className="inline-flex items-center">
+              Net Realized P&amp;L
+              <InfoTooltip text="Total cumulative net profit/loss across all closed trades in the current mode after every fee and rent cost." />
+            </span>
             <span>{trades.length} trades</span>
           </div>
           <div className="text-lg font-bold">
@@ -241,7 +258,10 @@ export function DashboardView() {
 
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-4 space-y-2">
           <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-            <span>Win Rate &amp; Expectancy</span>
+            <span className="inline-flex items-center">
+              Win Rate &amp; Expectancy
+              <InfoTooltip text="Percentage of profitable closed trades, Profit Factor (gross wins / gross losses), and average expected net SOL per trade." />
+            </span>
             <span>PF {(analytics?.profitFactor ?? 0).toFixed(2)}</span>
           </div>
           <div className="font-mono text-xl font-bold tabular-nums text-slate-900 dark:text-slate-100">
@@ -259,20 +279,23 @@ export function DashboardView() {
         <section className="lg:col-span-2 rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-5 space-y-4">
           <div className="flex items-center justify-between">
             <div>
-              <h2 className="font-display text-base font-bold text-slate-900 dark:text-slate-100">
+              <h2 className="font-display text-base font-bold text-slate-900 dark:text-slate-100 flex items-center">
                 Net Cumulative Equity Curve ({mode.toUpperCase()})
+                <InfoTooltip text="Visualizes cumulative net profit/loss over closed trades in the active mode after deducting DEX fees, priority fees, and rent." />
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400">
                 After fees, priority tips, and ATA rent · Labelled {confirmationTag}
               </p>
             </div>
-            <div className="text-right font-mono text-xs tabular-nums text-slate-500">
-              Max Drawdown:{' '}
-              <span className="text-rose-500 font-semibold">
-                -{formatSol(analytics?.maxDrawdownSol ?? 0, 4)}
-                {solUsd ? ` (${formatUsd((analytics?.maxDrawdownSol ?? 0) * solUsd)})` : ''}
-              </span>
-            </div>
+            <HoverTip text="Worst peak-to-trough drop in cumulative realized equity across your trade history.">
+              <div className="text-right font-mono text-xs tabular-nums text-slate-500 cursor-help">
+                Max Drawdown:{' '}
+                <span className="text-rose-500 font-semibold">
+                  -{formatSol(analytics?.maxDrawdownSol ?? 0, 4)}
+                  {solUsd ? ` (${formatUsd((analytics?.maxDrawdownSol ?? 0) * solUsd)})` : ''}
+                </span>
+              </div>
+            </HoverTip>
           </div>
 
           <EquityCurveChart data={equitySeries} theme={theme} height={240} />
@@ -280,7 +303,10 @@ export function DashboardView() {
           {equitySeries.length > 0 && (
             <div className="pt-3 border-t border-slate-200 dark:border-slate-800">
               <div className="flex items-center justify-between text-xs text-slate-500 mb-2">
-                <span>Trade-by-Trade Drawdown Depth</span>
+                <span className="inline-flex items-center">
+                  Trade-by-Trade Drawdown Depth
+                  <InfoTooltip text="Each bar shows how far equity dipped below its prior all-time high after that trade closed." />
+                </span>
                 <span className="font-mono tabular-nums">
                   {equitySeries.length} closed trades
                 </span>
@@ -304,14 +330,18 @@ export function DashboardView() {
         </section>
 
         <section className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-5 space-y-5">
-          <h2 className="font-display text-base font-bold text-slate-900 dark:text-slate-100">
+          <h2 className="font-display text-base font-bold text-slate-900 dark:text-slate-100 flex items-center">
             Exposure &amp; Safeguards
+            <InfoTooltip text="Real-time usage of your capital exposure cap, open position slots, daily loss budget, and Paper-vs-Live slippage calibration." />
           </h2>
 
           {/* Wallet Exposure Gauge */}
           <div className="space-y-2">
             <div className="flex items-center justify-between text-xs gap-2">
-              <span className="text-slate-500 dark:text-slate-400">Wallet Exposure</span>
+              <span className="text-slate-500 dark:text-slate-400 inline-flex items-center">
+                Wallet Exposure
+                <InfoTooltip text="Total SOL currently deployed in open positions compared against your Max Wallet Exposure cap." />
+              </span>
               <span className="font-mono tabular-nums font-semibold text-right">
                 {openCostSol.toFixed(4)} / {maxExposure.toFixed(4)} SOL
                 {solUsd ? (
@@ -339,7 +369,10 @@ export function DashboardView() {
           {/* Daily Loss Limit Bar */}
           <div className="space-y-2 pt-3 border-t border-slate-200 dark:border-slate-800">
             <div className="flex items-center justify-between text-xs gap-2">
-              <span className="text-slate-500 dark:text-slate-400">Daily Loss Budget Used</span>
+              <span className="text-slate-500 dark:text-slate-400 inline-flex items-center">
+                Daily Loss Budget Used
+                <InfoTooltip text="Tracks realized daily losses against your Daily Loss Limit. Reaching 100% automatically halts new buys." />
+              </span>
               <span className="font-mono tabular-nums font-semibold text-right">
                 {dailyLossUsed.toFixed(4)} / {dailyLossLimit.toFixed(4)} SOL
                 {solUsd ? (
@@ -362,7 +395,10 @@ export function DashboardView() {
           {/* Paper vs Live Reality Gap Summary */}
           <div className="pt-3 border-t border-slate-200 dark:border-slate-800 space-y-1.5">
             <div className="flex items-center justify-between text-xs">
-              <span className="text-slate-500 dark:text-slate-400">Paper vs Live Reality Gap</span>
+              <span className="text-slate-500 dark:text-slate-400 inline-flex items-center">
+                Paper vs Live Reality Gap
+                <InfoTooltip text="Average percentage difference between Jupiter quotes and real on-chain Live execution fills." />
+              </span>
               <span className="font-mono tabular-nums font-semibold text-violet-500">
                 {formatPct(status?.averagePaperLiveGapPct ?? 0)}
               </span>
@@ -370,14 +406,16 @@ export function DashboardView() {
             <p className="text-[11px] text-slate-500">
               Measured difference between quoted price and confirmed live fills.
             </p>
-            <button
-              type="button"
-              onClick={() => setActiveTab('shadow')}
-              className="inline-flex items-center gap-1 text-xs font-medium text-teal-600 dark:text-teal-400 hover:underline pt-1"
-            >
-              <span>Inspect Shadow Compare</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
+            <HoverTip text="Open the Shadow Compare view to compare Paper vs Live equity curves and recorded fill gaps.">
+              <button
+                type="button"
+                onClick={() => setActiveTab('shadow')}
+                className="inline-flex items-center gap-1 text-xs font-medium text-teal-600 dark:text-teal-400 hover:underline pt-1"
+              >
+                <span>Inspect Shadow Compare</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </HoverTip>
           </div>
         </section>
       </div>
@@ -385,16 +423,19 @@ export function DashboardView() {
       {/* Live Positions Preview */}
       <section className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-5 space-y-4">
         <div className="flex items-center justify-between">
-          <h2 className="font-display text-base font-bold text-slate-900 dark:text-slate-100">
+          <h2 className="font-display text-base font-bold text-slate-900 dark:text-slate-100 flex items-center">
             Active Positions ({positions.length})
+            <InfoTooltip text="Quick preview of currently open trades with Quality/Trade entry scores, live prices, and exit thresholds." />
           </h2>
-          <button
-            type="button"
-            onClick={() => setActiveTab('positions')}
-            className="text-xs font-medium text-teal-600 dark:text-teal-400 hover:underline"
-          >
-            Manage all positions
-          </button>
+          <HoverTip text="Open the full Positions workspace with Hold Timers, Trailing Profit Lock tiers, and Manual Sell.">
+            <button
+              type="button"
+              onClick={() => setActiveTab('positions')}
+              className="text-xs font-medium text-teal-600 dark:text-teal-400 hover:underline"
+            >
+              Manage all positions
+            </button>
+          </HoverTip>
         </div>
 
         {positions.length === 0 ? (

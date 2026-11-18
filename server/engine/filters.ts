@@ -204,6 +204,49 @@ export function evaluateHardFilters(
     reasons.push(`Buy ratio ${buyRatio.toFixed(2)} < ${effectiveMinBuyRatio.toFixed(2)} minimum`);
   }
 
+  // Short-term 5m & 1h momentum/order-flow guards (prevents buying 1h-green coins already dumping now)
+  if (!isNewLaunchMode) {
+    if (token.priceChange5mPct !== undefined && Number.isFinite(token.priceChange5mPct)) {
+      const min5mFloor = isCustomMicroWindow ? -6.0 : -2.5;
+      if (token.priceChange5mPct < min5mFloor) {
+        reasons.push(
+          `5m price change ${token.priceChange5mPct.toFixed(2)}% < ${min5mFloor}% (active short-term dump guard)`
+        );
+      }
+      if (!isCustomMicroWindow && token.priceChange5mPct > 25) {
+        reasons.push(
+          `Parabolic 5m spike +${token.priceChange5mPct.toFixed(1)}% > +25% (mean-reversion guard)`
+        );
+      }
+    }
+
+    if (token.buys5m !== undefined && token.sells5m !== undefined) {
+      const total5m = token.buys5m + token.sells5m;
+      if (total5m >= 10) {
+        const buyRatio5m = token.buys5m / total5m;
+        const min5mBuyRatio = isCustomMicroWindow ? 0.38 : 0.45;
+        if (buyRatio5m < min5mBuyRatio) {
+          reasons.push(
+            `5m sell pressure dominant: buy ratio ${(buyRatio5m * 100).toFixed(0)}% < ${(min5mBuyRatio * 100).toFixed(0)}% across ${total5m} txns`
+          );
+        }
+      }
+    }
+
+    if (token.buys1h !== undefined && token.sells1h !== undefined) {
+      const total1h = token.buys1h + token.sells1h;
+      if (total1h >= 20) {
+        const buyRatio1h = token.buys1h / total1h;
+        const min1hBuyRatio = isCustomMicroWindow ? 0.4 : 0.46;
+        if (buyRatio1h < min1hBuyRatio) {
+          reasons.push(
+            `1h sell pressure dominant: buy ratio ${(buyRatio1h * 100).toFixed(0)}% < ${(min1hBuyRatio * 100).toFixed(0)}% across ${total1h} txns`
+          );
+        }
+      }
+    }
+  }
+
   // 5. Planned trade price impact check
   if (plannedPriceImpactPct === null || !Number.isFinite(plannedPriceImpactPct)) {
     reasons.push('Planned buy quote price impact missing (fail closed)');

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Info, Save } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
+import { HoverTip, InfoTooltip } from '../ui/Primitives';
 import type { BotSettings, StopLossTier } from '../../types';
 import { validateSettingsDraft } from '../../utils/settingsValidation';
 
@@ -350,33 +351,46 @@ export function SettingsView() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            disabled={saving}
-            onClick={() => void applyPreset('quick_profit')}
-            className="px-3 py-2 rounded-xl text-xs font-bold border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20"
-          >
-            ⚡ Quick Profit Scalper
-          </button>
-          {(['safe', 'balanced', 'aggressive'] as const).map((preset) => (
+          <HoverTip text="Fast scalping preset: 0.10 SOL size, strict 5m/1h momentum filters, -4% SL, +12% TP, tight 3%–12% trailing profit lock, ATA rent auto-reclaim ON, and low-friction Paper realism.">
             <button
-              key={preset}
               type="button"
               disabled={saving}
-              onClick={() => void applyPreset(preset)}
-              className="px-3 py-2 rounded-xl text-xs font-medium capitalize border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
+              onClick={() => void applyPreset('quick_profit')}
+              className="px-3 py-2 rounded-xl text-xs font-bold border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20"
             >
-              {preset} Preset
+              ⚡ Quick Profit Scalper
             </button>
-          ))}
-          <button
-            type="submit"
-            disabled={saving}
-            className="px-4 py-2 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white inline-flex items-center gap-1.5"
-          >
-            <Save className="w-3.5 h-3.5" />
-            <span>{saving ? 'Saving…' : 'Save Settings'}</span>
-          </button>
+          </HoverTip>
+          {(['safe', 'balanced', 'aggressive'] as const).map((preset) => {
+            const presetTip =
+              preset === 'safe'
+                ? 'Conservative preset: mature pools (>=120m), $50K+ liquidity, Q>=82/T>=75, -6% SL, +15% TP.'
+                : preset === 'balanced'
+                  ? 'Default balanced preset: 30m+ pools, $25K+ liquidity, Q>=60/T>=55, -8% SL, +18% TP, 13-tier profit lock.'
+                  : 'Higher-risk preset: 0.05 SOL trades, up to 4 open slots, -12% SL, +24% TP.';
+            return (
+              <HoverTip key={preset} text={presetTip}>
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={() => void applyPreset(preset)}
+                  className="px-3 py-2 rounded-xl text-xs font-medium capitalize border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
+                >
+                  {preset} Preset
+                </button>
+              </HoverTip>
+            );
+          })}
+          <HoverTip text="Validate and save all draft settings to SQLite (and sync active positions if checked below).">
+            <button
+              type="submit"
+              disabled={saving}
+              className="px-4 py-2 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white inline-flex items-center gap-1.5"
+            >
+              <Save className="w-3.5 h-3.5" />
+              <span>{saving ? 'Saving…' : 'Save Settings'}</span>
+            </button>
+          </HoverTip>
         </div>
       </div>
 
@@ -389,14 +403,16 @@ export function SettingsView() {
               : 'Applies to new positions only (active trades retain their entry rules).'}
           </span>
         </div>
-        <label className="flex items-center gap-2 cursor-pointer font-medium text-slate-800 dark:text-slate-200 bg-white/70 dark:bg-slate-900/70 px-2.5 py-1 rounded-lg border border-teal-500/30">
-          <input
-            type="checkbox"
-            checked={applyToOpenPositions}
-            onChange={(e) => setApplyToOpenPositions(e.target.checked)}
-          />
-          <span>Apply exit rules to active open positions on save</span>
-        </label>
+        <HoverTip text="When checked, clicking Save Settings updates Stop-Loss, Take-Profit, and Trailing Ladder on every currently open position immediately.">
+          <label className="flex items-center gap-2 cursor-pointer font-medium text-slate-800 dark:text-slate-200 bg-white/70 dark:bg-slate-900/70 px-2.5 py-1 rounded-lg border border-teal-500/30">
+            <input
+              type="checkbox"
+              checked={applyToOpenPositions}
+              onChange={(e) => setApplyToOpenPositions(e.target.checked)}
+            />
+            <span>Apply exit rules to active open positions on save</span>
+          </label>
+        </HoverTip>
       </div>
 
       {validationError && (
@@ -425,11 +441,35 @@ export function SettingsView() {
         <div className="space-y-6">
           {/* Risk & Sizing */}
           <section className={sectionClass(sizingHasError)}>
-            <h2 className="font-display text-sm font-bold">Position Sizing &amp; Risk Caps</h2>
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="font-display text-sm font-bold flex items-center">
+                <span>Position Sizing &amp; Risk Caps</span>
+                <InfoTooltip text="Controls how much SOL is risked per trade, total concurrent open capital, daily stop-buying cap, and SOL reserved for transaction fees." />
+              </h2>
+            </div>
+            {!draft.autoReclaimRent && Number.isFinite(draft.tradeSizeSol) && draft.tradeSizeSol <= 0.1 && (
+              <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300 flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  <strong>Rent Drag Warning:</strong> With Auto-Reclaim ATA Rent unchecked, a{' '}
+                  <span className="font-mono">{safeFixed(draft.tradeSizeSol * 0.4, 3)} SOL</span> meme trade pays{' '}
+                  <span className="font-mono">0.00204 SOL</span> (~
+                  {safeFixed((0.00203928 / Math.max(0.005, draft.tradeSizeSol * 0.4)) * 100, 1)}%) in ATA rent on entry, starting Net P&amp;L deep in red.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => updateField('autoReclaimRent', true)}
+                  className="px-2 py-1 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-semibold shrink-0"
+                >
+                  Enable Rent Reclaim
+                </button>
+              </div>
+            )}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
               <label className="space-y-1">
                 <span className="text-slate-500 flex items-center justify-between">
-                  <span>Trade Size (SOL)</span>
+                  <HoverTip text="Base SOL amount allocated per buy (scaled by token class: bluechip 1.0x, mid-cap 0.9x, early-stage 0.7x, meme 0.4x).">
+                    <span className="cursor-help">Trade Size (SOL)</span>
+                  </HoverTip>
                   <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
                     ≈ ${safeFixed((Number.isFinite(draft.tradeSizeSol) ? draft.tradeSizeSol : 0) * solUsd)} USD
                   </span>
@@ -450,7 +490,9 @@ export function SettingsView() {
 
               <label className="space-y-1">
                 <span className="text-slate-500 flex items-center justify-between">
-                  <span>Max Wallet Exposure (SOL)</span>
+                  <HoverTip text="Maximum total SOL allowed across all open positions combined. New buys are blocked once exposure reaches this cap.">
+                    <span className="cursor-help">Max Wallet Exposure (SOL)</span>
+                  </HoverTip>
                   <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
                     ≈ ${safeFixed((Number.isFinite(draft.maxWalletExposureSol) ? draft.maxWalletExposureSol : 0) * solUsd)} USD
                   </span>
@@ -471,7 +513,9 @@ export function SettingsView() {
 
               <label className="space-y-1">
                 <span className="text-slate-500 flex items-center justify-between">
-                  <span>Daily Loss Limit (SOL)</span>
+                  <HoverTip text="Circuit-breaker cap: if net realized losses today reach this SOL amount, the bot halts all new buys until the next UTC day.">
+                    <span className="cursor-help">Daily Loss Limit (SOL)</span>
+                  </HoverTip>
                   <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
                     ≈ ${safeFixed((Number.isFinite(draft.dailyLossLimitSol) ? draft.dailyLossLimitSol : 0) * solUsd)} USD
                   </span>
@@ -492,7 +536,9 @@ export function SettingsView() {
 
               <label className="space-y-1">
                 <span className="text-slate-500 flex items-center justify-between">
-                  <span>Gas Reserve (SOL)</span>
+                  <HoverTip text="Minimum SOL always left untouched in your wallet so stop-losses and emergency exits always have enough gas to execute.">
+                    <span className="cursor-help">Gas Reserve (SOL)</span>
+                  </HoverTip>
                   <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
                     ≈ ${safeFixed((Number.isFinite(draft.gasReserveSol) ? draft.gasReserveSol : 0) * solUsd)} USD
                   </span>
@@ -513,7 +559,11 @@ export function SettingsView() {
               </label>
 
               <label className="space-y-1">
-                <span className="text-slate-500 block">Max Open Positions</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="Maximum number of different tokens held open at the same time (1–10).">
+                    <span className="cursor-help">Max Open Positions</span>
+                  </HoverTip>
+                </span>
                 <input
                   type="number"
                   min="1"
@@ -530,7 +580,11 @@ export function SettingsView() {
               </label>
 
               <label className="space-y-1">
-                <span className="text-slate-500 block">Re-entry Cooldown (min)</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="Waiting period (in minutes) before the bot is allowed to buy the same token mint again after closing it.">
+                    <span className="cursor-help">Re-entry Cooldown (min)</span>
+                  </HoverTip>
+                </span>
                 <input
                   type="number"
                   min="0"
@@ -551,38 +605,43 @@ export function SettingsView() {
           <section className={sectionClass(stopLossHasError)}>
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h2 className="font-display text-sm font-bold">
-                  Custom Stop-Loss Tiers ({draft.stopLossTiers?.length || 0} Tiers · Unlimited)
+                <h2 className="font-display text-sm font-bold flex items-center">
+                  <span>Custom Stop-Loss Tiers ({draft.stopLossTiers?.length || 0} Tiers · Unlimited)</span>
+                  <InfoTooltip text="Automatically sells the specified % of your position if price drops by Trigger Drop % below your entry price. Uncheck Enabled to disable stop-loss exits." />
                 </h2>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400">
                   Max Stop: <span className="font-mono text-rose-500">-{safeFixed(effectiveMaxSl, 1)}%</span> · Unlimited Trigger Drop % (no upper cap)
                 </p>
               </div>
               <div className="flex items-center gap-3">
-                <label
-                  data-field-key="stopLossEnabled"
-                  tabIndex={fieldErrors.stopLossEnabled ? -1 : undefined}
-                  className={`inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded-lg ${
-                    fieldErrors.stopLossEnabled
-                      ? 'border-2 border-rose-500 ring-2 ring-rose-500/35 bg-rose-500/10 text-rose-300'
-                      : 'text-slate-600 dark:text-slate-300'
-                  }`}
-                >
-                  <input
-                    type="checkbox"
-                    checked={draft.stopLossEnabled}
-                    onChange={(e) => updateField('stopLossEnabled', e.target.checked)}
-                  />
-                  <span>Enabled</span>
-                </label>
-                {draft.stopLossEnabled && (
-                  <button
-                    type="button"
-                    onClick={addStopLossTier}
-                    className="px-2.5 py-1 rounded-lg text-xs font-medium bg-rose-600 hover:bg-rose-500 text-white"
+                <HoverTip text="Toggle automatic stop-loss protection on or off.">
+                  <label
+                    data-field-key="stopLossEnabled"
+                    tabIndex={fieldErrors.stopLossEnabled ? -1 : undefined}
+                    className={`inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded-lg cursor-pointer ${
+                      fieldErrors.stopLossEnabled
+                        ? 'border-2 border-rose-500 ring-2 ring-rose-500/35 bg-rose-500/10 text-rose-300'
+                        : 'text-slate-600 dark:text-slate-300'
+                    }`}
                   >
-                    + Add Stop Loss Tier
-                  </button>
+                    <input
+                      type="checkbox"
+                      checked={draft.stopLossEnabled}
+                      onChange={(e) => updateField('stopLossEnabled', e.target.checked)}
+                    />
+                    <span>Enabled</span>
+                  </label>
+                </HoverTip>
+                {draft.stopLossEnabled && (
+                  <HoverTip text="Append another partial or full stop-loss tier.">
+                    <button
+                      type="button"
+                      onClick={addStopLossTier}
+                      className="px-2.5 py-1 rounded-lg text-xs font-medium bg-rose-600 hover:bg-rose-500 text-white"
+                    >
+                      + Add Stop Loss Tier
+                    </button>
+                  </HoverTip>
                 )}
               </div>
             </div>
@@ -677,7 +736,10 @@ export function SettingsView() {
 
           {/* Hard Filters & Security */}
           <section className={sectionClass(filtersHasError)}>
-            <h2 className="font-display text-sm font-bold">Hard Filters &amp; Security Thresholds</h2>
+            <h2 className="font-display text-sm font-bold flex items-center">
+              <span>Hard Filters &amp; Security Thresholds</span>
+              <InfoTooltip text="Gatekeeper filters every discovered token must pass before entering Security, Scoring, and Buy execution." />
+            </h2>
 
             {/* New Launches Only (Brand-new coins: e.g. 5s, 10s, 1m up to 5m) */}
             <div
@@ -687,27 +749,29 @@ export function SettingsView() {
                   : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60'
               }`}
             >
-              <label className="inline-flex items-center gap-2 font-semibold text-slate-800 dark:text-slate-200 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={draft.newLaunchOnlyEnabled}
-                  onChange={(e) => {
-                    const checked = e.target.checked;
-                    updateField('newLaunchOnlyEnabled', checked);
-                    if (checked && draft.customAgeWindowEnabled) {
-                      updateField('customAgeWindowEnabled', false);
-                    }
-                    clearFieldError(
-                      'newLaunchMinAgeSeconds',
-                      'newLaunchMaxAgeSeconds',
-                      'customMinPoolAgeMinutes',
-                      'customMaxPoolAgeMinutes',
-                      'minPoolAgeMinutes'
-                    );
-                  }}
-                />
-                <span>New Launches Only (Brand-New Coins Window in Seconds)</span>
-              </label>
+              <HoverTip text="Enable to snipe brand-new token pools within a strict age window measured in seconds (e.g., 5s to 300s). Automatically overrides Custom & Default pool age rules.">
+                <label className="inline-flex items-center gap-2 font-semibold text-slate-800 dark:text-slate-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={draft.newLaunchOnlyEnabled}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      updateField('newLaunchOnlyEnabled', checked);
+                      if (checked && draft.customAgeWindowEnabled) {
+                        updateField('customAgeWindowEnabled', false);
+                      }
+                      clearFieldError(
+                        'newLaunchMinAgeSeconds',
+                        'newLaunchMaxAgeSeconds',
+                        'customMinPoolAgeMinutes',
+                        'customMaxPoolAgeMinutes',
+                        'minPoolAgeMinutes'
+                      );
+                    }}
+                  />
+                  <span>New Launches Only (Brand-New Coins Window in Seconds)</span>
+                </label>
+              </HoverTip>
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
                 {draft.newLaunchOnlyEnabled
                   ? `Active: Bot searches & trades only newly launched coins between ${Number.isFinite(draft.newLaunchMinAgeSeconds) ? draft.newLaunchMinAgeSeconds : 0}s and ${Number.isFinite(draft.newLaunchMaxAgeSeconds) ? draft.newLaunchMaxAgeSeconds : 0}s (${safeFixed((Number.isFinite(draft.newLaunchMaxAgeSeconds) ? draft.newLaunchMaxAgeSeconds : 0) / 60, 1)}m) old.`
@@ -791,7 +855,9 @@ export function SettingsView() {
                     );
                   }}
                 />
-                <span>Use Custom Pool Age Timeframe (Min–Max Minutes)</span>
+                <HoverTip text="Enable to restrict trades to pools within an exact minute age range (e.g., 5m to 30m old).">
+                  <span>Use Custom Pool Age Timeframe (Min–Max Minutes)</span>
+                </HoverTip>
               </label>
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
                 {draft.customAgeWindowEnabled
@@ -846,7 +912,11 @@ export function SettingsView() {
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
               <label className="space-y-1">
-                <span className="text-slate-500 block">Default Min Pool Age (min, &ge; 30m)</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="Minimum age of a liquidity pool (at least 30 minutes) required when Custom Age Window and New Launches Only are unchecked.">
+                    <span className="cursor-help">Default Min Pool Age (min, &ge; 30m)</span>
+                  </HoverTip>
+                </span>
                 <input
                   type="number"
                   min="30"
@@ -866,7 +936,11 @@ export function SettingsView() {
               </label>
 
               <label className="space-y-1">
-                <span className="text-slate-500 block">Min Liquidity ($) · Unlimited</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="Minimum USD liquidity required in the token's DEX pool. Higher liquidity lowers slippage and rug risk.">
+                    <span className="cursor-help">Min Liquidity ($) · Unlimited</span>
+                  </HoverTip>
+                </span>
                 <input
                   type="number"
                   min="0"
@@ -895,7 +969,9 @@ export function SettingsView() {
                       clearFieldError('maxTop10HoldersPct');
                     }}
                   />
-                  <span>Max Top-10 Non-Pool Holders (%)</span>
+                  <HoverTip text="Blocks tokens where the top 10 non-pool wallets hold more than this % of supply (prevents whale dumps). Uncheck to disable this gate.">
+                    <span className="cursor-help">Max Top-10 Non-Pool Holders (%)</span>
+                  </HoverTip>
                 </label>
                 <input
                   type="number"
@@ -932,7 +1008,9 @@ export function SettingsView() {
                       clearFieldError('minQualityScore', 'minTradeScore');
                     }}
                   />
-                  <span>Min Quality / Trade Score</span>
+                  <HoverTip text="Requires tokens to meet both Minimum Quality Score (left box: safety, liquidity, holders) and Minimum Trade Score (right box: momentum & buy pressure). Uncheck to bypass the score gate completely.">
+                    <span className="cursor-help">Min Quality / Trade Score</span>
+                  </HoverTip>
                 </label>
                 <div className="flex gap-2">
                   <input
@@ -986,12 +1064,17 @@ export function SettingsView() {
         <div className="space-y-6">
           {/* Exits */}
           <section className={sectionClass(exitsHasError)}>
-            <h2 className="font-display text-sm font-bold">
-              Exit Rules
+            <h2 className="font-display text-sm font-bold flex items-center">
+              <span>Exit Rules</span>
+              <InfoTooltip text="Defines Take-Profit target, max stagnation hold duration, emergency rug-pull floor, and optional stepped trailing profit lock." />
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
               <label className="space-y-1">
-                <span className="text-slate-500 block">Take-Profit (%) · Unlimited</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="Target gross gain % where the bot automatically takes profit (verified against an executable Jupiter sell quote).">
+                    <span className="cursor-help">Take-Profit (%) · Unlimited</span>
+                  </HoverTip>
+                </span>
                 <input
                   type="number"
                   min="1.5"
@@ -1013,7 +1096,11 @@ export function SettingsView() {
               </label>
 
               <label className="space-y-1">
-                <span className="text-slate-500 block">Max Hold Time (minutes)</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="Maximum minutes to hold a stagnant trade that has not gained at least +2% before automatically exiting to free the slot.">
+                    <span className="cursor-help">Max Hold Time (minutes)</span>
+                  </HoverTip>
+                </span>
                 <input
                   type="number"
                   min="5"
@@ -1029,7 +1116,11 @@ export function SettingsView() {
               </label>
 
               <label className="space-y-1">
-                <span className="text-slate-500 block">Emergency Liquidity Floor ($)</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="If pool USD liquidity plunges below this floor while you hold the token, the bot immediately triggers an emergency exit.">
+                    <span className="cursor-help">Emergency Liquidity Floor ($)</span>
+                  </HoverTip>
+                </span>
                 <input
                   type="number"
                   min="0"
@@ -1047,46 +1138,54 @@ export function SettingsView() {
             </div>
 
             <div className="flex flex-wrap gap-4 pt-1 text-xs">
-              <label
-                data-field-key="trailingEnabled"
-                tabIndex={fieldErrors.trailingEnabled ? -1 : undefined}
-                className={`inline-flex items-center gap-2 px-2 py-1 rounded-lg ${
-                  fieldErrors.trailingEnabled
-                    ? 'border-2 border-rose-500 ring-2 ring-rose-500/35 bg-rose-500/10 text-rose-300'
-                    : ''
-                }`}
-              >
-                <input
-                  type="checkbox"
-                  checked={draft.trailingEnabled}
-                  onChange={(e) => updateField('trailingEnabled', e.target.checked)}
-                />
-                <span>Stepped Trailing Ladder</span>
-              </label>
-              <label className="inline-flex items-center gap-2 py-1">
-                <input
-                  type="checkbox"
-                  checked={draft.breakEvenRecoveryEnabled}
-                  onChange={(e) => updateField('breakEvenRecoveryEnabled', e.target.checked)}
-                />
-                <span>Break-Even Recovery Watch</span>
-              </label>
-              <label className="inline-flex items-center gap-2 py-1">
-                <input
-                  type="checkbox"
-                  checked={draft.allowSlotRotation}
-                  onChange={(e) => updateField('allowSlotRotation', e.target.checked)}
-                />
-                <span>Slot Rotation</span>
-              </label>
-              <label className="inline-flex items-center gap-2 py-1">
-                <input
-                  type="checkbox"
-                  checked={draft.autoReclaimRent}
-                  onChange={(e) => updateField('autoReclaimRent', e.target.checked)}
-                />
-                <span>Auto-Reclaim ATA Rent on 100% Sell (+0.00204 SOL)</span>
-              </label>
+              <HoverTip text="Locks in higher and higher profit floors as price climbs through custom Peak % tiers. Uncheck to wait strictly for Take-Profit %.">
+                <label
+                  data-field-key="trailingEnabled"
+                  tabIndex={fieldErrors.trailingEnabled ? -1 : undefined}
+                  className={`inline-flex items-center gap-2 px-2 py-1 rounded-lg cursor-pointer ${
+                    fieldErrors.trailingEnabled
+                      ? 'border-2 border-rose-500 ring-2 ring-rose-500/35 bg-rose-500/10 text-rose-300'
+                      : ''
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={draft.trailingEnabled}
+                    onChange={(e) => updateField('trailingEnabled', e.target.checked)}
+                  />
+                  <span>Stepped Trailing Ladder</span>
+                </label>
+              </HoverTip>
+              <HoverTip text="Protects winning recovery bounces after a sharp dip by watching break-even recovery levels.">
+                <label className="inline-flex items-center gap-2 py-1 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={draft.breakEvenRecoveryEnabled}
+                    onChange={(e) => updateField('breakEvenRecoveryEnabled', e.target.checked)}
+                  />
+                  <span>Break-Even Recovery Watch</span>
+                </label>
+              </HoverTip>
+              <HoverTip text="If all Open Position slots are full, allows closing the weakest stagnant position when a much higher-scoring token appears.">
+                <label className="inline-flex items-center gap-2 py-1 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={draft.allowSlotRotation}
+                    onChange={(e) => updateField('allowSlotRotation', e.target.checked)}
+                  />
+                  <span>Slot Rotation</span>
+                </label>
+              </HoverTip>
+              <HoverTip text="Automatically closes the empty SPL token account (ATA) when selling 100%, returning ~0.00204 SOL rent to your wallet instead of counting it as a loss.">
+                <label className="inline-flex items-center gap-2 py-1 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={draft.autoReclaimRent}
+                    onChange={(e) => updateField('autoReclaimRent', e.target.checked)}
+                  />
+                  <span>Auto-Reclaim ATA Rent on 100% Sell (+0.00204 SOL)</span>
+                </label>
+              </HoverTip>
             </div>
             <FieldErrorPopup
               message={fieldErrors.trailingEnabled}
@@ -1195,14 +1294,47 @@ export function SettingsView() {
 
           {/* Paper Realism */}
           <section className={sectionClass(paperHasError)}>
-            <h2 className="font-display text-sm font-bold">Paper Shadow Simulation Realism</h2>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2 className="font-display text-sm font-bold flex items-center">
+                  <span>Paper Shadow Simulation Realism</span>
+                  <InfoTooltip text="Simulates real-world Solana execution friction in Paper mode (network confirmation delay, worst-price slippage during the delay, missed blocks, and MEV/bot competition) so Paper results match real Live trading conditions." />
+                </h2>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 leading-relaxed">
+                  Stress-tests Paper entries with realistic execution latency, worst-price sampling, and &lt;24h bot competition slippage. High values cause Paper buys to start red immediately.
+                </p>
+              </div>
+              <HoverTip text="Reset Paper simulation friction to gentle defaults (0.5–2s delay, 0.25% competition penalty, 2%/3% fail chance) and turn on ATA Rent Reclaim to avoid artificial immediate losses.">
+                <button
+                  type="button"
+                  onClick={() => {
+                    updateField('paperDelayMinSec', 0.5);
+                    updateField('paperDelayMaxSec', 2);
+                    updateField('paperDefaultDelaySec', 1);
+                    updateField('paperBuyFailChancePct', 2);
+                    updateField('paperSellFailChancePct', 3);
+                    updateField('paperCompetitionPenaltyPct', 0.25);
+                    updateField('autoReclaimRent', true);
+                  }}
+                  className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border border-teal-500/40 text-teal-600 dark:text-teal-400 hover:bg-teal-500/10 shrink-0"
+                >
+                  Apply Realistic Defaults
+                </button>
+              </HoverTip>
+            </div>
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
               <label className="space-y-1">
-                <span className="text-slate-500 block">Delay Window Min / Max (sec)</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="Simulated confirmation wait window (in seconds) between signal and fill. The simulator samples prices across this window and fills at the worst price seen (set 0/0 for instant quote fill).">
+                    <span className="cursor-help">Delay Window Min / Max (sec)</span>
+                  </HoverTip>
+                </span>
                 <div className="flex gap-2">
                   <input
                     type="number"
                     min="0"
+                    step="0.5"
                     data-field-key="paperDelayMinSec"
                     aria-label="Paper delay min seconds"
                     value={inputValue(draft.paperDelayMinSec)}
@@ -1215,6 +1347,7 @@ export function SettingsView() {
                   <input
                     type="number"
                     min="0"
+                    step="0.5"
                     data-field-key="paperDelayMaxSec"
                     aria-label="Paper delay max seconds"
                     value={inputValue(draft.paperDelayMaxSec)}
@@ -1236,7 +1369,11 @@ export function SettingsView() {
               </label>
 
               <label className="space-y-1">
-                <span className="text-slate-500 block">Buy / Sell Failure Chance (%)</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="Probability (%) that a simulated Paper buy or sell transaction misses a block or fails route execution (set 0/0 to disable simulated failures).">
+                    <span className="cursor-help">Buy / Sell Failure Chance (%)</span>
+                  </HoverTip>
+                </span>
                 <div className="flex gap-2">
                   <input
                     type="number"
@@ -1276,7 +1413,11 @@ export function SettingsView() {
               </label>
 
               <label className="space-y-1">
-                <span className="text-slate-500 block">&lt;24h Competition Penalty (%)</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="Extra buy fill penalty (%) added for coins younger than 24 hours to mimic competing sniper bots / front-running (set 0% for exact quoted fill).">
+                    <span className="cursor-help">&lt;24h Competition Penalty (%)</span>
+                  </HoverTip>
+                </span>
                 <input
                   type="number"
                   min="0"
@@ -1293,7 +1434,11 @@ export function SettingsView() {
               </label>
 
               <label className="space-y-1">
-                <span className="text-slate-500 block">Priority Fee Preset</span>
+                <span className="text-slate-500 block">
+                  <HoverTip text="Solana priority fee speed tier used to compute transaction fees. Auto queries live Solana network fee percentiles and caps at Max Priority Fee.">
+                    <span className="cursor-help">Priority Fee Preset</span>
+                  </HoverTip>
+                </span>
                 <select
                   value={draft.priorityFeePreset}
                   onChange={(e) =>

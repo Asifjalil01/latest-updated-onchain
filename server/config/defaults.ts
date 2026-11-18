@@ -102,12 +102,12 @@ export const DEFAULT_SETTINGS: BotSettings = {
   emergencyMaxSellTaxPct: 15,
 
   // Paper Realism
-  paperDelayMinSec: 2,
-  paperDelayMaxSec: 8,
-  paperDefaultDelaySec: 4,
-  paperBuyFailChancePct: 5,
-  paperSellFailChancePct: 8,
-  paperCompetitionPenaltyPct: 1.0,
+  paperDelayMinSec: 0.5,
+  paperDelayMaxSec: 2,
+  paperDefaultDelaySec: 1,
+  paperBuyFailChancePct: 2,
+  paperSellFailChancePct: 3,
+  paperCompetitionPenaltyPct: 0.25,
   applyMeasuredGapToPaper: false,
   paperInitialBalanceSol: 10,
 
@@ -195,6 +195,12 @@ export const SETTINGS_PRESETS: Record<'safe' | 'balanced' | 'aggressive' | 'quic
       { peakGainPct: 12.0, allowedDropPct: 2.0 },
     ],
     breakEvenRecoveryEnabled: true,
+    paperDelayMinSec: 0.5,
+    paperDelayMaxSec: 1.5,
+    paperDefaultDelaySec: 1,
+    paperBuyFailChancePct: 0,
+    paperSellFailChancePct: 0,
+    paperCompetitionPenaltyPct: 0.1,
   },
 };
 

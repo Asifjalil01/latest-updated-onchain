@@ -152,8 +152,13 @@ export interface CandidateToken {
   buys24h: number;
   sells24h: number;
   uniqueTraders24h: number;
+  priceChange5mPct?: number;
   priceChange1hPct: number;
   priceChange24hPct: number;
+  buys5m?: number;
+  sells5m?: number;
+  buys1h?: number;
+  sells1h?: number;
   tokenDecimals?: number;
   isToken2022?: boolean;
   rawUpdatedAtMs: number;

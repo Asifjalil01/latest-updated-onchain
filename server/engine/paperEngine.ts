@@ -123,8 +123,8 @@ export async function executeRealisticPaperBuy(params: {
   const minSec = Math.max(0, settings.paperDelayMinSec);
   const maxSec = Math.max(minSec, settings.paperDelayMaxSec);
   const delaySec = minSec + rng() * (maxSec - minSec);
-  const steps = Math.max(2, Math.min(4, Math.ceil(delaySec)));
-  const stepMs = (delaySec * 1000) / steps;
+  const steps = delaySec <= 0 ? 0 : Math.max(1, Math.min(4, Math.ceil(delaySec)));
+  const stepMs = steps > 0 ? (delaySec * 1000) / steps : 0;
 
   let worstPriceUsd = quotedPriceUsd;
   let latestLiquidityUsd = token.liquidityUsd;
@@ -355,8 +355,8 @@ export async function executeRealisticPaperSell(params: {
   const minSec = Math.max(0, settings.paperDelayMinSec);
   const maxSec = Math.max(minSec, settings.paperDelayMaxSec);
   const delaySec = minSec + rng() * (maxSec - minSec);
-  const steps = Math.max(2, Math.min(4, Math.ceil(delaySec)));
-  const stepMs = (delaySec * 1000) / steps;
+  const steps = delaySec <= 0 ? 0 : Math.max(1, Math.min(4, Math.ceil(delaySec)));
+  const stepMs = steps > 0 ? (delaySec * 1000) / steps : 0;
 
   let finalQuote = initialQuote;
   for (let i = 0; i < steps; i++) {

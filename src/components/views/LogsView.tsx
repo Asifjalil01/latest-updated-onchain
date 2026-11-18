@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { Search, Trash2 } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
+import { HoverTip } from '../ui/Primitives';
 import type { LogSeverity } from '../../types';
 
 export function LogsView() {
@@ -43,40 +44,45 @@ export function LogsView() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => void handleClearLogs()}
-            className="px-3 py-1.5 rounded-xl text-xs font-medium border border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 inline-flex items-center gap-1.5 whitespace-nowrap"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span>Clear Logs</span>
-          </button>
+          <HoverTip text="Permanently remove stored log entries from the local SQLite log viewer.">
+            <button
+              type="button"
+              onClick={() => void handleClearLogs()}
+              className="px-3 py-1.5 rounded-xl text-xs font-medium border border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 inline-flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Clear Logs</span>
+            </button>
+          </HoverTip>
 
-          <div className="relative">
-            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search logs…"
-              className="pl-8 pr-3 py-1.5 rounded-xl text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
-            />
-          </div>
+          <HoverTip text="Filter event logs by keyword, symbol, category, or error message.">
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search logs…"
+                className="pl-8 pr-3 py-1.5 rounded-xl text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+              />
+            </div>
+          </HoverTip>
 
           <div className="flex p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
             {(['ALL', 'INFO', 'WARN', 'ERROR', 'CRITICAL'] as const).map((sev) => (
-              <button
-                key={sev}
-                type="button"
-                onClick={() => setSeverity(sev)}
-                className={`px-2.5 py-1 rounded-lg text-xs font-medium ${
-                  severity === sev
-                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
-                    : 'text-slate-500'
-                }`}
-              >
-                {sev}
-              </button>
+              <HoverTip key={sev} text={`Show ${sev === 'ALL' ? 'all event severities' : `${sev} level events only`}.`}>
+                <button
+                  type="button"
+                  onClick={() => setSeverity(sev)}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium ${
+                    severity === sev
+                      ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
+                      : 'text-slate-500'
+                  }`}
+                >
+                  {sev}
+                </button>
+              </HoverTip>
             ))}
           </div>
         </div>

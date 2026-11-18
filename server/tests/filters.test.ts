@@ -508,3 +508,66 @@ test('scoring & db: disabled enforceMinScores promotes high_risk_micro to meme a
   }
 });
 
+test('filters: rejects active 5m dump, parabolic 5m blow-off spike, and 5m/1h sell pressure while accepting steady 5m continuation', () => {
+  const now = 1_760_000_000_000;
+
+  // Token looks great on 1h/24h, but is dumping -4.2% in the last 5m
+  const dumping5m: CandidateToken = {
+    ...makeMatureCleanToken(now),
+    priceChange5mPct: -4.2,
+    buys5m: 12,
+    sells5m: 12,
+    buys1h: 60,
+    sells1h: 40,
+  };
+  const dumpRes = evaluateHardFilters(dumping5m, DEFAULT_SETTINGS, 0.3, now);
+  assert.equal(dumpRes.passed, false);
+  assert.ok(dumpRes.reasons.some((r) => r.includes('5m price change')));
+
+  // Parabolic +32% 5m blow-off spike
+  const spike5m: CandidateToken = {
+    ...makeMatureCleanToken(now),
+    priceChange5mPct: 32.0,
+    buys5m: 20,
+    sells5m: 5,
+  };
+  const spikeRes = evaluateHardFilters(spike5m, DEFAULT_SETTINGS, 0.3, now);
+  assert.equal(spikeRes.passed, false);
+  assert.ok(spikeRes.reasons.some((r) => r.includes('Parabolic 5m spike')));
+
+  // Heavy 5m sell pressure (4 buys vs 16 sells = 20% buy ratio across 20 txns)
+  const sellFlow5m: CandidateToken = {
+    ...makeMatureCleanToken(now),
+    priceChange5mPct: 0.4,
+    buys5m: 4,
+    sells5m: 16,
+  };
+  const sellFlow5mRes = evaluateHardFilters(sellFlow5m, DEFAULT_SETTINGS, 0.3, now);
+  assert.equal(sellFlow5mRes.passed, false);
+  assert.ok(sellFlow5mRes.reasons.some((r) => r.includes('5m sell pressure dominant')));
+
+  // Heavy 1h sell pressure (15 buys vs 35 sells = 30% buy ratio across 50 txns)
+  const sellFlow1h: CandidateToken = {
+    ...makeMatureCleanToken(now),
+    priceChange5mPct: 0.5,
+    buys5m: 6,
+    sells5m: 2,
+    buys1h: 15,
+    sells1h: 35,
+  };
+  const sellFlow1hRes = evaluateHardFilters(sellFlow1h, DEFAULT_SETTINGS, 0.3, now);
+  assert.equal(sellFlow1hRes.passed, false);
+  assert.ok(sellFlow1hRes.reasons.some((r) => r.includes('1h sell pressure dominant')));
+
+  // Healthy +2.1% 5m continuation with strong 5m/1h buy flow passes
+  const healthy5m: CandidateToken = {
+    ...makeMatureCleanToken(now),
+    priceChange5mPct: 2.1,
+    buys5m: 18,
+    sells5m: 6,
+    buys1h: 90,
+    sells1h: 40,
+  };
+  const healthyRes = evaluateHardFilters(healthy5m, DEFAULT_SETTINGS, 0.3, now);
+  assert.equal(healthyRes.passed, true, `Unexpected rejection: ${healthyRes.reasons.join('; ')}`);
+});

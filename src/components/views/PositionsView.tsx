@@ -1,7 +1,17 @@
-import React, { useState } from 'react';
-import { ExternalLink, RefreshCw, ShieldAlert, Sliders } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Clock, ExternalLink, RefreshCw, ShieldAlert, Sliders } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
-import { PnlText, SparklineSvg, formatSol, formatTokenPriceUsd, formatUsd, maskMint } from '../ui/Primitives';
+import {
+  HoverTip,
+  InfoTooltip,
+  PnlText,
+  SparklineSvg,
+  formatSol,
+  formatTokenPriceUsd,
+  formatUsd,
+  maskMint,
+} from '../ui/Primitives';
+import { formatHoldDuration } from '../../utils/formatters';
 import type { PositionRecord } from '../../types';
 
 export function PositionsView() {
@@ -12,6 +22,12 @@ export function PositionsView() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [reclaiming, setReclaiming] = useState(false);
   const [syncingSettings, setSyncingSettings] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   const solUsd = status?.solPriceUsd ?? 0;
 
@@ -111,50 +127,56 @@ export function PositionsView() {
         </div>
 
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => void handleSyncSettings()}
-            disabled={syncingSettings || positions.length === 0}
-            className="px-3 py-2 rounded-xl text-xs font-medium border border-teal-500/40 text-teal-600 dark:text-teal-400 hover:bg-teal-500/10 whitespace-nowrap shrink-0 flex items-center gap-1.5 disabled:opacity-40"
-          >
-            <Sliders className={`w-3.5 h-3.5 ${syncingSettings ? 'animate-spin' : ''}`} />
-            <span>Sync Settings to Open Positions</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => void handleReclaimRent()}
-            disabled={reclaiming}
-            className="px-3 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap shrink-0 flex items-center gap-1.5"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${reclaiming ? 'animate-spin' : ''}`} />
-            <span>Reclaim ATA Rent</span>
-          </button>
-
-          <div className="flex p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <HoverTip text="Push your current Settings (Stop-Loss, Take-Profit, and Stepped Trailing Ladder) immediately onto all currently open positions.">
             <button
               type="button"
-              onClick={() => setViewMode('cards')}
-              className={`px-3 py-1 rounded-lg text-xs font-medium whitespace-nowrap ${
-                viewMode === 'cards'
-                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
-                  : 'text-slate-500'
-              }`}
+              onClick={() => void handleSyncSettings()}
+              disabled={syncingSettings || positions.length === 0}
+              className="px-3 py-2 rounded-xl text-xs font-medium border border-teal-500/40 text-teal-600 dark:text-teal-400 hover:bg-teal-500/10 whitespace-nowrap shrink-0 flex items-center gap-1.5 disabled:opacity-40"
             >
-              Cards
+              <Sliders className={`w-3.5 h-3.5 ${syncingSettings ? 'animate-spin' : ''}`} />
+              <span>Sync Settings to Open Positions</span>
             </button>
+          </HoverTip>
+
+          <HoverTip text="Sweep and close empty SPL Associated Token Accounts (ATAs) in your wallet to recover locked ~0.00204 SOL rent deposits.">
             <button
               type="button"
-              onClick={() => setViewMode('table')}
-              className={`px-3 py-1 rounded-lg text-xs font-medium whitespace-nowrap ${
-                viewMode === 'table'
-                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
-                  : 'text-slate-500'
-              }`}
+              onClick={() => void handleReclaimRent()}
+              disabled={reclaiming}
+              className="px-3 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap shrink-0 flex items-center gap-1.5"
             >
-              Table
+              <RefreshCw className={`w-3.5 h-3.5 ${reclaiming ? 'animate-spin' : ''}`} />
+              <span>Reclaim ATA Rent</span>
             </button>
-          </div>
+          </HoverTip>
+
+          <HoverTip text="Switch between detailed position cards and compact comparison table layout.">
+            <div className="flex p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={() => setViewMode('cards')}
+                className={`px-3 py-1 rounded-lg text-xs font-medium whitespace-nowrap ${
+                  viewMode === 'cards'
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
+                    : 'text-slate-500'
+                }`}
+              >
+                Cards
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('table')}
+                className={`px-3 py-1 rounded-lg text-xs font-medium whitespace-nowrap ${
+                  viewMode === 'table'
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
+                    : 'text-slate-500'
+                }`}
+              >
+                Table
+              </button>
+            </div>
+          </HoverTip>
         </div>
       </div>
 
@@ -204,46 +226,69 @@ export function PositionsView() {
               >
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <h2 className="font-display text-lg font-bold text-slate-900 dark:text-slate-100">
                         {pos.symbol}
                       </h2>
                       <span className="font-mono text-xs text-slate-500">{maskMint(pos.mint)}</span>
+                      <HoverTip
+                        text={`Live elapsed hold duration since entry (${new Date(pos.openedAtMs).toLocaleString()}). Counts up in real time (seconds, minutes, hours).`}
+                      >
+                        <span
+                          data-testid={`hold-timer-${pos.symbol}`}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 font-mono text-[11px] font-semibold text-slate-700 dark:text-slate-200 tabular-nums"
+                        >
+                          <Clock className="w-3 h-3 text-teal-500" aria-hidden="true" />
+                          <span>{formatHoldDuration(nowMs - pos.openedAtMs)}</span>
+                        </span>
+                      </HoverTip>
                     </div>
                     <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                       {pos.dex} · {pos.source} · {pos.tokenClass.replace('_', ' ')} ·{' '}
-                      <span
-                        className={
+                      <HoverTip
+                        text={
                           pos.isStaleData
-                            ? 'text-amber-500 font-semibold'
-                            : 'text-emerald-600 dark:text-emerald-400 font-semibold'
+                            ? 'Latest price poll failed or fell back to cached value; automatic checks retry every 1s.'
+                            : 'Live Jupiter & DexScreener price feed updating every second.'
                         }
                       >
-                        {pos.isStaleData ? 'STALE' : 'LIVE'}
-                      </span>
+                        <span
+                          className={
+                            pos.isStaleData
+                              ? 'text-amber-500 font-semibold cursor-help'
+                              : 'text-emerald-600 dark:text-emerald-400 font-semibold cursor-help'
+                          }
+                        >
+                          {pos.isStaleData ? 'STALE' : 'LIVE'}
+                        </span>
+                      </HoverTip>
                     </p>
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <a
-                      href={`https://dexscreener.com/solana/${pos.mint}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-xs text-teal-600 dark:text-teal-400 hover:underline whitespace-nowrap"
-                    >
-                      <span>DexScreener</span>
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                    {pos.txBuy && (
+                    <HoverTip text="Open live pair chart and transaction feed on DexScreener.">
                       <a
-                        href={`https://solscan.io/tx/${pos.txBuy}`}
+                        href={`https://dexscreener.com/solana/${pos.mint}`}
                         target="_blank"
                         rel="noreferrer"
-                        className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 hover:underline whitespace-nowrap"
+                        className="inline-flex items-center gap-1 text-xs text-teal-600 dark:text-teal-400 hover:underline whitespace-nowrap"
                       >
-                        <span>Solscan</span>
+                        <span>DexScreener</span>
                         <ExternalLink className="w-3 h-3" />
                       </a>
+                    </HoverTip>
+                    {pos.txBuy && (
+                      <HoverTip text="View the entry transaction ID / signature on Solscan.">
+                        <a
+                          href={`https://solscan.io/tx/${pos.txBuy}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 hover:underline whitespace-nowrap"
+                        >
+                          <span>Solscan</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      </HoverTip>
                     )}
                   </div>
                 </div>
@@ -277,19 +322,31 @@ export function PositionsView() {
 
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-100 dark:border-slate-800/70">
                   <div>
-                    <span className="text-[11px] font-sans text-slate-500 block mb-1">Entry Price</span>
+                    <span className="text-[11px] font-sans text-slate-500 flex items-center mb-1">
+                      <HoverTip text="Effective buy fill price per token (includes Paper execution delay & competition slippage in Paper mode, or confirmed on-chain fill in Live mode).">
+                        <span className="cursor-help">Entry Price</span>
+                      </HoverTip>
+                    </span>
                     <div className="text-xs font-semibold font-mono tabular-nums text-slate-900 dark:text-slate-100 min-h-5 leading-snug">
                       {formatTokenPriceUsd(pos.entryPriceUsd)}
                     </div>
                   </div>
                   <div>
-                    <span className="text-[11px] font-sans text-slate-500 block mb-1">Current Price</span>
+                    <span className="text-[11px] font-sans text-slate-500 flex items-center mb-1">
+                      <HoverTip text="Latest live market price per token fetched every second from Jupiter & DexScreener.">
+                        <span className="cursor-help">Current Price</span>
+                      </HoverTip>
+                    </span>
                     <div className={`text-xs font-semibold font-mono tabular-nums min-h-5 leading-snug ${pos.currentPriceUsd >= pos.entryPriceUsd ? 'text-teal-600 dark:text-teal-400' : 'text-rose-500'}`}>
                       {formatTokenPriceUsd(pos.currentPriceUsd)}
                     </div>
                   </div>
                   <div>
-                    <span className="text-[11px] font-sans text-slate-500 block mb-1">Gross P&amp;L</span>
+                    <span className="text-[11px] font-sans text-slate-500 flex items-center mb-1">
+                      <HoverTip text="Pure token price movement P&L before subtracting Solana gas, priority tips, DEX fees, and ATA rent.">
+                        <span className="cursor-help">Gross P&amp;L</span>
+                      </HoverTip>
+                    </span>
                     <div className="text-xs font-semibold font-mono tabular-nums min-h-5 leading-snug">
                       <PnlText
                         valueSol={grossPnlSol}
@@ -299,8 +356,10 @@ export function PositionsView() {
                     </div>
                   </div>
                   <div>
-                    <span className="text-[11px] font-sans text-slate-500 block mb-1">
-                      Net P&amp;L ({pos.confirmationLabel})
+                    <span className="text-[11px] font-sans text-slate-500 flex items-center mb-1">
+                      <HoverTip text="True take-home P&L after deducting entry + exit fees, priority tips, and un-reclaimed ATA rent (if Auto-Reclaim Rent is off).">
+                        <span className="cursor-help">Net P&amp;L ({pos.confirmationLabel})</span>
+                      </HoverTip>
                     </span>
                     <div className="text-xs font-semibold font-mono tabular-nums min-h-5 leading-snug">
                       <PnlText
@@ -315,16 +374,26 @@ export function PositionsView() {
 
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono tabular-nums pt-3 border-t border-slate-100 dark:border-slate-800/70 text-slate-600 dark:text-slate-300">
                   <div>
-                    <span className="text-[11px] font-sans text-slate-500 block">Size In</span>
+                    <span className="text-[11px] font-sans text-slate-500 block">
+                      <HoverTip text="SOL capital invested into this position (scaled by token class safety multiplier).">
+                        <span className="cursor-help">Size In</span>
+                      </HoverTip>
+                    </span>
                     {formatSol(pos.solIn, 4)} <span className="text-slate-500 text-[11px]">({formatUsd(pos.solIn * solUsd, false)})</span>
                   </div>
                   <div>
-                    <span className="text-[11px] font-sans text-slate-500 block">Break-Even</span>
+                    <span className="text-[11px] font-sans text-slate-500 block">
+                      <HoverTip text="Minimum token price required to recover 100% of SOL spent plus all round-trip fees and rent.">
+                        <span className="cursor-help">Break-Even</span>
+                      </HoverTip>
+                    </span>
                     {formatTokenPriceUsd(pos.breakEvenPriceUsd)}
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block">
-                      Profit Lock Floor
+                      <HoverTip text="Locked minimum gain % protected by your Stepped Trailing Ladder. Once armed, if price drops below this floor, the bot sells to lock profit.">
+                        <span className="cursor-help">Profit Lock Floor</span>
+                      </HoverTip>
                     </span>
                     {(() => {
                       const trailingEnabled = pos.exitParams?.trailingEnabled !== false;
@@ -357,7 +426,11 @@ export function PositionsView() {
                     })()}
                   </div>
                   <div>
-                    <span className="text-[11px] font-sans text-slate-500 block">Peak / SL / TP</span>
+                    <span className="text-[11px] font-sans text-slate-500 block">
+                      <HoverTip text="Highest gain % reached since entry / Configured Stop-Loss drop % / Configured Take-Profit target %.">
+                        <span className="cursor-help">Peak / SL / TP</span>
+                      </HoverTip>
+                    </span>
                     +{pos.peakPnlPct.toFixed(1)}% / {pos.exitParams.stopLossEnabled === false ? 'Disabled' : `-${pos.exitParams.stopLossPct}%`} / +{pos.exitParams.takeProfitPct}%
                   </div>
                 </div>
@@ -513,7 +586,7 @@ export function PositionsView() {
                   </p>
                 )}
 
-                <div className="flex items-center justify-end gap-2 pt-2">
+                  <div className="flex items-center justify-end gap-2 pt-2">
                   {confirmSellId === pos.id ? (
                     <>
                       <button
@@ -533,13 +606,15 @@ export function PositionsView() {
                       </button>
                     </>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={() => setConfirmSellId(pos.id)}
-                      className="px-3.5 py-1.5 rounded-xl text-xs font-semibold border border-rose-500/40 text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 whitespace-nowrap"
-                    >
-                      Manual Sell
-                    </button>
+                    <HoverTip text="Immediately exit 100% of this position at the current executable Jupiter market price.">
+                      <button
+                        type="button"
+                        onClick={() => setConfirmSellId(pos.id)}
+                        className="px-3.5 py-1.5 rounded-xl text-xs font-semibold border border-rose-500/40 text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 whitespace-nowrap"
+                      >
+                        Manual Sell
+                      </button>
+                    </HoverTip>
                   )}
                 </div>
               </article>
@@ -551,12 +626,27 @@ export function PositionsView() {
           <table className="w-full text-left border-collapse text-xs">
             <thead>
               <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
-                <th className="py-3 px-4 font-medium">Token</th>
-                <th className="py-3 px-4 font-medium text-right">Entry</th>
-                <th className="py-3 px-4 font-medium text-right">Current</th>
-                <th className="py-3 px-4 font-medium text-right">Break-Even</th>
-                <th className="py-3 px-4 font-medium text-right">Net P&amp;L</th>
-                <th className="py-3 px-4 font-medium text-right">Profit Lock Floor</th>
+                <th className="py-3 px-4 font-medium">
+                  <HoverTip text="Token symbol, DEX venue, and live feed status."><span>Token</span></HoverTip>
+                </th>
+                <th className="py-3 px-4 font-medium text-right">
+                  <HoverTip text="Live elapsed hold time since position opened."><span>Holding</span></HoverTip>
+                </th>
+                <th className="py-3 px-4 font-medium text-right">
+                  <HoverTip text="Effective buy fill price."><span>Entry</span></HoverTip>
+                </th>
+                <th className="py-3 px-4 font-medium text-right">
+                  <HoverTip text="Live market price per token."><span>Current</span></HoverTip>
+                </th>
+                <th className="py-3 px-4 font-medium text-right">
+                  <HoverTip text="Minimum exit price needed to cover round-trip costs."><span>Break-Even</span></HoverTip>
+                </th>
+                <th className="py-3 px-4 font-medium text-right">
+                  <HoverTip text="Estimated take-home P&L after fees and rent."><span>Net P&amp;L</span></HoverTip>
+                </th>
+                <th className="py-3 px-4 font-medium text-right">
+                  <HoverTip text="Current stepped trailing profit floor status."><span>Profit Lock Floor</span></HoverTip>
+                </th>
                 <th className="py-3 px-4 font-medium text-right">Action</th>
               </tr>
             </thead>
@@ -584,6 +674,9 @@ export function PositionsView() {
                       <span className="text-slate-500">
                         · {pos.dex} · {pos.isStaleData ? 'STALE' : 'LIVE'}
                       </span>
+                    </td>
+                    <td className="py-3 px-4 text-right font-mono tabular-nums text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                      {formatHoldDuration(nowMs - pos.openedAtMs)}
                     </td>
                     <td className="py-3 px-4 text-right font-mono tabular-nums">
                       {formatTokenPriceUsd(pos.entryPriceUsd)}
@@ -616,14 +709,16 @@ export function PositionsView() {
                       )}
                     </td>
                     <td className="py-3 px-4 text-right">
-                      <button
-                        type="button"
-                        onClick={() => void handleSell(pos)}
-                        disabled={busyId === pos.id}
-                        className="px-2.5 py-1 rounded-lg text-xs font-medium text-rose-500 border border-rose-500/30 hover:bg-rose-500/10"
-                      >
-                        Sell
-                      </button>
+                      <HoverTip text="Immediately close 100% of this position at market.">
+                        <button
+                          type="button"
+                          onClick={() => void handleSell(pos)}
+                          disabled={busyId === pos.id}
+                          className="px-2.5 py-1 rounded-lg text-xs font-medium text-rose-500 border border-rose-500/30 hover:bg-rose-500/10"
+                        >
+                          Sell
+                        </button>
+                      </HoverTip>
                     </td>
                   </tr>
                 );

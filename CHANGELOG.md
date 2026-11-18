@@ -2,6 +2,26 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.18.0 — 5m Dump/Order-Flow Entry Protection, Calibrated Paper Realism, Live Hold Timers, History Hold in Minutes & Bot-Wide Hover Tooltips
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Short-Term 5m/1h Dump & Order-Flow Protection + Calibrated Paper Realism (`types.ts`, `dexscreener.ts`, `geckoterminal.ts`, `filters.ts`, `scoring.ts`, `paperEngine.ts`, `defaults.ts`)**:
+  - Added 5-minute price change and 5m/1h buy-vs-sell transaction flow extraction (`priceChange5mPct`, `buys5m`, `sells5m`, `buys1h`, `sells1h`) from DexScreener and GeckoTerminal.
+  - Added 5m active dump rejection (`< -2.5%`), 5m blow-off spike rejection (`> +25%`), and 5m/1h seller-dominated flow guards in `evaluateHardFilters` while blending 5m momentum and recent buy pressure into `Trade Score`, preventing tokens that look green on 1h charts from opening immediately into an active 5m sell-off.
+  - Fixed `paperEngine.ts` so `delaySec <= 0` executes `0` artificial delay samples instead of running extra worst-price loops, and tuned default Paper Realism (`0.5–2s` delay window, `0.25%` <24h competition penalty, `2%/3%` buy/sell fail probability) + Quick Profit Scalper realism parameters.
+- **Live Hold Duration Timer in Positions (`PositionsView.tsx`, `formatters.ts`)**:
+  - Added a live 1-second updating `Holding` timer pill (`42s`, `10m 05s`, `1h 15m`, `24h 00m`, `48h 12m`) on every Position card and a `Holding` column in Table view.
+- **History & Analytics Hold Duration in Minutes (`HistoryView.tsx`, `formatters.ts`)**:
+  - Updated History & Analytics **Hold** column and the Trade Detail drawer to display hold duration cleanly in minutes (e.g. `6.2 min`, `120 min`) with hover details showing exact seconds.
+- **Paper Shadow Simulation Realism Guidance & Rent Drag Alert (`SettingsView.tsx`)**:
+  - Added an inline plain-language explanation under **Paper Shadow Simulation Realism** plus a 1-click **"Apply Realistic Defaults"** button, and a **Rent Drag Warning** banner in Position Sizing when `Auto-Reclaim ATA Rent` is disabled on small `<= 0.1 SOL` trades.
+- **Global Portal Hover Tooltips Across Entire Bot (`Primitives.tsx`, `TopBar.tsx`, `Sidebar.tsx`, all Views)**:
+  - Added `HoverTip` and `InfoTooltip` popups across navigation tabs, top bar controls, KPIs, settings, checkboxes, table headers, buttons, and position metrics so hovering any control explains its exact purpose.
+
+---
+
 ## v1.17.0 — Auto Jupiter Route/Priority Fees, Verified TP Quotes, Disabled Score Gate Sync & App Version Display
 
 **Risk Warning: Trading can lose all of your money.**

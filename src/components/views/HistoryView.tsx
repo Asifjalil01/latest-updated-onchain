@@ -2,6 +2,8 @@ import React, { useMemo, useState } from 'react';
 import { Download, ExternalLink, RotateCcw, X } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import {
+  HoverTip,
+  InfoTooltip,
   PnlText,
   formatPct,
   formatSignedUsd,
@@ -10,6 +12,7 @@ import {
   formatUsd,
   maskMint,
 } from '../ui/Primitives';
+import { formatHoldMinutes } from '../../utils/formatters';
 import type { ExecutionMode, TradeRecord } from '../../types';
 
 export function HistoryView() {
@@ -116,38 +119,44 @@ export function HistoryView() {
 
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
-            <button
-              type="button"
-              onClick={() => setTab('trades')}
-              className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                tab === 'trades'
-                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
-                  : 'text-slate-500'
-              }`}
-            >
-              Ledger
-            </button>
-            <button
-              type="button"
-              onClick={() => setTab('analytics')}
-              className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                tab === 'analytics'
-                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
-                  : 'text-slate-500'
-              }`}
-            >
-              Analytics
-            </button>
+            <HoverTip text="View every closed trade with exact entry/exit price, fees, ATA rent, and hold duration in minutes.">
+              <button
+                type="button"
+                onClick={() => setTab('trades')}
+                className={`px-3 py-1 rounded-lg text-xs font-medium ${
+                  tab === 'trades'
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
+                    : 'text-slate-500'
+                }`}
+              >
+                Ledger
+              </button>
+            </HoverTip>
+            <HoverTip text="View aggregated win/loss statistics, total fees/rent paid, profit factor, and performance breakdown by exit reason and discovery source.">
+              <button
+                type="button"
+                onClick={() => setTab('analytics')}
+                className={`px-3 py-1 rounded-lg text-xs font-medium ${
+                  tab === 'analytics'
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100'
+                    : 'text-slate-500'
+                }`}
+              >
+                Analytics
+              </button>
+            </HoverTip>
           </div>
 
-          <a
-            href={csvHref}
-            download="trades_log.csv"
-            className="px-3.5 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap"
-          >
-            <Download className="w-3.5 h-3.5" />
-            <span>Export CSV</span>
-          </a>
+          <HoverTip text="Download the full closed-trade ledger for the selected mode as a CSV spreadsheet.">
+            <a
+              href={csvHref}
+              download="trades_log.csv"
+              className="px-3.5 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>Export CSV</span>
+            </a>
+          </HoverTip>
 
           {activeMode !== 'live' && (
             confirmArchive ? (
@@ -169,14 +178,16 @@ export function HistoryView() {
                 </button>
               </div>
             ) : (
-              <button
-                type="button"
-                onClick={() => setConfirmArchive(true)}
-                className="px-3.5 py-2 rounded-xl text-xs font-medium border border-amber-500/40 text-amber-600 dark:text-amber-400 hover:bg-amber-500/10 inline-flex items-center gap-1.5 whitespace-nowrap"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>Archive Paper Account</span>
-              </button>
+              <HoverTip text="Archive current Paper/Testnet trades and reset your virtual Paper balance back to its starting SOL balance.">
+                <button
+                  type="button"
+                  onClick={() => setConfirmArchive(true)}
+                  className="px-3.5 py-2 rounded-xl text-xs font-medium border border-amber-500/40 text-amber-600 dark:text-amber-400 hover:bg-amber-500/10 inline-flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Archive Paper Account</span>
+                </button>
+              </HoverTip>
             )
           )}
         </div>
@@ -221,15 +232,33 @@ export function HistoryView() {
               <table className="w-full text-left border-collapse text-xs">
                 <thead>
                   <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
-                    <th className="py-2.5 px-2 font-medium">Closed</th>
-                    <th className="py-2.5 px-2 font-medium">Token</th>
-                    <th className="py-2.5 px-2 font-medium">Exit Reason</th>
-                    <th className="py-2.5 px-2 font-medium text-right">Buy → Sell Price</th>
-                    <th className="py-2.5 px-2 font-medium text-right">Used (Buy)</th>
-                    <th className="py-2.5 px-2 font-medium text-right">Returned (Sell)</th>
-                    <th className="py-2.5 px-2 font-medium text-right">Fees + Rent</th>
-                    <th className="py-2.5 px-2 font-medium text-right">Net P&amp;L</th>
-                    <th className="py-2.5 px-2 font-medium text-right">Hold</th>
+                    <th className="py-2.5 px-2 font-medium">
+                      <HoverTip text="Date and time the position exited."><span>Closed</span></HoverTip>
+                    </th>
+                    <th className="py-2.5 px-2 font-medium">
+                      <HoverTip text="Token symbol, discovery source, and execution mode."><span>Token</span></HoverTip>
+                    </th>
+                    <th className="py-2.5 px-2 font-medium">
+                      <HoverTip text="Rule or emergency condition that triggered the sell."><span>Exit Reason</span></HoverTip>
+                    </th>
+                    <th className="py-2.5 px-2 font-medium text-right">
+                      <HoverTip text="Effective entry price vs exit price and gross price change %."><span>Buy → Sell Price</span></HoverTip>
+                    </th>
+                    <th className="py-2.5 px-2 font-medium text-right">
+                      <HoverTip text="SOL capital spent to enter the trade."><span>Used (Buy)</span></HoverTip>
+                    </th>
+                    <th className="py-2.5 px-2 font-medium text-right">
+                      <HoverTip text="Net SOL received after closing the position (including reclaimed ATA rent if enabled)."><span>Returned (Sell)</span></HoverTip>
+                    </th>
+                    <th className="py-2.5 px-2 font-medium text-right">
+                      <HoverTip text="Total Solana network + priority fees plus any un-reclaimed ATA rent."><span>Fees + Rent</span></HoverTip>
+                    </th>
+                    <th className="py-2.5 px-2 font-medium text-right">
+                      <HoverTip text="Final take-home profit or loss after all fees and rent."><span>Net P&amp;L</span></HoverTip>
+                    </th>
+                    <th className="py-2.5 px-2 font-medium text-right">
+                      <HoverTip text="Total time the coin was held from entry to exit, shown in minutes."><span>Hold</span></HoverTip>
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70">
@@ -322,7 +351,9 @@ export function HistoryView() {
                           </div>
                         </td>
                         <td className="py-2.5 px-2 text-right font-mono tabular-nums text-slate-500 whitespace-nowrap">
-                          {t.holdSeconds}s
+                          <HoverTip text={`Held for ${formatHoldMinutes(t.holdSeconds)} (${t.holdSeconds}s)`}>
+                            <span className="cursor-help">{formatHoldMinutes(t.holdSeconds)}</span>
+                          </HoverTip>
                         </td>
                       </tr>
                     );
@@ -336,7 +367,10 @@ export function HistoryView() {
         <div className="space-y-6">
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
             <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-4">
-              <span className="text-xs text-slate-500">Avg Win / Avg Loss</span>
+              <span className="text-xs text-slate-500 flex items-center">
+                <span>Avg Win / Avg Loss</span>
+                <InfoTooltip text="Average net SOL gained on winning trades versus average net SOL lost on losing trades." />
+              </span>
               <div className="font-mono text-sm font-bold tabular-nums mt-1">
                 <span className="text-emerald-500">
                   +{formatSol(analytics?.avgWinSol ?? 0, 4)}
@@ -346,19 +380,28 @@ export function HistoryView() {
               </div>
             </div>
             <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-4">
-              <span className="text-xs text-slate-500">Total Fees Paid</span>
+              <span className="text-xs text-slate-500 flex items-center">
+                <span>Total Fees Paid</span>
+                <InfoTooltip text="Cumulative Solana base + priority network fees paid across all closed trades in this mode." />
+              </span>
               <div className="font-mono text-sm font-bold tabular-nums mt-1">
                 {formatSol(analytics?.totalFeesSol ?? 0, 5)}
               </div>
             </div>
             <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-4">
-              <span className="text-xs text-slate-500">Total ATA Rent</span>
+              <span className="text-xs text-slate-500 flex items-center">
+                <span>Total ATA Rent</span>
+                <InfoTooltip text="Net SOL spent on SPL Token Account (ATA) rent that was not reclaimed on exit." />
+              </span>
               <div className="font-mono text-sm font-bold tabular-nums mt-1">
                 {formatSol(analytics?.totalRentSol ?? 0, 5)}
               </div>
             </div>
             <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-4">
-              <span className="text-xs text-slate-500">Profit Factor</span>
+              <span className="text-xs text-slate-500 flex items-center">
+                <span>Profit Factor</span>
+                <InfoTooltip text="Total gross profit divided by total gross loss. Above 1.0 means net profitable overall." />
+              </span>
               <div className="font-mono text-sm font-bold tabular-nums mt-1">
                 {(analytics?.profitFactor ?? 0).toFixed(2)}
               </div>
@@ -497,6 +540,13 @@ export function HistoryView() {
                     {formatUsd(selectedTrade.rentSol * selectedTrade.solPriceUsd)}
                   </span>
                 )}
+              </div>
+              <div>
+                <span className="font-sans text-slate-500 block">Hold Duration</span>
+                {formatHoldMinutes(selectedTrade.holdSeconds)}
+                <span className="block text-slate-500 text-[11px]">
+                  Peak: +{selectedTrade.peakPct.toFixed(2)}%
+                </span>
               </div>
             </div>
 

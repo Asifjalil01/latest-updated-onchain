@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Check, Copy, Lock, RefreshCw, Unlock } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
-import { SemanticStatusText, formatSol, formatUsd } from '../ui/Primitives';
+import { HoverTip, InfoTooltip, SemanticStatusText, formatSol, formatUsd } from '../ui/Primitives';
 
 interface BrowserSolanaProvider {
   isPhantom?: boolean;
@@ -206,21 +206,26 @@ export function WalletsView() {
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => void handleRefreshDiagnostics()}
-          disabled={busy}
-          className="px-3.5 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 inline-flex items-center gap-1.5"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${busy ? 'animate-spin' : ''}`} />
-          <span>Refresh Diagnostics</span>
-        </button>
+        <HoverTip text="Re-queries all Solana RPC endpoints for slot consensus and refreshes wallet balance and Live readiness status.">
+          <button
+            type="button"
+            onClick={() => void handleRefreshDiagnostics()}
+            disabled={busy}
+            className="px-3.5 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 inline-flex items-center gap-1.5"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${busy ? 'animate-spin' : ''}`} />
+            <span>Refresh Diagnostics</span>
+          </button>
+        </HoverTip>
       </div>
 
       {/* Diagnostics Panel */}
       <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4">
         <div className="flex items-center justify-between">
-          <h2 className="font-display text-sm font-bold">Wallet Diagnostics</h2>
+          <h2 className="font-display text-sm font-bold flex items-center">
+            Wallet Diagnostics
+            <InfoTooltip text="Live connection status, verified 2-RPC SOL balance, and whether autonomous Live execution is permitted." />
+          </h2>
           <SemanticStatusText
             status={walletDiagnostics?.liveReady ? 'ok' : 'warn'}
             text={walletDiagnostics?.liveReady ? 'LIVE READY' : 'NOT READY FOR LIVE'}
@@ -230,46 +235,66 @@ export function WalletsView() {
 
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 text-xs">
           <div>
-            <span className="text-slate-500 block">Provider</span>
-            <span className="font-semibold uppercase">
+            <span className="text-slate-500 inline-flex items-center">
+              Provider
+              <InfoTooltip text="Active wallet connection type (encrypted server keystore, Phantom, Solflare, or watch-only)." />
+            </span>
+            <span className="font-semibold uppercase block">
               {walletDiagnostics?.provider ?? 'none'}
             </span>
           </div>
           <div>
-            <span className="text-slate-500 block">Network</span>
-            <span className="font-mono">{walletDiagnostics?.network ?? 'mainnet-beta'}</span>
+            <span className="text-slate-500 inline-flex items-center">
+              Network
+              <InfoTooltip text="Solana cluster targeted by the signer and RPC pool (mainnet-beta or devnet/testnet)." />
+            </span>
+            <span className="font-mono block">{walletDiagnostics?.network ?? 'mainnet-beta'}</span>
           </div>
           <div>
-            <span className="text-slate-500 block">Address</span>
+            <span className="text-slate-500 inline-flex items-center">
+              Address
+              <InfoTooltip text="Public Solana wallet address derived from your signer or connected wallet." />
+            </span>
             <div className="flex items-center gap-1.5 font-mono">
               <span>{walletDiagnostics?.maskedAddress ?? 'none'}</span>
               {walletDiagnostics?.address && (
-                <button
-                  type="button"
-                  onClick={copyAddr}
-                  aria-label="Copy wallet address"
-                  className="text-slate-400 hover:text-teal-500"
-                >
-                  {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                </button>
+                <HoverTip text="Copy full public wallet address to clipboard.">
+                  <button
+                    type="button"
+                    onClick={copyAddr}
+                    aria-label="Copy wallet address"
+                    className="text-slate-400 hover:text-teal-500"
+                  >
+                    {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  </button>
+                </HoverTip>
               )}
             </div>
           </div>
           <div>
-            <span className="text-slate-500 block">RPC Agreed Balance</span>
-            <span className="font-mono font-semibold tabular-nums">
+            <span className="text-slate-500 inline-flex items-center">
+              RPC Agreed Balance
+              <InfoTooltip text="SOL balance confirmed across at least 2 independent Solana RPC endpoints before allowing Live trades." />
+            </span>
+            <span className="font-mono font-semibold tabular-nums block">
               {walletDiagnostics?.balanceSol !== null && walletDiagnostics?.balanceSol !== undefined
                 ? `${formatSol(walletDiagnostics.balanceSol, 4)} (${formatUsd(walletDiagnostics.balanceUsd)})`
                 : 'Unavailable'}
             </span>
           </div>
           <div>
-            <span className="text-slate-500 block">Signing Capability</span>
-            <span className="font-mono">{walletDiagnostics?.signingCapability ?? 'none'}</span>
+            <span className="text-slate-500 inline-flex items-center">
+              Signing Capability
+              <InfoTooltip text="Shows whether the server can sign autonomous swaps without interactive browser popups." />
+            </span>
+            <span className="font-mono block">{walletDiagnostics?.signingCapability ?? 'none'}</span>
           </div>
           <div>
-            <span className="text-slate-500 block">Sync State</span>
-            <span className="font-mono uppercase">{walletDiagnostics?.syncState ?? 'unavailable'}</span>
+            <span className="text-slate-500 inline-flex items-center">
+              Sync State
+              <InfoTooltip text="Consensus status across the configured Solana RPC endpoints (synced = multi-RPC agreement passed)." />
+            </span>
+            <span className="font-mono uppercase block">{walletDiagnostics?.syncState ?? 'unavailable'}</span>
           </div>
         </div>
 
@@ -289,8 +314,9 @@ export function WalletsView() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4">
           <div className="flex items-center justify-between">
-            <h2 className="font-display text-sm font-bold">
+            <h2 className="font-display text-sm font-bold flex items-center">
               Server-Side Encrypted Signer (Required for Live)
+              <InfoTooltip text="Stores your trading key locally encrypted with scrypt + AES-256-GCM so automated buys and stop-losses sign instantly without browser confirmation popups." />
             </h2>
             {walletDiagnostics?.signerUnlocked ? (
               <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-500">
@@ -314,13 +340,15 @@ export function WalletsView() {
                 placeholder="Enter keystore passphrase…"
                 className="flex-1 px-3 py-2 rounded-xl text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
               />
-              <button
-                type="submit"
-                disabled={busy || !unlockPassphrase}
-                className="px-4 py-2 rounded-xl text-xs font-semibold bg-teal-600 text-white"
-              >
-                Unlock
-              </button>
+              <HoverTip text="Decrypt the saved server keystore into memory so Live mode can sign transactions autonomously.">
+                <button
+                  type="submit"
+                  disabled={busy || !unlockPassphrase}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold bg-teal-600 text-white"
+                >
+                  Unlock
+                </button>
+              </HoverTip>
             </form>
           )}
 
@@ -343,58 +371,69 @@ export function WalletsView() {
               className="w-full px-3 py-2 rounded-xl text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
             />
             <div className="flex flex-wrap gap-2">
-              <button
-                type="submit"
-                disabled={busy || !privateKeyInput || passphraseInput.length < 8}
-                className="px-4 py-2 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white disabled:opacity-40"
-              >
-                Encrypt &amp; Save Keystore
-              </button>
-              {walletDiagnostics?.signerUnlocked && (
+              <HoverTip text="Encrypt your private key with your passphrase on disk and immediately unlock it for autonomous Live execution.">
                 <button
-                  type="button"
-                  onClick={() => void handleLockOrClear('lock')}
-                  className="px-3 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-700"
+                  type="submit"
+                  disabled={busy || !privateKeyInput || passphraseInput.length < 8}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white disabled:opacity-40"
                 >
-                  Lock Signer
+                  Encrypt &amp; Save Keystore
                 </button>
+              </HoverTip>
+              {walletDiagnostics?.signerUnlocked && (
+                <HoverTip text="Clear the decrypted key from memory (keeps the encrypted keystore file on disk for later unlock).">
+                  <button
+                    type="button"
+                    onClick={() => void handleLockOrClear('lock')}
+                    className="px-3 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-700"
+                  >
+                    Lock Signer
+                  </button>
+                </HoverTip>
               )}
               {walletDiagnostics?.keystoreExists && (
-                <button
-                  type="button"
-                  onClick={() => void handleLockOrClear('clear')}
-                  className="px-3 py-2 rounded-xl text-xs font-medium text-rose-500 border border-rose-500/30"
-                >
-                  Delete Keystore
-                </button>
+                <HoverTip text="Permanently wipe the encrypted keystore file from the server.">
+                  <button
+                    type="button"
+                    onClick={() => void handleLockOrClear('clear')}
+                    className="px-3 py-2 rounded-xl text-xs font-medium text-rose-500 border border-rose-500/30"
+                  >
+                    Delete Keystore
+                  </button>
+                </HoverTip>
               )}
             </div>
           </form>
         </section>
 
         <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4">
-          <h2 className="font-display text-sm font-bold">
+          <h2 className="font-display text-sm font-bold flex items-center">
             Browser Wallets (Manual Only) &amp; Watch-Only
+            <InfoTooltip text="Connect a browser wallet for balance display or paste any Solana public address to monitor it in read-only mode." />
           </h2>
           <p className="text-xs text-slate-500">
             Phantom and Solflare popup signing cannot execute automated stop-loss exits and are
             strictly blocked from automated Live mode.
           </p>
           <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={() => void handleBrowserConnect('phantom')}
-              className="px-3.5 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
-            >
-              Connect Phantom (Manual)
-            </button>
-            <button
-              type="button"
-              onClick={() => void handleBrowserConnect('solflare')}
-              className="px-3.5 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
-            >
-              Connect Solflare (Manual)
-            </button>
+            <HoverTip text="Request public address connection from your Phantom browser extension (display/manual only).">
+              <button
+                type="button"
+                onClick={() => void handleBrowserConnect('phantom')}
+                className="px-3.5 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                Connect Phantom (Manual)
+              </button>
+            </HoverTip>
+            <HoverTip text="Request public address connection from your Solflare browser extension (display/manual only).">
+              <button
+                type="button"
+                onClick={() => void handleBrowserConnect('solflare')}
+                className="px-3.5 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                Connect Solflare (Manual)
+              </button>
+            </HoverTip>
           </div>
 
           <form onSubmit={(e) => void handleWatchOnly(e)} className="flex gap-2 pt-2">
@@ -415,8 +454,9 @@ export function WalletsView() {
           </form>
 
           <div className="pt-3 border-t border-slate-100 dark:border-slate-800/70 space-y-2">
-            <h3 className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+            <h3 className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center">
               Solana RPC Endpoint Pool (2-Endpoint Agreement Required)
+              <InfoTooltip text="Live mode requires at least 2 independent RPC nodes to agree on wallet balances and transaction confirmations before risking real SOL." />
             </h3>
             <div className="space-y-1.5 text-xs font-mono">
               {rpcs.map((r) => (
@@ -440,8 +480,9 @@ export function WalletsView() {
       {/* Display-Only Wallet Fee Profile Matrix */}
       <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-3">
         <div>
-          <h2 className="font-display text-sm font-bold">
+          <h2 className="font-display text-sm font-bold flex items-center">
             Wallet Fee Profiles (Display-Only Reference)
+            <InfoTooltip text="Informational comparison of popular Solana wallet built-in swap fees vs direct Jupiter routing used by this bot." />
           </h2>
           <p className="text-xs text-slate-500">
             Informational comparison only — never alters real swap fee calculations.

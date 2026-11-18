@@ -11,8 +11,10 @@ interface GeckoPoolItem {
     fdv_usd?: string;
     reserve_in_usd?: string;
     volume_usd?: { h24?: string };
-    price_change_percentage?: { h1?: string; h24?: string };
+    price_change_percentage?: { m5?: string; h1?: string; h24?: string };
     transactions?: {
+      m5?: { buys?: number; sells?: number };
+      h1?: { buys?: number; sells?: number };
       h24?: { buys?: number; sells?: number; buyers?: number; sellers?: number };
     };
   };
@@ -53,6 +55,16 @@ export class GeckoTerminalProvider {
     const sellers = Number(attrs?.transactions?.h24?.sellers ?? 0);
     const symbolPart = (attrs?.name || 'UNKNOWN').split('/')[0]?.trim() || 'UNKNOWN';
 
+    const rawM5 = attrs?.price_change_percentage?.m5;
+    const priceChange5mPct =
+      rawM5 !== undefined && rawM5 !== null && Number.isFinite(Number(rawM5))
+        ? Number(rawM5)
+        : undefined;
+    const buys5m = attrs?.transactions?.m5?.buys !== undefined ? Number(attrs.transactions.m5.buys) : undefined;
+    const sells5m = attrs?.transactions?.m5?.sells !== undefined ? Number(attrs.transactions.m5.sells) : undefined;
+    const buys1h = attrs?.transactions?.h1?.buys !== undefined ? Number(attrs.transactions.h1.buys) : undefined;
+    const sells1h = attrs?.transactions?.h1?.sells !== undefined ? Number(attrs.transactions.h1.sells) : undefined;
+
     return {
       mint,
       symbol: symbolPart,
@@ -73,8 +85,13 @@ export class GeckoTerminalProvider {
         buyers + sellers > 0
           ? Math.max(buyers, sellers) + Math.round(Math.min(buyers, sellers) * 0.6)
           : Math.round((buys24h + sells24h) * 0.5),
+      priceChange5mPct,
       priceChange1hPct: Number(attrs?.price_change_percentage?.h1 ?? NaN),
       priceChange24hPct: Number(attrs?.price_change_percentage?.h24 ?? NaN),
+      buys5m,
+      sells5m,
+      buys1h,
+      sells1h,
       rawUpdatedAtMs: Date.now(),
     };
   }

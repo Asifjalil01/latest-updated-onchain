@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { ExternalLink, RotateCcw, Search, X } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
-import { SemanticStatusText, formatUsd, maskMint } from '../ui/Primitives';
+import { HoverTip, InfoTooltip, SemanticStatusText, formatUsd, maskMint } from '../ui/Primitives';
 import type { ExplanationRecord, SecurityReport, SeenTokenRecord } from '../../types';
 
 export function ScannerView() {
@@ -160,43 +160,80 @@ export function ScannerView() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <span
-            className={`px-2.5 py-1.5 rounded-xl text-xs font-medium border whitespace-nowrap ${
+          <HoverTip
+            text={
               settings?.enforceMinScores === false
-                ? 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400'
-                : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-            }`}
+                ? 'Min Quality/Trade Score checks are currently disabled. Any coin passing Hard Filters and Security checks gets a BUY signal.'
+                : 'Active minimum Quality (Q) and Trade (T) scores required after passing Hard Filters & Security to trigger a BUY.'
+            }
           >
-            {settings?.enforceMinScores === false
-              ? 'Score Gate: Disabled (Bypassed)'
-              : `Score Gate: Q >= ${settings?.minQualityScore ?? 60} / T >= ${settings?.minTradeScore ?? 55}`}
-          </span>
-          <button
-            type="button"
-            onClick={() => void handleResetSeen()}
-            className="px-3.5 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            <span>Reset Seen Cache</span>
-          </button>
+            <span
+              className={`px-2.5 py-1.5 rounded-xl text-xs font-medium border whitespace-nowrap cursor-help ${
+                settings?.enforceMinScores === false
+                  ? 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                  : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+              }`}
+            >
+              {settings?.enforceMinScores === false
+                ? 'Score Gate: Disabled (Bypassed)'
+                : `Score Gate: Q >= ${settings?.minQualityScore ?? 60} / T >= ${settings?.minTradeScore ?? 55}`}
+            </span>
+          </HoverTip>
+          <HoverTip text="Clears previously scanned coins from the cache so the bot re-evaluates all tokens freshly on the next scan.">
+            <button
+              type="button"
+              onClick={() => void handleResetSeen()}
+              className="px-3.5 py-2 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Reset Seen Cache</span>
+            </button>
+          </HoverTip>
         </div>
       </div>
 
       {/* Funnel */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         {[
-          { label: 'Discovered', value: funnel.discovered },
-          { label: 'Validated', value: funnel.validated },
-          { label: 'Hard Filtered', value: funnel.filtered },
-          { label: 'Security Passed', value: funnel.securityPassed },
-          { label: 'Scored', value: funnel.scored },
-          { label: 'Executed', value: funnel.bought },
+          {
+            label: 'Discovered',
+            value: funnel.discovered,
+            tip: 'Total raw Solana token mints pulled from PumpPortal, GeckoTerminal, Jupiter Trending, and DexScreener.',
+          },
+          {
+            label: 'Validated',
+            value: funnel.validated,
+            tip: 'Candidates with complete, sane USD price, liquidity, and mint format ready for rule evaluation.',
+          },
+          {
+            label: 'Hard Filtered',
+            value: funnel.filtered,
+            tip: 'Tokens passing pool age, liquidity floor, 5m dump/momentum protection, order flow, and price impact caps.',
+          },
+          {
+            label: 'Security Passed',
+            value: funnel.securityPassed,
+            tip: 'Tokens verified fail-closed for revoked mint/freeze authority, RugCheck safety, LP lock, holders, and live sell route.',
+          },
+          {
+            label: 'Scored',
+            value: funnel.scored,
+            tip: 'Safe tokens graded 0–100 on Quality (safety/depth) and Trade Score (momentum/buy pressure).',
+          },
+          {
+            label: 'Executed',
+            value: funnel.bought,
+            tip: 'BUY signals that passed position-sizing, exposure, and daily loss caps to open an active trade.',
+          },
         ].map((stage) => (
           <div
             key={stage.label}
             className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-4"
           >
-            <span className="text-xs text-slate-500 dark:text-slate-400 block">{stage.label}</span>
+            <span className="text-xs text-slate-500 dark:text-slate-400 inline-flex items-center">
+              {stage.label}
+              <InfoTooltip text={stage.tip} />
+            </span>
             <span className="font-mono text-2xl font-bold tabular-nums text-slate-900 dark:text-slate-100 mt-1 block">
               {stage.value}
             </span>
@@ -207,8 +244,9 @@ export function ScannerView() {
       {/* Source Health + Mint Probe */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-5 space-y-3">
-          <h2 className="font-display text-sm font-bold text-slate-900 dark:text-slate-100">
+          <h2 className="font-display text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center">
             Discovery &amp; Data Source Health
+            <InfoTooltip text="Circuit-breaker status for every external Solana data API. CLOSED = healthy, HALF_OPEN = recovering, OPEN = cooled down due to errors/rate-limits." />
           </h2>
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
             {sources.map((src) => {
@@ -318,8 +356,9 @@ export function ScannerView() {
         </div>
 
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-5 space-y-3">
-          <h2 className="font-display text-sm font-bold text-slate-900 dark:text-slate-100">
+          <h2 className="font-display text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center">
             Probe Mint Through Pipeline
+            <InfoTooltip text="Manually inspect any Solana token mint through every filter, RugCheck security audit, and Jupiter sell-route test without spending SOL." />
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400">
             Test any Solana token mint against every hard filter, RugCheck, holder check, and
@@ -337,13 +376,15 @@ export function ScannerView() {
               placeholder="Paste Solana mint address…"
               className="w-full px-3.5 py-2.5 rounded-xl font-mono text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
             />
-            <button
-              type="submit"
-              disabled={probing || probeMint.trim().length < 32}
-              className="w-full py-2.5 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white disabled:opacity-40"
-            >
-              {probing ? 'Running Pipeline Probe…' : 'Run Security & Score Probe'}
-            </button>
+            <HoverTip block className="w-full" text="Run a full diagnostic check on the pasted mint address.">
+              <button
+                type="submit"
+                disabled={probing || probeMint.trim().length < 32}
+                className="w-full py-2.5 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white disabled:opacity-40"
+              >
+                {probing ? 'Running Pipeline Probe…' : 'Run Security & Score Probe'}
+              </button>
+            </HoverTip>
           </form>
         </div>
       </div>
@@ -408,14 +449,38 @@ export function ScannerView() {
               <table className="w-full text-left border-collapse text-xs">
                 <thead>
                   <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
-                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">Token</th>
-                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">Source / DEX</th>
-                    <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">Liquidity</th>
-                    <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">
-                      Scores (Q / T){settings?.enforceMinScores === false ? ' · Gate Off' : ''}
+                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">
+                      <HoverTip text="Token ticker and masked Solana mint address. Click any row to inspect full security audit details.">
+                        <span className="cursor-help">Token</span>
+                      </HoverTip>
                     </th>
-                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">Decision</th>
-                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">Reason</th>
+                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">
+                      <HoverTip text="Discovery feed that surfaced the token and the Solana DEX hosting its pool.">
+                        <span className="cursor-help">Source / DEX</span>
+                      </HoverTip>
+                    </th>
+                    <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">
+                      <HoverTip text="Total pooled USD liquidity available for swaps.">
+                        <span className="cursor-help">Liquidity</span>
+                      </HoverTip>
+                    </th>
+                    <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">
+                      <HoverTip text="Quality Score (Q: contract safety, LP lock, holders, depth) / Trade Score (T: 5m/1h momentum & buy/sell pressure).">
+                        <span className="cursor-help">
+                          Scores (Q / T){settings?.enforceMinScores === false ? ' · Gate Off' : ''}
+                        </span>
+                      </HoverTip>
+                    </th>
+                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">
+                      <HoverTip text="Final pipeline decision (BUY or REJECT).">
+                        <span className="cursor-help">Decision</span>
+                      </HoverTip>
+                    </th>
+                    <th className="py-2.5 px-3 font-medium whitespace-nowrap">
+                      <HoverTip text="Exact stage & rule explanation for why this coin passed or was rejected.">
+                        <span className="cursor-help">Reason</span>
+                      </HoverTip>
+                    </th>
                     <th className="py-2.5 px-3 font-medium text-right whitespace-nowrap">Link</th>
                   </tr>
                 </thead>

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Sliders, ShieldCheck, CheckCircle2, AlertTriangle, Save } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
+import { HoverTip, InfoTooltip } from '../ui/Primitives';
 
 export function PipelineConfigView() {
   const { settings, apiFetch, hydrateAll, pushToast } = useBotStore();
@@ -98,34 +99,42 @@ export function PipelineConfigView() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => void handleApplyPreset('quick_profit')}
-            className="px-3 py-1.5 rounded-xl text-xs font-bold border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20"
-          >
-            ⚡ Quick Profit Scalper
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleApplyPreset('safe')}
-            className="px-3 py-1.5 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
-          >
-            Safe Preset
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleApplyPreset('balanced')}
-            className="px-3 py-1.5 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
-          >
-            Balanced Preset
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleApplyPreset('aggressive')}
-            className="px-3 py-1.5 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
-          >
-            Aggressive Preset
-          </button>
+          <HoverTip text="High-speed momentum scalp setup: $25k+ liq, 15m+ age, tight 4% SL, 12% TP, +1.5% trailing lock, 0.1 SOL size.">
+            <button
+              type="button"
+              onClick={() => void handleApplyPreset('quick_profit')}
+              className="px-3 py-1.5 rounded-xl text-xs font-bold border border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20"
+            >
+              ⚡ Quick Profit Scalper
+            </button>
+          </HoverTip>
+          <HoverTip text="Conservative mature-pool rules ($50k+ liq, >=60m pool age, high Quality/Trade scores, smaller 0.03 SOL size).">
+            <button
+              type="button"
+              onClick={() => void handleApplyPreset('safe')}
+              className="px-3 py-1.5 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
+              Safe Preset
+            </button>
+          </HoverTip>
+          <HoverTip text="Balanced configuration matching realistic defaults ($25k+ liq, 30m+ age, 0.05 SOL size, 0.5–2s realism window).">
+            <button
+              type="button"
+              onClick={() => void handleApplyPreset('balanced')}
+              className="px-3 py-1.5 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
+              Balanced Preset
+            </button>
+          </HoverTip>
+          <HoverTip text="Looser liquidity/age thresholds ($10k+ liq, 15m+ age) with higher max exposure and wider profit targets.">
+            <button
+              type="button"
+              onClick={() => void handleApplyPreset('aggressive')}
+              className="px-3 py-1.5 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
+              Aggressive Preset
+            </button>
+          </HoverTip>
         </div>
       </div>
 
@@ -195,20 +204,23 @@ export function PipelineConfigView() {
               Adjust core rules below to allow micro-caps, new launches, or stricter safety gates.
             </p>
           </div>
-          <button
-            type="submit"
-            disabled={saving}
-            className="px-4 py-2 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white inline-flex items-center gap-1.5 disabled:opacity-50"
-          >
-            <Save className="w-3.5 h-3.5" />
-            <span>{saving ? 'Saving Rules…' : 'Save Pipeline Rules'}</span>
-          </button>
+          <HoverTip text="Save these pipeline thresholds immediately to the backend and refresh Scanner evaluation gates.">
+            <button
+              type="submit"
+              disabled={saving}
+              className="px-4 py-2 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white inline-flex items-center gap-1.5 disabled:opacity-50"
+            >
+              <Save className="w-3.5 h-3.5" />
+              <span>{saving ? 'Saving Rules…' : 'Save Pipeline Rules'}</span>
+            </button>
+          </HoverTip>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
+            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center">
               Min Liquidity ($) · Unlimited
+              <InfoTooltip text="Minimum USD liquidity required in a pool before buying. Higher liquidity prevents extreme buy/sell slippage." />
             </label>
             <input
               type="number"
@@ -222,8 +234,9 @@ export function PipelineConfigView() {
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
+            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center">
               Default Min Pool Age (Minutes)
+              <InfoTooltip text="Minimum minutes a pool must exist before entry (used when Custom Age Window and New Launches Only are unchecked)." />
             </label>
             <input
               type="number"
@@ -236,8 +249,9 @@ export function PipelineConfigView() {
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
+            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center">
               Max Top-10 Non-Pool Holders (%)
+              <InfoTooltip text="Maximum percentage of token supply allowed in the top 10 wallets (excluding AMM pools/burn addresses) to avoid whale dumps." />
             </label>
             <div className="flex items-center gap-2">
               <input
@@ -250,20 +264,23 @@ export function PipelineConfigView() {
                 className="w-full px-3.5 py-2 rounded-xl font-mono text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 disabled:opacity-40"
               />
             </div>
-            <label className="flex items-center gap-2 pt-1 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={enforceTop10}
-                onChange={(e) => setEnforceTop10(e.target.checked)}
-                className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
-              />
-              <span className="text-[11px] text-slate-600 dark:text-slate-400">Enforce Top-10 Holder Rule</span>
-            </label>
+            <HoverTip text="Uncheck to skip top-10 wallet concentration rejection during security audits.">
+              <label className="flex items-center gap-2 pt-1 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={enforceTop10}
+                  onChange={(e) => setEnforceTop10(e.target.checked)}
+                  className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                />
+                <span className="text-[11px] text-slate-600 dark:text-slate-400">Enforce Top-10 Holder Rule</span>
+              </label>
+            </HoverTip>
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
+            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center">
               Min Quality Score {enforceScores ? '(50–100)' : '(Disabled)'}
+              <InfoTooltip text="Minimum 0–100 safety & structural quality score (liquidity depth, RugCheck score, LP lock, holder distribution)." />
             </label>
             <input
               type="number"
@@ -277,8 +294,9 @@ export function PipelineConfigView() {
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
+            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center">
               Min Trade Score {enforceScores ? '(50–100)' : '(Disabled)'}
+              <InfoTooltip text="Minimum 0–100 trade opportunity score measuring 5m/1h momentum, buyer dominance, volume-to-liquidity turnover, and pool regime." />
             </label>
             <input
               type="number"
@@ -292,28 +310,32 @@ export function PipelineConfigView() {
           </div>
 
           <div className="space-y-2 flex flex-col justify-center">
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={enforceScores}
-                onChange={(e) => setEnforceScores(e.target.checked)}
-                className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
-              />
-              <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                Enforce Quality &amp; Trade Score Thresholds
-              </span>
-            </label>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={newLaunchOnly}
-                onChange={(e) => setNewLaunchOnly(e.target.checked)}
-                className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
-              />
-              <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                New Launches Only Mode (5s–300s window)
-              </span>
-            </label>
+            <HoverTip text="When checked, coins below Min Quality or Min Trade score are rejected. Uncheck to trade any coin passing Hard Filters + Security.">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={enforceScores}
+                  onChange={(e) => setEnforceScores(e.target.checked)}
+                  className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                />
+                <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                  Enforce Quality &amp; Trade Score Thresholds
+                </span>
+              </label>
+            </HoverTip>
+            <HoverTip text="Restricts discovery and entry to brand-new launches in the 5s–300s age window instead of established pools.">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={newLaunchOnly}
+                  onChange={(e) => setNewLaunchOnly(e.target.checked)}
+                  className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                />
+                <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                  New Launches Only Mode (5s–300s window)
+                </span>
+              </label>
+            </HoverTip>
           </div>
         </div>
       </form>

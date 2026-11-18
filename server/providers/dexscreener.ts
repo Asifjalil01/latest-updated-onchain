@@ -10,9 +10,13 @@ interface DexScreenerPair {
   quoteToken?: { address?: string; symbol?: string };
   priceNative?: string;
   priceUsd?: string;
-  txns?: { h24?: { buys?: number; sells?: number }; h1?: { buys?: number; sells?: number } };
-  volume?: { h24?: number; h1?: number };
-  priceChange?: { h1?: number; h24?: number };
+  txns?: {
+    h24?: { buys?: number; sells?: number };
+    h1?: { buys?: number; sells?: number };
+    m5?: { buys?: number; sells?: number };
+  };
+  volume?: { h24?: number; h1?: number; m5?: number };
+  priceChange?: { m5?: number; h1?: number; h24?: number };
   liquidity?: { usd?: number };
   fdv?: number;
   pairCreatedAt?: number;
@@ -80,6 +84,16 @@ export class DexScreenerProvider {
     // Estimate unique traders conservatively when DexScreener omits distinct maker count
     const estimatedUniqueTraders = Math.round(txCount24h * 0.55);
 
+    const buys5m = pair.txns?.m5?.buys !== undefined ? Number(pair.txns.m5.buys) : undefined;
+    const sells5m = pair.txns?.m5?.sells !== undefined ? Number(pair.txns.m5.sells) : undefined;
+    const buys1h = pair.txns?.h1?.buys !== undefined ? Number(pair.txns.h1.buys) : undefined;
+    const sells1h = pair.txns?.h1?.sells !== undefined ? Number(pair.txns.h1.sells) : undefined;
+    const rawM5Change = pair.priceChange?.m5;
+    const priceChange5mPct =
+      rawM5Change !== undefined && rawM5Change !== null && Number.isFinite(Number(rawM5Change))
+        ? Number(rawM5Change)
+        : undefined;
+
     return {
       mint: pair.baseToken.address,
       symbol: pair.baseToken.symbol || 'UNKNOWN',
@@ -97,8 +111,13 @@ export class DexScreenerProvider {
       buys24h,
       sells24h,
       uniqueTraders24h: estimatedUniqueTraders,
+      priceChange5mPct,
       priceChange1hPct: Number(pair.priceChange?.h1 ?? NaN),
       priceChange24hPct: Number(pair.priceChange?.h24 ?? NaN),
+      buys5m,
+      sells5m,
+      buys1h,
+      sells1h,
       rawUpdatedAtMs: Date.now(),
     };
   }
