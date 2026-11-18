@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { DEFAULT_SETTINGS, validateSettingsUpdate } from '../config/defaults';
 import { snapshotExitParams } from '../engine/fees';
+import { resolveTrailingAllowedDrop } from '../engine/exits';
 import type {
   BotSettings,
   ExecutionMode,
@@ -493,10 +494,21 @@ export class BotDatabase {
   syncOpenPositionsExitParams(mode: ExecutionMode, settings: BotSettings): number {
     const openPositions = this.getPositions(mode, false);
     let count = 0;
-    const stmt = this.db.prepare('UPDATE positions SET exit_params_json = ? WHERE id = ?');
+    const stmt = this.db.prepare(
+      'UPDATE positions SET exit_params_json = ?, trailing_armed = ?, trailing_floor_pct = ? WHERE id = ?'
+    );
     for (const pos of openPositions) {
       const snap = snapshotExitParams(settings, pos.exitParams?.roundTripCostPct ?? 1.5);
-      stmt.run(JSON.stringify(snap), pos.id);
+      let nextArmed = 0;
+      let nextFloor: number | null = null;
+      if (snap.trailingEnabled) {
+        const allowedDrop = resolveTrailingAllowedDrop(pos.peakPnlPct, snap.trailingLadder);
+        if (allowedDrop !== null) {
+          nextArmed = 1;
+          nextFloor = pos.peakPnlPct - allowedDrop;
+        }
+      }
+      stmt.run(JSON.stringify(snap), nextArmed, nextFloor, pos.id);
       count += 1;
     }
     return count;

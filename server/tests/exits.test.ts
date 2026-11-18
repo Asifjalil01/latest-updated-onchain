@@ -331,3 +331,78 @@ test('exits: stepped trailing profit lock arms at user tier #1 (+1.2% -> 0.8% fl
   assert.equal(exitRes.reason, 'TRAILING_STOP');
   assert.ok(exitRes.message?.includes('Trailing stop hit'));
 });
+
+test('exits: disabling Stepped Trailing Ladder follows Take-Profit only and sync clears/updates open positions', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssb-exits-sync-'));
+  const db = new BotDatabase(path.join(tmpDir, 'test.db'));
+  try {
+    // 1. Open position initially with trailing enabled and peak +5.2% (past Tier #1 +1.2%)
+    const pos = makePosition({
+      peakPriceUsd: 1.052,
+      peakPnlPct: 5.2,
+      trailingArmed: false,
+      trailingFloorPct: null,
+      exitParams: {
+        ...snapshotExitParams(DEFAULT_SETTINGS, 1.5),
+        trailingEnabled: true,
+        takeProfitPct: 18,
+        trailingLadder: [
+          { peakGainPct: 1.2, allowedDropPct: 0.4 },
+          { peakGainPct: 5.0, allowedDropPct: 0.2 },
+          { peakGainPct: 6.0, allowedDropPct: 0.2 },
+        ],
+      },
+    });
+    db.upsertPosition(pos);
+
+    // Syncing with trailingEnabled=true immediately locks Tier #2 (+5.0% -> 5.2 - 0.2 = 5.0%)
+    db.syncOpenPositionsExitParams('paper', {
+      ...DEFAULT_SETTINGS,
+      trailingEnabled: true,
+      takeProfitPct: 18,
+      trailingLadder: [
+        { peakGainPct: 1.2, allowedDropPct: 0.4 },
+        { peakGainPct: 5.0, allowedDropPct: 0.2 },
+        { peakGainPct: 6.0, allowedDropPct: 0.2 },
+      ],
+    });
+    const armedPos = db.getPositionById(pos.id)!;
+    assert.equal(armedPos.trailingArmed, true);
+    assert.ok(armedPos.trailingFloorPct !== null && Math.abs(armedPos.trailingFloorPct - 5.0) < 0.01);
+
+    // 2. Disable Stepped Trailing Ladder and Stop-Loss, leave only Take-Profit 18%
+    db.syncOpenPositionsExitParams('paper', {
+      ...DEFAULT_SETTINGS,
+      stopLossEnabled: false,
+      trailingEnabled: false,
+      takeProfitPct: 18,
+    });
+    const tpOnlyPos = db.getPositionById(pos.id)!;
+    assert.equal(tpOnlyPos.exitParams.trailingEnabled, false);
+    assert.equal(tpOnlyPos.exitParams.stopLossEnabled, false);
+    assert.equal(tpOnlyPos.trailingArmed, false);
+    assert.equal(tpOnlyPos.trailingFloorPct, null);
+
+    // Pullback from +5.2% down to +1.0% must NOT trigger TRAILING_STOP when trailing is disabled
+    const pullback = evaluatePositionExit(tpOnlyPos, {
+      currentPriceUsd: 1.01,
+      currentLiquidityUsd: 100_000,
+      nowMs: tpOnlyPos.openedAtMs + 60_000,
+    });
+    assert.equal(pullback.shouldExit, false);
+    assert.equal(pullback.updatedTrailingArmed, false);
+    assert.equal(pullback.updatedTrailingFloorPct, null);
+
+    // Reaching +18% triggers TAKE_PROFIT
+    const atTp = evaluatePositionExit(tpOnlyPos, {
+      currentPriceUsd: 1.18,
+      currentLiquidityUsd: 100_000,
+      nowMs: tpOnlyPos.openedAtMs + 70_000,
+    });
+    assert.equal(atTp.shouldExit, true);
+    assert.equal(atTp.reason, 'TAKE_PROFIT');
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

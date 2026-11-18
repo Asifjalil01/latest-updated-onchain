@@ -2,6 +2,21 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.16.0 — Disabled Stepped Trailing Ladder Take-Profit-Only Mode & Dynamic Next-Tier Progress Target
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Take-Profit-Only Mode When Stepped Trailing Ladder Is Disabled (`exits.ts`, `db.ts`, `PositionsView.tsx`, `SettingsView.tsx`)**:
+  - When **Stepped Trailing Ladder** is unchecked in Settings and synced to active positions, `syncOpenPositionsExitParams` and `evaluatePositionExit` immediately clear `trailingArmed` and `trailingFloorPct` so positions exit strictly at your configured **Take-Profit (%) · Unlimited** target.
+  - Position cards and table rows now display **Profit Lock Floor: Disabled** and switch the progress bar to **Progress to Take-Profit (+X%) · Trailing Ladder Disabled**, hiding the stepped trailing tier badges when disabled.
+- **Dynamic Next-Tier Target & Locked Floor Sync (`PositionsView.tsx`, `db.ts`)**:
+  - Fixed a UI desync where the progress bar target and header still displayed `Tier #1 (+1.2%)` even when the position had already cleared earlier tiers and was actively progressing toward a higher tier (e.g., `#7: +6%`).
+  - Both the progress bar target (`Target: +6%`), header status (`Tier #6 Locked (+5.0% Floor) · Next: #7 (+6% ➔ +5.8%)`), and `Profit Lock Floor` cell now stay synchronized with the highest cleared tier and the active amber tier in progress.
+- **Changelog & Version Tracking**: Updated version to `1.16.0` in `package.json` and documented all changes in `CHANGELOG.md`.
+
+---
+
 ## v1.15.0 — Trailing Profit Lock System Fix, Settings Schema Sync, Auto-Stop Mode Switch & Wallet Private Key Parsing
 
 **Risk Warning: Trading can lose all of your money.**

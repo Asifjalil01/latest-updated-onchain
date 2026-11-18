@@ -1002,7 +1002,9 @@ export function SettingsView() {
                   className={inputClass('takeProfitPct')}
                 />
                 <span className="text-[11px] text-slate-400 block">
-                  Waits here if price clears all trailing tiers.
+                  {draft.trailingEnabled
+                    ? 'Waits here if price clears all trailing tiers.'
+                    : 'Trailing ladder disabled — exits directly at this Take-Profit %.'}
                 </span>
                 <FieldErrorPopup
                   message={fieldErrors.takeProfitPct}

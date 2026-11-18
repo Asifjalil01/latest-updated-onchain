@@ -25,6 +25,8 @@ export interface ExitEvaluationResult {
   message?: string;
 }
 
+const PNL_EPSILON = 1e-9;
+
 export function resolveTrailingAllowedDrop(
   peakGainPct: number,
   ladder: TrailingTier[]
@@ -33,7 +35,7 @@ export function resolveTrailingAllowedDrop(
   const sorted = [...ladder].sort((a, b) => a.peakGainPct - b.peakGainPct);
   let matched: TrailingTier | null = null;
   for (const tier of sorted) {
-    if (peakGainPct >= tier.peakGainPct) {
+    if (peakGainPct + PNL_EPSILON >= tier.peakGainPct) {
       matched = tier;
     }
   }
@@ -61,7 +63,7 @@ export function evaluatePositionExit(
 
   // Gap-down tracking for break-even recovery watch
   let updatedGapDownTriggered = position.gapDownTriggered;
-  if (grossPnlPct <= -Math.max(0.5, params.stopLossPct) * 0.75) {
+  if (grossPnlPct - PNL_EPSILON <= -Math.max(0.5, params.stopLossPct) * 0.75) {
     updatedGapDownTriggered = true;
   }
 
@@ -77,6 +79,9 @@ export function evaluatePositionExit(
       updatedTrailingFloorPct =
         updatedTrailingFloorPct === null ? candidateFloor : Math.max(updatedTrailingFloorPct, candidateFloor);
     }
+  } else {
+    updatedTrailingArmed = false;
+    updatedTrailingFloorPct = null;
   }
 
   const baseResult = {
@@ -136,7 +141,7 @@ export function evaluatePositionExit(
     const liqDrainPct =
       ((position.entryLiquidityUsd - telemetry.currentLiquidityUsd) / position.entryLiquidityUsd) *
       100;
-    if (liqDrainPct >= params.emergencyLiquidityDrainPct) {
+    if (liqDrainPct + PNL_EPSILON >= params.emergencyLiquidityDrainPct) {
       return {
         ...baseResult,
         shouldExit: true,
@@ -150,7 +155,7 @@ export function evaluatePositionExit(
   // 2. Hard stop-loss & tiered stop-loss rules
   if (params.stopLossEnabled) {
     const hardClampedStop = Math.max(0.5, params.stopLossPct);
-    if (grossPnlPct <= -hardClampedStop) {
+    if (grossPnlPct - PNL_EPSILON <= -hardClampedStop) {
       return {
         ...baseResult,
         shouldExit: true,
@@ -168,7 +173,7 @@ export function evaluatePositionExit(
     for (const tier of tiers) {
       if (alreadyTriggered.has(tier.triggerDropPct)) continue;
       const clampedTierDrop = Math.max(0.5, tier.triggerDropPct);
-      if (grossPnlPct <= -clampedTierDrop) {
+      if (grossPnlPct - PNL_EPSILON <= -clampedTierDrop) {
         const sellFraction = Math.min(1, Math.max(0.01, tier.sellPct / 100));
         return {
           ...baseResult,
@@ -184,7 +189,7 @@ export function evaluatePositionExit(
   }
 
   // 3. Take-profit
-  if (grossPnlPct >= params.takeProfitPct) {
+  if (grossPnlPct + PNL_EPSILON >= params.takeProfitPct) {
     return {
       ...baseResult,
       shouldExit: true,
@@ -199,7 +204,7 @@ export function evaluatePositionExit(
     params.trailingEnabled &&
     updatedTrailingArmed &&
     updatedTrailingFloorPct !== null &&
-    grossPnlPct <= updatedTrailingFloorPct
+    grossPnlPct - PNL_EPSILON <= updatedTrailingFloorPct
   ) {
     return {
       ...baseResult,

@@ -323,15 +323,35 @@ export function PositionsView() {
                     <span className="text-[11px] font-sans text-slate-500 block">
                       Profit Lock Floor
                     </span>
-                    {pos.trailingArmed && pos.trailingFloorPct !== null ? (
-                      <span className="text-emerald-500 dark:text-emerald-400 font-bold">
-                        +{pos.trailingFloorPct.toFixed(1)}% (Locked)
-                      </span>
-                    ) : (
-                      <span className="text-slate-500">
-                        Pending (Arms at +{pos.exitParams?.trailingLadder?.[0]?.peakGainPct ?? 1.2}%)
-                      </span>
-                    )}
+                    {(() => {
+                      const trailingEnabled = pos.exitParams?.trailingEnabled !== false;
+                      if (!trailingEnabled) {
+                        return <span className="text-slate-500">Disabled</span>;
+                      }
+                      const ladder = pos.exitParams?.trailingLadder || [];
+                      let activeIdx = -1;
+                      for (let i = ladder.length - 1; i >= 0; i--) {
+                        if (pos.peakPnlPct >= ladder[i].peakGainPct) {
+                          activeIdx = i;
+                          break;
+                        }
+                      }
+                      const floorVal =
+                        pos.trailingFloorPct ??
+                        (activeIdx >= 0 ? pos.peakPnlPct - ladder[activeIdx].allowedDropPct : null);
+                      if ((pos.trailingArmed || activeIdx >= 0) && floorVal !== null) {
+                        return (
+                          <span className="text-emerald-500 dark:text-emerald-400 font-bold">
+                            +{floorVal.toFixed(1)}% (Locked)
+                          </span>
+                        );
+                      }
+                      return (
+                        <span className="text-slate-500">
+                          Pending (Arms at +{ladder[0]?.peakGainPct ?? 1.2}%)
+                        </span>
+                      );
+                    })()}
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block">Peak / SL / TP</span>
@@ -341,13 +361,50 @@ export function PositionsView() {
 
                 {/* Trailing Profit Lock System & Progress Bar */}
                 {(() => {
+                  const trailingEnabled = pos.exitParams?.trailingEnabled !== false;
+                  const isLoss = grossPct < 0;
+
+                  if (!trailingEnabled) {
+                    const tpPct = Math.max(0.1, pos.exitParams.takeProfitPct);
+                    const tpProgressPct = Math.min(100, Math.max(0, (grossPct / tpPct) * 100));
+                    return (
+                      <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800/70">
+                        <div className="flex flex-wrap items-center justify-between text-[11px] font-mono gap-1">
+                          <span className="text-slate-500 font-sans">
+                            Progress to Take-Profit (+{pos.exitParams.takeProfitPct}%) · Trailing Ladder Disabled
+                          </span>
+                          <span className={`font-semibold ${isLoss ? 'text-rose-500' : 'text-emerald-500 dark:text-emerald-400'}`}>
+                            {grossPct >= 0 ? `+${grossPct.toFixed(2)}%` : `${grossPct.toFixed(2)}%`} (Target: +{pos.exitParams.takeProfitPct}%)
+                          </span>
+                        </div>
+
+                        <div className="h-2 w-full rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all duration-500 ${
+                              isLoss
+                                ? 'bg-rose-500'
+                                : 'bg-gradient-to-r from-teal-500 to-emerald-400'
+                            }`}
+                            style={{ width: `${isLoss ? Math.min(100, Math.max(4, Math.abs(grossPct) * 5)) : Math.max(4, tpProgressPct)}%` }}
+                          />
+                        </div>
+
+                        <div className="flex flex-wrap items-center justify-between text-[10px] text-slate-500 pt-1">
+                          <span className="font-semibold uppercase tracking-wider">Stepped Trailing Profit Lock</span>
+                          <span className="font-mono text-slate-400">
+                            Disabled — Exiting at Take-Profit (+{pos.exitParams.takeProfitPct}%)
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  }
+
                   const ladder = pos.exitParams?.trailingLadder || [];
                   const firstTier = ladder[0];
                   const firstTierPeak = firstTier ? firstTier.peakGainPct : 20;
                   const firstTierFloor = firstTier ? (firstTier.peakGainPct - firstTier.allowedDropPct) : 17;
-                  const isArmed = pos.trailingArmed && pos.trailingFloorPct !== null;
 
-                  // Find highest tier reached
+                  // Find highest tier reached based on peakPnlPct
                   let activeTierIndex = -1;
                   for (let i = ladder.length - 1; i >= 0; i--) {
                     if (pos.peakPnlPct >= ladder[i].peakGainPct) {
@@ -356,26 +413,32 @@ export function PositionsView() {
                     }
                   }
 
+                  const hasPassedTier = activeTierIndex >= 0;
                   const nextTierIndex = activeTierIndex + 1;
                   const nextTier = nextTierIndex < ladder.length ? ladder[nextTierIndex] : null;
-                  const targetPeak = isArmed
+                  const effectiveFloorPct = hasPassedTier
+                    ? (pos.trailingFloorPct ?? (pos.peakPnlPct - ladder[activeTierIndex].allowedDropPct))
+                    : pos.trailingFloorPct;
+                  const effectiveArmed = (pos.trailingArmed || hasPassedTier) && effectiveFloorPct !== null;
+
+                  const targetPeak = hasPassedTier
                     ? (nextTier ? nextTier.peakGainPct : pos.exitParams.takeProfitPct)
                     : firstTierPeak;
 
-                  const isLoss = grossPct < 0;
-                  const armedSpan = Math.max(0.1, targetPeak - (pos.trailingFloorPct ?? 0));
-                  const progressPct = isArmed
-                    ? Math.min(100, Math.max(0, ((grossPct - (pos.trailingFloorPct ?? 0)) / armedSpan) * 100))
+                  const baseFloor = effectiveArmed && effectiveFloorPct !== null ? effectiveFloorPct : 0;
+                  const armedSpan = Math.max(0.1, targetPeak - baseFloor);
+                  const progressPct = effectiveArmed
+                    ? Math.min(100, Math.max(0, ((grossPct - baseFloor) / armedSpan) * 100))
                     : Math.min(100, Math.max(0, (grossPct / Math.max(0.1, targetPeak)) * 100));
 
                   return (
                     <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800/70">
                       <div className="flex flex-wrap items-center justify-between text-[11px] font-mono gap-1">
                         <span className="text-slate-500 font-sans">
-                          {isArmed
+                          {effectiveArmed && effectiveFloorPct !== null
                             ? (nextTier
-                                ? `Profit Lock Active (+${pos.trailingFloorPct?.toFixed(1)}% Floor) · Aiming for Tier #${nextTierIndex + 1} (+${nextTier.peakGainPct}%)`
-                                : `Profit Lock Active (+${pos.trailingFloorPct?.toFixed(1)}% Floor) · All Tiers Cleared! Aiming for TP (+${pos.exitParams.takeProfitPct}%)`)
+                                ? `Progress to Profit Lock Tier #${nextTierIndex + 1} (Peak +${nextTier.peakGainPct}%)`
+                                : `All Tiers Cleared · Progress to TP (+${pos.exitParams.takeProfitPct}%)`)
                             : `Progress to Profit Lock Tier #1 (Peak +${firstTierPeak}%)`}
                         </span>
                         <span className={`font-semibold ${isLoss ? 'text-rose-500' : 'text-emerald-500 dark:text-emerald-400'}`}>
@@ -388,7 +451,7 @@ export function PositionsView() {
                           className={`h-full rounded-full transition-all duration-500 ${
                             isLoss
                               ? 'bg-rose-500'
-                              : isArmed
+                              : effectiveArmed
                                 ? 'bg-gradient-to-r from-teal-500 to-emerald-400'
                                 : 'bg-sky-500'
                           }`}
@@ -402,8 +465,8 @@ export function PositionsView() {
                           <div className="flex flex-wrap items-center justify-between text-[10px] text-slate-500 gap-1">
                             <span className="font-semibold uppercase tracking-wider">Your Stepped Trailing Profit Lock System</span>
                             <span className="font-mono text-emerald-500 dark:text-emerald-400 font-medium">
-                              {isArmed
-                                ? `Tier #${activeTierIndex + 1} Locked Floor: +${pos.trailingFloorPct?.toFixed(1)}% ${nextTier ? `➔ Target: Tier #${nextTierIndex + 1} (+${nextTier.peakGainPct}%)` : '➔ All Tiers Hit!'}`
+                              {effectiveArmed && effectiveFloorPct !== null
+                                ? `Tier #${activeTierIndex + 1} Locked (+${effectiveFloorPct.toFixed(1)}% Floor) ${nextTier ? `· Next: #${nextTierIndex + 1} (+${nextTier.peakGainPct}% ➔ +${(nextTier.peakGainPct - nextTier.allowedDropPct).toFixed(1)}%)` : '· All Tiers Hit!'}`
                                 : `Arms at Peak +${firstTierPeak}% ➔ Locks +${firstTierFloor.toFixed(1)}% Floor`}
                             </span>
                           </div>
@@ -535,7 +598,9 @@ export function PositionsView() {
                       />
                     </td>
                     <td className="py-3 px-4 text-right font-mono tabular-nums">
-                      {pos.trailingArmed && pos.trailingFloorPct !== null ? (
+                      {pos.exitParams?.trailingEnabled === false ? (
+                        <span className="text-slate-500 text-xs">Disabled</span>
+                      ) : pos.trailingArmed && pos.trailingFloorPct !== null ? (
                         <span className="text-emerald-500 dark:text-emerald-400 font-bold">
                           +{pos.trailingFloorPct.toFixed(1)}% (Locked)
                         </span>
