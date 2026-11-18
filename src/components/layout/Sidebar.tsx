@@ -51,9 +51,14 @@ export function Sidebar({
           {!sidebarCollapsed && (
             <div className="flex items-center gap-2.5 min-w-0">
               <BarChart3 className="w-5 h-5 text-teal-500 shrink-0" aria-hidden="true" />
-              <span className="font-display font-bold text-base tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap">
-                Solana Spot Bot
-              </span>
+              <div className="min-w-0 leading-tight">
+                <span className="font-display font-bold text-base tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap block">
+                  Solana Spot Bot
+                </span>
+                <span className="font-mono text-[10px] font-semibold text-teal-600 dark:text-teal-400">
+                  v{__APP_VERSION__}
+                </span>
+              </div>
             </div>
           )}
           <button
@@ -111,6 +116,12 @@ export function Sidebar({
 
       {!sidebarCollapsed && (
         <div className="px-4 pt-4 border-t border-slate-200 dark:border-slate-800/80 text-xs text-slate-500 dark:text-slate-400 space-y-1.5">
+          <div className="flex items-center justify-between font-mono tabular-nums">
+            <span>Version</span>
+            <span className="font-semibold text-teal-600 dark:text-teal-400">
+              v{__APP_VERSION__}
+            </span>
+          </div>
           <div className="flex items-center justify-between font-mono tabular-nums">
             <span>Mode</span>
             <span className="font-semibold text-slate-800 dark:text-slate-200 uppercase">

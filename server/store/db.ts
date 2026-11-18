@@ -709,6 +709,19 @@ export class BotDatabase {
     this.db.prepare('DELETE FROM seen_tokens').run();
   }
 
+  clearScoreStageRejections(): number {
+    const tx = this.db.transaction(() => {
+      const delSeen = this.db
+        .prepare(
+          "DELETE FROM seen_tokens WHERE last_reason LIKE '[SCORE]%' OR (last_decision = 'REJECT' AND last_reason LIKE '%threshold%')"
+        )
+        .run();
+      const delRej = this.db.prepare("DELETE FROM rejections WHERE stage = 'SCORE'").run();
+      return (delSeen.changes || 0) + (delRej.changes || 0);
+    });
+    return tx();
+  }
+
   insertRejection(rej: Omit<RejectionRecord, 'id'>): RejectionRecord {
     const info = this.db
       .prepare(

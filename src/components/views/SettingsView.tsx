@@ -1079,6 +1079,14 @@ export function SettingsView() {
                 />
                 <span>Slot Rotation</span>
               </label>
+              <label className="inline-flex items-center gap-2 py-1">
+                <input
+                  type="checkbox"
+                  checked={draft.autoReclaimRent}
+                  onChange={(e) => updateField('autoReclaimRent', e.target.checked)}
+                />
+                <span>Auto-Reclaim ATA Rent on 100% Sell (+0.00204 SOL)</span>
+              </label>
             </div>
             <FieldErrorPopup
               message={fieldErrors.trailingEnabled}
@@ -1293,6 +1301,7 @@ export function SettingsView() {
                   }
                   className="w-full px-3 py-2 rounded-xl text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
                 >
+                  <option value="auto">Auto · Live Jupiter / Network (Adaptive)</option>
                   <option value="standard">Standard (0.0001 SOL)</option>
                   <option value="high">High (0.0005 SOL)</option>
                   <option value="ultra">Ultra (0.0015 SOL)</option>

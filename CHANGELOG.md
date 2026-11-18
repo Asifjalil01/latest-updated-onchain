@@ -2,6 +2,24 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.17.0 — Auto Jupiter Route/Priority Fees, Verified TP Quotes, Disabled Score Gate Sync & App Version Display
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Auto Jupiter Route Fee Extraction, Adaptive Priority Fees & ATA Rent Reclaim (`jupiter.ts`, `fees.ts`, `paperEngine.ts`, `liveEngine.ts`, `HistoryView.tsx`, `SettingsView.tsx`)**:
+  - Added **Auto · Live Jupiter / Network (Adaptive)** priority fee preset (default) querying recent Solana prioritization fee percentiles (`getRecentPrioritizationFees`) capped safely by `maxPriorityFeeSol`.
+  - Parsed real DEX AMM route pool fees (`routePlan[].swapInfo`), Jupiter platform fees, and route AMM labels directly from Jupiter quotes, eliminating double-subtraction of LP fees already netted inside `quote.outAmount`.
+  - Enabled **Auto-Reclaim ATA Rent on 100% Sell (+0.00204 SOL)** by default so full position exits reclaim the rent deposit instead of wiping out profit on 0.02–0.05 SOL trades, with full itemized Jupiter route/fee/rent breakdown shown in **History & Analytics**.
+- **Executable Jupiter Sell Quote Verification Before TP/Trailing Exits (`pipeline.ts`)**:
+  - `TAKE_PROFIT` and `TRAILING_STOP` triggers now verify against a live executable Jupiter sell quote (`getQuote`) before selling, preventing phantom spot-tick spikes (e.g. `+18%` spike closing at `+6.7%` and losing after fees) from triggering premature exits.
+- **Disabled Min Quality / Trade Score Gate Synchronization (`scoring.ts`, `db.ts`, `api.ts`, `ScannerView.tsx`, `PipelineConfigView.tsx`)**:
+  - When **Min Quality / Trade Score** (`enforceMinScores`) is unchecked, `SCORE` gate rejections are completely bypassed (including filter+security-approved `high_risk_micro` promotions), stale `[SCORE]` rejections in `seen_tokens` / `rejections` are automatically cleared on save, `PipelineConfigView` syncs immediately with Settings, and **Scanner** displays a clear **Score Gate: Disabled (Bypassed)** indicator.
+- **Visible App Version Badge & Footer (`vite.config.ts`, `Sidebar.tsx`, `App.tsx`, `api.ts`)**:
+  - Exposed the build version from `package.json` (`v1.17.0`) in the sidebar header, sidebar footer card, app footer, and `/api/health`.
+
+---
+
 ## v1.16.0 — Disabled Stepped Trailing Ladder Take-Profit-Only Mode & Dynamic Next-Tier Progress Target
 
 **Risk Warning: Trading can lose all of your money.**

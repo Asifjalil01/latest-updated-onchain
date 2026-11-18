@@ -2,7 +2,7 @@ export type ExecutionMode = 'paper' | 'testnet' | 'live';
 export type BotRunState = 'stopped' | 'running' | 'killing';
 export type TokenClass = 'bluechip' | 'mid_cap' | 'early_stage' | 'meme' | 'high_risk_micro';
 export type ConfirmationLabel = 'confirmed' | 'simulated' | 'est.';
-export type PriorityFeePreset = 'standard' | 'high' | 'ultra' | 'custom';
+export type PriorityFeePreset = 'auto' | 'standard' | 'high' | 'ultra' | 'custom';
 export type LogSeverity = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR' | 'CRITICAL';
 
 export type ExitReason =
@@ -236,6 +236,10 @@ export interface FeeBreakdown {
   jupiterPlatformFeeSol: number;
   ataRentSol: number;
   tokenTaxSol: number;
+  walletOutFeeSol: number;
+  routeLabels?: string[];
+  priorityFeeSource?: 'jupiter_auto' | 'rpc_recent' | 'preset' | 'custom';
+  rentReclaimedSol?: number;
   totalSol: number;
 }
 

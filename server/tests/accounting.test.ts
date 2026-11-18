@@ -5,8 +5,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { Keypair } from '@solana/web3.js';
 import { DEFAULT_SETTINGS } from '../config/defaults';
-import { ATA_RENT_SOL, computeEntryFees, SOLANA_BASE_FEE_SOL } from '../engine/fees';
+import {
+  ATA_RENT_SOL,
+  computeEntryFees,
+  computeExitFees,
+  extractRouteDexFeeSol,
+  extractRouteLabels,
+  resolvePriorityFeeSol,
+  SOLANA_BASE_FEE_SOL,
+} from '../engine/fees';
 import { LiveExecutionEngine, type LiveTxAdapter } from '../engine/liveEngine';
+import { executeRealisticPaperBuy, executeRealisticPaperSell } from '../engine/paperEngine';
 import { BotDatabase } from '../store/db';
 import { ServerSignerManager } from '../security/signer';
 import type { SolanaRpcPool } from '../providers/rpcPool';
@@ -174,4 +183,190 @@ test('accounting: entry price comes from real SOL spent in parsed transaction an
     db.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('accounting: extracts Jupiter routePlan DEX LP fees, adaptive auto priority fee, and reclaims ATA rent on 100% TP sell', async () => {
+  const quoteWithRoute: JupiterQuoteResponse = {
+    inputMint: WSOL_MINT,
+    outputMint: 'Acrux11111111111111111111111111111111111111',
+    inAmount: String(20_000_000), // 0.02 SOL
+    outAmount: String(113_000_000_000),
+    slippageBps: 500,
+    priceImpactPct: '0.25',
+    routePlan: [
+      {
+        percent: 100,
+        swapInfo: {
+          label: 'Raydium CLMM',
+          inputMint: WSOL_MINT,
+          outputMint: 'Acrux11111111111111111111111111111111111111',
+          inAmount: '20000000',
+          outAmount: '113000000000',
+          feeAmount: '50000', // 0.00005 SOL in WSOL
+          feeMint: WSOL_MINT,
+        },
+      },
+    ],
+  };
+
+  assert.equal(extractRouteDexFeeSol(quoteWithRoute, 0.02), 0.00005);
+  assert.deepEqual(extractRouteLabels(quoteWithRoute), ['Raydium CLMM']);
+
+  const autoSettings = {
+    ...DEFAULT_SETTINGS,
+    priorityFeePreset: 'auto' as const,
+    maxPriorityFeeSol: 0.002,
+    autoReclaimRent: true,
+    paperDelayMinSec: 0,
+    paperDelayMaxSec: 0,
+    paperBuyFailChancePct: 0,
+    paperSellFailChancePct: 0,
+    paperCompetitionPenaltyPct: 0,
+  };
+
+  assert.equal(resolvePriorityFeeSol(autoSettings, 0.00018), 0.00018);
+  assert.equal(resolvePriorityFeeSol(autoSettings, 0.01), 0.002); // capped at maxPriorityFeeSol
+
+  const entryFees = computeEntryFees({
+    solAmount: 0.02,
+    settings: autoSettings,
+    quote: quoteWithRoute,
+    needsAtaRent: true,
+    liveAutoPriorityFeeSol: 0.0001,
+    priorityFeeSource: 'jupiter_auto',
+  });
+  // walletOutFeeSol must NOT double-count LP fee when quote is present
+  assert.ok(Math.abs(entryFees.walletOutFeeSol - (SOLANA_BASE_FEE_SOL + 0.0001)) < 1e-9);
+  assert.equal(entryFees.dexFeeSol, 0.00005);
+
+  const token: CandidateToken = {
+    mint: 'Acrux11111111111111111111111111111111111111',
+    symbol: 'ACRUX',
+    name: 'Acrux',
+    source: 'dexscreener',
+    dex: 'raydium',
+    pairAddress: 'PairAcrux1111111111111111111111111111111111',
+    poolCreatedAtMs: 1_759_990_000_000,
+    priceUsd: 0.000177,
+    priceSol: 0.000177 / 75,
+    liquidityUsd: 40_000,
+    volume24hUsd: 80_000,
+    fdvUsd: 300_000,
+    txCount24h: 300,
+    buys24h: 190,
+    sells24h: 110,
+    uniqueTraders24h: 120,
+    priceChange1hPct: 12,
+    priceChange24hPct: 24,
+    tokenDecimals: 6,
+    rawUpdatedAtMs: 1_760_000_000_000,
+  };
+
+  const explanation: ExplanationRecord = {
+    mint: token.mint,
+    symbol: token.symbol,
+    tokenClass: 'meme',
+    qualityScore: 80,
+    tradeScore: 78,
+    combinedScore: 79,
+    sizeMultiplier: 1,
+    decision: 'BUY',
+    reasons: [],
+    warnings: [],
+    qualityBreakdown: {},
+    tradeBreakdown: {},
+    evaluatedAtMs: 1_760_000_000_000,
+  };
+
+  const buyRes = await executeRealisticPaperBuy({
+    mode: 'paper',
+    token,
+    solAmount: 0.02,
+    solPriceUsd: 75,
+    settings: autoSettings,
+    explanation,
+    initialQuote: quoteWithRoute,
+    measuredLiveGapPct: 0,
+    liveAutoPriorityFeeSol: 0.0001,
+    priorityFeeSource: 'jupiter_auto',
+    nowMs: 1_760_000_000_000,
+    hooks: {
+      random: () => 0.5,
+      sleepMs: async () => undefined,
+      sampleBuyWindow: async () => ({
+        priceUsd: 0.000177,
+        liquidityUsd: 40_000,
+        quote: quoteWithRoute,
+      }),
+    },
+  });
+  assert.equal(buyRes.executed, true);
+  assert.ok(buyRes.position);
+
+  // Simulate +18% Take-Profit exit on 0.02 SOL position with autoReclaimRent: true
+  const rawUnits = Math.floor(buyRes.position.quantity * 10 ** 6);
+  const tpSolOutLamports = Math.floor(0.02 * 1.18 * 1e9); // 0.0236 SOL out
+  const sellQuote: JupiterQuoteResponse = {
+    inputMint: token.mint,
+    outputMint: WSOL_MINT,
+    inAmount: String(rawUnits),
+    outAmount: String(tpSolOutLamports),
+    slippageBps: 500,
+    priceImpactPct: '0.2',
+    routePlan: [
+      {
+        percent: 100,
+        swapInfo: {
+          label: 'Raydium CLMM',
+          inputMint: token.mint,
+          outputMint: WSOL_MINT,
+          inAmount: String(rawUnits),
+          outAmount: String(tpSolOutLamports),
+          feeAmount: '59000', // 0.000059 SOL already deducted in outAmount
+          feeMint: WSOL_MINT,
+        },
+      },
+    ],
+  };
+
+  const exitFees = computeExitFees({
+    estimatedSolOut: 0.0236,
+    settings: autoSettings,
+    quote: sellQuote,
+    liveAutoPriorityFeeSol: 0.0001,
+    priorityFeeSource: 'jupiter_auto',
+  });
+  assert.equal(exitFees.dexFeeSol, 0.000059);
+
+  const sellRes = await executeRealisticPaperSell({
+    position: {
+      ...buyRes.position,
+      currentPriceUsd: buyRes.position.entryPriceUsd * 1.18,
+      peakPnlPct: 18,
+    },
+    exitReason: 'TAKE_PROFIT',
+    solPriceUsd: 75,
+    settings: autoSettings,
+    measuredLiveGapPct: 0,
+    liveAutoPriorityFeeSol: 0.0001,
+    priorityFeeSource: 'jupiter_auto',
+    nowMs: 1_760_000_060_000,
+    hooks: {
+      random: () => 0.5,
+      sleepMs: async () => undefined,
+      sampleSellWindow: async () => ({
+        priceUsd: buyRes.position!.entryPriceUsd * 1.18,
+        liquidityUsd: 40_000,
+        quote: sellQuote,
+      }),
+    },
+  });
+
+  assert.equal(sellRes.executed, true);
+  assert.ok(sellRes.trade);
+  // Rent is reclaimed on 100% sell, so net rent is 0 and +18% TP nets clearly positive SOL!
+  assert.equal(sellRes.trade.rentSol, 0);
+  assert.ok(sellRes.trade.pnlSol > 0.003, `Expected positive net P&L on +18% TP, got ${sellRes.trade.pnlSol}`);
+  assert.ok(sellRes.trade.feeBreakdownJson.includes('Raydium CLMM'));
+  assert.ok(sellRes.trade.feeBreakdownJson.includes('rentReclaimedSol'));
 });

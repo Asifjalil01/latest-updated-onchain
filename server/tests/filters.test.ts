@@ -1,8 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { DEFAULT_SETTINGS } from '../config/defaults';
 import { evaluateHardFilters, validateCandidateData } from '../engine/filters';
 import { scoreCandidate } from '../engine/scoring';
+import { BotDatabase } from '../store/db';
 import type { CandidateToken, SecurityReport } from '../types';
 
 function makeMatureCleanToken(nowMs: number): CandidateToken {
@@ -371,5 +375,136 @@ test('filters, scoring & sizing: New Launches Only (5s-300s), unlimited $0/$1 li
   });
   assert.equal(sizing.approved, true, `Unexpected sizing block: ${sizing.reason}`);
   assert.ok(sizing.solAmount > 0);
+});
+
+test('scoring & db: disabled enforceMinScores promotes high_risk_micro to meme and clearScoreStageRejections removes stale [SCORE] rows', () => {
+  const now = 1_760_000_000_000;
+  const settingsNoScoreGate = {
+    ...DEFAULT_SETTINGS,
+    minLiquidityUsd: 1_000,
+    customAgeWindowEnabled: false,
+    newLaunchOnlyEnabled: false,
+    enforceMinScores: false,
+    minQualityScore: 95,
+    minTradeScore: 95,
+  };
+
+  // Mature enough (>= 30m) and passes liquidity floor ($1k) with low volume (would fail score thresholds if enabled)
+  const lowScoreToken: CandidateToken = {
+    ...makeMatureCleanToken(now),
+    mint: 'LowScore111111111111111111111111111111111111',
+    symbol: 'LOWSC',
+    poolCreatedAtMs: now - 45 * 60_000,
+    liquidityUsd: 1_500,
+    fdvUsd: 15_000,
+    volume24hUsd: 2_000,
+    txCount24h: 25,
+    buys24h: 15,
+    sells24h: 10,
+    uniqueTraders24h: 12,
+    priceChange1hPct: 1,
+    priceChange24hPct: 1,
+  };
+
+  // Force high_risk_micro path by testing a young candidate that cleared custom/hard filter or passed filterResult directly
+  const passedFilter = evaluateHardFilters(lowScoreToken, settingsNoScoreGate, 0.4, now);
+  assert.equal(passedFilter.passed, true);
+
+  const cleanSec: SecurityReport = {
+    passed: true,
+    reasons: [],
+    warnings: [],
+    criticalFlags: [],
+    sourcesAgreed: 2,
+    mintAuthorityRevoked: true,
+    freezeAuthorityRevoked: true,
+    token2022DisallowedExtensions: [],
+    rugCheckScore: 10,
+    rugCheckRisks: [],
+    lpLockedOrBurnedPct: 95,
+    top10HoldersPct: 20,
+    singleMaxHolderPct: 5,
+    holders: [],
+    deployerFlagged: false,
+    sellRouteExists: true,
+    sellRouteImpactPct: 0.4,
+    sellTaxPct: 0,
+    tradingEnabled: true,
+  };
+
+  const youngButFilteredToken: CandidateToken = {
+    ...lowScoreToken,
+    poolCreatedAtMs: now - 20 * 60_000, // 20m old: classifyToken marks high_risk_micro when customAgeWindowEnabled is false
+  };
+  const scored = scoreCandidate({
+    token: youngButFilteredToken,
+    filterResult: { ...passedFilter, computed: { ...passedFilter.computed, poolAgeMinutes: 20 } },
+    securityReport: cleanSec,
+    settings: settingsNoScoreGate,
+    nowMs: now,
+  });
+
+  assert.equal(scored.tokenClass, 'meme');
+  assert.equal(scored.decision, 'BUY');
+  assert.ok(scored.warnings.some((w) => w.includes('score check bypassed')));
+
+  // Verify DB clears stale [SCORE] rejections while keeping HARD_FILTER rejections
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssb-score-db-'));
+  const db = new BotDatabase(path.join(tmpDir, 'test.db'));
+  try {
+    db.upsertSeenToken({
+      mint: 'ScoreRej11111111111111111111111111111111111',
+      symbol: 'SCOREREJ',
+      name: 'Score Rejected',
+      source: 'dexscreener',
+      dex: 'raydium',
+      lastScannedMs: now,
+      lastQualityScore: 52,
+      lastTradeScore: 48,
+      lastDecision: 'REJECT',
+      lastReason: '[SCORE] Trade score 48 < 55 threshold',
+      liquidityUsd: 20000,
+      priceUsd: 0.01,
+      explanationJson: '{}',
+      nowMs: now,
+    });
+    db.upsertSeenToken({
+      mint: 'FilterRej1111111111111111111111111111111111',
+      symbol: 'FILTREJ',
+      name: 'Filter Rejected',
+      source: 'dexscreener',
+      dex: 'raydium',
+      lastScannedMs: now,
+      lastQualityScore: 0,
+      lastTradeScore: 0,
+      lastDecision: 'REJECT',
+      lastReason: '[HARD_FILTER] Liquidity $500 < $25000',
+      liquidityUsd: 500,
+      priceUsd: 0.01,
+      explanationJson: '{}',
+      nowMs: now,
+    });
+    db.insertRejection({
+      mint: 'ScoreRej11111111111111111111111111111111111',
+      symbol: 'SCOREREJ',
+      source: 'dexscreener',
+      stage: 'SCORE',
+      reason: 'Trade score 48 < 55 threshold',
+      qualityScore: 52,
+      tradeScore: 48,
+      createdAtMs: now,
+      detailsJson: '{}',
+    });
+
+    const cleared = db.clearScoreStageRejections();
+    assert.equal(cleared, 2);
+    const remainingSeen = db.getSeenTokens(50);
+    assert.equal(remainingSeen.length, 1);
+    assert.equal(remainingSeen[0].symbol, 'FILTREJ');
+    assert.equal(db.getRejections(50).length, 0);
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 

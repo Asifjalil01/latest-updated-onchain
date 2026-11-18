@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import express, { type Request, type Response } from 'express';
 import { z } from 'zod';
 import { SETTINGS_PRESETS, WALLET_FEE_PROFILES } from '../config/defaults';
@@ -5,6 +7,18 @@ import { createApiTokenMiddleware, constantTimeTokenEqual } from '../auth/middle
 import { computeAnalyticsSummary } from '../engine/fees';
 import type { BotOrchestrator } from '../engine/pipeline';
 import type { BotSettings, ExecutionMode, LogSeverity, SseEventPayload } from '../types';
+
+function readPackageVersion(): string {
+  try {
+    const raw = fs.readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { version?: string };
+    return parsed.version || '1.0.0';
+  } catch {
+    return '1.0.0';
+  }
+}
+
+const APP_VERSION = readPackageVersion();
 
 const settingsPatchSchema = z
   .object({
@@ -18,7 +32,7 @@ const settingsPatchSchema = z
     allowSlotRotation: z.boolean().optional(),
     slotRotationMinScoreDelta: z.number().min(5).max(50).optional(),
     autoReclaimRent: z.boolean().optional(),
-    priorityFeePreset: z.enum(['standard', 'high', 'ultra', 'custom']).optional(),
+    priorityFeePreset: z.enum(['auto', 'standard', 'high', 'ultra', 'custom']).optional(),
     customPriorityFeeSol: z.number().min(0).max(0.05).optional(),
     maxPriorityFeeSol: z.number().min(0.0001).max(0.05).optional(),
     slippageBps: z.number().int().min(10).max(1000).optional(),
@@ -48,8 +62,8 @@ const settingsPatchSchema = z
     maxSingleHolderPct: z.number().min(1).max(20).optional(),
     maxSellRouteImpactPct: z.number().min(0.1).max(25).optional(),
     enforceMinScores: z.boolean().optional(),
-    minQualityScore: z.number().min(50).max(100).optional(),
-    minTradeScore: z.number().min(50).max(100).optional(),
+    minQualityScore: z.number().min(0).max(100).optional(),
+    minTradeScore: z.number().min(0).max(100).optional(),
     enableDexScreenerBoosts: z.boolean().optional(),
     enablePumpPortalWs: z.boolean().optional(),
     scanIntervalSeconds: z.number().int().min(10).max(600).optional(),
@@ -103,7 +117,7 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
 
   // Public health & auth setup routes
   router.get('/health', (_req: Request, res: Response) => {
-    res.json({ ok: true, mode: orchestrator.getStatusSnapshot().mode });
+    res.json({ ok: true, version: APP_VERSION, mode: orchestrator.getStatusSnapshot().mode });
   });
 
   router.get('/auth/status', (_req: Request, res: Response) => {
@@ -355,6 +369,7 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     }
 
     const { applyToOpenPositions, ...settingsPatch } = parsed.data;
+    const previous = orchestrator.db.getSettings();
     const result = orchestrator.db.updateSettings(settingsPatch as Partial<BotSettings>);
     if (!result.valid) {
       res.status(400).json({
@@ -363,6 +378,17 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
         fieldErrors: result.fieldErrors,
       });
       return;
+    }
+
+    if (previous.enforceMinScores && !result.settings.enforceMinScores) {
+      const cleared = orchestrator.db.clearScoreStageRejections();
+      if (cleared > 0) {
+        orchestrator.log(
+          'INFO',
+          'SCANNER',
+          `Cleared ${cleared} stale [SCORE] rejection entries after Min Quality / Trade Score gate was disabled.`
+        );
+      }
     }
 
     orchestrator.invalidateLiveConfirmationIfCriticalChanged(result.settings);

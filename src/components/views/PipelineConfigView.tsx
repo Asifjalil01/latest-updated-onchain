@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Sliders, ShieldCheck, CheckCircle2, AlertTriangle, Save } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 
@@ -14,6 +14,18 @@ export function PipelineConfigView() {
   const [enforceScores, setEnforceScores] = useState(settings?.enforceMinScores ?? true);
   const [newLaunchOnly, setNewLaunchOnly] = useState(settings?.newLaunchOnlyEnabled ?? false);
   const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!settings) return;
+    setMinLiquidity(settings.minLiquidityUsd);
+    setMinPoolAge(settings.minPoolAgeMinutes);
+    setMaxTop10(settings.maxTop10HoldersPct);
+    setEnforceTop10(settings.enforceMaxTop10Holders);
+    setMinQuality(settings.minQualityScore);
+    setMinTrade(settings.minTradeScore);
+    setEnforceScores(settings.enforceMinScores);
+    setNewLaunchOnly(settings.newLaunchOnlyEnabled);
+  }, [settings]);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -143,12 +155,15 @@ export function PipelineConfigView() {
           {
             stage: '05. Scored',
             desc: 'Composite grading across quality (safety, depth, holders) and trade metrics (momentum, buy ratio).',
-            defaultRule: 'Quality >= 60 and Trade Score >= 55 (when enabled)',
+            defaultRule:
+              settings?.enforceMinScores === false
+                ? 'Score Gate Disabled (Threshold checks bypassed)'
+                : `Quality >= ${settings?.minQualityScore ?? 60} and Trade Score >= ${settings?.minTradeScore ?? 55}`,
           },
           {
             stage: '06. Executed',
             desc: 'Position sizing calculations, risk budget checks, and simulated/live order routing.',
-            defaultRule: 'Max 3 open slots, 0.05 SOL trade size, daily loss limit protection',
+            defaultRule: `Max ${settings?.maxOpenPositions ?? 3} open slots, ${settings?.tradeSizeSol ?? 0.05} SOL trade size, daily loss limit protection`,
           },
         ].map((item) => (
           <div
@@ -248,11 +263,11 @@ export function PipelineConfigView() {
 
           <div className="space-y-1.5">
             <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
-              Min Quality Score (50–100)
+              Min Quality Score {enforceScores ? '(50–100)' : '(Disabled)'}
             </label>
             <input
               type="number"
-              min="50"
+              min={enforceScores ? 50 : 0}
               max="100"
               disabled={!enforceScores}
               value={minQuality}
@@ -263,11 +278,11 @@ export function PipelineConfigView() {
 
           <div className="space-y-1.5">
             <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
-              Min Trade Score (50–100)
+              Min Trade Score {enforceScores ? '(50–100)' : '(Disabled)'}
             </label>
             <input
               type="number"
-              min="50"
+              min={enforceScores ? 50 : 0}
               max="100"
               disabled={!enforceScores}
               value={minTrade}

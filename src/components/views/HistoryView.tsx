@@ -45,6 +45,33 @@ export function HistoryView() {
     return Array.from(new Set(trades.map((t) => t.exitReason)));
   }, [trades]);
 
+  const feeDetail = useMemo(() => {
+    if (!selectedTrade?.feeBreakdownJson) return null;
+    try {
+      return JSON.parse(selectedTrade.feeBreakdownJson) as {
+        entryFeesSol?: number;
+        entryRentSol?: number;
+        rentReclaimedSol?: number;
+        exitFees?: {
+          baseFeeSol?: number;
+          priorityFeeSol?: number;
+          dexFeeSol?: number;
+          jupiterPlatformFeeSol?: number;
+          tokenTaxSol?: number;
+          walletOutFeeSol?: number;
+          routeLabels?: string[];
+          priorityFeeSource?: string;
+        };
+        dexFeeSol?: number;
+        jupiterPlatformFeeSol?: number;
+        routeLabels?: string[];
+        priorityFeeSource?: string;
+      };
+    } catch {
+      return null;
+    }
+  }, [selectedTrade]);
+
   const handleArchivePaper = async () => {
     setBusy(true);
     try {
@@ -270,6 +297,9 @@ export function HistoryView() {
                           <div>{(t.feesSol + t.rentSol).toFixed(5)}</div>
                           <div className="text-[11px]">
                             {feesUsd !== null ? formatUsd(feesUsd) : '—'}
+                            {t.rentSol === 0 && t.feeBreakdownJson.includes('rentReclaimedSol') && (
+                              <span className="ml-1 text-emerald-600 dark:text-emerald-400">· Reclaimed</span>
+                            )}
                           </div>
                         </td>
                         <td className="py-2.5 px-2 text-right whitespace-nowrap">
@@ -460,7 +490,7 @@ export function HistoryView() {
                 )}
               </div>
               <div>
-                <span className="font-sans text-slate-500 block">ATA Rent</span>
+                <span className="font-sans text-slate-500 block">Net ATA Rent</span>
                 {selectedTrade.rentSol.toFixed(6)} SOL
                 {selectedTrade.solPriceUsd > 0 && (
                   <span className="block text-slate-500">
@@ -469,6 +499,59 @@ export function HistoryView() {
                 )}
               </div>
             </div>
+
+            {feeDetail && (
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60 p-4 space-y-2 text-xs">
+                <p className="font-display font-semibold text-slate-800 dark:text-slate-200">
+                  Jupiter Route &amp; Fee Breakdown
+                </p>
+                <div className="space-y-1.5 font-mono tabular-nums text-[11px]">
+                  <div className="flex justify-between gap-3">
+                    <span className="font-sans text-slate-500">Jupiter Route AMMs</span>
+                    <span className="text-slate-800 dark:text-slate-200 text-right">
+                      {feeDetail.routeLabels?.length
+                        ? feeDetail.routeLabels.join(' → ')
+                        : feeDetail.exitFees?.routeLabels?.length
+                          ? feeDetail.exitFees.routeLabels.join(' → ')
+                          : 'Direct / Quote'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="font-sans text-slate-500">DEX LP Fee (in quote outAmount)</span>
+                    <span>
+                      {(feeDetail.dexFeeSol ?? feeDetail.exitFees?.dexFeeSol ?? 0).toFixed(6)} SOL
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="font-sans text-slate-500">Jupiter Platform Fee</span>
+                    <span>
+                      {(
+                        feeDetail.jupiterPlatformFeeSol ??
+                        feeDetail.exitFees?.jupiterPlatformFeeSol ??
+                        0
+                      ).toFixed(6)}{' '}
+                      SOL
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="font-sans text-slate-500">
+                      Network + Priority ({feeDetail.priorityFeeSource ?? feeDetail.exitFees?.priorityFeeSource ?? 'preset'})
+                    </span>
+                    <span>{selectedTrade.feesSol.toFixed(6)} SOL</span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="font-sans text-slate-500">ATA Rent Paid / Reclaimed</span>
+                    <span>
+                      {(feeDetail.entryRentSol ?? 0).toFixed(5)} /{' '}
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        +{(feeDetail.rentReclaimedSol ?? 0).toFixed(5)}
+                      </span>{' '}
+                      SOL
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
 
             <div className="flex gap-3 pt-3 border-t border-slate-200 dark:border-slate-800 text-xs">
               {selectedTrade.txBuy && (

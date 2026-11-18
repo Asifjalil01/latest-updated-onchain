@@ -139,7 +139,7 @@ export default function App() {
         </main>
 
         <footer className="px-6 py-3 border-t border-slate-200 dark:border-slate-800/80 text-[11px] text-slate-500 flex flex-wrap items-center justify-between gap-2">
-          <span>Solana Spot Bot · Safety-first spot terminal</span>
+          <span>Solana Spot Bot v{__APP_VERSION__} · Safety-first spot terminal</span>
           <span>Trading can lose all of your money. No guarantee of profit.</span>
         </footer>
       </div>

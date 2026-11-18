@@ -9,21 +9,73 @@ import type { JupiterQuoteResponse } from '../providers/jupiter';
 
 export const SOLANA_BASE_FEE_SOL = 0.000005; // 5,000 lamports per signature
 export const ATA_RENT_SOL = 0.00203928;
+const WSOL_MINT_ADDR = 'So11111111111111111111111111111111111111112';
 
-export function resolvePriorityFeeSol(settings: BotSettings): number {
+export function resolvePriorityFeeSol(
+  settings: BotSettings,
+  liveAutoPriorityFeeSol?: number | null
+): number {
   let raw = settings.customPriorityFeeSol;
-  if (settings.priorityFeePreset === 'standard') raw = 0.0001;
+  if (settings.priorityFeePreset === 'auto') {
+    raw =
+      typeof liveAutoPriorityFeeSol === 'number' && Number.isFinite(liveAutoPriorityFeeSol) && liveAutoPriorityFeeSol >= 0
+        ? liveAutoPriorityFeeSol
+        : 0.0001;
+  } else if (settings.priorityFeePreset === 'standard') raw = 0.0001;
   else if (settings.priorityFeePreset === 'high') raw = 0.0005;
   else if (settings.priorityFeePreset === 'ultra') raw = 0.0015;
   return Math.min(Math.max(0, raw), settings.maxPriorityFeeSol);
 }
 
+export function extractRouteLabels(quote: JupiterQuoteResponse | null): string[] {
+  if (!quote || !Array.isArray(quote.routePlan)) return [];
+  const labels = quote.routePlan
+    .map((step) => step.swapInfo?.label?.trim())
+    .filter((l): l is string => Boolean(l));
+  return Array.from(new Set(labels));
+}
+
+/**
+ * Extracts actual DEX AMM pool fees from Jupiter's `routePlan[].swapInfo`.
+ * Note: On Jupiter exact-in quotes, AMM pool fees are already deducted inside `quote.outAmount`.
+ */
 export function extractRouteDexFeeSol(quote: JupiterQuoteResponse | null, solAmount: number): number {
   if (!quote || !Array.isArray(quote.routePlan) || quote.routePlan.length === 0) {
-    // Typical Raydium/Orca pool fee ~0.25%
     return solAmount * 0.0025;
   }
-  // Approximate DEX pool fee per hop (0.25% average across Solana AMMs if feeAmount is denominated in token)
+
+  let parsedFeeSol = 0;
+  let parsedSteps = 0;
+
+  for (const step of quote.routePlan) {
+    const info = step.swapInfo;
+    if (!info) continue;
+    const rawFee = Number(info.feeAmount ?? 0);
+    if (!Number.isFinite(rawFee) || rawFee <= 0) continue;
+
+    const splitRatio = Math.max(0.01, Math.min(1, Number(step.percent ?? 100) / 100));
+    const stepSolShare = solAmount * splitRatio;
+
+    if (info.feeMint === WSOL_MINT_ADDR) {
+      parsedFeeSol += rawFee / 1e9;
+      parsedSteps += 1;
+    } else if (info.feeMint && info.feeMint === info.inputMint && Number(info.inAmount) > 0) {
+      const feeRatio = Math.min(0.2, rawFee / Number(info.inAmount));
+      parsedFeeSol += stepSolShare * feeRatio;
+      parsedSteps += 1;
+    } else if (info.feeMint && info.feeMint === info.outputMint && Number(info.outAmount) > 0) {
+      const outAmt = Number(info.outAmount);
+      const feeRatio = Math.min(0.2, rawFee / (outAmt + rawFee));
+      parsedFeeSol += stepSolShare * feeRatio;
+      parsedSteps += 1;
+    }
+  }
+
+  if (parsedSteps > 0) {
+    return parsedFeeSol;
+  }
+
+  // Fallback when Jupiter route step omits numeric feeAmount (e.g. unit test mocks)
   const hops = Math.max(1, quote.routePlan.length);
   return solAmount * 0.0025 * Math.min(hops, 2);
 }
@@ -32,7 +84,17 @@ export function extractJupiterPlatformFeeSol(
   quote: JupiterQuoteResponse | null,
   solAmount: number
 ): number {
-  if (!quote?.platformFee?.feeBps) return 0;
+  if (!quote?.platformFee) return 0;
+  const rawAmt = Number(quote.platformFee.amount ?? 0);
+  if (Number.isFinite(rawAmt) && rawAmt > 0) {
+    if (quote.inputMint === WSOL_MINT_ADDR || quote.outputMint === WSOL_MINT_ADDR) {
+      // Jupiter platform fee is charged in outputMint (or inputMint for ExactOut); for SOL-out swaps it's lamports
+      if (quote.outputMint === WSOL_MINT_ADDR) {
+        return rawAmt / 1e9;
+      }
+    }
+  }
+  if (!quote.platformFee.feeBps) return 0;
   return solAmount * (quote.platformFee.feeBps / 10_000);
 }
 
@@ -42,13 +104,22 @@ export function computeEntryFees(params: {
   quote: JupiterQuoteResponse | null;
   needsAtaRent: boolean;
   tokenTaxPct?: number;
+  liveAutoPriorityFeeSol?: number | null;
+  priorityFeeSource?: FeeBreakdown['priorityFeeSource'];
 }): FeeBreakdown {
   const baseFeeSol = SOLANA_BASE_FEE_SOL;
-  const priorityFeeSol = resolvePriorityFeeSol(params.settings);
+  const priorityFeeSol = resolvePriorityFeeSol(params.settings, params.liveAutoPriorityFeeSol);
   const dexFeeSol = extractRouteDexFeeSol(params.quote, params.solAmount);
   const jupiterPlatformFeeSol = extractJupiterPlatformFeeSol(params.quote, params.solAmount);
   const ataRentSol = params.needsAtaRent ? ATA_RENT_SOL : 0;
   const tokenTaxSol = params.solAmount * ((params.tokenTaxPct ?? 0) / 100);
+  const routeLabels = extractRouteLabels(params.quote);
+  // Wallet fees paid directly in SOL (LP/DEX fees are already deducted inside Jupiter quote.outAmount when quote is present)
+  const walletOutFeeSol =
+    baseFeeSol +
+    priorityFeeSol +
+    tokenTaxSol +
+    (params.quote ? 0 : dexFeeSol + jupiterPlatformFeeSol);
   const totalSol =
     baseFeeSol + priorityFeeSol + dexFeeSol + jupiterPlatformFeeSol + ataRentSol + tokenTaxSol;
 
@@ -59,6 +130,15 @@ export function computeEntryFees(params: {
     jupiterPlatformFeeSol,
     ataRentSol,
     tokenTaxSol,
+    walletOutFeeSol,
+    routeLabels,
+    priorityFeeSource:
+      params.priorityFeeSource ??
+      (params.settings.priorityFeePreset === 'auto'
+        ? 'jupiter_auto'
+        : params.settings.priorityFeePreset === 'custom'
+          ? 'custom'
+          : 'preset'),
     totalSol,
   };
 }
@@ -68,12 +148,20 @@ export function computeExitFees(params: {
   settings: BotSettings;
   quote: JupiterQuoteResponse | null;
   tokenTaxPct?: number;
+  liveAutoPriorityFeeSol?: number | null;
+  priorityFeeSource?: FeeBreakdown['priorityFeeSource'];
 }): FeeBreakdown {
   const baseFeeSol = SOLANA_BASE_FEE_SOL;
-  const priorityFeeSol = resolvePriorityFeeSol(params.settings);
+  const priorityFeeSol = resolvePriorityFeeSol(params.settings, params.liveAutoPriorityFeeSol);
   const dexFeeSol = extractRouteDexFeeSol(params.quote, params.estimatedSolOut);
   const jupiterPlatformFeeSol = extractJupiterPlatformFeeSol(params.quote, params.estimatedSolOut);
   const tokenTaxSol = params.estimatedSolOut * ((params.tokenTaxPct ?? 0) / 100);
+  const routeLabels = extractRouteLabels(params.quote);
+  const walletOutFeeSol =
+    baseFeeSol +
+    priorityFeeSol +
+    tokenTaxSol +
+    (params.quote ? 0 : dexFeeSol + jupiterPlatformFeeSol);
   const totalSol = baseFeeSol + priorityFeeSol + dexFeeSol + jupiterPlatformFeeSol + tokenTaxSol;
 
   return {
@@ -83,6 +171,15 @@ export function computeExitFees(params: {
     jupiterPlatformFeeSol,
     ataRentSol: 0,
     tokenTaxSol,
+    walletOutFeeSol,
+    routeLabels,
+    priorityFeeSource:
+      params.priorityFeeSource ??
+      (params.settings.priorityFeePreset === 'auto'
+        ? 'jupiter_auto'
+        : params.settings.priorityFeePreset === 'custom'
+          ? 'custom'
+          : 'preset'),
     totalSol,
   };
 }

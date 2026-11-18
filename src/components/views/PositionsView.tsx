@@ -5,7 +5,8 @@ import { PnlText, SparklineSvg, formatSol, formatTokenPriceUsd, formatUsd, maskM
 import type { PositionRecord } from '../../types';
 
 export function PositionsView() {
-  const { status, positions, colorBlindSafe, apiFetch, refreshModeData, pushToast } = useBotStore();
+  const { status, settings, positions, colorBlindSafe, apiFetch, refreshModeData, pushToast } = useBotStore();
+  const autoReclaimRent = settings?.autoReclaimRent !== false;
   const [viewMode, setViewMode] = useState<'cards' | 'table'>('cards');
   const [confirmSellId, setConfirmSellId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -158,9 +159,9 @@ export function PositionsView() {
       </div>
 
       <div className="rounded-2xl border border-teal-500/30 bg-teal-500/5 p-4 text-xs text-slate-700 dark:text-slate-300 space-y-1">
-        <p className="font-semibold text-teal-600 dark:text-teal-400">Understanding Gross vs Net P&L (Take-Home)</p>
+        <p className="font-semibold text-teal-600 dark:text-teal-400">Understanding Gross vs Net P&amp;L (Take-Home)</p>
         <p>
-          <strong>Net P&amp;L</strong> is your true take-home earnings after deducting entry fees, priority tips, and ATA rent. <strong>Gross P&amp;L</strong> reflects price movement only. Prices update live every 1 second.
+          <strong>Net P&amp;L</strong> is your true take-home earnings after Jupiter route DEX fees, Solana base/priority fees{autoReclaimRent ? ' (ATA rent auto-reclaimed on 100% sell)' : ', and ATA rent'}. <strong>Gross P&amp;L</strong> reflects price movement only.
         </p>
       </div>
 
@@ -184,13 +185,15 @@ export function PositionsView() {
             const currentSolVal =
               solUsd > 0 ? (pos.quantity * pos.currentPriceUsd) / solUsd : pos.solIn;
             const grossPnlSol = currentSolVal - pos.solIn;
+            const rentCostSol = autoReclaimRent ? 0 : pos.entryRentSol;
+            const baseWalletFeesSol = pos.entryFeesSol * 2 + rentCostSol;
             const estRoundTripCostSol =
               pos.exitParams?.roundTripCostPct > 0
                 ? Math.max(
-                    pos.entryFeesSol + pos.entryRentSol,
+                    baseWalletFeesSol,
                     pos.solIn * (pos.exitParams.roundTripCostPct / 100)
                   )
-                : pos.entryFeesSol + pos.entryRentSol;
+                : baseWalletFeesSol;
             const netPnlSol = grossPnlSol - estRoundTripCostSol;
             const netPct = pos.solIn > 0 ? (netPnlSol / pos.solIn) * 100 : 0;
 
@@ -561,13 +564,15 @@ export function PositionsView() {
               {positions.map((pos) => {
                 const currentSolVal =
                   solUsd > 0 ? (pos.quantity * pos.currentPriceUsd) / solUsd : pos.solIn;
+                const rentCostSol = autoReclaimRent ? 0 : pos.entryRentSol;
+                const baseWalletFeesSol = pos.entryFeesSol * 2 + rentCostSol;
                 const estRoundTripCostSol =
                   pos.exitParams?.roundTripCostPct > 0
                     ? Math.max(
-                        pos.entryFeesSol + pos.entryRentSol,
+                        baseWalletFeesSol,
                         pos.solIn * (pos.exitParams.roundTripCostPct / 100)
                       )
-                    : pos.entryFeesSol + pos.entryRentSol;
+                    : baseWalletFeesSol;
                 const netPnlSol = currentSolVal - pos.solIn - estRoundTripCostSol;
                 const netPct = pos.solIn > 0 ? (netPnlSol / pos.solIn) * 100 : 0;
                 return (

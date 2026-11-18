@@ -212,8 +212,15 @@ export class LiveExecutionEngine {
       timestampMs: Date.now(),
     });
 
-    const priorityFeeSol = resolvePriorityFeeSol(settings);
-    const priorityFeeLamports = Math.round(priorityFeeSol * LAMPORTS_PER_SOL);
+    const autoPriority =
+      settings.priorityFeePreset === 'auto' && typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
+        ? await this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
+        : null;
+    const priorityFeeSol = resolvePriorityFeeSol(settings, autoPriority?.sol);
+    const priorityFeeLamports: number | 'auto' =
+      settings.priorityFeePreset === 'auto'
+        ? 'auto'
+        : Math.round(priorityFeeSol * LAMPORTS_PER_SOL);
 
     let swapTxResp;
     try {
@@ -284,14 +291,23 @@ export class LiveExecutionEngine {
       settings,
       quote,
       needsAtaRent: true,
+      liveAutoPriorityFeeSol: autoPriority?.sol,
+      priorityFeeSource: autoPriority?.source,
+    });
+    const estExitFees = computeExitFees({
+      estimatedSolOut: solAmount,
+      settings,
+      quote,
+      liveAutoPriorityFeeSol: autoPriority?.sol,
+      priorityFeeSource: autoPriority?.source,
     });
     const estBreakEven = computeBreakEvenPrices({
       entryPriceUsd: quotedPriceUsd,
       entryPriceSol: quotedPriceUsd / solPriceUsd,
       solIn: solAmount,
-      entryFeesSol: estEntryFees.totalSol - estEntryFees.ataRentSol,
-      entryRentSol: estEntryFees.ataRentSol,
-      estimatedExitFeesSol: estEntryFees.totalSol - estEntryFees.ataRentSol,
+      entryFeesSol: estEntryFees.walletOutFeeSol,
+      entryRentSol: settings.autoReclaimRent ? 0 : estEntryFees.ataRentSol,
+      estimatedExitFeesSol: estExitFees.walletOutFeeSol,
     });
 
     // Create initial PENDING position immediately so timeout never leaves an untracked buy
@@ -319,7 +335,7 @@ export class LiveExecutionEngine {
       entryLiquidityUsd: token.liquidityUsd,
       currentLiquidityUsd: token.liquidityUsd,
       solIn: solAmount,
-      entryFeesSol: estEntryFees.totalSol - estEntryFees.ataRentSol,
+      entryFeesSol: estEntryFees.walletOutFeeSol,
       entryRentSol: estEntryFees.ataRentSol,
       solPriceUsdAtEntry: solPriceUsd,
       peakPriceUsd: quotedPriceUsd,
@@ -447,8 +463,8 @@ export class LiveExecutionEngine {
       entryPriceSol: realEntryPriceSol,
       solIn: realSolSpent,
       entryFeesSol: realFeesSol,
-      entryRentSol: pendingPos.entryRentSol,
-      estimatedExitFeesSol: exitFeeEst.totalSol,
+      entryRentSol: settings.autoReclaimRent ? 0 : pendingPos.entryRentSol,
+      estimatedExitFeesSol: exitFeeEst.walletOutFeeSol,
     });
 
     const confirmedPos: PositionRecord = {
@@ -706,9 +722,15 @@ export class LiveExecutionEngine {
     }
 
     try {
-      const priorityFeeLamports = Math.round(
-        resolvePriorityFeeSol(settings) * (isEmergency ? 2 : 1) * LAMPORTS_PER_SOL
-      );
+      const autoExitPriority =
+        settings.priorityFeePreset === 'auto' && typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
+          ? await this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
+          : null;
+      const resolvedExitPrioritySol = resolvePriorityFeeSol(settings, autoExitPriority?.sol);
+      const priorityFeeLamports: number | 'auto' =
+        settings.priorityFeePreset === 'auto' && !isEmergency
+          ? 'auto'
+          : Math.round(resolvedExitPrioritySol * (isEmergency ? 2 : 1) * LAMPORTS_PER_SOL);
       const swapResp = await this.jupiter.buildSwapTransaction({
         quoteResponse: quote,
         userPublicKey: owner,
@@ -738,14 +760,30 @@ export class LiveExecutionEngine {
         delta.found && delta.solDeltaLamports > 0
           ? delta.solDeltaLamports / LAMPORTS_PER_SOL
           : estSolOut;
+      const computedExitFees = computeExitFees({
+        estimatedSolOut: realSolOut,
+        settings,
+        quote,
+        liveAutoPriorityFeeSol: autoExitPriority?.sol,
+        priorityFeeSource: autoExitPriority?.source,
+      });
       const exitFeeSol = delta.found
         ? delta.feeLamports / LAMPORTS_PER_SOL
-        : computeExitFees({ estimatedSolOut: realSolOut, settings, quote }).totalSol;
+        : computedExitFees.walletOutFeeSol;
+
+      let rentReclaimedSol = 0;
+      if (!isPartial && settings.autoReclaimRent) {
+        const reclaimed = await this.reclaimEmptyTokenAccounts().catch(() => null);
+        if (reclaimed && reclaimed.reclaimedSol > 0 && soldEntryRent > 0) {
+          rentReclaimedSol = Math.min(soldEntryRent, reclaimed.reclaimedSol);
+        }
+      }
 
       const closedAtMs = Date.now();
       const totalFeesSol = soldEntryFees + exitFeeSol;
+      const remainingRentSol = Math.max(0, soldEntryRent - rentReclaimedSol);
       const grossPnlSol = realSolOut - soldSolIn;
-      const netPnlSol = realSolOut - (soldSolIn + totalFeesSol + soldEntryRent);
+      const netPnlSol = realSolOut + rentReclaimedSol - (soldSolIn + totalFeesSol + soldEntryRent);
       const exitPriceSol = soldQty > 0 ? realSolOut / soldQty : position.currentPriceSol;
       const exitPriceUsd = exitPriceSol * solPriceUsd;
 
@@ -763,9 +801,9 @@ export class LiveExecutionEngine {
         exitPrice: exitPriceUsd,
         quantity: soldQty,
         solIn: soldSolIn,
-        solOut: realSolOut,
+        solOut: realSolOut + rentReclaimedSol,
         feesSol: totalFeesSol,
-        rentSol: soldEntryRent,
+        rentSol: remainingRentSol,
         grossPnlSol,
         pnlSol: netPnlSol,
         pnlUsd: netPnlSol * solPriceUsd,
@@ -779,7 +817,14 @@ export class LiveExecutionEngine {
         solPriceUsd,
         feeBreakdownJson: JSON.stringify({
           entryFeesSol: soldEntryFees,
+          entryRentSol: soldEntryRent,
+          rentReclaimedSol,
           exitFeeSol,
+          exitFees: { ...computedExitFees, rentReclaimedSol },
+          dexFeeSol: computedExitFees.dexFeeSol,
+          jupiterPlatformFeeSol: computedExitFees.jupiterPlatformFeeSol,
+          routeLabels: computedExitFees.routeLabels ?? [],
+          priorityFeeSource: computedExitFees.priorityFeeSource ?? 'preset',
           partialFraction: isPartial ? clampedFraction : 1,
         }),
         archivedSessionId: null,
@@ -819,10 +864,6 @@ export class LiveExecutionEngine {
       this.db.upsertPosition(closedPos);
       this.db.insertTrade(trade);
       this.db.setCooldown(position.mint, 'live', settings.cooldownMinutes);
-
-      if (settings.autoReclaimRent) {
-        await this.reclaimEmptyTokenAccounts().catch(() => undefined);
-      }
 
       return { ok: true, trade, position: closedPos };
     } catch (err) {

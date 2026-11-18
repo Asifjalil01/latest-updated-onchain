@@ -132,10 +132,21 @@ export function scoreCandidate(params: {
     Math.round(Object.values(tradeBreakdown).reduce((a, b) => a + b, 0))
   );
 
+  const effectiveClass =
+    tokenClass === 'high_risk_micro' && !settings.enforceMinScores && filterResult.passed && securityReport.passed
+      ? 'meme'
+      : tokenClass;
+  const effectiveMultiplier =
+    effectiveClass === 'meme' && sizeMultiplier === 0 ? 0.4 : sizeMultiplier;
+
   const reasons: string[] = [...filterResult.reasons, ...securityReport.reasons];
   const warnings: string[] = [...filterResult.warnings, ...securityReport.warnings];
 
-  if (tokenClass === 'high_risk_micro') {
+  if (!settings.enforceMinScores) {
+    warnings.push('Min Quality / Trade Score gate disabled — score check bypassed');
+  }
+
+  if (effectiveClass === 'high_risk_micro') {
     reasons.push('Classified as high_risk_micro (always rejected)');
   }
   if (settings.enforceMinScores) {
@@ -158,17 +169,17 @@ export function scoreCandidate(params: {
     filterResult.passed &&
     securityReport.passed &&
     securityReport.criticalFlags.length === 0 &&
-    tokenClass !== 'high_risk_micro' &&
+    effectiveClass !== 'high_risk_micro' &&
     scoreGatePassed;
 
   return {
     mint: token.mint,
     symbol: token.symbol,
-    tokenClass,
+    tokenClass: effectiveClass,
     qualityScore,
     tradeScore,
     combinedScore: Math.round((qualityScore + tradeScore) / 2),
-    sizeMultiplier,
+    sizeMultiplier: effectiveMultiplier,
     decision: approved ? 'BUY' : 'REJECT',
     stageFailed: approved
       ? undefined

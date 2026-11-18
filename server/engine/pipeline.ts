@@ -19,7 +19,7 @@ import type { BotDatabase } from '../store/db';
 import type { ServerSignerManager } from '../security/signer';
 import { hashSettingsSnapshot, maskAddress } from '../security/crypto';
 import type { SolanaRpcPool } from '../providers/rpcPool';
-import type { JupiterProvider } from '../providers/jupiter';
+import type { JupiterProvider, JupiterQuoteResponse } from '../providers/jupiter';
 import { WSOL_MINT } from '../providers/jupiter';
 import type { DexScreenerProvider } from '../providers/dexscreener';
 import type { GeckoTerminalProvider } from '../providers/geckoterminal';
@@ -869,6 +869,11 @@ export class BotOrchestrator {
             ...candidate,
             tokenDecimals: resolvedDecimals,
           };
+          const autoPriority =
+            settings.priorityFeePreset === 'auto' &&
+            typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
+              ? await this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
+              : null;
           const paperBuy = await executeRealisticPaperBuy({
             mode: this.mode,
             token: paperCandidate,
@@ -879,6 +884,8 @@ export class BotOrchestrator {
             initialQuote: buyQuote,
             measuredLiveGapPct: this.db.getAveragePaperLiveGapPct(),
             jupiterProvider: this.jupiter,
+            liveAutoPriorityFeeSol: autoPriority?.sol,
+            priorityFeeSource: autoPriority?.source,
             hooks: {
               sampleBuyWindow: async () => {
                 const fresh = await this.dexScreener.enrichMintsBatch([candidate.mint]);
@@ -1022,6 +1029,7 @@ export class BotOrchestrator {
         this.dexScreener.enrichMintsBatch(mints),
       ]);
 
+      const settings = this.db.getSettings();
       const deltas: Array<{
         id: string;
         currentPriceUsd: number;
@@ -1042,14 +1050,49 @@ export class BotOrchestrator {
         }
 
         const ds = dsMap.get(pos.mint);
-        const livePrice = jupPrices[pos.mint] ?? ds?.priceUsd ?? pos.currentPriceUsd;
+        let livePrice = jupPrices[pos.mint] ?? ds?.priceUsd ?? pos.currentPriceUsd;
         const liveLiquidity = ds?.liquidityUsd ?? pos.currentLiquidityUsd;
         const isStale = !jupPrices[pos.mint] && !ds;
 
-        const evalExit = evaluatePositionExit(pos, {
+        let evalExit = evaluatePositionExit(pos, {
           currentPriceUsd: livePrice,
           currentLiquidityUsd: liveLiquidity,
         });
+
+        let verifiedSellQuote: JupiterQuoteResponse | null = null;
+        if (
+          evalExit.shouldExit &&
+          (evalExit.reason === 'TAKE_PROFIT' || evalExit.reason === 'TRAILING_STOP') &&
+          pos.quantity > 0
+        ) {
+          const rawUnits = Math.max(1, Math.floor(pos.quantity * 10 ** pos.decimals));
+          const sellQuote = await this.jupiter.getQuote({
+            inputMint: pos.mint,
+            outputMint: WSOL_MINT,
+            amountRaw: String(rawUnits),
+            slippageBps: settings.slippageBps,
+          });
+          if (sellQuote && Number(sellQuote.outAmount) > 0) {
+            const execSol = Number(sellQuote.outAmount) / LAMPORTS_PER_SOL;
+            const execPriceUsd = (execSol / pos.quantity) * solPriceUsd;
+            const quoteEval = evaluatePositionExit(pos, {
+              currentPriceUsd: execPriceUsd,
+              currentLiquidityUsd: liveLiquidity,
+            });
+            livePrice = execPriceUsd;
+            if (quoteEval.shouldExit && quoteEval.reason) {
+              verifiedSellQuote = sellQuote;
+              evalExit = quoteEval;
+            } else {
+              this.log(
+                'INFO',
+                'EXIT_VERIFY',
+                `${pos.symbol}: Spot feed signaled ${evalExit.reason}, but Jupiter executable sell quote is $${execPriceUsd.toFixed(6)} — holding.`
+              );
+              evalExit = quoteEval;
+            }
+          }
+        }
 
         const nextHistory = [...pos.priceHistory, livePrice].slice(-60);
         const updatedPos: PositionRecord = {
@@ -1085,7 +1128,8 @@ export class BotOrchestrator {
             evalExit.reason,
             evalExit.isEmergency,
             evalExit.sellFraction ?? 1,
-            evalExit.triggeredStopLossTier
+            evalExit.triggeredStopLossTier,
+            verifiedSellQuote
           );
         }
       }
@@ -1103,7 +1147,8 @@ export class BotOrchestrator {
     reason: ExitReason,
     isEmergency = false,
     sellFraction = 1,
-    triggeredStopLossTier?: number
+    triggeredStopLossTier?: number,
+    preVerifiedQuote?: JupiterQuoteResponse | null
   ): Promise<{ ok: boolean; trade?: TradeRecord; error?: string }> {
     if (this.sellingPositionIds.has(positionId)) {
       return { ok: false, error: 'Sell already in progress for position' };
@@ -1155,6 +1200,12 @@ export class BotOrchestrator {
           }
         : pos;
 
+      const autoExitPriority =
+        settings.priorityFeePreset === 'auto' &&
+        typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
+          ? await this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
+          : null;
+
       // Paper or Testnet simulated realistic exit
       const res = await executeRealisticPaperSell({
         position: sellPos,
@@ -1163,6 +1214,9 @@ export class BotOrchestrator {
         settings,
         measuredLiveGapPct: this.db.getAveragePaperLiveGapPct(),
         jupiterProvider: this.jupiter,
+        initialQuote: preVerifiedQuote ?? null,
+        liveAutoPriorityFeeSol: autoExitPriority?.sol,
+        priorityFeeSource: autoExitPriority?.source,
         hooks: {
           sampleSellWindow: async (p) => {
             const fresh = await this.dexScreener.enrichMintsBatch([p.mint]);

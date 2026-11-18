@@ -1,4 +1,5 @@
 import { HttpProvider } from './base';
+import type { SolanaRpcPool } from './rpcPool';
 import type { CandidateToken } from '../types';
 
 export const WSOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -274,10 +275,12 @@ export class JupiterProvider {
     }
   }
 
+  private cachedAutoPriorityFee: { sol: number; source: 'rpc_recent' | 'preset'; atMs: number } | null = null;
+
   async buildSwapTransaction(params: {
     quoteResponse: JupiterQuoteResponse;
     userPublicKey: string;
-    priorityFeeLamports: number;
+    priorityFeeLamports: number | 'auto';
   }): Promise<JupiterSwapResponse> {
     return this.swapHttp.fetchJson<JupiterSwapResponse>(
       'https://lite-api.jup.ag/swap/v1/swap',
@@ -292,11 +295,60 @@ export class JupiterProvider {
           userPublicKey: params.userPublicKey,
           wrapAndUnwrapSol: true,
           dynamicComputeUnitLimit: true,
-          prioritizationFeeLamports: params.priorityFeeLamports,
+          prioritizationFeeLamports:
+            params.priorityFeeLamports === 'auto'
+              ? { autoMultiplier: 2 }
+              : params.priorityFeeLamports,
         }),
       },
       '',
       0
     );
+  }
+
+  /**
+   * Estimates live priority fee in SOL using Solana RPC recent prioritization fees
+   * (typical Jupiter route swap = ~200,000 CUs), cached briefly for 15s.
+   */
+  async estimateLivePriorityFeeSol(
+    rpcPool?: SolanaRpcPool,
+    maxCapSol = 0.002,
+    fallbackSol = 0.0001
+  ): Promise<{ sol: number; source: 'rpc_recent' | 'preset' }> {
+    const now = Date.now();
+    if (this.cachedAutoPriorityFee && now - this.cachedAutoPriorityFee.atMs < 15_000) {
+      return {
+        sol: Math.min(this.cachedAutoPriorityFee.sol, maxCapSol),
+        source: this.cachedAutoPriorityFee.source,
+      };
+    }
+
+    if (!rpcPool) {
+      return { sol: Math.min(fallbackSol, maxCapSol), source: 'preset' };
+    }
+
+    try {
+      const fees = await rpcPool.withFailover((conn) => conn.getRecentPrioritizationFees());
+      const nonZero = (fees || [])
+        .map((f) => Number(f.prioritizationFee))
+        .filter((v) => Number.isFinite(v) && v >= 0)
+        .sort((a, b) => a - b);
+
+      if (nonZero.length > 0) {
+        // 75th percentile microLamports per Compute Unit * 200,000 CU typical Jupiter swap
+        const p75Index = Math.min(nonZero.length - 1, Math.floor(nonZero.length * 0.75));
+        const microLamportsPerCu = nonZero[p75Index];
+        const estimatedLamports = Math.max(5_000, Math.round((microLamportsPerCu * 200_000) / 1_000_000));
+        const sol = Math.min(maxCapSol, Math.max(0.000005, estimatedLamports / 1e9));
+        this.cachedAutoPriorityFee = { sol, source: 'rpc_recent', atMs: now };
+        return { sol, source: 'rpc_recent' };
+      }
+    } catch {
+      // fall through to safe fallback
+    }
+
+    const cappedFallback = Math.min(fallbackSol, maxCapSol);
+    this.cachedAutoPriorityFee = { sol: cappedFallback, source: 'preset', atMs: now };
+    return { sol: cappedFallback, source: 'preset' };
   }
 }

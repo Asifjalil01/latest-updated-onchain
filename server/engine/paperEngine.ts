@@ -69,6 +69,8 @@ export async function executeRealisticPaperBuy(params: {
   measuredLiveGapPct: number;
   jupiterProvider?: JupiterProvider;
   hooks?: PaperSimulationHooks;
+  liveAutoPriorityFeeSol?: number | null;
+  priorityFeeSource?: FeeBreakdown['priorityFeeSource'];
   nowMs?: number;
 }): Promise<PaperBuyExecutionResult> {
   const {
@@ -188,27 +190,45 @@ export async function executeRealisticPaperBuy(params: {
   const effectiveFillPriceUsd = worstPriceUsd * totalAdverseMultiplier;
   const effectiveFillPriceSol = effectiveFillPriceUsd / solPriceUsd;
 
+  const resolvedAutoPriority =
+    params.liveAutoPriorityFeeSol === undefined &&
+    jupiterProvider &&
+    settings.priorityFeePreset === 'auto' &&
+    typeof jupiterProvider.estimateLivePriorityFeeSol === 'function'
+      ? await jupiterProvider.estimateLivePriorityFeeSol(undefined, settings.maxPriorityFeeSol)
+      : null;
+  const liveAutoPriorityFeeSol = params.liveAutoPriorityFeeSol ?? resolvedAutoPriority?.sol ?? null;
+  const priorityFeeSource = params.priorityFeeSource ?? resolvedAutoPriority?.source;
+
   const entryFees = computeEntryFees({
     solAmount,
     settings,
     quote: finalQuote,
     needsAtaRent: true,
+    liveAutoPriorityFeeSol,
+    priorityFeeSource,
   });
 
   const quantity = effectiveFillPriceSol > 0 ? solAmount / effectiveFillPriceSol : initialTokensOut;
   const estimatedExitFees = computeExitFees({
     estimatedSolOut: solAmount,
     settings,
-    quote: null,
+    quote: finalQuote,
+    liveAutoPriorityFeeSol,
+    priorityFeeSource,
   });
+
+  const entryWalletFeesSol = entryFees.walletOutFeeSol;
+  const estimatedExitWalletFeesSol = estimatedExitFees.walletOutFeeSol;
+  const netRentCostAtExitSol = settings.autoReclaimRent ? 0 : entryFees.ataRentSol;
 
   const breakEven = computeBreakEvenPrices({
     entryPriceUsd: effectiveFillPriceUsd,
     entryPriceSol: effectiveFillPriceSol,
     solIn: solAmount,
-    entryFeesSol: entryFees.totalSol - entryFees.ataRentSol,
-    entryRentSol: entryFees.ataRentSol,
-    estimatedExitFeesSol: estimatedExitFees.totalSol,
+    entryFeesSol: entryWalletFeesSol,
+    entryRentSol: netRentCostAtExitSol,
+    estimatedExitFeesSol: estimatedExitWalletFeesSol,
   });
 
   const exitParams = snapshotExitParams(settings, breakEven.roundTripCostPct);
@@ -239,7 +259,7 @@ export async function executeRealisticPaperBuy(params: {
     entryLiquidityUsd: latestLiquidityUsd,
     currentLiquidityUsd: latestLiquidityUsd,
     solIn: solAmount,
-    entryFeesSol: entryFees.totalSol - entryFees.ataRentSol,
+    entryFeesSol: entryWalletFeesSol,
     entryRentSol: entryFees.ataRentSol,
     solPriceUsdAtEntry: solPriceUsd,
     peakPriceUsd: effectiveFillPriceUsd,
@@ -268,7 +288,7 @@ export async function executeRealisticPaperBuy(params: {
     quotedPriceUsd,
     worstWindowPriceUsd: worstPriceUsd,
     effectiveFillPriceUsd,
-    totalSpentSol: solAmount + entryFees.totalSol,
+    totalSpentSol: solAmount + entryWalletFeesSol + entryFees.ataRentSol,
   };
 }
 
@@ -280,6 +300,9 @@ export async function executeRealisticPaperSell(params: {
   measuredLiveGapPct: number;
   jupiterProvider?: JupiterProvider;
   hooks?: PaperSimulationHooks;
+  initialQuote?: JupiterQuoteResponse | null;
+  liveAutoPriorityFeeSol?: number | null;
+  priorityFeeSource?: FeeBreakdown['priorityFeeSource'];
   nowMs?: number;
 }): Promise<PaperSellExecutionResult> {
   const { position, exitReason, solPriceUsd, settings, measuredLiveGapPct, jupiterProvider, hooks } =
@@ -299,12 +322,12 @@ export async function executeRealisticPaperSell(params: {
   }
 
   const rawUnits = Math.max(1, Math.floor(position.quantity * 10 ** position.decimals));
-  let initialQuote: JupiterQuoteResponse | null = null;
+  let initialQuote: JupiterQuoteResponse | null = params.initialQuote ?? null;
 
   if (hooks?.sampleSellWindow) {
     const sample = await hooks.sampleSellWindow(position);
     initialQuote = sample.quote;
-  } else if (jupiterProvider) {
+  } else if (!initialQuote && jupiterProvider) {
     initialQuote = await jupiterProvider.getQuote({
       inputMint: position.mint,
       outputMint: WSOL_MINT,
@@ -377,16 +400,34 @@ export async function executeRealisticPaperSell(params: {
   const effectiveExitPriceUsd = worstExitPriceUsd * (1 - gapPenaltyPct / 100);
   const grossSolOut = (position.quantity * effectiveExitPriceUsd) / solPriceUsd;
 
-  const exitFees: FeeBreakdown = computeExitFees({
+  const resolvedAutoPriority =
+    params.liveAutoPriorityFeeSol === undefined &&
+    jupiterProvider &&
+    settings.priorityFeePreset === 'auto' &&
+    typeof jupiterProvider.estimateLivePriorityFeeSol === 'function'
+      ? await jupiterProvider.estimateLivePriorityFeeSol(undefined, settings.maxPriorityFeeSol)
+      : null;
+  const liveAutoPriorityFeeSol = params.liveAutoPriorityFeeSol ?? resolvedAutoPriority?.sol ?? null;
+  const priorityFeeSource = params.priorityFeeSource ?? resolvedAutoPriority?.source;
+
+  const exitFeesRaw: FeeBreakdown = computeExitFees({
     estimatedSolOut: grossSolOut,
     settings,
     quote: finalQuote,
+    liveAutoPriorityFeeSol,
+    priorityFeeSource,
   });
+  const rentReclaimedSol = settings.autoReclaimRent && position.entryRentSol > 0 ? position.entryRentSol : 0;
+  const exitFees: FeeBreakdown = {
+    ...exitFeesRaw,
+    rentReclaimedSol,
+  };
 
-  const totalFeesSol = position.entryFeesSol + exitFees.totalSol;
-  const rentSol = position.entryRentSol;
+  const exitWalletFeesSol = exitFees.walletOutFeeSol;
+  const totalFeesSol = position.entryFeesSol + exitWalletFeesSol;
+  const rentSol = Math.max(0, position.entryRentSol - rentReclaimedSol);
   const grossPnlSol = grossSolOut - position.solIn;
-  const netSolReturned = Math.max(0, grossSolOut - exitFees.totalSol);
+  const netSolReturned = Math.max(0, grossSolOut - exitWalletFeesSol) + rentReclaimedSol;
   const netPnlSol = netSolReturned - (position.solIn + position.entryFeesSol + position.entryRentSol);
   const pnlUsd = netPnlSol * solPriceUsd;
   const pnlPct = position.solIn > 0 ? (netPnlSol / position.solIn) * 100 : 0;
@@ -424,7 +465,13 @@ export async function executeRealisticPaperSell(params: {
     feeBreakdownJson: JSON.stringify({
       entryFeesSol: position.entryFeesSol,
       entryRentSol: position.entryRentSol,
+      rentReclaimedSol,
       exitFees,
+      dexFeeSol: exitFees.dexFeeSol,
+      jupiterPlatformFeeSol: exitFees.jupiterPlatformFeeSol,
+      routeLabels: exitFees.routeLabels ?? [],
+      priorityFeeSource: exitFees.priorityFeeSource ?? 'preset',
+      note: 'DEX AMM fees extracted from Jupiter routePlan[].swapInfo (already reflected in Jupiter quote output)',
     }),
     archivedSessionId: null,
   };
