@@ -311,8 +311,9 @@ export class BotDatabase {
 
     const tx = this.db.transaction(() => {
       for (const key of Object.keys(patch) as Array<keyof BotSettings>) {
-        const oldVal = JSON.stringify(current[key]);
-        const newVal = JSON.stringify(validation.merged[key]);
+        if (!(key in current) && !(key in validation.merged)) continue;
+        const oldVal = JSON.stringify(current[key] ?? null);
+        const newVal = JSON.stringify(validation.merged[key] ?? null);
         if (oldVal !== newVal) {
           insertHistory.run(String(key), oldVal, newVal, now);
         }

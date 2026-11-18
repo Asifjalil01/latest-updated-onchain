@@ -85,6 +85,7 @@ const settingsPatchSchema = z
     paperInitialBalanceSol: z.number().min(0.1).max(10000).optional(),
     shadowCompareEnabled: z.boolean().optional(),
     shadowLiveSizeSol: z.number().min(0.005).max(0.5).optional(),
+    applyToOpenPositions: z.boolean().optional(),
   })
   .strict();
 
@@ -353,7 +354,8 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       return;
     }
 
-    const result = orchestrator.db.updateSettings(parsed.data as Partial<BotSettings>);
+    const { applyToOpenPositions, ...settingsPatch } = parsed.data;
+    const result = orchestrator.db.updateSettings(settingsPatch as Partial<BotSettings>);
     if (!result.valid) {
       res.status(400).json({
         error: 'Settings validation failed',
@@ -364,7 +366,7 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     }
 
     orchestrator.invalidateLiveConfirmationIfCriticalChanged(result.settings);
-    if (req.body?.applyToOpenPositions === true) {
+    if (applyToOpenPositions === true) {
       const mode = orchestrator.getStatusSnapshot().mode;
       orchestrator.db.syncOpenPositionsExitParams(mode, result.settings);
       orchestrator.log(
@@ -434,11 +436,29 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
   });
 
   router.post('/wallet/connect', async (req: Request, res: Response) => {
+    let rawAddress = typeof req.body?.address === 'string' ? req.body.address.trim() : '';
+    // If user accidentally passed their private key (base58 or byte array), safely extract public key
+    if (rawAddress.startsWith('[') || rawAddress.length > 50) {
+      try {
+        const { parseSolanaSecretKey } = await import('../security/crypto');
+        const { Keypair } = await import('@solana/web3.js');
+        const bytes = parseSolanaSecretKey(rawAddress);
+        const kp = await Keypair.fromSecretKey(bytes);
+        rawAddress = kp.publicKey.toBase58();
+        bytes.fill(0);
+      } catch {
+        // Fall through to validation
+      }
+    }
+
     const schema = z.object({
       provider: z.enum(['phantom', 'solflare', 'watch_only']),
       address: z.string().min(32).max(64),
     });
-    const parsed = schema.safeParse(req.body);
+    const parsed = schema.safeParse({
+      provider: req.body?.provider,
+      address: rawAddress,
+    });
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid wallet connection payload' });
       return;
@@ -556,7 +576,8 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       res.status(400).json({ error: 'Invalid mode' });
       return;
     }
-    const result = await orchestrator.switchMode(targetMode);
+    const autoStop = req.body?.autoStop === true;
+    const result = await orchestrator.switchMode(targetMode, autoStop);
     if (!result.ok) {
       res.status(400).json({ error: result.error });
       return;

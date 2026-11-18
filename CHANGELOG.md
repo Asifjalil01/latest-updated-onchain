@@ -2,6 +2,25 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.15.0 — Trailing Profit Lock System Fix, Settings Schema Sync, Auto-Stop Mode Switch & Wallet Private Key Parsing
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Stepped Trailing Profit Lock System & Arming (`exits.ts`, `exits.test.ts`)**:
+  - Removed restrictive round-trip cost arming offset so that custom user trailing profit lock tiers (e.g. Tier #1 Peak +1.2% / Allowed Drop 0.4%) arm immediately and lock the profit floor as soon as the peak gain threshold is reached on micro-positions.
+  - Renamed "Trailing Floor" to **"Profit Lock Floor"** with clear status indicators (`Locked` vs `Pending (+X%)`).
+  - Added color-coded badges for all stepped trailing ladder tiers: green for hit/passed tiers, pulsing amber for the currently in-progress tier, and slate for upcoming tiers.
+- **Settings Save & Schema Fix (`api.ts`, `SettingsView.tsx`)**:
+  - Added `applyToOpenPositions` to `settingsPatchSchema` to eliminate `Unrecognized key: "applyToOpenPositions"` errors when saving settings.
+- **Running Mode Switch & Auto-Stop (`pipeline.ts`, `api.ts`, `TopBar.tsx`, `LiveConfirmModal.tsx`)**:
+  - Enabled mode switching while the bot is running by adding an `autoStop` flag that automatically stops active bot execution before switching modes or arming Live mode.
+- **Robust Wallet Private Key & Keystore Input (`api.ts`, `WalletsView.tsx`)**:
+  - Enhanced `/api/wallet/connect` and Server-Side Signer ingestion to automatically parse and extract public keys when users paste raw Base58 private keys or JSON byte arrays (`[1, 2, ... ]`) into wallet/signer inputs.
+- **Changelog & Version Tracking**: Updated version to `1.15.0` in `package.json` and documented all improvements in `CHANGELOG.md`.
+
+---
+
 ## v1.14.0 — Trailing Profit Lock Badges, Active Position Settings Sync, Uniform Font Heights & Quick-Profit Preset
 
 **Risk Warning: Trading can lose all of your money.**

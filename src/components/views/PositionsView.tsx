@@ -275,19 +275,19 @@ export function PositionsView() {
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-100 dark:border-slate-800/70">
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block mb-1">Entry Price</span>
-                    <div className="text-xs font-semibold font-mono tabular-nums text-slate-900 dark:text-slate-100 flex items-center h-5">
+                    <div className="text-xs font-semibold font-mono tabular-nums text-slate-900 dark:text-slate-100 min-h-5 leading-snug">
                       {formatTokenPriceUsd(pos.entryPriceUsd)}
                     </div>
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block mb-1">Current Price</span>
-                    <div className={`text-xs font-semibold font-mono tabular-nums flex items-center h-5 ${pos.currentPriceUsd >= pos.entryPriceUsd ? 'text-teal-600 dark:text-teal-400' : 'text-rose-500'}`}>
+                    <div className={`text-xs font-semibold font-mono tabular-nums min-h-5 leading-snug ${pos.currentPriceUsd >= pos.entryPriceUsd ? 'text-teal-600 dark:text-teal-400' : 'text-rose-500'}`}>
                       {formatTokenPriceUsd(pos.currentPriceUsd)}
                     </div>
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block mb-1">Gross P&amp;L</span>
-                    <div className="text-xs font-semibold font-mono tabular-nums flex items-center h-5">
+                    <div className="text-xs font-semibold font-mono tabular-nums min-h-5 leading-snug">
                       <PnlText
                         valueSol={grossPnlSol}
                         valuePct={grossPct}
@@ -299,7 +299,7 @@ export function PositionsView() {
                     <span className="text-[11px] font-sans text-slate-500 block mb-1">
                       Net P&amp;L ({pos.confirmationLabel})
                     </span>
-                    <div className="text-xs font-semibold font-mono tabular-nums flex items-center h-5">
+                    <div className="text-xs font-semibold font-mono tabular-nums min-h-5 leading-snug">
                       <PnlText
                         valueSol={netPnlSol}
                         valuePct={netPct}
@@ -321,15 +321,15 @@ export function PositionsView() {
                   </div>
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 block">
-                      Trailing Floor
+                      Profit Lock Floor
                     </span>
                     {pos.trailingArmed && pos.trailingFloorPct !== null ? (
-                      <span className="text-teal-600 dark:text-teal-400 font-bold">
+                      <span className="text-emerald-500 dark:text-emerald-400 font-bold">
                         +{pos.trailingFloorPct.toFixed(1)}% (Locked)
                       </span>
                     ) : (
                       <span className="text-slate-500">
-                        Inactive (Arms at Tier #1)
+                        Pending (Arms at +{pos.exitParams?.trailingLadder?.[0]?.peakGainPct ?? 1.2}%)
                       </span>
                     )}
                   </div>
@@ -347,35 +347,38 @@ export function PositionsView() {
                   const firstTierFloor = firstTier ? (firstTier.peakGainPct - firstTier.allowedDropPct) : 17;
                   const isArmed = pos.trailingArmed && pos.trailingFloorPct !== null;
 
-                  // Find active tier
+                  // Find highest tier reached
                   let activeTierIndex = -1;
-                  if (isArmed) {
-                    for (let i = ladder.length - 1; i >= 0; i--) {
-                      if (pos.peakPnlPct >= ladder[i].peakGainPct) {
-                        activeTierIndex = i;
-                        break;
-                      }
+                  for (let i = ladder.length - 1; i >= 0; i--) {
+                    if (pos.peakPnlPct >= ladder[i].peakGainPct) {
+                      activeTierIndex = i;
+                      break;
                     }
                   }
-                  const nextTier = activeTierIndex + 1 < ladder.length ? ladder[activeTierIndex + 1] : null;
+
+                  const nextTierIndex = activeTierIndex + 1;
+                  const nextTier = nextTierIndex < ladder.length ? ladder[nextTierIndex] : null;
                   const targetPeak = isArmed
                     ? (nextTier ? nextTier.peakGainPct : pos.exitParams.takeProfitPct)
                     : firstTierPeak;
 
                   const isLoss = grossPct < 0;
+                  const armedSpan = Math.max(0.1, targetPeak - (pos.trailingFloorPct ?? 0));
                   const progressPct = isArmed
-                    ? Math.min(100, Math.max(0, ((grossPct - (pos.trailingFloorPct ?? 0)) / (targetPeak - (pos.trailingFloorPct ?? 0))) * 100))
-                    : Math.min(100, Math.max(0, (grossPct / targetPeak) * 100));
+                    ? Math.min(100, Math.max(0, ((grossPct - (pos.trailingFloorPct ?? 0)) / armedSpan) * 100))
+                    : Math.min(100, Math.max(0, (grossPct / Math.max(0.1, targetPeak)) * 100));
 
                   return (
                     <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800/70">
                       <div className="flex flex-wrap items-center justify-between text-[11px] font-mono gap-1">
                         <span className="text-slate-500 font-sans">
                           {isArmed
-                            ? (nextTier ? `Trailing Active · Progress to Tier #${activeTierIndex + 2} Peak (+${nextTier.peakGainPct}%)` : `Trailing Active · Progress to TP (+${pos.exitParams.takeProfitPct}%)`)
+                            ? (nextTier
+                                ? `Profit Lock Active (+${pos.trailingFloorPct?.toFixed(1)}% Floor) · Aiming for Tier #${nextTierIndex + 1} (+${nextTier.peakGainPct}%)`
+                                : `Profit Lock Active (+${pos.trailingFloorPct?.toFixed(1)}% Floor) · All Tiers Cleared! Aiming for TP (+${pos.exitParams.takeProfitPct}%)`)
                             : `Progress to Profit Lock Tier #1 (Peak +${firstTierPeak}%)`}
                         </span>
-                        <span className={`font-semibold ${isLoss ? 'text-rose-500' : 'text-teal-600 dark:text-teal-400'}`}>
+                        <span className={`font-semibold ${isLoss ? 'text-rose-500' : 'text-emerald-500 dark:text-emerald-400'}`}>
                           {grossPct >= 0 ? `+${grossPct.toFixed(2)}%` : `${grossPct.toFixed(2)}%`} (Target: +{targetPeak}%)
                         </span>
                       </div>
@@ -396,31 +399,38 @@ export function PositionsView() {
                       {/* Display Custom Trailing Profit Lock System Tiers */}
                       {ladder.length > 0 && (
                         <div className="space-y-1 pt-1">
-                          <div className="flex items-center justify-between text-[10px] text-slate-500">
+                          <div className="flex flex-wrap items-center justify-between text-[10px] text-slate-500 gap-1">
                             <span className="font-semibold uppercase tracking-wider">Your Stepped Trailing Profit Lock System</span>
-                            <span className="font-mono text-teal-600 dark:text-teal-400 font-medium">
+                            <span className="font-mono text-emerald-500 dark:text-emerald-400 font-medium">
                               {isArmed
-                                ? `Tier #${activeTierIndex + 1} Locked Floor: +${pos.trailingFloorPct?.toFixed(1)}%`
+                                ? `Tier #${activeTierIndex + 1} Locked Floor: +${pos.trailingFloorPct?.toFixed(1)}% ${nextTier ? `➔ Target: Tier #${nextTierIndex + 1} (+${nextTier.peakGainPct}%)` : '➔ All Tiers Hit!'}`
                                 : `Arms at Peak +${firstTierPeak}% ➔ Locks +${firstTierFloor.toFixed(1)}% Floor`}
                             </span>
                           </div>
                           <div className="flex flex-wrap gap-1.5">
                             {ladder.map((t, idx) => {
                               const tierFloor = t.peakGainPct - t.allowedDropPct;
-                              const currentActive = idx === activeTierIndex;
-                              const passed = pos.peakPnlPct >= t.peakGainPct;
+                              const isHit = pos.peakPnlPct >= t.peakGainPct;
+                              const isInProgress = !isHit && idx === nextTierIndex;
                               return (
                                 <span
                                   key={idx}
-                                  className={`px-2 py-0.5 rounded-md font-mono text-[10px] tabular-nums border ${
-                                    currentActive
-                                      ? 'bg-emerald-500/15 border-emerald-500 text-emerald-500 dark:text-emerald-300 font-bold ring-1 ring-emerald-500/30'
-                                      : passed
-                                        ? 'bg-slate-100 dark:bg-slate-800/80 border-slate-300 dark:border-slate-700 text-slate-400'
+                                  className={`px-2 py-0.5 rounded-md font-mono text-[10px] tabular-nums border transition-all ${
+                                    isHit
+                                      ? 'bg-emerald-500/20 border-emerald-500 text-emerald-600 dark:text-emerald-300 font-semibold ring-1 ring-emerald-500/30'
+                                      : isInProgress
+                                        ? 'bg-amber-500/20 border-amber-500 text-amber-700 dark:text-amber-300 font-bold ring-2 ring-amber-500/40 animate-pulse'
                                         : 'bg-slate-50 dark:bg-slate-900/60 border-slate-200 dark:border-slate-800 text-slate-500'
                                   }`}
+                                  title={
+                                    isHit
+                                      ? `Tier #${idx + 1} reached (Floor +${tierFloor.toFixed(1)}% secured)`
+                                      : isInProgress
+                                        ? `Currently in progress (Arms at +${t.peakGainPct}% peak)`
+                                        : `Upcoming Tier #${idx + 1}`
+                                  }
                                 >
-                                  #{idx + 1}: +{t.peakGainPct}% ➔ Lock +{tierFloor.toFixed(1)}%
+                                  {isHit ? '✓ ' : isInProgress ? '▶ ' : ''}#{idx + 1}: +{t.peakGainPct}% ➔ {isHit ? `Locked +${tierFloor.toFixed(1)}%` : `Lock +${tierFloor.toFixed(1)}%`}
                                 </span>
                               );
                             })}
@@ -480,7 +490,7 @@ export function PositionsView() {
                 <th className="py-3 px-4 font-medium text-right">Current</th>
                 <th className="py-3 px-4 font-medium text-right">Break-Even</th>
                 <th className="py-3 px-4 font-medium text-right">Net P&amp;L</th>
-                <th className="py-3 px-4 font-medium text-right">Trailing Floor</th>
+                <th className="py-3 px-4 font-medium text-right">Profit Lock Floor</th>
                 <th className="py-3 px-4 font-medium text-right">Action</th>
               </tr>
             </thead>
@@ -525,9 +535,15 @@ export function PositionsView() {
                       />
                     </td>
                     <td className="py-3 px-4 text-right font-mono tabular-nums">
-                      {pos.trailingArmed && pos.trailingFloorPct !== null
-                        ? `+${pos.trailingFloorPct.toFixed(2)}%`
-                        : 'Pending'}
+                      {pos.trailingArmed && pos.trailingFloorPct !== null ? (
+                        <span className="text-emerald-500 dark:text-emerald-400 font-bold">
+                          +{pos.trailingFloorPct.toFixed(1)}% (Locked)
+                        </span>
+                      ) : (
+                        <span className="text-slate-400 text-xs">
+                          Pending (+{pos.exitParams?.trailingLadder?.[0]?.peakGainPct ?? 1.2}%)
+                        </span>
+                      )}
                     </td>
                     <td className="py-3 px-4 text-right">
                       <button

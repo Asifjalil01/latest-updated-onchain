@@ -115,48 +115,66 @@ export function WalletsView() {
 
   const handleBrowserConnect = async (kind: 'phantom' | 'solflare') => {
     const win = window as unknown as {
+      phantom?: { solana?: BrowserSolanaProvider };
       solana?: BrowserSolanaProvider;
       solflare?: BrowserSolanaProvider;
     };
-    const providerObj = kind === 'phantom' ? win.solana : win.solflare;
+    const providerObj =
+      kind === 'phantom' ? (win.phantom?.solana ?? win.solana) : win.solflare;
     if (!providerObj) {
       pushToast({
         kind: 'warn',
-        title: `${kind} extension not detected`,
-        body: 'Browser popup wallets are optional and supported for manual trades only.',
+        title: `${kind === 'phantom' ? 'Phantom' : 'Solflare'} extension not detected`,
+        body: 'If you are running inside an embedded preview iframe, open the app directly in your browser tab or use the Server-Side Encrypted Signer on the left for Live autonomous trading.',
       });
       return;
     }
     try {
       const resp = await providerObj.connect();
-      const addr = resp.publicKey.toString();
+      const addr = resp.publicKey?.toString?.() ?? '';
+      if (!addr) {
+        throw new Error('Wallet did not return a public key.');
+      }
       await apiFetch('/api/wallet/connect', {
         method: 'POST',
         body: JSON.stringify({ provider: kind, address: addr }),
       });
       await hydrateAll();
-      pushToast({ kind: 'info', title: `Connected ${kind} (manual trades only)` });
+      pushToast({ kind: 'success', title: `Connected ${kind} (${addr.slice(0, 4)}...${addr.slice(-4)})` });
     } catch (err) {
+      const errMsg =
+        err instanceof Error
+          ? err.message
+          : typeof err === 'object' && err !== null && 'message' in err
+            ? String((err as { message: unknown }).message)
+            : 'Connection rejected or cancelled';
       pushToast({
         kind: 'error',
         title: 'Wallet connect failed',
-        body: err instanceof Error ? err.message : 'Rejected',
+        body: errMsg,
       });
     }
   };
 
   const handleWatchOnly = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (watchAddress.trim().length < 32) return;
+    const cleaned = watchAddress.trim();
+    if (cleaned.length < 32) return;
     setBusy(true);
     try {
       await apiFetch('/api/wallet/connect', {
         method: 'POST',
-        body: JSON.stringify({ provider: 'watch_only', address: watchAddress.trim() }),
+        body: JSON.stringify({ provider: 'watch_only', address: cleaned }),
       });
       setWatchAddress('');
       await hydrateAll();
-      pushToast({ kind: 'info', title: 'Watch-only address connected' });
+      pushToast({
+        kind: 'info',
+        title: 'Wallet address connected (Watch-Only)',
+        body: cleaned.length > 50 || cleaned.startsWith('[')
+          ? 'Public address extracted from your key. To enable autonomous Live buys/sells, also save it in the Server-Side Encrypted Signer panel.'
+          : undefined,
+      });
     } catch (err) {
       pushToast({
         kind: 'error',
@@ -308,8 +326,7 @@ export function WalletsView() {
 
           <form onSubmit={(e) => void handleSetSigner(e)} className="space-y-3">
             <p className="text-xs text-slate-500">
-              Encrypt and store a Solana keypair (Base58 or 64-byte JSON array) locally using
-              scrypt + AES-256-GCM:
+              <strong>Autonomous Live Auto-Confirm:</strong> Once unlocked, the bot signs and sends Live buys &amp; sells automatically without browser popups. Private keys (Base58 or 64-byte JSON array) are encrypted locally using scrypt + AES-256-GCM.
             </p>
             <input
               type="password"

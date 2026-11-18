@@ -106,6 +106,66 @@ test('API: requests without x-api-token return 401 and paper reset keeps live ro
     assert.equal(db.getTrades('paper', false).length, 0);
     assert.equal(db.getTrades('paper', true).length, 1);
     assert.equal(db.getTrades('live', false).length, 1);
+    // 4. POST /settings accepts applyToOpenPositions without Unrecognized key error
+    const settingsRes = await fetch(`${base}/settings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': token,
+      },
+      body: JSON.stringify({
+        takeProfitPct: 22,
+        applyToOpenPositions: true,
+      }),
+    });
+    assert.equal(settingsRes.status, 200);
+    const settingsJson = (await settingsRes.json()) as { settings: { takeProfitPct: number } };
+    assert.equal(settingsJson.settings.takeProfitPct, 22);
+
+    // 5. POST /wallet/connect safely extracts public key from a 64-byte JSON secret key array
+    const { Keypair } = await import('@solana/web3.js');
+    const kp = await Keypair.generate();
+    const secretArr = JSON.stringify(Array.from(kp.secretKey));
+    const connectRes = await fetch(`${base}/wallet/connect`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': token,
+      },
+      body: JSON.stringify({
+        provider: 'watch_only',
+        address: secretArr,
+      }),
+    });
+    assert.equal(connectRes.status, 200);
+    const connectJson = (await connectRes.json()) as { diagnostics: { address: string } };
+    assert.equal(connectJson.diagnostics.address, kp.publicKey.toBase58());
+
+    // 6. POST /mode rejects while running without autoStop, and stops + switches cleanly with autoStop=true
+    (orch as unknown as { runState: string }).runState = 'running';
+    assert.equal(orch.getStatusSnapshot().runState, 'running');
+    const blockedModeRes = await fetch(`${base}/mode`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': token,
+      },
+      body: JSON.stringify({ mode: 'testnet' }),
+    });
+    assert.equal(blockedModeRes.status, 400);
+
+    const modeRes = await fetch(`${base}/mode`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': token,
+      },
+      body: JSON.stringify({ mode: 'testnet', autoStop: true }),
+    });
+    assert.equal(modeRes.status, 200);
+    const modeJson = (await modeRes.json()) as { status: { mode: string; runState: string } };
+    assert.equal(modeJson.status.mode, 'testnet');
+    assert.equal(modeJson.status.runState, 'stopped');
   } finally {
     orch.stop();
     db.close();

@@ -30,7 +30,7 @@ export function LiveConfirmModal() {
       });
       await apiFetch('/api/mode', {
         method: 'POST',
-        body: JSON.stringify({ mode: 'live' }),
+        body: JSON.stringify({ mode: 'live', autoStop: true }),
       });
       await refreshModeData('live');
       setLiveConfirmModalOpen(false);

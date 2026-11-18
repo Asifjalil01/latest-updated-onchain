@@ -313,9 +313,14 @@ export class BotOrchestrator {
     return { ok: true };
   }
 
-  async switchMode(targetMode: ExecutionMode): Promise<{ ok: boolean; error?: string }> {
+  async switchMode(targetMode: ExecutionMode, autoStop = false): Promise<{ ok: boolean; error?: string }> {
     if (this.runState !== 'stopped') {
-      return { ok: false, error: 'Cannot switch execution mode while the bot is running.' };
+      if (autoStop) {
+        this.stop();
+        this.log('INFO', 'MODE', `Bot stopped automatically to switch mode to ${targetMode.toUpperCase()}.`);
+      } else {
+        return { ok: false, error: 'Cannot switch execution mode while the bot is running.' };
+      }
     }
     if (targetMode === 'live') {
       const diag = await this.refreshWalletDiagnostics();

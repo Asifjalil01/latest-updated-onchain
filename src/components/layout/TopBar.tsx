@@ -36,10 +36,6 @@ export function TopBar({ onOpenMobileNav }: { onOpenMobileNav: () => void }) {
   const isRunning = runState === 'running';
 
   const handleModeSwitch = async (nextMode: ExecutionMode) => {
-    if (isRunning) {
-      pushToast({ kind: 'warn', title: 'Mode switch blocked', body: 'Stop the bot before switching modes.' });
-      return;
-    }
     if (nextMode === 'live' && !status?.liveConfirmed) {
       setLiveConfirmModalOpen(true);
       return;
@@ -48,10 +44,15 @@ export function TopBar({ onOpenMobileNav }: { onOpenMobileNav: () => void }) {
       setBusyAction(true);
       await apiFetch('/api/mode', {
         method: 'POST',
-        body: JSON.stringify({ mode: nextMode }),
+        body: JSON.stringify({ mode: nextMode, autoStop: true }),
       });
       await refreshModeData(nextMode);
-      pushToast({ kind: 'info', title: `Switched to ${nextMode.toUpperCase()} mode` });
+      pushToast({
+        kind: 'info',
+        title: isRunning
+          ? `Bot stopped & switched to ${nextMode.toUpperCase()} mode`
+          : `Switched to ${nextMode.toUpperCase()} mode`,
+      });
     } catch (err) {
       pushToast({
         kind: 'error',
@@ -132,7 +133,7 @@ export function TopBar({ onOpenMobileNav }: { onOpenMobileNav: () => void }) {
               <button
                 key={m}
                 type="button"
-                disabled={busyAction || (isRunning && !active)}
+                disabled={busyAction}
                 onClick={() => void handleModeSwitch(m)}
                 className={`px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg text-[11px] sm:text-xs font-semibold uppercase tracking-wide transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 disabled:opacity-50 ${
                   active

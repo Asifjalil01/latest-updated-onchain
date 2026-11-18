@@ -278,43 +278,43 @@ test('exits: validateSettingsUpdate syncs stopLossPct from stopLossTiers and all
   assert.ok(invalidBelowMin.fieldErrors['stopLossTiers.0.triggerDropPct']);
 });
 
-test('exits: trailing stop never arms or locks floor below round-trip break-even costs', () => {
-  // Simulate 0.045 SOL trade with 5.51% round-trip cost (fees + ATA rent + est exit fees)
+test('exits: stepped trailing profit lock arms at user tier #1 (+1.2% -> 0.8% floor) and exits on drop', () => {
   let pos = makePosition({
-    solIn: 0.045,
+    solIn: 0.02,
     exitParams: {
-      ...snapshotExitParams(DEFAULT_SETTINGS, 5.51),
+      ...snapshotExitParams(DEFAULT_SETTINGS, 11.5),
       trailingLadder: [
-        { peakGainPct: 4, allowedDropPct: 2.5 },
-        { peakGainPct: 8, allowedDropPct: 3.0 },
+        { peakGainPct: 1.2, allowedDropPct: 0.4 },
+        { peakGainPct: 1.8, allowedDropPct: 0.3 },
+        { peakGainPct: 7.5, allowedDropPct: 0.2 },
       ],
     },
   });
 
-  // Peak at +5.8% exceeds roundTripCostPct (5.51%) slightly, but is below +6.51% arm threshold
-  const tooEarly = evaluatePositionExit(pos, {
-    currentPriceUsd: 1.058,
+  // Price at +0.8% is below Tier #1 peak (+1.2%) -> not yet armed
+  const beforeArm = evaluatePositionExit(pos, {
+    currentPriceUsd: 1.008,
+    currentLiquidityUsd: 100_000,
+    nowMs: pos.openedAtMs + 30_000,
+  });
+  assert.equal(beforeArm.updatedTrailingArmed, false);
+  assert.equal(beforeArm.updatedTrailingFloorPct, null);
+  assert.equal(beforeArm.shouldExit, false);
+
+  // Peak reaches +1.2% -> arms Tier #1 and locks floor at +0.8% (1.2% - 0.4%)
+  const armed = evaluatePositionExit(pos, {
+    currentPriceUsd: 1.012,
     currentLiquidityUsd: 100_000,
     nowMs: pos.openedAtMs + 60_000,
   });
-  assert.equal(tooEarly.updatedTrailingArmed, false);
-  assert.equal(tooEarly.updatedTrailingFloorPct, null);
-  assert.equal(tooEarly.shouldExit, false);
-
-  // Peak reaches +6.6% (>= 5.51 + 1.0 = 6.51%) -> arms and locks floor >= 5.51 + 0.5 = 6.01%
-  const armed = evaluatePositionExit(pos, {
-    currentPriceUsd: 1.066,
-    currentLiquidityUsd: 100_000,
-    nowMs: pos.openedAtMs + 70_000,
-  });
   assert.equal(armed.updatedTrailingArmed, true);
   assert.ok(
-    armed.updatedTrailingFloorPct !== null && armed.updatedTrailingFloorPct >= 6.0,
-    `Expected trailing floor >= 6.01%, got ${armed.updatedTrailingFloorPct}`
+    armed.updatedTrailingFloorPct !== null && Math.abs(armed.updatedTrailingFloorPct - 0.8) < 0.01,
+    `Expected trailing floor ~0.8%, got ${armed.updatedTrailingFloorPct}`
   );
   assert.equal(armed.shouldExit, false);
 
-  // Pullback to +5.9% triggers TRAILING_STOP above true round-trip break-even (5.51%)
+  // Price drops to +0.75% (below locked +0.8% floor) -> triggers TRAILING_STOP exit immediately
   pos = {
     ...pos,
     peakPriceUsd: armed.updatedPeakPriceUsd,
@@ -323,11 +323,11 @@ test('exits: trailing stop never arms or locks floor below round-trip break-even
     trailingFloorPct: armed.updatedTrailingFloorPct,
   };
   const exitRes = evaluatePositionExit(pos, {
-    currentPriceUsd: 1.059,
+    currentPriceUsd: 1.0075,
     currentLiquidityUsd: 100_000,
-    nowMs: pos.openedAtMs + 80_000,
+    nowMs: pos.openedAtMs + 70_000,
   });
   assert.equal(exitRes.shouldExit, true);
   assert.equal(exitRes.reason, 'TRAILING_STOP');
-  assert.ok(exitRes.netPnlPctEstimate > 0);
+  assert.ok(exitRes.message?.includes('Trailing stop hit'));
 });
