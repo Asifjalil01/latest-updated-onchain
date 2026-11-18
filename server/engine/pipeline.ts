@@ -69,6 +69,17 @@ export class BotOrchestrator {
     bought: 0,
   };
 
+  resetFunnel(): void {
+    this.funnel = {
+      discovered: 0,
+      validated: 0,
+      filtered: 0,
+      securityPassed: 0,
+      scored: 0,
+      bought: 0,
+    };
+  }
+
   private sseClients = new Set<(payload: SseEventPayload) => void>();
   private scanTimer: NodeJS.Timeout | null = null;
   private exitTimer: NodeJS.Timeout | null = null;

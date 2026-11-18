@@ -138,11 +138,13 @@ export function PnlText({
   valuePct,
   label,
   colorBlindSafe,
+  solUsd,
 }: {
   valueSol: number;
   valuePct?: number;
-  label?: ConfirmationLabel;
+  label?: ConfirmationLabel | string;
   colorBlindSafe?: boolean;
+  solUsd?: number | null;
 }) {
   const prevRef = useRef(valueSol);
   const [flash, setFlash] = useState<'up' | 'down' | null>(null);
@@ -171,6 +173,8 @@ export function PnlText({
         ? 'bg-rose-500/15'
         : 'bg-transparent';
 
+  const usdVal = solUsd && solUsd > 0 ? valueSol * solUsd : null;
+
   return (
     <span
       className={`inline-flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 font-mono text-xs font-semibold tabular-nums rounded px-1 -mx-1 transition-colors duration-300 ${colorCls} ${flashBg}`}
@@ -189,6 +193,11 @@ export function PnlText({
       </span>
       {valuePct !== undefined && (
         <span className="text-xs opacity-80 whitespace-nowrap">({formatPct(valuePct)})</span>
+      )}
+      {usdVal !== null && (
+        <span className="text-xs opacity-90 whitespace-nowrap">
+          · {formatSignedUsd(usdVal)}
+        </span>
       )}
       {label && (
         <span className="text-[11px] font-sans uppercase tracking-wider text-slate-500 dark:text-slate-400 whitespace-nowrap">

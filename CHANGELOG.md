@@ -2,6 +2,21 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.19.0 — Side-by-Side USD ($) P&L, Complete Scanner Funnel Reset Cache, and Dedicated Avg Win / Avg Loss Tab
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Side-by-Side USD ($) P&L Display (`Primitives.tsx`, `PositionsView.tsx`, `HistoryView.tsx`, `DashboardView.tsx`)**:
+  - Added USD earnings and losses (`· +$0.14` / `· -$0.08`) directly side by side with Gross P&L and Net P&L (simulated) across Open Positions, Dashboard KPIs, and History closed trades.
+- **Scanner Reset Seen Cache Resets Funnel Counters (`api.ts`, `pipeline.ts`, `ScannerView.tsx`)**:
+  - Clicking **Reset Seen Cache** in the Scanner tab now fully resets all funnel counters (Discovered, Validated, Hard Filtered, Security Passed, Scored, Executed) back to 0 alongside clearing seen tokens.
+- **Dedicated Avg Win / Avg Loss Tab & Analytics (`AvgWinLossView.tsx`, `Sidebar.tsx`, `App.tsx`, `HistoryView.tsx`)**:
+  - Added a new **Avg Win / Avg Loss** tab in the Sidebar right after Risk Centre, providing detailed side-by-side SOL and USD ($) performance comparisons of winning vs losing trades, win rates, profit factor, and expectancy.
+  - Updated History & Analytics performance summary cards to show Avg Win / Avg Loss in SOL and USD side by side.
+
+---
+
 ## v1.18.0 — 5m Dump/Order-Flow Entry Protection, Calibrated Paper Realism, Live Hold Timers, History Hold in Minutes & Bot-Wide Hover Tooltips
 
 **Risk Warning: Trading can lose all of your money.**

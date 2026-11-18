@@ -170,6 +170,7 @@ export function DashboardView() {
               valueSol={openPnlSol}
               label={isSim ? 'simulated' : 'est.'}
               colorBlindSafe={colorBlindSafe}
+              solUsd={solUsd}
             />
           </div>
           <div className="flex items-center justify-between gap-2">
@@ -204,6 +205,7 @@ export function DashboardView() {
               valueSol={todayPnlSol}
               label={confirmationTag}
               colorBlindSafe={colorBlindSafe}
+              solUsd={solUsd}
             />
           </div>
           <div className="text-xs font-mono tabular-nums flex items-center justify-between gap-2 flex-wrap">
@@ -238,6 +240,7 @@ export function DashboardView() {
               valueSol={realizedNetSol}
               label={confirmationTag}
               colorBlindSafe={colorBlindSafe}
+              solUsd={solUsd}
             />
           </div>
           <div className="flex items-center justify-between gap-2">

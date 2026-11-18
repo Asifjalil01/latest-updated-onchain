@@ -693,6 +693,7 @@ export function PositionsView() {
                         valuePct={netPct}
                         label={pos.confirmationLabel}
                         colorBlindSafe={colorBlindSafe}
+                        solUsd={solUsd}
                       />
                     </td>
                     <td className="py-3 px-4 text-right font-mono tabular-nums">

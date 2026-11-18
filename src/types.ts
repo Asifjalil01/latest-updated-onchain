@@ -58,4 +58,5 @@ export type AppTab =
   | 'wallets'
   | 'logs'
   | 'pipeline'
-  | 'risk';
+  | 'risk'
+  | 'avgwin';

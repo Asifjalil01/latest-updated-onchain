@@ -371,12 +371,19 @@ export function HistoryView() {
                 <span>Avg Win / Avg Loss</span>
                 <InfoTooltip text="Average net SOL gained on winning trades versus average net SOL lost on losing trades." />
               </span>
-              <div className="font-mono text-sm font-bold tabular-nums mt-1">
-                <span className="text-emerald-500">
-                  +{formatSol(analytics?.avgWinSol ?? 0, 4)}
-                </span>{' '}
-                /{' '}
-                <span className="text-rose-500">{formatSol(analytics?.avgLossSol ?? 0, 4)}</span>
+              <div className="font-mono text-xs font-bold tabular-nums mt-1 space-y-0.5">
+                <div>
+                  <span className="text-emerald-500">
+                    +{formatSol(analytics?.avgWinSol ?? 0, 4)}
+                    {status?.solPriceUsd ? ` (${formatSignedUsd((analytics?.avgWinSol ?? 0) * status.solPriceUsd)})` : ''}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-rose-500">
+                    {formatSol(analytics?.avgLossSol ?? 0, 4)}
+                    {status?.solPriceUsd ? ` (${formatSignedUsd((analytics?.avgLossSol ?? 0) * status.solPriceUsd)})` : ''}
+                  </span>
+                </div>
               </div>
             </div>
             <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-4">
@@ -520,6 +527,7 @@ export function HistoryView() {
                   valueSol={selectedTrade.pnlSol}
                   valuePct={selectedTrade.pnlPct}
                   colorBlindSafe={colorBlindSafe}
+                  solUsd={status?.solPriceUsd ?? selectedTrade.solPriceUsd ?? 0}
                 />
                 <div className="text-slate-500 mt-0.5">{formatSignedUsd(selectedTrade.pnlUsd)}</div>
               </div>

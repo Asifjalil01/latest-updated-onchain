@@ -702,8 +702,9 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
 
   router.post('/seen-tokens/reset', (_req: Request, res: Response) => {
     orchestrator.db.clearSeenTokensCache();
-    orchestrator.log('INFO', 'SCANNER', 'Seen tokens cache cleared.');
-    res.json({ ok: true });
+    orchestrator.resetFunnel();
+    orchestrator.log('INFO', 'SCANNER', 'Seen tokens cache and funnel counters reset.');
+    res.json({ ok: true, status: orchestrator.getStatusSnapshot() });
   });
 
   router.post('/account/reset', (req: Request, res: Response) => {

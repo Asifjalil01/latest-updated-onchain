@@ -18,6 +18,7 @@ import { WalletsView } from './components/views/WalletsView';
 import { LogsView } from './components/views/LogsView';
 import { PipelineConfigView } from './components/views/PipelineConfigView';
 import { RiskCentreView } from './components/views/RiskCentreView';
+import { AvgWinLossView } from './components/views/AvgWinLossView';
 
 export default function App() {
   const {
@@ -85,6 +86,8 @@ export default function App() {
         return <PipelineConfigView />;
       case 'risk':
         return <RiskCentreView />;
+      case 'avgwin':
+        return <AvgWinLossView />;
       default:
         return <DashboardView />;
     }

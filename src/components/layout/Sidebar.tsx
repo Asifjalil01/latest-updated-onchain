@@ -12,6 +12,7 @@ import {
   ShieldAlert,
   Sliders,
   Terminal,
+  TrendingUp,
   Wallet,
 } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
@@ -83,6 +84,12 @@ const NAV_ITEMS: Array<{
     label: 'Risk Centre',
     description: 'Pre-flight Live trading readiness checklist, plain-language Solana risk briefing, and emergency kill switch.',
     icon: ShieldAlert,
+  },
+  {
+    id: 'avgwin',
+    label: 'Avg Win / Avg Loss',
+    description: 'Detailed analysis of average winning vs losing trades in SOL and USD side by side.',
+    icon: TrendingUp,
   },
 ];
 
