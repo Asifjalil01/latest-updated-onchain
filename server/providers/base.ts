@@ -152,7 +152,26 @@ export class HttpProvider {
         }
 
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status} from ${this.sourceName}`);
+          let detail = '';
+          try {
+            const text = await response.text();
+            if (text) {
+              try {
+                const parsed = JSON.parse(text) as { error?: string; message?: string };
+                detail = parsed.error || parsed.message || text.slice(0, 140);
+              } catch {
+                detail = text.slice(0, 140);
+              }
+            }
+          } catch {
+            // ignore body read error
+          }
+          const suffix = detail ? `: ${detail}` : '';
+          const httpErr = new Error(`HTTP ${response.status} from ${this.sourceName}${suffix}`) as Error & {
+            httpStatus?: number;
+          };
+          httpErr.httpStatus = response.status;
+          throw httpErr;
         }
 
         domainState.consecutive429s = 0;
@@ -171,7 +190,9 @@ export class HttpProvider {
         return data;
       } catch (err) {
         lastErr = err instanceof Error ? err : new Error(String(err));
-        if (lastErr.message.includes('HTTP 429')) {
+        const status = (lastErr as Error & { httpStatus?: number }).httpStatus;
+        const isClient4xx = typeof status === 'number' && status >= 400 && status < 500 && status !== 429;
+        if (lastErr.message.includes('HTTP 429') || isClient4xx) {
           break;
         }
         if (attempt < this.maxRetries) {
@@ -181,14 +202,19 @@ export class HttpProvider {
       }
     }
 
-    this.errorCount += 1;
-    this.consecutiveFailures += 1;
+    const finalStatus = (lastErr as (Error & { httpStatus?: number }) | null)?.httpStatus;
+    const isClient4xx =
+      typeof finalStatus === 'number' && finalStatus >= 400 && finalStatus < 500 && finalStatus !== 429;
     const errMsg = lastErr ? lastErr.message : 'Unknown provider failure';
     this.lastError = errMsg;
-    this.recentErrors = [{ message: errMsg, atMs: Date.now() }, ...this.recentErrors].slice(0, 10);
-    if (this.consecutiveFailures >= this.circuitFailureThreshold) {
-      this.circuitState = 'OPEN';
-      this.circuitOpenedAtMs = Date.now();
+    if (!isClient4xx) {
+      this.errorCount += 1;
+      this.consecutiveFailures += 1;
+      this.recentErrors = [{ message: errMsg, atMs: Date.now() }, ...this.recentErrors].slice(0, 10);
+      if (this.consecutiveFailures >= this.circuitFailureThreshold) {
+        this.circuitState = 'OPEN';
+        this.circuitOpenedAtMs = Date.now();
+      }
     }
     throw lastErr ?? new Error(`Provider failure: ${this.sourceName}`);
   }

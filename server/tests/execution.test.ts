@@ -6,11 +6,11 @@ import path from 'node:path';
 import { Keypair, VersionedTransaction, TransactionMessage } from '@solana/web3.js';
 import { DEFAULT_SETTINGS } from '../config/defaults';
 import { LiveExecutionEngine, type LiveTxAdapter } from '../engine/liveEngine';
+import { calculatePositionSize } from '../engine/sizing';
 import { BotDatabase } from '../store/db';
 import { ServerSignerManager } from '../security/signer';
 import type { SolanaRpcPool } from '../providers/rpcPool';
-import type { JupiterProvider, JupiterQuoteResponse } from '../providers/jupiter';
-import { WSOL_MINT } from '../providers/jupiter';
+import { JupiterProvider, WSOL_MINT, type JupiterQuoteResponse } from '../providers/jupiter';
 import { BotOrchestrator } from '../engine/pipeline';
 import type { DexScreenerProvider } from '../providers/dexscreener';
 import type { GeckoTerminalProvider } from '../providers/geckoterminal';
@@ -643,7 +643,7 @@ test('execution: hasTradedMint blocks rebuy after coin sells, 1s pricing stays f
       mode: 'live',
       status: 'OPEN',
       confirmationLabel: 'confirmed',
-      exitParams: { ...openPos.exitParams, takeProfitPct: 60 },
+      exitParams: { ...openPos.exitParams, takeProfitPct: 100 },
     });
     (orchestrator as unknown as { mode: string }).mode = 'live';
     balCalls = 0;
@@ -653,6 +653,331 @@ test('execution: hasTradedMint blocks rebuy after coin sells, 1s pricing stays f
     assert.equal(balCalls, 1, `Expected verifyBalanceAndExternalSell to run once per 20s window, got ${balCalls}`);
 
     orchestrator.shutdown();
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('execution: Jupiter 400 route errors do not trip circuit breaker and relaxed fallback + on-chain rawAmount fix live sells', async () => {
+  const origFetch = globalThis.fetch;
+  const seenUrls: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    seenUrls.push(url);
+    if (url.includes('BadMint')) {
+      return new Response(JSON.stringify({ error: 'Could not find any route' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (!url.includes('restrictIntermediateTokens=false')) {
+      return new Response(JSON.stringify({ error: 'Route not found without intermediate' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    return new Response(
+      JSON.stringify({
+        inputMint: 'GoodToken111111111111111111111111111111111',
+        inAmount: '99500000000',
+        outputMint: WSOL_MINT,
+        outAmount: '25000000',
+        slippageBps: 500,
+        priceImpactPct: '0.01',
+        routePlan: [{ percent: 100, swapInfo: { label: 'PumpSwap' } }],
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  }) as typeof fetch;
+
+  try {
+    const jup = new JupiterProvider();
+    // Simulate 6 HTTP 400 route errors on bad tokens: circuit breaker MUST remain CLOSED
+    for (let i = 0; i < 6; i += 1) {
+      const bad = await jup.getQuote({
+        inputMint: `BadMint${i}1111111111111111111111111111111111`,
+        outputMint: WSOL_MINT,
+        amountRaw: '1000000',
+        slippageBps: 500,
+        allowRelaxFallback: false,
+      });
+      assert.equal(bad, null);
+    }
+    const swapHealth = jup.getHealth().find((h) => h.source === 'jupiter_swap');
+    assert.equal(swapHealth?.circuitState, 'CLOSED');
+
+    // Now test live sell using real on-chain rawAmount (decimals=9 while position recorded decimals=6) + relaxed fallback
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssb-rawsell-'));
+    const db = new BotDatabase(path.join(tmpDir, 'test.db'));
+    const kp = await Keypair.generate();
+    const signer = new ServerSignerManager(path.join(tmpDir, 'ks.json'));
+    await signer.initFromEnv(JSON.stringify(Array.from(kp.secretKey)));
+    try {
+      const msg = new TransactionMessage({
+        payerKey: kp.publicKey,
+        recentBlockhash: '11111111111111111111111111111111' as unknown as ConstructorParameters<
+          typeof TransactionMessage
+        >[0]['recentBlockhash'],
+        instructions: [],
+      }).compileToV0Message();
+      const dummySwapB64 = Buffer.from(new VersionedTransaction(msg).serialize()).toString('base64');
+
+      // Override fetch temporarily for POST /swap as well
+      const prevMockFetch = globalThis.fetch;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).includes('/swap/v1/swap')) {
+          return new Response(JSON.stringify({ swapTransaction: dummySwapB64 }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return prevMockFetch(input, init);
+      }) as typeof fetch;
+
+      const mockRpcPool = {
+        getAgreedTokenBalanceUi: async () => ({
+          agreed: true,
+          balanceUi: 99.5,
+          readings: [99.5, 99.5],
+          decimals: 9,
+          rawAmount: '99500000000',
+        }),
+      } as unknown as SolanaRpcPool;
+
+      const mockAdapter: LiveTxAdapter = {
+        sendSignedTransaction: async () => 'sig_sell_1',
+        pollConfirmation: async () => ({ status: 'confirmed' }),
+        reconcileParsedSwapSolDelta: async () => ({
+          found: true,
+          solDeltaLamports: 25_000_000 - 5000,
+          feeLamports: 5000,
+          closedAtaRentLamports: 0,
+        }),
+        findRecentSellSignature: async () => null,
+      };
+
+      const engine = new LiveExecutionEngine(db, signer, mockRpcPool, jup, () => undefined, mockAdapter);
+      const pos: PositionRecord = {
+        id: 'live_coin_1',
+        mode: 'live',
+        mint: 'GoodToken111111111111111111111111111111111',
+        symbol: '1',
+        name: 'Coin 1',
+        source: 'dexscreener',
+        dex: 'pumpswap',
+        tokenClass: 'early_stage',
+        status: 'OPEN',
+        openedAtMs: Date.now() - 60_000,
+        updatedAtMs: Date.now(),
+        tokenAgeAtEntryMin: 15,
+        decimals: 6, // intentionally stale vs on-chain 9 decimals
+        quantity: 100, // intentionally slightly > actual 99.5 on-chain
+        entryPriceUsd: 0.001,
+        entryPriceSol: 0.001 / 75,
+        currentPriceUsd: 0.0012,
+        currentPriceSol: 0.0012 / 75,
+        breakEvenPriceUsd: 0.00105,
+        breakEvenPriceSol: 0.00105 / 75,
+        entryLiquidityUsd: 25_000,
+        currentLiquidityUsd: 25_000,
+        solIn: 0.015,
+        entryFeesSol: 0.0001,
+        entryRentSol: 0,
+        solPriceUsdAtEntry: 75,
+        peakPriceUsd: 0.0012,
+        peakPnlPct: 20,
+        trailingFloorPct: null,
+        trailingArmed: false,
+        gapDownTriggered: false,
+        exitParams: {
+          stopLossEnabled: true,
+          stopLossPct: 10,
+          stopLossTiers: DEFAULT_SETTINGS.stopLossTiers,
+          takeProfitPct: 50,
+          trailingEnabled: false,
+          trailingLadder: [],
+          breakEvenRecoveryEnabled: false,
+          maxHoldMinutes: 240,
+          maxHoldStagnationEnabled: false,
+          stagnationMinGainPct: 2,
+          emergencyLiquidityFloorUsd: 1000,
+          emergencyLiquidityDrainPct: 40,
+          emergencyMaxSellTaxPct: 15,
+          roundTripCostPct: 1.5,
+        },
+        txBuy: 'sig_buy_1',
+        confirmationLabel: 'confirmed',
+        qualityScore: 80,
+        tradeScore: 80,
+        explanationJson: '{}',
+        sellAttempts: 0,
+        firstSellFailureAtMs: null,
+        lastSellError: null,
+        consecutiveZeroBalanceReads: 0,
+        reviewReason: null,
+        isStaleData: false,
+        priceHistory: [0.001],
+      };
+      db.upsertPosition(pos);
+
+      const res = await engine.executeLiveSell({
+        position: pos,
+        exitReason: 'MANUAL_SELL',
+        solPriceUsd: 75,
+        settings: DEFAULT_SETTINGS,
+        isEmergency: false,
+      });
+      assert.equal(res.ok, true, `Expected live sell to succeed via exact rawAmount + relaxed fallback, got error: ${res.error}`);
+      assert.ok(seenUrls.some((u) => u.includes('amount=99500000000') && u.includes('restrictIntermediateTokens=false')));
+    } finally {
+      db.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('execution: direct Live switch/start without ENABLE LIVE or gas reserve recovers RPCs and alerts SOL+$ when wallet empty on buy', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssb-live-nobal-'));
+  const db = new BotDatabase(path.join(tmpDir, 'test.db'));
+  const kp = await Keypair.generate();
+  const signer = new ServerSignerManager(path.join(tmpDir, 'ks.json'));
+  await signer.initFromEnv(JSON.stringify(Array.from(kp.secretKey)));
+
+  try {
+    let probeCount = 0;
+    let rpcsHealthy = false;
+    const mockRpcPool = {
+      getHealthSnapshot: () => [
+        { url: 'https://rpc1', label: 'RPC1', healthy: rpcsHealthy, latencyMs: 20, slot: 1, errorCount: 0, lastCheckedMs: 1, lastError: null },
+        { url: 'https://rpc2', label: 'RPC2', healthy: rpcsHealthy, latencyMs: 25, slot: 1, errorCount: 0, lastCheckedMs: 1, lastError: null },
+      ],
+      checkAllEndpoints: async () => {
+        probeCount += 1;
+        rpcsHealthy = true;
+        return [
+          { url: 'https://rpc1', label: 'RPC1', healthy: true, latencyMs: 20, slot: 100, errorCount: 0, lastCheckedMs: Date.now(), lastError: null },
+          { url: 'https://rpc2', label: 'RPC2', healthy: true, latencyMs: 25, slot: 100, errorCount: 0, lastCheckedMs: Date.now(), lastError: null },
+        ];
+      },
+      getAgreedBalanceSol: async () => ({ agreed: true, balanceSol: 0, readings: [0, 0] }),
+      getAgreedTokenBalanceUi: async () => ({ agreed: true, balanceUi: 0, readings: [0, 0] }),
+    } as unknown as SolanaRpcPool;
+
+    const mockJupiter = {
+      getLiveSolPriceUsd: async () => 75,
+      getLivePricesUsd: async () => ({}),
+      getHealth: () => [],
+    } as unknown as JupiterProvider;
+
+    const mockDex = {
+      getLiveSolPriceUsd: async () => 75,
+      discoverMints: async () => ({ mints: [], candidates: [] }),
+      enrichMintsBatch: async () => new Map(),
+      getHealth: () => ({ source: 'dexscreener', itemsCount: 0, lastOkMs: null, errorCount: 0, lastError: null, recentErrors: [], rateLimitedUntilMs: null, circuitState: 'CLOSED' }),
+    } as unknown as DexScreenerProvider;
+
+    const mockGecko = {
+      discoverPools: async () => [],
+      getHealth: () => ({ source: 'geckoterminal', itemsCount: 0, lastOkMs: null, errorCount: 0, lastError: null, recentErrors: [], rateLimitedUntilMs: null, circuitState: 'CLOSED' }),
+    } as unknown as GeckoTerminalProvider;
+
+    const orch = new BotOrchestrator(
+      db,
+      signer,
+      mockRpcPool,
+      mockJupiter,
+      mockDex,
+      mockGecko,
+      { getHealth: () => ({ source: 'rugcheck', itemsCount: 0, lastOkMs: null, errorCount: 0, lastError: null, recentErrors: [], rateLimitedUntilMs: null, circuitState: 'CLOSED' }) } as unknown as RugCheckProvider,
+      { start: () => undefined, stop: () => undefined, drainRecentMints: () => [], getHealth: () => ({ source: 'pumpportal', itemsCount: 0, lastOkMs: null, errorCount: 0, lastError: null, recentErrors: [], rateLimitedUntilMs: null, circuitState: 'CLOSED' }) } as unknown as PumpPortalWsProvider
+    );
+
+    // 1. Live mode switch succeeds cleanly WITHOUT calling confirmLiveMode('ENABLE LIVE') and with 0.0000 SOL
+    const sw = await orch.switchMode('live', true);
+    assert.equal(sw.ok, true);
+    assert.equal(orch.getStatusSnapshot().mode, 'live');
+    assert.ok(probeCount >= 1, 'Expected refreshWalletDiagnostics to auto-recover RPC health');
+
+    // 2. Live start succeeds even with 0.0000 SOL (no trade size + gas reserve block)
+    const st = await orch.start();
+    assert.equal(st.ok, true, `Expected Live start to succeed at 0 SOL, got: ${st.error}`);
+    orch.stop();
+
+    // 3. Attempting to size/buy a coin at 0 SOL reports explicit SOL + $ alert
+    const sizing = calculatePositionSize({
+      settings: { ...DEFAULT_SETTINGS, tradeSizeSol: 0.02 },
+      availableBalanceSol: 0,
+      currentExposureSol: 0,
+      openPositionsCount: 0,
+      dailyRealizedPnlSol: 0,
+      poolLiquidityUsd: 50_000,
+      solPriceUsd: 75,
+      tokenClassMultiplier: 1,
+    });
+    assert.equal(sizing.approved, false);
+    assert.equal(sizing.cappedBy, 'INSUFFICIENT_WALLET_SOL');
+    assert.match(sizing.reason || '', /no SOL.*0\.0000 SOL.*\$0\.00/i);
+
+    // 4. Direct liveEngine.executeLiveBuy at 0 SOL also returns explicit SOL + $ error
+    const liveEngine = new LiveExecutionEngine(db, signer, mockRpcPool, mockJupiter, () => undefined);
+    const buyFail = await liveEngine.executeLiveBuy({
+      token: {
+        mint: 'EmptyWalletMint111111111111111111111111111',
+        symbol: 'TEST',
+        name: 'Test',
+        source: 'dexscreener',
+        dex: 'raydium',
+        pairAddress: 'P1',
+        poolCreatedAtMs: Date.now() - 3600_000,
+        priceUsd: 0.01,
+        priceSol: 0.01 / 75,
+        liquidityUsd: 50_000,
+        volume24hUsd: 80_000,
+        fdvUsd: 200_000,
+        txCount24h: 200,
+        buys24h: 120,
+        sells24h: 80,
+        uniqueTraders24h: 100,
+        priceChange1hPct: 4,
+        priceChange24hPct: 8,
+        rawUpdatedAtMs: Date.now(),
+      },
+      solAmount: 0.02,
+      solPriceUsd: 75,
+      settings: DEFAULT_SETTINGS,
+      explanation: {
+        mint: 'EmptyWalletMint111111111111111111111111111',
+        symbol: 'TEST',
+        tokenClass: 'early_stage',
+        qualityScore: 80,
+        tradeScore: 80,
+        combinedScore: 80,
+        sizeMultiplier: 1,
+        decision: 'BUY',
+        reasons: [],
+        warnings: [],
+        qualityBreakdown: {},
+        tradeBreakdown: {},
+        evaluatedAtMs: Date.now(),
+      },
+      decimals: 6,
+      quote: {
+        inputMint: WSOL_MINT,
+        inAmount: '20000000',
+        outputMint: 'EmptyWalletMint111111111111111111111111111',
+        outAmount: '1000000',
+        slippageBps: 150,
+        priceImpactPct: '0.001',
+        routePlan: [],
+      },
+    });
+    assert.equal(buyFail.ok, false);
+    assert.match(buyFail.error || '', /no enough SOL \(\$0\.00\) in the wallet to trade TEST/i);
+
+    orch.shutdown();
   } finally {
     db.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

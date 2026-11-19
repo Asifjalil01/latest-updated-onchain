@@ -18,7 +18,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   tradeSizeSol: 0.05,
   maxPositionSizeSol: 0.1,
   maxWalletExposureSol: 0.1,
-  gasReserveSol: 0.02,
+  gasReserveSol: 0,
   dailyLossLimitSol: 0.15,
   maxOpenPositions: 3,
   cooldownMinutes: 60,
@@ -412,8 +412,8 @@ export function validateSettingsUpdate(
   if (!Number.isFinite(merged.dailyLossLimitSol) || merged.dailyLossLimitSol <= 0) {
     pushErr('dailyLossLimitSol', 'Daily Loss Limit (SOL) must be greater than 0.');
   }
-  if (!Number.isFinite(merged.gasReserveSol) || merged.gasReserveSol < 0.01) {
-    pushErr('gasReserveSol', 'Gas Reserve (SOL) must be at least 0.01 SOL to prevent trapped exits.');
+  if (!Number.isFinite(merged.gasReserveSol) || merged.gasReserveSol < 0) {
+    pushErr('gasReserveSol', 'Gas Reserve (SOL) must be 0 or greater.');
   }
   if (!Number.isFinite(merged.maxHoldMinutes) || merged.maxHoldMinutes < 5 || merged.maxHoldMinutes > 10080) {
     pushErr('maxHoldMinutes', 'Max Hold Time must be between 5 and 10080 minutes.');

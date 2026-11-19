@@ -361,9 +361,8 @@ export function DashboardView() {
               />
             </div>
             <p className="text-[11px] text-slate-500">
-              {positions.length} of {settings?.maxOpenPositions ?? 3} max open slots · Gas reserve{' '}
-              {settings?.gasReserveSol ?? 0.02} SOL
-              {solUsd ? ` (${formatUsd((settings?.gasReserveSol ?? 0.02) * solUsd)})` : ''}
+              {positions.length} of {settings?.maxOpenPositions ?? 3} max open slots
+              {/* · Gas reserve {settings?.gasReserveSol ?? 0.02} SOL */}
             </p>
           </div>
 

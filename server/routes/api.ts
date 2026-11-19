@@ -26,7 +26,7 @@ const settingsPatchSchema = z
     tradeSizeSol: z.number().positive().optional(),
     maxPositionSizeSol: z.number().positive().optional(),
     maxWalletExposureSol: z.number().positive().optional(),
-    gasReserveSol: z.number().min(0.01).optional(),
+    gasReserveSol: z.number().min(0).optional(),
     dailyLossLimitSol: z.number().positive().optional(),
     maxOpenPositions: z.number().int().min(1).max(10).optional(),
     cooldownMinutes: z.number().int().min(0).max(1440).optional(),

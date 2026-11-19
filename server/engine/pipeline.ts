@@ -43,7 +43,7 @@ export class BotOrchestrator {
   // Always starts in Paper mode, stopped!
   private mode: ExecutionMode = 'paper';
   private runState: BotRunState = 'stopped';
-  private liveConfirmed = false;
+  private liveConfirmed = true;
   private liveConfirmedSettingsHash: string | null = null;
   private lastScanAtMs: number | null = null;
 
@@ -155,21 +155,10 @@ export class BotOrchestrator {
     );
   }
 
-  invalidateLiveConfirmationIfCriticalChanged(newSettings: BotSettings): void {
-    const nextHash = this.getLiveCriticalSettingsHash(newSettings);
-    if (this.liveConfirmed && this.liveConfirmedSettingsHash !== nextHash) {
-      this.liveConfirmed = false;
-      this.liveConfirmedSettingsHash = null;
-      if (this.mode === 'live' && this.runState === 'running') {
-        this.stop();
-      }
-      this.log(
-        'WARN',
-        'RISK',
-        'Critical risk settings changed; Live confirmation cleared and must be re-confirmed.'
-      );
-      this.broadcastStatus();
-    }
+  invalidateLiveConfirmationIfCriticalChanged(_newSettings: BotSettings): void {
+    // ENABLE LIVE confirmation box/gate disabled per user request; changing settings no longer forces Live stop or re-confirmation.
+    this.liveConfirmed = true;
+    this.liveConfirmedSettingsHash = this.getLiveCriticalSettingsHash(_newSettings);
   }
 
   async refreshSolPrice(): Promise<number | null> {
@@ -226,6 +215,16 @@ export class BotOrchestrator {
 
     this.lastWalletSyncMs = Date.now();
 
+    // Auto-recover RPC health snapshot if fewer than 2 RPCs currently read healthy
+    let healthyRpcs = this.rpcPool.getHealthSnapshot().filter((r) => r.healthy).length;
+    if (healthyRpcs < 2 && typeof this.rpcPool.checkAllEndpoints === 'function') {
+      const checked = await this.rpcPool.checkAllEndpoints().catch(() => []);
+      for (const r of checked) {
+        this.db.upsertRpcHealth(r);
+      }
+      healthyRpcs = checked.filter((r) => r.healthy).length;
+    }
+
     const liveNotReadyReasons: string[] = [];
     if (!this.signer.isUnlocked()) {
       liveNotReadyReasons.push('Server-side encrypted signer is locked or not configured.');
@@ -235,25 +234,20 @@ export class BotOrchestrator {
         'Browser popup wallets (Phantom/Solflare) cannot be used for automated Live exits.'
       );
     }
-    const requiredMinSol = settings.tradeSizeSol + settings.gasReserveSol;
-    if (balanceSol === null) {
-      liveNotReadyReasons.push('Two-endpoint RPC balance confirmation unavailable.');
-    } else if (balanceSol < requiredMinSol) {
-      liveNotReadyReasons.push(
-        `Wallet balance ${balanceSol.toFixed(4)} SOL is below trade size + gas reserve (${requiredMinSol.toFixed(4)} SOL).`
-      );
-    }
+    // Trade size + gas reserve & ENABLE LIVE confirmation gates removed:
+    // User can shift to Live mode cleanly and will receive an alert when buying a coin if wallet has no SOL / $.
     if (this.solPriceUsd === null) {
       liveNotReadyReasons.push('Live SOL/USD price unavailable.');
     }
-    const healthyRpcs = this.rpcPool.getHealthSnapshot().filter((r) => r.healthy).length;
     if (healthyRpcs < 2) {
       liveNotReadyReasons.push(`Need >= 2 healthy Solana RPC endpoints (currently ${healthyRpcs}).`);
     }
+    /* ENABLE LIVE confirmation requirement commented out per user request:
     const currentHash = this.getLiveCriticalSettingsHash(settings);
     if (!this.liveConfirmed || this.liveConfirmedSettingsHash !== currentHash) {
       liveNotReadyReasons.push('Explicit "ENABLE LIVE" confirmation required for current risk settings.');
     }
+    */
 
     const signingCapability: WalletDiagnostics['signingCapability'] = this.signer.isUnlocked()
       ? 'automated_server'
@@ -299,10 +293,8 @@ export class BotOrchestrator {
       currentExposureSol,
       dailyRealizedPnlSol,
       dailyLossLimitHit,
-      liveConfirmed:
-        this.liveConfirmed &&
-        this.liveConfirmedSettingsHash === this.getLiveCriticalSettingsHash(settings),
-      liveConfirmedSettingsHash: this.liveConfirmedSettingsHash,
+      liveConfirmed: true,
+      liveConfirmedSettingsHash: this.liveConfirmedSettingsHash ?? this.getLiveCriticalSettingsHash(settings),
       lastScanAtMs: this.lastScanAtMs,
       funnel: { ...this.funnel },
       averagePaperLiveGapPct: this.db.getAveragePaperLiveGapPct(),
@@ -324,16 +316,9 @@ export class BotOrchestrator {
     );
   }
 
-  confirmLiveMode(confirmationText: string): { ok: boolean; error?: string } {
-    if (confirmationText.trim() !== 'ENABLE LIVE') {
-      return { ok: false, error: 'You must type exact confirmation text: ENABLE LIVE' };
-    }
-    if (!this.signer.isUnlocked()) {
-      return { ok: false, error: 'Server-side signer must be unlocked before confirming Live mode.' };
-    }
+  confirmLiveMode(_confirmationText: string): { ok: boolean; error?: string } {
     this.liveConfirmed = true;
     this.liveConfirmedSettingsHash = this.getLiveCriticalSettingsHash();
-    this.log('WARN', 'RISK', 'User confirmed Live execution parameters (ENABLE LIVE).');
     this.broadcastStatus();
     return { ok: true };
   }
@@ -348,12 +333,19 @@ export class BotOrchestrator {
       }
     }
     if (targetMode === 'live') {
-      const diag = await this.refreshWalletDiagnostics();
-      if (!diag.liveReady) {
-        return {
-          ok: false,
-          error: `Live mode blocked: ${diag.liveNotReadyReasons.join(' | ')}`,
-        };
+      const diag = await this.refreshWalletDiagnostics().catch(() => null);
+      if (!this.signer.isUnlocked()) {
+        this.log(
+          'WARN',
+          'MODE',
+          'Switched to LIVE mode. Server-side signer is currently locked — unlock it in Wallets & Signer before starting live trades.'
+        );
+      } else if (diag?.balanceSol !== null && diag?.balanceSol !== undefined && diag.balanceSol <= 0) {
+        this.log(
+          'WARN',
+          'MODE',
+          `Switched to LIVE mode (wallet balance ${diag.balanceSol.toFixed(4)} SOL / $0.00).`
+        );
       }
     }
     this.mode = targetMode;
@@ -374,6 +366,14 @@ export class BotOrchestrator {
           ok: false,
           error: `Live start blocked: ${diag.liveNotReadyReasons.join(' | ')}`,
         };
+      }
+      if (diag.balanceSol !== null && diag.balanceSol < 0.005) {
+        const usdStr = diag.balanceUsd !== null ? `$${diag.balanceUsd.toFixed(2)}` : '$0.00';
+        this.log(
+          'WARN',
+          'WALLET',
+          `Live bot started with ${diag.balanceSol.toFixed(4)} SOL (${usdStr}) — attempting to buy a coin will alert that there is no SOL / $ in the wallet to trade.`
+        );
       }
     }
 
@@ -601,6 +601,24 @@ export class BotOrchestrator {
         this.broadcastStatus();
         return { evaluated: 0, bought: 0 };
       }
+
+      if (this.mode === 'live' && (this.liveBalanceSol === null || Date.now() - this.lastWalletSyncMs > 10_000)) {
+        const owner = this.signer.getPublicKey();
+        if (owner && typeof this.rpcPool.getAgreedBalanceSol === 'function') {
+          const bal = await this.rpcPool.getAgreedBalanceSol(owner).catch(() => ({
+            agreed: false,
+            balanceSol: null,
+            readings: [],
+          }));
+          if (bal.agreed && bal.balanceSol !== null) {
+            this.liveBalanceSol = bal.balanceSol;
+            this.lastWalletSyncMs = Date.now();
+            this.walletSyncState = 'synced';
+            this.db.setModeBalanceSol('live', bal.balanceSol);
+          }
+        }
+      }
+      let insufficientWalletAlertSent = false;
 
       // Stage 1: DISCOVER
       const preferNewPoolsOnly = settings.newLaunchOnlyEnabled;
@@ -877,6 +895,24 @@ export class BotOrchestrator {
         });
 
         if (!sizing.approved) {
+          if (sizing.cappedBy === 'INSUFFICIENT_WALLET_SOL') {
+            const msg = sizing.reason || `There is no SOL ($0.00) in the wallet to trade ${candidate.symbol}.`;
+            this.log('WARN', 'WALLET', `${candidate.symbol}: ${msg}`);
+            if (!insufficientWalletAlertSent) {
+              insufficientWalletAlertSent = true;
+              this.broadcast({
+                type: 'wallet_insufficient',
+                data: {
+                  symbol: candidate.symbol,
+                  availableSol: availableBalance,
+                  availableUsd: availableBalance * solPriceUsd,
+                  requiredSol: settings.tradeSizeSol,
+                  requiredUsd: settings.tradeSizeSol * solPriceUsd,
+                  message: msg,
+                },
+              });
+            }
+          }
           this.recordRejection(
             candidate,
             'RISK_SIZE',
@@ -914,6 +950,22 @@ export class BotOrchestrator {
                 `Max open positions slots filled (${latestOpenCount}/${settings.maxOpenPositions}). Pausing scan until a slot opens.`
               );
               break;
+            }
+          } else if (!res.ok && res.error) {
+            this.log('WARN', 'LIVE_BUY', `${candidate.symbol}: ${res.error}`);
+            if (!insufficientWalletAlertSent && res.error.toLowerCase().includes('no enough sol')) {
+              insufficientWalletAlertSent = true;
+              this.broadcast({
+                type: 'wallet_insufficient',
+                data: {
+                  symbol: candidate.symbol,
+                  availableSol: availableBalance,
+                  availableUsd: availableBalance * solPriceUsd,
+                  requiredSol: sizing.solAmount,
+                  requiredUsd: sizing.solAmount * solPriceUsd,
+                  message: res.error,
+                },
+              });
             }
           }
         } else {

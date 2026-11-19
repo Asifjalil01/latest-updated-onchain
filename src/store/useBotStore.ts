@@ -459,6 +459,24 @@ export const useBotStore = create<BotStoreState>((set, get) => ({
       void get().refreshModeData();
     });
 
+    es.addEventListener('wallet_insufficient', (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as {
+          symbol?: string;
+          message?: string;
+        };
+        get().pushToast({
+          kind: 'error',
+          title: data.symbol
+            ? `No SOL / $ to buy ${data.symbol}`
+            : 'No SOL / $ in wallet to trade',
+          body: data.message || 'There is no SOL or $ in the wallet to trade.',
+        });
+      } catch {
+        // ignore
+      }
+    });
+
     return () => {
       if (rejectionRefreshTimer) {
         clearTimeout(rejectionRefreshTimer);

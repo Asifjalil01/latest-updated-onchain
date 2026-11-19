@@ -2,6 +2,26 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.27.0 — Reliable Live Sell Routing, Direct Live Mode Switching (No ENABLE LIVE Modal / Gas Reserve Blocker), RPC Self-Healing & Clear No-Balance Buy Alerts
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Fixed `No sell route available` Live Sell Failures (`base.ts`, `jupiter.ts`, `rpcPool.ts`, `liveEngine.ts`)**:
+  - Stopped per-token HTTP 4xx (`400`/`404`) Jupiter route responses from retrying or tripping the `jupiter_swap` circuit breaker for 60 seconds across all coins.
+  - Added automatic relaxed intermediate-token routing fallback (`restrictIntermediateTokens=false`) in `JupiterProvider.getQuote()` plus wider manual/emergency sell slippage retry and exact Jupiter error diagnostics.
+  - Enhanced `getAgreedTokenBalanceUi()` and `executeLiveSell()` to use the exact on-chain raw integer balance (`rawAmount`) and verified mint `decimals`, eliminating sell failures caused by rounding, transfer taxes, or decimals mismatches.
+- **Direct Live Mode Switching Without `ENABLE LIVE` Modal (`TopBar.tsx`, `App.tsx`, `RiskCentreView.tsx`, `pipeline.ts`)**:
+  - Commented out the `ENABLE LIVE` confirmation popup modal (`LiveConfirmModal`), Risk Centre `Arm Live Confirmation` button/gate, and live-switch confirmation block so clicking **LIVE** shifts immediately into Live mode.
+  - Prevented risk settings changes from forcing Live confirmation invalidation or auto-stopping Live mode.
+- **Removed `Trade Size + Gas Reserve` Blocker & Added Clear Buy-Time No-SOL / `$` Alerts (`sizing.ts`, `pipeline.ts`, `liveEngine.ts`, `SettingsView.tsx`, `RiskCentreView.tsx`, `DashboardView.tsx`, `useBotStore.ts`)**:
+  - Commented out the `Gas Reserve (SOL)` setting box and removed the `trade size + gas reserve` blocker from Live mode switching, Live start readiness, and position sizing.
+  - When trying to buy a coin without sufficient SOL in the wallet, sizing and live execution emit an explicit log and toast alert with both SOL and USD (`There is no SOL (0.0000 SOL / $0.00) in the wallet to trade`).
+- **RPC Health Self-Healing (`rpcPool.ts`, `pipeline.ts`)**:
+  - Auto-probes RPC endpoints inside `refreshWalletDiagnostics()` whenever fewer than 2 endpoints currently read healthy, avoids marking rate-limited (`429`) RPCs permanently unhealthy, and marks endpoints healthy as soon as balance calls succeed.
+
+---
+
 ## v1.26.0 — Main Solana Spot Bot Accurate P&L Accounting, Confirmed Fill Entry Prices, 1-Second Live Pricing, Single Total P&L UI, Anti-Rebuy Guard & 429/HMR Stability Fixes
 
 **Risk Warning: Trading can lose all of your money.**

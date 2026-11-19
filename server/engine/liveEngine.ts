@@ -263,6 +263,24 @@ export class LiveExecutionEngine {
       return { ok: false, error: `Mint ${token.symbol} already attempted or traded.` };
     }
 
+    // Check live wallet SOL balance before spending RPC/build calls if supported by pool
+    if (typeof this.rpcPool.getAgreedBalanceSol === 'function') {
+      const solBal = await this.rpcPool.getAgreedBalanceSol(owner).catch(() => ({
+        agreed: false,
+        balanceSol: null,
+        readings: [],
+      }));
+      const minRequiredSol = solAmount + 0.001;
+      if (solBal.agreed && solBal.balanceSol !== null && solBal.balanceSol < minRequiredSol) {
+        const availUsd = solBal.balanceSol * solPriceUsd;
+        const needUsd = minRequiredSol * solPriceUsd;
+        return {
+          ok: false,
+          error: `There is no enough SOL ($${availUsd.toFixed(2)}) in the wallet to trade ${token.symbol}: have ${solBal.balanceSol.toFixed(4)} SOL ($${availUsd.toFixed(2)}), need ${minRequiredSol.toFixed(4)} SOL ($${needUsd.toFixed(2)}).`,
+        };
+      }
+    }
+
     // Parallelize on-chain existing-balance check & priority fee estimate for speed
     const [preBalance, autoPriority] = await Promise.all([
       this.rpcPool.getAgreedTokenBalanceUi(owner, token.mint),
@@ -740,10 +758,38 @@ export class LiveExecutionEngine {
 
     const clampedFraction = Math.min(1, Math.max(0.01, params.sellFraction ?? 1));
     const isPartial = clampedFraction < 0.999;
-    const soldQty = isPartial ? position.quantity * clampedFraction : position.quantity;
+    let soldQty = isPartial ? position.quantity * clampedFraction : position.quantity;
     const soldSolIn = isPartial ? position.solIn * clampedFraction : position.solIn;
     const soldEntryFees = isPartial ? position.entryFeesSol * clampedFraction : position.entryFeesSol;
     const soldEntryRent = isPartial ? 0 : position.entryRentSol;
+
+    // Clamp sell quantity against live on-chain token balance (when > 0) to prevent failed routes / oversells from rounding or decimals mismatch
+    let exactRawUnitsStr: string | null = null;
+    let effectiveDecimals = position.decimals;
+    if (typeof this.rpcPool.getAgreedTokenBalanceUi === 'function') {
+      const bal = await this.rpcPool.getAgreedTokenBalanceUi(owner, position.mint).catch(() => ({
+        agreed: false,
+        balanceUi: null,
+        readings: [],
+        decimals: undefined,
+        rawAmount: undefined,
+      }));
+      if (bal.agreed && bal.balanceUi !== null && bal.balanceUi > 0) {
+        if (typeof bal.decimals === 'number' && bal.decimals >= 0) {
+          effectiveDecimals = bal.decimals;
+        }
+        if (isPartial) {
+          soldQty = Math.min(soldQty, bal.balanceUi);
+        } else {
+          if (bal.balanceUi < soldQty) {
+            soldQty = bal.balanceUi;
+          }
+          if (bal.rawAmount && /^\d+$/.test(bal.rawAmount) && BigInt(bal.rawAmount) > 0n) {
+            exactRawUnitsStr = bal.rawAmount;
+          }
+        }
+      }
+    }
 
     const attempts = position.sellAttempts + 1;
     const firstFailureAt = position.firstSellFailureAtMs ?? Date.now();
@@ -753,20 +799,43 @@ export class LiveExecutionEngine {
       settings.slippageBps + (isEmergency ? 300 : 0) + (attempts - 1) * 150
     );
 
-    const rawUnits = Math.max(1, Math.floor(soldQty * 10 ** position.decimals));
-    const quote = await this.jupiter.getQuote({
+    const rawUnitsStr =
+      exactRawUnitsStr ?? String(Math.max(1, Math.floor(soldQty * 10 ** effectiveDecimals)));
+    let quote = await this.jupiter.getQuote({
       inputMint: position.mint,
       outputMint: WSOL_MINT,
-      amountRaw: String(rawUnits),
+      amountRaw: rawUnitsStr,
       slippageBps,
+      allowRelaxFallback: true,
     });
 
+    // Manual / emergency / retry fallback: retry with wider slippage and relaxed intermediate token routing
     if (!quote || Number(quote.outAmount) <= 0) {
+      const retrySlippageBps = Math.min(
+        5000,
+        Math.max(slippageBps + 500, isEmergency || exitReason === 'MANUAL_SELL' ? 2500 : 1500)
+      );
+      if (retrySlippageBps > slippageBps) {
+        quote = await this.jupiter.getQuote({
+          inputMint: position.mint,
+          outputMint: WSOL_MINT,
+          amountRaw: rawUnitsStr,
+          slippageBps: retrySlippageBps,
+          restrictIntermediateTokens: false,
+          allowRelaxFallback: true,
+        });
+      }
+    }
+
+    if (!quote || Number(quote.outAmount) <= 0) {
+      const detail =
+        typeof this.jupiter.getLastQuoteError === 'function' ? this.jupiter.getLastQuoteError() : null;
+      const errDetail = detail ? ` (${detail})` : '';
       const updatedPos: PositionRecord = {
         ...position,
         sellAttempts: attempts,
         firstSellFailureAtMs: firstFailureAt,
-        lastSellError: 'No sell route available from Jupiter',
+        lastSellError: `No sell route available from Jupiter${errDetail}`,
         updatedAtMs: Date.now(),
       };
 
@@ -816,7 +885,11 @@ export class LiveExecutionEngine {
       }
 
       this.db.upsertPosition(updatedPos);
-      return { ok: false, position: updatedPos, error: 'No sell route available; keeping position open for retry' };
+      return {
+        ok: false,
+        position: updatedPos,
+        error: `No sell route available${errDetail}; keeping position open for retry`,
+      };
     }
 
     try {

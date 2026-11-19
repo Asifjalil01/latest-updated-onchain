@@ -10,7 +10,7 @@ export function RiskCentreView() {
     walletDiagnostics,
     rpcs,
     colorBlindSafe,
-    setLiveConfirmModalOpen,
+    // setLiveConfirmModalOpen,
     setKillModalOpen,
   } = useBotStore();
 
@@ -29,6 +29,7 @@ export function RiskCentreView() {
       label: 'Live SOL/USD price feed available (Jupiter v3 / DexScreener)',
       ok: status?.solPriceUsd !== null && status?.solPriceUsd !== undefined,
     },
+    /* Trade size + gas reserve & ENABLE LIVE confirmation gates commented out per user request:
     {
       label: `Wallet balance covers trade size + gas reserve (${(
         (settings?.tradeSizeSol ?? 0.05) + (settings?.gasReserveSol ?? 0.02)
@@ -43,6 +44,7 @@ export function RiskCentreView() {
       label: 'Explicit ENABLE LIVE confirmation matching current risk limits',
       ok: Boolean(status?.liveConfirmed),
     },
+    */
   ];
 
   const allGreen = checklist.every((c) => c.ok);
@@ -61,6 +63,7 @@ export function RiskCentreView() {
         </div>
 
         <div className="flex items-center gap-2">
+          {/* ENABLE LIVE confirmation modal button commented out per user request:
           <HoverTip text="Open the explicit Live Trading Confirmation modal to review active caps and type ENABLE LIVE before switching to real funds.">
             <button
               type="button"
@@ -70,6 +73,7 @@ export function RiskCentreView() {
               Arm Live Confirmation
             </button>
           </HoverTip>
+          */}
           <HoverTip text="Emergency halt: immediately stops scanning and trading, locks Live mode, and lets you close all open positions.">
             <button
               type="button"

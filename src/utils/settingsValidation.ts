@@ -44,8 +44,8 @@ export function validateSettingsDraft(draft: BotSettings): SettingsValidationRes
   if (!Number.isFinite(draft.dailyLossLimitSol) || draft.dailyLossLimitSol <= 0) {
     addError('dailyLossLimitSol', 'Must be greater than 0 SOL.');
   }
-  if (!Number.isFinite(draft.gasReserveSol) || draft.gasReserveSol < 0.01) {
-    addError('gasReserveSol', 'Must be at least 0.01 SOL (prevents trapped exits).');
+  if (!Number.isFinite(draft.gasReserveSol) || draft.gasReserveSol < 0) {
+    addError('gasReserveSol', 'Must be 0 or greater.');
   }
   if (
     !Number.isFinite(draft.maxOpenPositions) ||

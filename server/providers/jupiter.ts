@@ -249,34 +249,67 @@ export class JupiterProvider {
     }
   }
 
+  private lastQuoteError: string | null = null;
+
+  getLastQuoteError(): string | null {
+    return this.lastQuoteError;
+  }
+
   async getQuote(params: {
     inputMint: string;
     outputMint: string;
     amountRaw: string;
     slippageBps: number;
+    restrictIntermediateTokens?: boolean;
+    onlyDirectRoutes?: boolean;
+    allowRelaxFallback?: boolean;
   }): Promise<JupiterQuoteResponse | null> {
-    const qs = new URLSearchParams({
-      inputMint: params.inputMint,
-      outputMint: params.outputMint,
-      amount: params.amountRaw,
-      slippageBps: String(params.slippageBps),
-    });
-
-    try {
-      const quote = await this.swapHttp.fetchJson<JupiterQuoteResponse>(
-        `${this.baseUrl}/swap/v1/quote?${qs.toString()}`,
-        { headers: this.getHeaders() },
-        `quote_${params.inputMint}_${params.outputMint}_${params.amountRaw}_${params.slippageBps}`,
-        1500
-      );
-      if (!quote || !quote.outAmount || !Array.isArray(quote.routePlan)) {
-        return null;
-      }
-      this.swapHttp.recordItems(1);
-      return quote;
-    } catch {
-      return null;
+    const attempts: Array<{ restrictIntermediate: boolean; onlyDirect: boolean }> = [
+      {
+        restrictIntermediate: params.restrictIntermediateTokens ?? true,
+        onlyDirect: params.onlyDirectRoutes ?? false,
+      },
+    ];
+    if (params.allowRelaxFallback !== false && (params.restrictIntermediateTokens ?? true) === true) {
+      attempts.push({ restrictIntermediate: false, onlyDirect: false });
     }
+
+    let lastErr: string | null = null;
+    for (const attempt of attempts) {
+      const qs = new URLSearchParams({
+        inputMint: params.inputMint,
+        outputMint: params.outputMint,
+        amount: params.amountRaw,
+        slippageBps: String(params.slippageBps),
+        swapMode: 'ExactIn',
+      });
+      if (!attempt.restrictIntermediate) {
+        qs.set('restrictIntermediateTokens', 'false');
+      }
+      if (attempt.onlyDirect) {
+        qs.set('onlyDirectRoutes', 'true');
+      }
+
+      try {
+        const quote = await this.swapHttp.fetchJson<JupiterQuoteResponse>(
+          `${this.baseUrl}/swap/v1/quote?${qs.toString()}`,
+          { headers: this.getHeaders() },
+          `quote_${params.inputMint}_${params.outputMint}_${params.amountRaw}_${params.slippageBps}_${attempt.restrictIntermediate ? 'strict' : 'relaxed'}`,
+          1200
+        );
+        if (quote && quote.outAmount && Number(quote.outAmount) > 0 && Array.isArray(quote.routePlan)) {
+          this.lastQuoteError = null;
+          this.swapHttp.recordItems(1);
+          return quote;
+        }
+        lastErr = 'Empty routePlan or zero outAmount';
+      } catch (err) {
+        lastErr = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    this.lastQuoteError = lastErr;
+    return null;
   }
 
   private cachedAutoPriorityFee: { sol: number; source: 'rpc_recent' | 'preset'; atMs: number } | null = null;

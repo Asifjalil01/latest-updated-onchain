@@ -492,6 +492,7 @@ export interface SseEventPayload {
     | 'positions_batch_update'
     | 'trade_event'
     | 'execution_progress'
-    | 'rejection';
+    | 'rejection'
+    | 'wallet_insufficient';
   data: unknown;
 }

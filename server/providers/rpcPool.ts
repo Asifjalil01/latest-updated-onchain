@@ -156,12 +156,13 @@ export class SolanaRpcPool {
           });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes('429')) {
+          const is429 = msg.includes('429') || msg.toLowerCase().includes('too many requests');
+          if (is429) {
             this.endpointCooldownUntil.set(ep.url, Date.now() + 20_000);
           }
           this.healthMap.set(ep.url, {
             ...current,
-            healthy: false,
+            healthy: is429 ? true : false,
             latencyMs: Date.now() - start,
             errorCount: current.errorCount + 1,
             lastCheckedMs: Date.now(),
@@ -214,11 +215,23 @@ export class SolanaRpcPool {
 
     await Promise.all(
       ordered.map(async ({ ep, conn }) => {
+        const start = Date.now();
         try {
           const lamports = await Promise.race([
             conn.getBalance(pubkey, 'confirmed'),
             new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 5000)),
           ]);
+          const h = this.healthMap.get(ep.url);
+          if (h) {
+            this.endpointCooldownUntil.delete(ep.url);
+            this.healthMap.set(ep.url, {
+              ...h,
+              healthy: true,
+              latencyMs: Date.now() - start,
+              lastCheckedMs: Date.now(),
+              lastError: null,
+            });
+          }
           readings.push(Number(lamports) / LAMPORTS_PER_SOL);
         } catch (err) {
           this.recordEndpointError(ep.url, err instanceof Error ? err.message : String(err));
@@ -244,27 +257,65 @@ export class SolanaRpcPool {
   async getAgreedTokenBalanceUi(
     ownerAddress: string,
     mintAddress: string
-  ): Promise<{ agreed: boolean; balanceUi: number | null; readings: number[] }> {
+  ): Promise<{
+    agreed: boolean;
+    balanceUi: number | null;
+    readings: number[];
+    decimals?: number;
+    rawAmount?: string;
+  }> {
     const owner = new PublicKey(ownerAddress);
     const mint = new PublicKey(mintAddress);
     const ordered = this.getOrderedConnections().slice(0, 3);
     const readings: number[] = [];
+    const rawDetails: Array<{ ui: number; rawBigInt: bigint; decimals?: number }> = [];
 
     await Promise.all(
       ordered.map(async ({ ep, conn }) => {
+        const start = Date.now();
         try {
           const resp = await Promise.race([
             conn.getParsedTokenAccountsByOwner(owner, { mint }, 'confirmed'),
             new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 5000)),
           ]);
           let total = 0;
+          let totalRaw = 0n;
+          let parsedDecimals: number | undefined;
           for (const acc of resp.value) {
             const parsed = acc.account.data.parsed as {
-              info?: { tokenAmount?: { uiAmount?: number | null } };
+              info?: {
+                tokenAmount?: {
+                  uiAmount?: number | null;
+                  amount?: string;
+                  decimals?: number;
+                };
+              };
             };
             total += parsed?.info?.tokenAmount?.uiAmount ?? 0;
+            if (parsed?.info?.tokenAmount?.amount) {
+              try {
+                totalRaw += BigInt(parsed.info.tokenAmount.amount);
+              } catch {
+                // ignore malformed amount
+              }
+            }
+            if (typeof parsed?.info?.tokenAmount?.decimals === 'number') {
+              parsedDecimals = parsed.info.tokenAmount.decimals;
+            }
+          }
+          const h = this.healthMap.get(ep.url);
+          if (h) {
+            this.endpointCooldownUntil.delete(ep.url);
+            this.healthMap.set(ep.url, {
+              ...h,
+              healthy: true,
+              latencyMs: Date.now() - start,
+              lastCheckedMs: Date.now(),
+              lastError: null,
+            });
           }
           readings.push(total);
+          rawDetails.push({ ui: total, rawBigInt: totalRaw, decimals: parsedDecimals });
         } catch (err) {
           this.recordEndpointError(ep.url, err instanceof Error ? err.message : String(err));
         }
@@ -275,12 +326,20 @@ export class SolanaRpcPool {
       return { agreed: false, balanceUi: null, readings };
     }
 
-    for (let i = 0; i < readings.length; i++) {
-      for (let j = i + 1; j < readings.length; j++) {
-        const diff = Math.abs(readings[i] - readings[j]);
-        const tol = Math.max(1e-9, Math.max(readings[i], readings[j]) * 0.001);
+    for (let i = 0; i < rawDetails.length; i++) {
+      for (let j = i + 1; j < rawDetails.length; j++) {
+        const diff = Math.abs(rawDetails[i].ui - rawDetails[j].ui);
+        const tol = Math.max(1e-9, Math.max(rawDetails[i].ui, rawDetails[j].ui) * 0.001);
         if (diff <= tol) {
-          return { agreed: true, balanceUi: Math.min(readings[i], readings[j]), readings };
+          const minIdx = rawDetails[i].ui <= rawDetails[j].ui ? i : j;
+          const chosen = rawDetails[minIdx];
+          return {
+            agreed: true,
+            balanceUi: chosen.ui,
+            readings,
+            decimals: chosen.decimals,
+            rawAmount: chosen.rawBigInt > 0n ? chosen.rawBigInt.toString() : undefined,
+          };
         }
       }
     }

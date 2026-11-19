@@ -32,7 +32,7 @@ export function TopBar({ onOpenMobileNav }: { onOpenMobileNav: () => void }) {
     toggleTheme,
     toggleColorBlindSafe,
     setCommandPaletteOpen,
-    setLiveConfirmModalOpen,
+    // setLiveConfirmModalOpen,
     setKillModalOpen,
     apiFetch,
     refreshModeData,
@@ -45,10 +45,12 @@ export function TopBar({ onOpenMobileNav }: { onOpenMobileNav: () => void }) {
   const isRunning = runState === 'running';
 
   const handleModeSwitch = async (nextMode: ExecutionMode) => {
+    /* ENABLE LIVE confirmation modal disabled so clicking LIVE switches immediately:
     if (nextMode === 'live' && !status?.liveConfirmed) {
       setLiveConfirmModalOpen(true);
       return;
     }
+    */
     try {
       setBusyAction(true);
       await apiFetch('/api/mode', {

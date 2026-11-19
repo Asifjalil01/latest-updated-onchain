@@ -5,7 +5,7 @@ import { useBotStore } from './store/useBotStore';
 import { Sidebar } from './components/layout/Sidebar';
 import { TopBar } from './components/layout/TopBar';
 import { SetupModal } from './components/modals/SetupModal';
-import { LiveConfirmModal } from './components/modals/LiveConfirmModal';
+// import { LiveConfirmModal } from './components/modals/LiveConfirmModal';
 import { KillSwitchModal } from './components/modals/KillSwitchModal';
 import { CommandPalette } from './components/modals/CommandPalette';
 import { DashboardView } from './components/views/DashboardView';
@@ -152,7 +152,7 @@ export default function App() {
 
       {/* Modals & Palettes */}
       <CommandPalette />
-      <LiveConfirmModal />
+      {/* <LiveConfirmModal /> */}
       <KillSwitchModal />
 
       {/* Toast Stack */}

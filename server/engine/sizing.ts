@@ -66,15 +66,30 @@ export function calculatePositionSize(params: {
   }
 
   const remainingExposure = Math.max(0, settings.maxWalletExposureSol - currentExposureSol);
-  const spendableBalance = Math.max(0, availableBalanceSol - settings.gasReserveSol);
+  // Gas reserve check removed: evaluate directly against available wallet balance
+  const spendableBalance = Math.max(0, availableBalanceSol);
   const twoPctLiquiditySol = (poolLiquidityUsd * 0.02) / solPriceUsd;
   const targetByClass = settings.tradeSizeSol * tokenClassMultiplier;
+
+  const targetNeedSol = Math.max(0.005, Math.min(targetByClass, settings.maxPositionSizeSol));
+  if (spendableBalance <= 0 || spendableBalance < 0.005) {
+    const availUsd = spendableBalance * solPriceUsd;
+    const needUsd = targetNeedSol * solPriceUsd;
+    return {
+      approved: false,
+      reason: `There is no SOL (${spendableBalance.toFixed(4)} SOL / $${availUsd.toFixed(2)}) in the wallet to trade (need >= ${targetNeedSol.toFixed(4)} SOL / $${needUsd.toFixed(2)}).`,
+      solAmount: 0,
+      usdAmount: 0,
+      tokenClassMultiplier,
+      cappedBy: 'INSUFFICIENT_WALLET_SOL',
+    };
+  }
 
   const candidates: Array<{ label: string; amount: number }> = [
     { label: 'TRADE_SIZE', amount: targetByClass },
     { label: 'MAX_POSITION_SIZE', amount: settings.maxPositionSizeSol },
     { label: 'MAX_WALLET_EXPOSURE', amount: remainingExposure },
-    { label: 'AVAILABLE_MINUS_GAS_RESERVE', amount: spendableBalance },
+    { label: 'AVAILABLE_SOL', amount: spendableBalance },
   ];
   if (settings.minLiquidityUsd >= 500 || poolLiquidityUsd >= 2000) {
     candidates.push({ label: 'TWO_PCT_POOL_LIQUIDITY', amount: twoPctLiquiditySol });
@@ -85,9 +100,21 @@ export function calculatePositionSize(params: {
   const finalSol = Number(limiting.amount.toFixed(6));
 
   if (finalSol < 0.005) {
+    if (limiting.label === 'AVAILABLE_SOL') {
+      const availUsd = spendableBalance * solPriceUsd;
+      const needUsd = targetNeedSol * solPriceUsd;
+      return {
+        approved: false,
+        reason: `There is no SOL (${spendableBalance.toFixed(4)} SOL / $${availUsd.toFixed(2)}) in the wallet to trade (need >= ${targetNeedSol.toFixed(4)} SOL / $${needUsd.toFixed(2)}).`,
+        solAmount: 0,
+        usdAmount: 0,
+        tokenClassMultiplier,
+        cappedBy: 'INSUFFICIENT_WALLET_SOL',
+      };
+    }
     return {
       approved: false,
-      reason: `Sized amount ${finalSol} SOL below 0.005 SOL viable minimum (capped by ${limiting.label})`,
+      reason: `Sized amount ${finalSol} SOL ($${(finalSol * solPriceUsd).toFixed(2)}) below 0.005 SOL viable minimum (capped by ${limiting.label})`,
       solAmount: 0,
       usdAmount: 0,
       tokenClassMultiplier,

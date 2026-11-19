@@ -307,7 +307,7 @@ export function SettingsView() {
     'tradeSizeSol',
     'maxWalletExposureSol',
     'dailyLossLimitSol',
-    'gasReserveSol',
+    // 'gasReserveSol',
     'maxOpenPositions',
     'cooldownMinutes'
   );
@@ -534,6 +534,7 @@ export function SettingsView() {
                 />
               </label>
 
+              {/* Gas Reserve (SOL) field commented out per user request:
               <label className="space-y-1">
                 <span className="text-slate-500 flex items-center justify-between">
                   <HoverTip text="Minimum SOL always left untouched in your wallet so stop-losses and emergency exits always have enough gas to execute.">
@@ -557,6 +558,7 @@ export function SettingsView() {
                   onDismiss={() => clearFieldError('gasReserveSol')}
                 />
               </label>
+              */}
 
               <label className="space-y-1">
                 <span className="text-slate-500 block">
