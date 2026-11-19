@@ -46,27 +46,31 @@ export class JupiterProvider {
   private readonly swapHttp: HttpProvider;
   private readonly tokensHttp: HttpProvider;
   private readonly apiKey?: string;
+  private readonly baseUrl: string;
 
   constructor(apiKey?: string) {
-    this.apiKey = apiKey || undefined;
+    this.apiKey = apiKey?.trim() || undefined;
+    const domain = this.apiKey ? 'api.jup.ag' : 'lite-api.jup.ag';
+    this.baseUrl = `https://${domain}`;
     this.priceHttp = new HttpProvider({
       sourceName: 'jupiter_price',
-      domain: 'lite-api.jup.ag',
-      minIntervalMs: 350,
-      timeoutMs: 7000,
-      cacheTtlMs: 8000,
+      domain,
+      minIntervalMs: 250,
+      timeoutMs: 6000,
+      maxRetries: 0,
+      cacheTtlMs: 850,
     });
     this.swapHttp = new HttpProvider({
       sourceName: 'jupiter_swap',
-      domain: 'lite-api.jup.ag',
-      minIntervalMs: 350,
+      domain,
+      minIntervalMs: 250,
       timeoutMs: 9000,
-      cacheTtlMs: 2500,
+      cacheTtlMs: 1500,
     });
     this.tokensHttp = new HttpProvider({
       sourceName: 'jupiter_tokens',
-      domain: 'lite-api.jup.ag',
-      minIntervalMs: 500,
+      domain,
+      minIntervalMs: 400,
       timeoutMs: 8000,
       cacheTtlMs: 30_000,
     });
@@ -84,7 +88,7 @@ export class JupiterProvider {
     ];
   }
 
-  async getLivePricesUsd(mints: string[]): Promise<Record<string, number>> {
+  async getLivePricesUsd(mints: string[], cacheTtlMs = 850): Promise<Record<string, number>> {
     if (mints.length === 0) return {};
     const unique = Array.from(new Set(mints)).slice(0, 50);
     const ids = unique.join(',');
@@ -94,10 +98,10 @@ export class JupiterProvider {
       const data = await this.priceHttp.fetchJson<
         Record<string, { usdPrice?: number; price?: string | number }> | { data?: Record<string, { price?: string | number }> }
       >(
-        `https://lite-api.jup.ag/price/v3?ids=${encodeURIComponent(ids)}`,
+        `${this.baseUrl}/price/v3?ids=${encodeURIComponent(ids)}`,
         { headers: this.getHeaders() },
         `jup_v3_${ids}`,
-        8000
+        cacheTtlMs
       );
 
       const maybeNested = (data as { data?: Record<string, { price?: string | number; usdPrice?: number }> }).data;
@@ -119,7 +123,7 @@ export class JupiterProvider {
   }
 
   async getLiveSolPriceUsd(): Promise<number | null> {
-    const prices = await this.getLivePricesUsd([WSOL_MINT]);
+    const prices = await this.getLivePricesUsd([WSOL_MINT], 5000);
     return prices[WSOL_MINT] ?? null;
   }
 
@@ -128,14 +132,14 @@ export class JupiterProvider {
     const now = Date.now();
     const endpoints: Array<{ url: string; key: string; ttlMs: number; tag: string; limit: number }> = [
       {
-        url: 'https://lite-api.jup.ag/tokens/v2/toptrending/5m',
+        url: `${this.baseUrl}/tokens/v2/toptrending/5m`,
         key: 'jup_tokens_toptrending_5m',
         ttlMs: 45_000,
         tag: 'jupiter_toptrending_5m',
         limit: 40,
       },
       {
-        url: 'https://lite-api.jup.ag/tokens/v2/recent',
+        url: `${this.baseUrl}/tokens/v2/recent`,
         key: 'jup_tokens_recent',
         ttlMs: 25_000,
         tag: 'jupiter_tokens_v2',
@@ -208,7 +212,7 @@ export class JupiterProvider {
           usdPrice?: number;
         }>
       >(
-        `https://lite-api.jup.ag/tokens/v2/search?query=${encodeURIComponent(query)}`,
+        `${this.baseUrl}/tokens/v2/search?query=${encodeURIComponent(query)}`,
         { headers: this.getHeaders() },
         `jup_search_${query}`,
         45_000
@@ -260,10 +264,10 @@ export class JupiterProvider {
 
     try {
       const quote = await this.swapHttp.fetchJson<JupiterQuoteResponse>(
-        `https://lite-api.jup.ag/swap/v1/quote?${qs.toString()}`,
+        `${this.baseUrl}/swap/v1/quote?${qs.toString()}`,
         { headers: this.getHeaders() },
         `quote_${params.inputMint}_${params.outputMint}_${params.amountRaw}_${params.slippageBps}`,
-        2000
+        1500
       );
       if (!quote || !quote.outAmount || !Array.isArray(quote.routePlan)) {
         return null;
@@ -283,7 +287,7 @@ export class JupiterProvider {
     priorityFeeLamports: number | 'auto';
   }): Promise<JupiterSwapResponse> {
     return this.swapHttp.fetchJson<JupiterSwapResponse>(
-      'https://lite-api.jup.ag/swap/v1/swap',
+      `${this.baseUrl}/swap/v1/swap`,
       {
         method: 'POST',
         headers: {

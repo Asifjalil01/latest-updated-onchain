@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Keypair } from '@solana/web3.js';
+import { Keypair, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import { DEFAULT_SETTINGS } from '../config/defaults';
 import {
   ATA_RENT_SOL,
@@ -369,4 +369,179 @@ test('accounting: extracts Jupiter routePlan DEX LP fees, adaptive auto priority
   assert.ok(sellRes.trade.pnlSol > 0.003, `Expected positive net P&L on +18% TP, got ${sellRes.trade.pnlSol}`);
   assert.ok(sellRes.trade.feeBreakdownJson.includes('Raydium CLMM'));
   assert.ok(sellRes.trade.feeBreakdownJson.includes('rentReclaimedSol'));
+});
+
+test('accounting: upsertPosition updates confirmed entry price, ATA rent handles 0 vs created rent, and live sell P&L matches solOut - solIn - fees', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssb-acct-live-'));
+  const db = new BotDatabase(path.join(tmpDir, 'test.db'));
+  const kp = await Keypair.generate();
+  const signer = new ServerSignerManager(path.join(tmpDir, 'ks.json'));
+  await signer.initFromEnv(JSON.stringify(Array.from(kp.secretKey)));
+
+  try {
+    const mint = 'DacityCoin1111111111111111111111111111111111';
+    const solPriceUsd = 75; // $75/SOL
+
+    // 1. Verify upsertPosition overwrites pending quote entryPriceUsd with confirmed entryPriceUsd
+    const pendingPos: PositionRecord = {
+      id: 'live_dacity_1',
+      mode: 'live',
+      mint,
+      symbol: 'DACITY',
+      name: 'DacityCoin',
+      source: 'jupiter_toptrending_5m',
+      dex: 'pumpswap',
+      tokenClass: 'early_stage',
+      status: 'PENDING',
+      openedAtMs: 1_760_000_000_000,
+      updatedAtMs: 1_760_000_000_000,
+      tokenAgeAtEntryMin: 12,
+      decimals: 6,
+      quantity: 2000,
+      entryPriceUsd: 0.00042,
+      entryPriceSol: 0.00042 / solPriceUsd,
+      currentPriceUsd: 0.00042,
+      currentPriceSol: 0.00042 / solPriceUsd,
+      breakEvenPriceUsd: 0.00043,
+      breakEvenPriceSol: 0.00043 / solPriceUsd,
+      entryLiquidityUsd: 35_000,
+      currentLiquidityUsd: 35_000,
+      solIn: 0.0110,
+      entryFeesSol: 0.00016,
+      entryRentSol: ATA_RENT_SOL,
+      solPriceUsdAtEntry: solPriceUsd,
+      peakPriceUsd: 0.00042,
+      peakPnlPct: 0,
+      trailingFloorPct: null,
+      trailingArmed: false,
+      gapDownTriggered: false,
+      exitParams: {
+        stopLossEnabled: true,
+        stopLossPct: 10,
+        stopLossTiers: DEFAULT_SETTINGS.stopLossTiers,
+        takeProfitPct: 60,
+        trailingEnabled: true,
+        trailingLadder: DEFAULT_SETTINGS.trailingLadder,
+        breakEvenRecoveryEnabled: true,
+        maxHoldMinutes: 240,
+        maxHoldStagnationEnabled: true,
+        stagnationMinGainPct: 2,
+        emergencyLiquidityFloorUsd: 10000,
+        emergencyLiquidityDrainPct: 40,
+        emergencyMaxSellTaxPct: 15,
+        roundTripCostPct: 1.5,
+      },
+      txBuy: 'sig_dacity_buy',
+      confirmationLabel: 'est.',
+      qualityScore: 80,
+      tradeScore: 80,
+      explanationJson: '{}',
+      sellAttempts: 0,
+      firstSellFailureAtMs: null,
+      lastSellError: null,
+      consecutiveZeroBalanceReads: 0,
+      reviewReason: null,
+      isStaleData: false,
+      priceHistory: [0.00042],
+    };
+    db.upsertPosition(pendingPos);
+
+    const realQuantity = 2317.42;
+    const realEntryPriceSol = 0.0110 / realQuantity;
+    const realEntryPriceUsd = realEntryPriceSol * solPriceUsd;
+    db.upsertPosition({
+      ...pendingPos,
+      status: 'OPEN',
+      quantity: realQuantity,
+      entryPriceSol: realEntryPriceSol,
+      entryPriceUsd: realEntryPriceUsd,
+      breakEvenPriceUsd: realEntryPriceUsd * 1.03,
+      entryRentSol: ATA_RENT_SOL,
+      confirmationLabel: 'confirmed',
+    });
+
+    const loaded = db.getPositionById(pendingPos.id)!;
+    assert.equal(loaded.confirmationLabel, 'confirmed');
+    assert.ok(Math.abs(loaded.entryPriceUsd - realEntryPriceUsd) < 1e-12);
+    assert.ok(Math.abs((loaded.quantity * loaded.entryPriceUsd) / solPriceUsd - loaded.solIn) < 1e-8);
+
+    // 2. Live sell: bought 0.0110 SOL, sold 0.0123 SOL gross, exit fee 0.00016 SOL, ATA closed & reclaimed in-tx
+    // Wallet delta on Solana = +0.0123 SOL (proceeds) - 0.00016 SOL (fee) + 0.00203928 SOL (closed ATA rent)
+    const grossOutLamports = 12_300_000;
+    const exitFeeLamports = 160_000;
+    const closedRentLamports = Math.round(ATA_RENT_SOL * 1e9);
+    const walletNetLamportsDelta = grossOutLamports - exitFeeLamports + closedRentLamports;
+
+    const mockRpcPool = {
+      getAgreedTokenBalanceUi: async () => ({ agreed: true, balanceUi: 0, readings: [0, 0] }),
+    } as unknown as SolanaRpcPool;
+    const vtxMsg = new TransactionMessage({
+      payerKey: kp.publicKey,
+      recentBlockhash: '11111111111111111111111111111111' as unknown as ConstructorParameters<
+        typeof TransactionMessage
+      >[0]['recentBlockhash'],
+      instructions: [],
+    }).compileToV0Message();
+    const dummySwapBase64 = Buffer.from(new VersionedTransaction(vtxMsg).serialize()).toString('base64');
+
+    const mockJupiter = {
+      getQuote: async () => ({
+        inputMint: mint,
+        outputMint: WSOL_MINT,
+        inAmount: String(Math.floor(realQuantity * 1e6)),
+        outAmount: String(grossOutLamports),
+        slippageBps: 500,
+        priceImpactPct: '0.002',
+        routePlan: [],
+      }),
+      buildSwapTransaction: async () => ({ swapTransaction: dummySwapBase64 }),
+    } as unknown as JupiterProvider;
+
+    const mockAdapter: LiveTxAdapter = {
+      sendSignedTransaction: async () => 'sig_dacity_sell',
+      pollConfirmation: async () => ({ status: 'confirmed' }),
+      reconcileParsedSwapSolDelta: async () => ({
+        found: true,
+        solDeltaLamports: walletNetLamportsDelta,
+        feeLamports: exitFeeLamports,
+        createdAtaRentLamports: 0,
+        closedAtaRentLamports: closedRentLamports,
+      }),
+      findRecentSellSignature: async () => null,
+    };
+
+    const engine = new LiveExecutionEngine(
+      db,
+      signer,
+      mockRpcPool,
+      mockJupiter,
+      () => undefined,
+      mockAdapter
+    );
+
+    const sellResult = await engine.executeLiveSell({
+      position: loaded,
+      exitReason: 'MANUAL_SELL',
+      solPriceUsd,
+      settings: { ...DEFAULT_SETTINGS, autoReclaimRent: true },
+      isEmergency: false,
+    });
+
+    assert.equal(sellResult.ok, true);
+    assert.ok(sellResult.trade);
+    assert.ok(Math.abs(sellResult.trade.solIn - 0.0110) < 1e-6);
+    assert.ok(Math.abs(sellResult.trade.solOut - 0.0123) < 1e-6);
+    assert.ok(Math.abs(sellResult.trade.feesSol - 0.00032) < 1e-6);
+    assert.equal(sellResult.trade.rentSol, 0);
+    // Total P&L must be positive: 0.0123 - 0.0110 - 0.00032 = +0.00098 SOL (+$0.0735)
+    assert.ok(
+      Math.abs(sellResult.trade.pnlSol - 0.00098) < 1e-6,
+      `Expected positive pnlSol ~0.00098, got ${sellResult.trade.pnlSol}`
+    );
+    assert.ok(sellResult.trade.pnlSol > 0);
+    assert.ok(sellResult.trade.pnlUsd > 0);
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

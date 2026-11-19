@@ -2,6 +2,52 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.26.0 — Main Solana Spot Bot Accurate P&L Accounting, Confirmed Fill Entry Prices, 1-Second Live Pricing, Single Total P&L UI, Anti-Rebuy Guard & 429/HMR Stability Fixes
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Fixed History & Open Position P&L Math & Confirmed Entry Price Sync (`db.ts`, `liveEngine.ts`)**:
+  - Fixed `db.upsertPosition()` `ON CONFLICT` clause so confirmed on-chain buy reconciliation properly updates `entry_price_usd`, `entry_price_sol`, `break_even_price_usd`, `entry_rent_sol`, `exit_params_json`, and `confirmation_label` (previously stuck on initial pending quote estimates, causing `Entry Price`, `Size In`, and `%` vs `SOL` P&L mismatches across coins).
+  - Updated `reconcileParsedSwapSolDelta()` and `reconcileConfirmedBuy()` to measure exact ATA creation rent vs swap SOL outflow and real token balance delta on-chain.
+  - Fixed `executeLiveSell()` so `solOut` records true gross swap proceeds before fees/rent and `Total P&L` accurately equals `Returned (Sell) - Used (Buy) - Fees - Unreclaimed Rent`, eliminating the bug where a profitable sell (`$0.82 -> $0.92`) appeared negative (`-$0.08`) due to ATA rent accounting skew.
+- **Single Clear Total P&L Across All Views (`PositionsView.tsx`, `HistoryView.tsx`, `DashboardView.tsx`)**:
+  - Commented out the confusing `Gross vs Net P&L` explainer banner and separate `Gross P&L` card/drawer blocks, displaying one consistent **Total P&L** (SOL, %, and side-by-side USD) across Dashboard, Open Positions (Cards & Table), and History & Analytics.
+- **True 1-Second Live Price Updates (`jupiter.ts`, `dexscreener.ts`, `pipeline.ts`)**:
+  - Lowered Jupiter Price v3 cache TTL to `850ms` (with dynamic `api.jup.ag` / `lite-api.jup.ag` routing) and DexScreener batch cache TTL to `4s`, with automatic 10-second SOL/USD refreshes.
+  - Added a background 1-second price monitor in `BotOrchestrator` (`refreshOpenPositionPricesTick`) so open position prices still stream live every second when the bot is stopped (never triggering exits while stopped).
+- **Eliminated Auto-Stop / 429 Rate-Limit Flood & Vite HMR CSS Reload Loops (`pipeline.ts`, `rpcPool.ts`, `vite.config.ts`, `src/index.css`, `server.ts`)**:
+  - Throttled `verifyBalanceAndExternalSell` RPC balance checks from every 1s to once per 20s per position and added 20s RPC cooldowns on HTTP 429 with `disableRetryOnRateLimit: true` on `@solana/web3.js` `Connection` instances.
+  - Parallelized RPC 2-of-3 agreement queries and reduced live confirmation poll interval (`650ms`) for faster live execution.
+  - Ignored `sniper/**`, `data/**`, `*.db*`, and `.playwright-cli/**` in Vite file-watcher and Tailwind v4 `@source not` scanning, stopping the `/src/index.css` HMR & 429 retry flood that caused bots to stall.
+- **Anti-Rebuy Protection & Immediate Slot-Full Pause (`db.ts`, `pipeline.ts`, `liveEngine.ts`)**:
+  - Added `hasTradedMint()` check alongside `isMintAttempted()` and cooldown checks so previously sold/traded coins cannot be rebought automatically, and halted remaining candidate buys immediately once `maxOpenPositions` slots are filled.
+
+---
+
+## v1.25.0 — Python Sniper 1-Second Live Pricing, Side-by-Side SOL Conversions, Entry & Exit Trade History Prices, Slot-Full Scan Auto-Pause & Newest-First Scan Log
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **True 1-Second Live Price Updates & Resilient Monitor Loop (`sniper/bot.py`, `sniper/settings.json`, `server/sniperManager.ts`, `PythonSniperView.tsx`)**:
+  - Enabled `use_jupiter_price` (`lite-api.jup.ag/price/v3` when no API key is set, `api.jup.ag/price/v3` when an API key is provided) with automatic highest-liquidity DexScreener fallback on every 1-second monitor tick.
+  - Wrapped `monitor(acct)` in exception handling inside `run()` and added retry logic for `os.replace()` on Windows so concurrent reads from Node never interrupt 1-second price updates.
+  - Added non-blocking 1-second open-position live price refresh in `sniperManager.ts` whenever the Python bot is stopped with open positions, and delegated manual sells via `sell_queue.json` when running so state never races.
+  - Updated the header status badge to report live price freshness (`prices updated X.Xs ago` / `waiting for prices` / `Scan Paused`).
+- **Live SOL Price & Side-by-Side `$` + `SOL` Display Everywhere (`bot.py`, `sniperManager.ts`, `sniperFormat.ts`, `PythonSniperView.tsx`)**:
+  - Added a live SOL/USD price tracker refreshed periodically from Jupiter and DexScreener (`WSOL_MINT`), displayed in the top header (`SOL: $XX.XX`).
+  - Added converted `SOL` values side by side with every `$` figure across all KPI cards (`Cash`, `Est. total value`, `Open PnL`, `Today's PnL`, `Realized PnL`), Open Positions (`PnL`, `Entry price`, `Price now`), Trade History (`Entry price`, `Exit price`, `Amount`, `PnL`), and USD Settings fields (`≈ X.XXXX SOL`).
+- **Purchase (Entry) & Sale (Exit) Prices in Trade History (`bot.py`, `sniperManager.ts`, `sniperFormat.ts`, `PythonSniperView.tsx`)**:
+  - Added chronological `BUY` → `SELL` pairing plus explicit `entry_price` & `sol_price_usd` CSV logging so every closed trade row clearly shows both **Entry price ($ / SOL)** and **Exit price ($ / SOL)**.
+- **Auto-Pause Coin Scanning When Position Slots Are Full (`bot.py`, `PythonSniperView.tsx`)**:
+  - Automatically pauses candidate scanning as soon as open positions reach `max_open_positions` (e.g. 3/3 slots filled), logging the pause once without wasting API requests.
+  - Automatically wakes up and resumes scanning on the next tick as soon as any position sells (TP, trailing stop, max hold, or manual exit) and frees a slot, with live settings hot-reloading (`mtime` check).
+- **Newest-First Scan Log Ordering (`PythonSniperView.tsx`, `sniperFormat.ts`)**:
+  - Reversed the Scan Log feed so the newest live log entries always appear at the **top** without scrolling.
+
+---
+
 ## v1.24.0 — Cross-Platform Python Detection & Isolated Settings Draft State
 
 **Risk Warning: Trading can lose all of your money.**

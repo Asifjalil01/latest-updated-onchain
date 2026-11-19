@@ -49,6 +49,7 @@ export class SolanaRpcPool {
   private readonly connections: Map<string, Connection>;
   private readonly healthMap: Map<string, RpcEndpointHealth>;
   private readonly largestAccountsCooldownUntil = new Map<string, number>();
+  private readonly endpointCooldownUntil = new Map<string, number>();
 
   constructor(customUrls: string[] = []) {
     const merged: RpcEndpointConfig[] = [];
@@ -74,7 +75,10 @@ export class SolanaRpcPool {
     this.healthMap = new Map();
 
     for (const ep of this.endpoints) {
-      this.connections.set(ep.url, new Connection(ep.url, { commitment: 'confirmed' }));
+      this.connections.set(
+        ep.url,
+        new Connection(ep.url, { commitment: 'confirmed', disableRetryOnRateLimit: true })
+      );
       this.healthMap.set(ep.url, {
         url: ep.url,
         label: ep.label,
@@ -97,8 +101,12 @@ export class SolanaRpcPool {
   }
 
   getOrderedConnections(): Array<{ ep: RpcEndpointConfig; conn: Connection }> {
+    const now = Date.now();
     return [...this.endpoints]
       .sort((a, b) => {
+        const aCooldown = (this.endpointCooldownUntil.get(a.url) ?? 0) > now ? 1 : 0;
+        const bCooldown = (this.endpointCooldownUntil.get(b.url) ?? 0) > now ? 1 : 0;
+        if (aCooldown !== bCooldown) return aCooldown - bCooldown;
         const ha = this.healthMap.get(a.url);
         const hb = this.healthMap.get(b.url);
         const healthyDiff = Number(Boolean(hb?.healthy)) - Number(Boolean(ha?.healthy));
@@ -106,6 +114,24 @@ export class SolanaRpcPool {
         return (ha?.latencyMs ?? 9999) - (hb?.latencyMs ?? 9999);
       })
       .map((ep) => ({ ep, conn: this.connections.get(ep.url)! }));
+  }
+
+  private recordEndpointError(epUrl: string, errMsg: string): void {
+    const now = Date.now();
+    const health = this.healthMap.get(epUrl);
+    const is429 = errMsg.includes('429') || errMsg.toLowerCase().includes('too many requests');
+    if (is429) {
+      this.endpointCooldownUntil.set(epUrl, now + 20_000);
+    }
+    if (health) {
+      this.healthMap.set(epUrl, {
+        ...health,
+        healthy: is429 ? health.healthy : false,
+        errorCount: health.errorCount + 1,
+        lastCheckedMs: now,
+        lastError: errMsg,
+      });
+    }
   }
 
   async checkAllEndpoints(): Promise<RpcEndpointHealth[]> {
@@ -119,6 +145,7 @@ export class SolanaRpcPool {
             conn.getSlot('confirmed'),
             new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 5000)),
           ]);
+          this.endpointCooldownUntil.delete(ep.url);
           this.healthMap.set(ep.url, {
             ...current,
             healthy: true,
@@ -128,13 +155,17 @@ export class SolanaRpcPool {
             lastError: null,
           });
         } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('429')) {
+            this.endpointCooldownUntil.set(ep.url, Date.now() + 20_000);
+          }
           this.healthMap.set(ep.url, {
             ...current,
             healthy: false,
             latencyMs: Date.now() - start,
             errorCount: current.errorCount + 1,
             lastCheckedMs: Date.now(),
-            lastError: err instanceof Error ? err.message : String(err),
+            lastError: msg,
           });
         }
       })
@@ -153,6 +184,7 @@ export class SolanaRpcPool {
           fn(conn, ep.url),
           new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC call timeout')), 8000)),
         ]);
+        this.endpointCooldownUntil.delete(ep.url);
         this.healthMap.set(ep.url, {
           ...health,
           healthy: true,
@@ -163,13 +195,7 @@ export class SolanaRpcPool {
         return res;
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
-        this.healthMap.set(ep.url, {
-          ...health,
-          healthy: false,
-          errorCount: health.errorCount + 1,
-          lastCheckedMs: Date.now(),
-          lastError: lastError.message,
-        });
+        this.recordEndpointError(ep.url, lastError.message);
       }
     }
     throw lastError ?? new Error('All Solana RPC endpoints failed.');
@@ -183,27 +209,22 @@ export class SolanaRpcPool {
     toleranceSol = 0.0005
   ): Promise<{ agreed: boolean; balanceSol: number | null; readings: number[] }> {
     const pubkey = new PublicKey(address);
-    const ordered = this.getOrderedConnections();
+    const ordered = this.getOrderedConnections().slice(0, 3);
     const readings: number[] = [];
 
-    for (const { ep, conn } of ordered) {
-      if (readings.length >= 3) break;
-      try {
-        const lamports = await Promise.race([
-          conn.getBalance(pubkey, 'confirmed'),
-          new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 6000)),
-        ]);
-        readings.push(Number(lamports) / LAMPORTS_PER_SOL);
-      } catch {
-        const health = this.healthMap.get(ep.url)!;
-        this.healthMap.set(ep.url, {
-          ...health,
-          healthy: false,
-          errorCount: health.errorCount + 1,
-          lastCheckedMs: Date.now(),
-        });
-      }
-    }
+    await Promise.all(
+      ordered.map(async ({ ep, conn }) => {
+        try {
+          const lamports = await Promise.race([
+            conn.getBalance(pubkey, 'confirmed'),
+            new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 5000)),
+          ]);
+          readings.push(Number(lamports) / LAMPORTS_PER_SOL);
+        } catch (err) {
+          this.recordEndpointError(ep.url, err instanceof Error ? err.message : String(err));
+        }
+      })
+    );
 
     if (readings.length < 2) {
       return { agreed: false, balanceSol: null, readings };
@@ -226,28 +247,29 @@ export class SolanaRpcPool {
   ): Promise<{ agreed: boolean; balanceUi: number | null; readings: number[] }> {
     const owner = new PublicKey(ownerAddress);
     const mint = new PublicKey(mintAddress);
-    const ordered = this.getOrderedConnections();
+    const ordered = this.getOrderedConnections().slice(0, 3);
     const readings: number[] = [];
 
-    for (const { conn } of ordered) {
-      if (readings.length >= 3) break;
-      try {
-        const resp = await Promise.race([
-          conn.getParsedTokenAccountsByOwner(owner, { mint }, 'confirmed'),
-          new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 6000)),
-        ]);
-        let total = 0;
-        for (const acc of resp.value) {
-          const parsed = acc.account.data.parsed as {
-            info?: { tokenAmount?: { uiAmount?: number | null } };
-          };
-          total += parsed?.info?.tokenAmount?.uiAmount ?? 0;
+    await Promise.all(
+      ordered.map(async ({ ep, conn }) => {
+        try {
+          const resp = await Promise.race([
+            conn.getParsedTokenAccountsByOwner(owner, { mint }, 'confirmed'),
+            new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 5000)),
+          ]);
+          let total = 0;
+          for (const acc of resp.value) {
+            const parsed = acc.account.data.parsed as {
+              info?: { tokenAmount?: { uiAmount?: number | null } };
+            };
+            total += parsed?.info?.tokenAmount?.uiAmount ?? 0;
+          }
+          readings.push(total);
+        } catch (err) {
+          this.recordEndpointError(ep.url, err instanceof Error ? err.message : String(err));
         }
-        readings.push(total);
-      } catch {
-        // continue to next RPC
-      }
-    }
+      })
+    );
 
     if (readings.length < 2) {
       return { agreed: false, balanceUi: null, readings };
@@ -269,33 +291,35 @@ export class SolanaRpcPool {
   async getAgreedSignatureConfirmation(
     signature: string
   ): Promise<{ confirmed: boolean; err: string | null; agreements: number }> {
-    const ordered = this.getOrderedConnections();
+    const ordered = this.getOrderedConnections().slice(0, 3);
     let confirmedCount = 0;
     let errorCount = 0;
     let lastErr: string | null = null;
 
-    for (const { conn } of ordered.slice(0, 3)) {
-      try {
-        const statusResp = await Promise.race([
-          conn.getSignatureStatuses([signature], { searchTransactionHistory: true }),
-          new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 6000)),
-        ]);
-        const st = statusResp.value[0];
-        if (st) {
-          if (st.err) {
-            errorCount += 1;
-            lastErr = JSON.stringify(st.err);
-          } else if (
-            st.confirmationStatus === 'confirmed' ||
-            st.confirmationStatus === 'finalized'
-          ) {
-            confirmedCount += 1;
+    await Promise.all(
+      ordered.map(async ({ ep, conn }) => {
+        try {
+          const statusResp = await Promise.race([
+            conn.getSignatureStatuses([signature], { searchTransactionHistory: true }),
+            new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 4500)),
+          ]);
+          const st = statusResp.value[0];
+          if (st) {
+            if (st.err) {
+              errorCount += 1;
+              lastErr = JSON.stringify(st.err);
+            } else if (
+              st.confirmationStatus === 'confirmed' ||
+              st.confirmationStatus === 'finalized'
+            ) {
+              confirmedCount += 1;
+            }
           }
+        } catch (err) {
+          this.recordEndpointError(ep.url, err instanceof Error ? err.message : String(err));
         }
-      } catch {
-        // try next endpoint
-      }
-    }
+      })
+    );
 
     if (confirmedCount >= 2) {
       return { confirmed: true, err: null, agreements: confirmedCount };

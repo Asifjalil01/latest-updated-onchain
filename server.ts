@@ -77,13 +77,21 @@ async function bootstrapServer() {
   });
 
   const shutdown = () => {
-    orchestrator.stop();
+    orchestrator.shutdown();
     db.close();
     server.close(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Solana Spot Bot] Unhandled promise rejection (caught safely):', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Solana Spot Bot] Uncaught exception (caught safely):', err);
+});
 
 bootstrapServer().catch((err) => {
   console.error('Fatal server startup error:', err);

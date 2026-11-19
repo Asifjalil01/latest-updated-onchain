@@ -30,6 +30,6 @@
   "fee_pct": 1,
   "log_rejects": true,
   "jupiter_api_key": "",
-  "use_jupiter_price": false,
+  "use_jupiter_price": true,
   "python_binary_path": ""
 }

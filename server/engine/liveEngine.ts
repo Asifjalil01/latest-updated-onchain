@@ -52,8 +52,16 @@ export interface LiveTxAdapter {
   ) => Promise<{ status: 'confirmed' | 'failed' | 'timeout'; err?: string }>;
   reconcileParsedSwapSolDelta: (
     signature: string,
-    ownerAddress: string
-  ) => Promise<{ found: boolean; solDeltaLamports: number; feeLamports: number }>;
+    ownerAddress: string,
+    mintAddress?: string
+  ) => Promise<{
+    found: boolean;
+    solDeltaLamports: number;
+    feeLamports: number;
+    createdAtaRentLamports?: number;
+    closedAtaRentLamports?: number;
+    tokenDeltaUi?: number;
+  }>;
   findRecentSellSignature: (
     ownerAddress: string,
     mintAddress: string
@@ -83,38 +91,104 @@ export class DefaultLiveTxAdapter implements LiveTxAdapter {
       const res = await this.rpcPool.getAgreedSignatureConfirmation(signature);
       if (res.confirmed) return { status: 'confirmed' };
       if (res.err) return { status: 'failed', err: res.err };
-      await new Promise((r) => setTimeout(r, 2500));
+      await new Promise((r) => setTimeout(r, 650));
     }
     return { status: 'timeout' };
   }
 
   async reconcileParsedSwapSolDelta(
     signature: string,
-    ownerAddress: string
-  ): Promise<{ found: boolean; solDeltaLamports: number; feeLamports: number }> {
+    ownerAddress: string,
+    mintAddress?: string
+  ): Promise<{
+    found: boolean;
+    solDeltaLamports: number;
+    feeLamports: number;
+    createdAtaRentLamports?: number;
+    closedAtaRentLamports?: number;
+    tokenDeltaUi?: number;
+  }> {
     try {
-      return await this.rpcPool.withFailover(async (conn) => {
-        const tx = await conn.getParsedTransaction(signature, {
-          commitment: 'confirmed',
-          maxSupportedTransactionVersion: 0,
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const res = await this.rpcPool.withFailover(async (conn) => {
+          const tx = await conn.getParsedTransaction(signature, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0,
+          });
+          if (!tx || !tx.meta) {
+            return { found: false, solDeltaLamports: 0, feeLamports: 5000 };
+          }
+          const keys = tx.transaction.message.accountKeys.map((k) => String(k.pubkey.toBase58()));
+          const idx = keys.indexOf(ownerAddress);
+          const feeLamports = Number(tx.meta.fee);
+          if (idx < 0) {
+            return { found: false, solDeltaLamports: 0, feeLamports };
+          }
+          const pre = Number(tx.meta.preBalances[idx] ?? 0);
+          const post = Number(tx.meta.postBalances[idx] ?? 0);
+
+          const preTokens = tx.meta.preTokenBalances ?? [];
+          const postTokens = tx.meta.postTokenBalances ?? [];
+          const preIdxSet = new Set(preTokens.map((b) => b.accountIndex));
+          const postIdxSet = new Set(postTokens.map((b) => b.accountIndex));
+
+          let createdAtaRentLamports = 0;
+          for (const b of postTokens) {
+            if (b.owner !== ownerAddress || b.mint === WSOL_MINT) continue;
+            if (b.accountIndex === idx || preIdxSet.has(b.accountIndex)) continue;
+            const accPre = Number(tx.meta.preBalances[b.accountIndex] ?? 0);
+            const accPost = Number(tx.meta.postBalances[b.accountIndex] ?? 0);
+            if (accPre === 0 && accPost > 0) {
+              createdAtaRentLamports += accPost;
+            }
+          }
+
+          let closedAtaRentLamports = 0;
+          for (const b of preTokens) {
+            if (b.owner !== ownerAddress || b.mint === WSOL_MINT) continue;
+            if (b.accountIndex === idx || postIdxSet.has(b.accountIndex)) continue;
+            const accPre = Number(tx.meta.preBalances[b.accountIndex] ?? 0);
+            const accPost = Number(tx.meta.postBalances[b.accountIndex] ?? 0);
+            if (accPre > 0 && accPost === 0) {
+              closedAtaRentLamports += accPre;
+            }
+          }
+
+          let tokenDeltaUi: number | undefined;
+          if (mintAddress) {
+            let preUi = 0;
+            let postUi = 0;
+            for (const b of preTokens) {
+              if (b.owner === ownerAddress && b.mint === mintAddress) {
+                preUi += Number(b.uiTokenAmount?.uiAmount ?? 0);
+              }
+            }
+            for (const b of postTokens) {
+              if (b.owner === ownerAddress && b.mint === mintAddress) {
+                postUi += Number(b.uiTokenAmount?.uiAmount ?? 0);
+              }
+            }
+            const deltaUi = postUi - preUi;
+            if (Number.isFinite(deltaUi) && Math.abs(deltaUi) > 0) {
+              tokenDeltaUi = deltaUi;
+            }
+          }
+
+          return {
+            found: true,
+            solDeltaLamports: post - pre,
+            feeLamports,
+            createdAtaRentLamports,
+            closedAtaRentLamports,
+            tokenDeltaUi,
+          };
         });
-        if (!tx || !tx.meta) {
-          return { found: false, solDeltaLamports: 0, feeLamports: 5000 };
+        if (res.found || attempt === 1) {
+          return res;
         }
-        const keys = tx.transaction.message.accountKeys.map((k) => String(k.pubkey.toBase58()));
-        const idx = keys.indexOf(ownerAddress);
-        const feeLamports = Number(tx.meta.fee);
-        if (idx < 0) {
-          return { found: false, solDeltaLamports: 0, feeLamports };
-        }
-        const pre = Number(tx.meta.preBalances[idx] ?? 0);
-        const post = Number(tx.meta.postBalances[idx] ?? 0);
-        return {
-          found: true,
-          solDeltaLamports: post - pre,
-          feeLamports,
-        };
-      });
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      return { found: false, solDeltaLamports: 0, feeLamports: 5000 };
     } catch {
       return { found: false, solDeltaLamports: 0, feeLamports: 5000 };
     }
@@ -184,13 +258,18 @@ export class LiveExecutionEngine {
       return { ok: false, error: 'Server signer is not unlocked for live execution.' };
     }
 
-    // Never rebuy if already attempted
-    if (this.db.isMintAttempted(token.mint, 'live')) {
-      return { ok: false, error: `Mint ${token.symbol} already in persisted attempted set.` };
+    // Never rebuy if already attempted or previously traded in this session
+    if (this.db.isMintAttempted(token.mint, 'live') || this.db.hasTradedMint(token.mint, 'live')) {
+      return { ok: false, error: `Mint ${token.symbol} already attempted or traded.` };
     }
 
-    // Check existing on-chain balance BEFORE any buy; never rebuy
-    const preBalance = await this.rpcPool.getAgreedTokenBalanceUi(owner, token.mint);
+    // Parallelize on-chain existing-balance check & priority fee estimate for speed
+    const [preBalance, autoPriority] = await Promise.all([
+      this.rpcPool.getAgreedTokenBalanceUi(owner, token.mint),
+      settings.priorityFeePreset === 'auto' && typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
+        ? this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
+        : Promise.resolve(null),
+    ]);
     if (preBalance.agreed && (preBalance.balanceUi ?? 0) > 0) {
       this.db.insertLog(
         'WARN',
@@ -212,10 +291,6 @@ export class LiveExecutionEngine {
       timestampMs: Date.now(),
     });
 
-    const autoPriority =
-      settings.priorityFeePreset === 'auto' && typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
-        ? await this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
-        : null;
     const priorityFeeSol = resolvePriorityFeeSol(settings, autoPriority?.sol);
     const priorityFeeLamports: number | 'auto' =
       settings.priorityFeePreset === 'auto'
@@ -406,6 +481,7 @@ export class LiveExecutionEngine {
       quotedPriceUsd,
       solPriceUsd,
       settings,
+      quote,
     });
 
     this.emitProgress({
@@ -428,27 +504,46 @@ export class LiveExecutionEngine {
     quotedPriceUsd: number;
     solPriceUsd: number;
     settings: BotSettings;
+    quote?: JupiterQuoteResponse;
   }): Promise<PositionRecord> {
-    const { pendingPos, owner, sig, quotedPriceUsd, solPriceUsd, settings } = params;
+    const { pendingPos, owner, sig, quotedPriceUsd, solPriceUsd, settings, quote } = params;
 
     const [balCheck, txDelta] = await Promise.all([
       this.rpcPool.getAgreedTokenBalanceUi(owner, pendingPos.mint),
-      this.txAdapter.reconcileParsedSwapSolDelta(sig, owner),
+      this.txAdapter.reconcileParsedSwapSolDelta(sig, owner, pendingPos.mint),
     ]);
 
     const realQuantity =
       balCheck.agreed && (balCheck.balanceUi ?? 0) > 0
         ? balCheck.balanceUi!
-        : pendingPos.quantity;
+        : txDelta.tokenDeltaUi && txDelta.tokenDeltaUi > 0
+          ? txDelta.tokenDeltaUi
+          : pendingPos.quantity;
 
     let realSolSpent = pendingPos.solIn;
     let realFeesSol = pendingPos.entryFeesSol;
+    let realEntryRentSol = pendingPos.entryRentSol;
+
     if (txDelta.found && txDelta.solDeltaLamports < 0) {
       const totalOutSol = Math.abs(txDelta.solDeltaLamports) / LAMPORTS_PER_SOL;
       const networkFeeSol = txDelta.feeLamports / LAMPORTS_PER_SOL;
-      const rentSol = ATA_RENT_SOL;
+
+      let rentSol = 0;
+      if (typeof txDelta.createdAtaRentLamports === 'number') {
+        rentSol = txDelta.createdAtaRentLamports / LAMPORTS_PER_SOL;
+      } else {
+        // Fallback heuristic when adapter does not report createdAtaRentLamports (e.g. unit test mocks)
+        const withoutRent = totalOutSol - networkFeeSol;
+        const withAtaRent = withoutRent - ATA_RENT_SOL;
+        rentSol =
+          Math.abs(withAtaRent - pendingPos.solIn) <= Math.abs(withoutRent - pendingPos.solIn)
+            ? ATA_RENT_SOL
+            : 0;
+      }
+
       realSolSpent = Math.max(0.0001, totalOutSol - networkFeeSol - rentSol);
       realFeesSol = networkFeeSol;
+      realEntryRentSol = rentSol;
     }
 
     const realEntryPriceSol = realQuantity > 0 ? realSolSpent / realQuantity : pendingPos.entryPriceSol;
@@ -456,14 +551,14 @@ export class LiveExecutionEngine {
     const exitFeeEst = computeExitFees({
       estimatedSolOut: realSolSpent,
       settings,
-      quote: null,
+      quote: quote ?? null,
     });
     const breakEven = computeBreakEvenPrices({
       entryPriceUsd: realEntryPriceUsd,
       entryPriceSol: realEntryPriceSol,
       solIn: realSolSpent,
       entryFeesSol: realFeesSol,
-      entryRentSol: settings.autoReclaimRent ? 0 : pendingPos.entryRentSol,
+      entryRentSol: settings.autoReclaimRent ? 0 : realEntryRentSol,
       estimatedExitFeesSol: exitFeeEst.walletOutFeeSol,
     });
 
@@ -474,6 +569,8 @@ export class LiveExecutionEngine {
       quantity: realQuantity,
       solIn: realSolSpent,
       entryFeesSol: realFeesSol,
+      entryRentSol: realEntryRentSol,
+      solPriceUsdAtEntry: solPriceUsd,
       entryPriceSol: realEntryPriceSol,
       entryPriceUsd: realEntryPriceUsd,
       currentPriceSol: realEntryPriceSol,
@@ -481,6 +578,7 @@ export class LiveExecutionEngine {
       peakPriceUsd: realEntryPriceUsd,
       breakEvenPriceSol: breakEven.breakEvenPriceSol,
       breakEvenPriceUsd: breakEven.breakEvenPriceUsd,
+      exitParams: snapshotExitParams(settings, breakEven.roundTripCostPct),
       confirmationLabel: 'confirmed',
     };
 
@@ -754,12 +852,19 @@ export class LiveExecutionEngine {
         return { ok: false, position: retryPos, error: retryPos.lastSellError ?? 'Sell pending' };
       }
 
-      const delta = await this.txAdapter.reconcileParsedSwapSolDelta(sig, owner);
+      const delta = await this.txAdapter.reconcileParsedSwapSolDelta(sig, owner, position.mint);
       const estSolOut = Number(quote.outAmount) / LAMPORTS_PER_SOL;
-      const realSolOut =
-        delta.found && delta.solDeltaLamports > 0
-          ? delta.solDeltaLamports / LAMPORTS_PER_SOL
-          : estSolOut;
+      const closedInTxRentSol = (delta.closedAtaRentLamports ?? 0) / LAMPORTS_PER_SOL;
+      // On Solana, postBalances - preBalances already has tx.meta.fee deducted and any closed ATA rent added.
+      // Reconstruct gross swap proceeds BEFORE fees & rent so Used (Buy) / Returned (Sell) / Fees / Total P&L reconcile identically.
+      const realSolOut = delta.found
+        ? Math.max(
+            0,
+            (delta.solDeltaLamports + delta.feeLamports - (delta.closedAtaRentLamports ?? 0)) /
+              LAMPORTS_PER_SOL
+          )
+        : estSolOut;
+
       const computedExitFees = computeExitFees({
         estimatedSolOut: realSolOut,
         settings,
@@ -771,10 +876,10 @@ export class LiveExecutionEngine {
         ? delta.feeLamports / LAMPORTS_PER_SOL
         : computedExitFees.walletOutFeeSol;
 
-      let rentReclaimedSol = 0;
-      if (!isPartial && settings.autoReclaimRent) {
-        const reclaimed = await this.reclaimEmptyTokenAccounts().catch(() => null);
-        if (reclaimed && reclaimed.reclaimedSol > 0 && soldEntryRent > 0) {
+      let rentReclaimedSol = closedInTxRentSol > 0 && soldEntryRent > 0 ? Math.min(soldEntryRent, closedInTxRentSol) : 0;
+      if (!isPartial && settings.autoReclaimRent && soldEntryRent > 0 && rentReclaimedSol === 0) {
+        const reclaimed = await this.reclaimEmptyTokenAccounts(position.mint).catch(() => null);
+        if (reclaimed && reclaimed.reclaimedSol > 0) {
           rentReclaimedSol = Math.min(soldEntryRent, reclaimed.reclaimedSol);
         }
       }
@@ -783,7 +888,7 @@ export class LiveExecutionEngine {
       const totalFeesSol = soldEntryFees + exitFeeSol;
       const remainingRentSol = Math.max(0, soldEntryRent - rentReclaimedSol);
       const grossPnlSol = realSolOut - soldSolIn;
-      const netPnlSol = realSolOut + rentReclaimedSol - (soldSolIn + totalFeesSol + soldEntryRent);
+      const netPnlSol = realSolOut - soldSolIn - totalFeesSol - remainingRentSol;
       const exitPriceSol = soldQty > 0 ? realSolOut / soldQty : position.currentPriceSol;
       const exitPriceUsd = exitPriceSol * solPriceUsd;
 
@@ -801,7 +906,7 @@ export class LiveExecutionEngine {
         exitPrice: exitPriceUsd,
         quantity: soldQty,
         solIn: soldSolIn,
-        solOut: realSolOut + rentReclaimedSol,
+        solOut: realSolOut,
         feesSol: totalFeesSol,
         rentSol: remainingRentSol,
         grossPnlSol,
@@ -879,7 +984,9 @@ export class LiveExecutionEngine {
     }
   }
 
-  async reclaimEmptyTokenAccounts(): Promise<{ closedCount: number; reclaimedSol: number; txSig: string | null }> {
+  async reclaimEmptyTokenAccounts(
+    targetMint?: string
+  ): Promise<{ closedCount: number; reclaimedSol: number; txSig: string | null }> {
     const owner = this.signer.getPublicKey();
     if (!this.signer.isUnlocked() || !owner) {
       throw new Error('Server signer must be unlocked to reclaim ATA rent.');
@@ -889,25 +996,34 @@ export class LiveExecutionEngine {
     const kp = this.signer.getKeypairForInternalSigning();
 
     return this.rpcPool.withFailover(async (conn) => {
-      const [splAccs, t22Accs] = await Promise.all([
-        conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_PROGRAM_ID }),
-        conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_2022_PROGRAM_ID }),
-      ]);
+      const scanEmpty = async () => {
+        const [splAccs, t22Accs] = await Promise.all([
+          conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_PROGRAM_ID }),
+          conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_2022_PROGRAM_ID }),
+        ]);
 
-      const emptyClosures: Array<{ pubkey: PublicKey; programId: PublicKey }> = [];
-      for (const acc of splAccs.value) {
-        const amt = Number(
-          (acc.account.data.parsed as { info?: { tokenAmount?: { amount?: string } } })?.info
-            ?.tokenAmount?.amount ?? '1'
-        );
-        if (amt === 0) emptyClosures.push({ pubkey: acc.pubkey, programId: TOKEN_PROGRAM_ID });
-      }
-      for (const acc of t22Accs.value) {
-        const amt = Number(
-          (acc.account.data.parsed as { info?: { tokenAmount?: { amount?: string } } })?.info
-            ?.tokenAmount?.amount ?? '1'
-        );
-        if (amt === 0) emptyClosures.push({ pubkey: acc.pubkey, programId: TOKEN_2022_PROGRAM_ID });
+        const list: Array<{ pubkey: PublicKey; programId: PublicKey }> = [];
+        for (const acc of splAccs.value) {
+          const info = (acc.account.data.parsed as { info?: { mint?: string; tokenAmount?: { amount?: string } } })
+            ?.info;
+          if (targetMint && info?.mint !== targetMint) continue;
+          const amt = Number(info?.tokenAmount?.amount ?? '1');
+          if (amt === 0) list.push({ pubkey: acc.pubkey, programId: TOKEN_PROGRAM_ID });
+        }
+        for (const acc of t22Accs.value) {
+          const info = (acc.account.data.parsed as { info?: { mint?: string; tokenAmount?: { amount?: string } } })
+            ?.info;
+          if (targetMint && info?.mint !== targetMint) continue;
+          const amt = Number(info?.tokenAmount?.amount ?? '1');
+          if (amt === 0) list.push({ pubkey: acc.pubkey, programId: TOKEN_2022_PROGRAM_ID });
+        }
+        return list;
+      };
+
+      let emptyClosures = await scanEmpty();
+      if (emptyClosures.length === 0 && targetMint) {
+        await new Promise((r) => setTimeout(r, 500));
+        emptyClosures = await scanEmpty();
       }
 
       if (emptyClosures.length === 0) {

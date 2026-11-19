@@ -41,12 +41,10 @@ export function DashboardView() {
     const val = solUsd && solUsd > 0 ? (p.quantity * p.currentPriceUsd) / solUsd : p.solIn;
     return s + val;
   }, 0);
+  const autoReclaimRent = settings?.autoReclaimRent !== false;
   const estOpenRoundTripCostsSol = positions.reduce((s, p) => {
-    const roundTripCost =
-      p.exitParams?.roundTripCostPct > 0
-        ? Math.max(p.entryFeesSol + p.entryRentSol, p.solIn * (p.exitParams.roundTripCostPct / 100))
-        : p.entryFeesSol + p.entryRentSol;
-    return s + roundTripCost;
+    const rentCostSol = autoReclaimRent ? 0 : p.entryRentSol;
+    return s + p.entryFeesSol * 2 + rentCostSol;
   }, 0);
   const openPnlSol = openMarketSol - openCostSol - estOpenRoundTripCostsSol;
   const totalValueSol = activeBalanceSol + openMarketSol;
@@ -230,8 +228,8 @@ export function DashboardView() {
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-4 space-y-2">
           <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
             <span className="inline-flex items-center">
-              Net Realized P&amp;L
-              <InfoTooltip text="Total cumulative net profit/loss across all closed trades in the current mode after every fee and rent cost." />
+              Total Realized P&amp;L
+              <InfoTooltip text="Total cumulative profit/loss across all closed trades in the current mode after every fee and rent cost." />
             </span>
             <span>{trades.length} trades</span>
           </div>
@@ -456,14 +454,9 @@ export function DashboardView() {
             {positions.slice(0, 6).map((pos) => {
               const currentSolVal =
                 solUsd && solUsd > 0 ? (pos.quantity * pos.currentPriceUsd) / solUsd : pos.solIn;
-              const roundTripCostSol =
-                pos.exitParams?.roundTripCostPct > 0
-                  ? Math.max(
-                      pos.entryFeesSol + pos.entryRentSol,
-                      pos.solIn * (pos.exitParams.roundTripCostPct / 100)
-                    )
-                  : pos.entryFeesSol + pos.entryRentSol;
-              const estPnlSol = currentSolVal - pos.solIn - roundTripCostSol;
+              const rentCostSol = autoReclaimRent ? 0 : pos.entryRentSol;
+              const estFeesSol = pos.entryFeesSol * 2 + rentCostSol;
+              const estPnlSol = currentSolVal - pos.solIn - estFeesSol;
               const estNetPct = pos.solIn > 0 ? (estPnlSol / pos.solIn) * 100 : 0;
               return (
                 <div

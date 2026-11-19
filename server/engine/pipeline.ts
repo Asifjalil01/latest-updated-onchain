@@ -83,8 +83,12 @@ export class BotOrchestrator {
   private sseClients = new Set<(payload: SseEventPayload) => void>();
   private scanTimer: NodeJS.Timeout | null = null;
   private exitTimer: NodeJS.Timeout | null = null;
+  private priceMonitorTimer: NodeJS.Timeout | null = null;
   private scanInFlight = false;
   private exitTickInFlight = false;
+  private priceMonitorTickInFlight = false;
+  private lastSolPriceRefreshMs = 0;
+  private readonly lastLiveBalanceSyncByPos = new Map<string, number>();
   private readonly sellingPositionIds = new Set<string>();
   private readonly youngPoolWatchlist = new Map<string, number>();
   private readonly liveEngine: LiveExecutionEngine;
@@ -106,6 +110,14 @@ export class BotOrchestrator {
       jupiter,
       (ev: ExecutionProgressEvent) => this.broadcast({ type: 'execution_progress', data: ev })
     );
+    this.priceMonitorTimer = setInterval(() => {
+      if (this.runState === 'stopped') {
+        void this.refreshOpenPositionPricesTick();
+      }
+    }, 1000);
+    if (typeof this.priceMonitorTimer.unref === 'function') {
+      this.priceMonitorTimer.unref();
+    }
     this.log('INFO', 'SYSTEM', 'Solana Spot Bot initialized in PAPER mode (stopped). Trading can lose all of your money.');
   }
 
@@ -161,21 +173,23 @@ export class BotOrchestrator {
   }
 
   async refreshSolPrice(): Promise<number | null> {
-    const jupPrice = await this.jupiter.getLiveSolPriceUsd();
+    this.lastSolPriceRefreshMs = Date.now();
+    const jupPrice = await this.jupiter.getLiveSolPriceUsd().catch(() => null);
     if (jupPrice && jupPrice > 0) {
       this.solPriceUsd = jupPrice;
       this.solPriceSource = 'jupiter_v3';
       return jupPrice;
     }
-    const dsPrice = await this.dexScreener.getLiveSolPriceUsd();
+    const dsPrice = await this.dexScreener.getLiveSolPriceUsd().catch(() => null);
     if (dsPrice && dsPrice > 0) {
       this.solPriceUsd = dsPrice;
       this.solPriceSource = 'dexscreener_fallback';
       return dsPrice;
     }
-    this.solPriceUsd = null;
-    this.solPriceSource = 'unavailable';
-    return null;
+    if (this.solPriceUsd === null) {
+      this.solPriceSource = 'unavailable';
+    }
+    return this.solPriceUsd;
   }
 
   async refreshWalletDiagnostics(): Promise<WalletDiagnostics> {
@@ -343,6 +357,7 @@ export class BotOrchestrator {
       }
     }
     this.mode = targetMode;
+    this.lastLiveBalanceSyncByPos.clear();
     this.log('WARN', 'MODE', `Execution mode switched to ${targetMode.toUpperCase()}.`);
     this.broadcastStatus();
     return { ok: true };
@@ -360,6 +375,15 @@ export class BotOrchestrator {
           error: `Live start blocked: ${diag.liveNotReadyReasons.join(' | ')}`,
         };
       }
+    }
+
+    if (this.scanTimer) {
+      clearInterval(this.scanTimer);
+      this.scanTimer = null;
+    }
+    if (this.exitTimer) {
+      clearInterval(this.exitTimer);
+      this.exitTimer = null;
     }
 
     this.runState = 'running';
@@ -397,6 +421,14 @@ export class BotOrchestrator {
     this.runState = 'stopped';
     this.log('INFO', 'ENGINE', 'Bot stopped.');
     this.broadcastStatus();
+  }
+
+  shutdown(): void {
+    this.stop();
+    if (this.priceMonitorTimer) {
+      clearInterval(this.priceMonitorTimer);
+      this.priceMonitorTimer = null;
+    }
   }
 
   async killSwitch(): Promise<{ closedCount: number; errors: string[] }> {
@@ -684,10 +716,11 @@ export class BotOrchestrator {
       for (const candidate of candidates) {
         if (this.runState === 'killing') break;
 
-        // Exclude already held, in cooldown, or already attempted
+        // Exclude already held, in cooldown, previously attempted, or already traded
         if (this.db.getOpenPositionByMint(this.mode, candidate.mint)) continue;
         if (this.db.isInCooldown(candidate.mint, this.mode)) continue;
         if (this.db.isMintAttempted(candidate.mint, this.mode)) continue;
+        if (this.db.hasTradedMint(candidate.mint, this.mode)) continue;
 
         evaluated += 1;
 
@@ -873,6 +906,15 @@ export class BotOrchestrator {
             bought += 1;
             this.funnel.bought += 1;
             this.broadcast({ type: 'trade_event', data: { kind: 'BUY', position: res.position } });
+            const latestOpenCount = this.db.getPositions(this.mode, false).length;
+            if (latestOpenCount >= settings.maxOpenPositions && !settings.allowSlotRotation) {
+              this.log(
+                'INFO',
+                'SCAN',
+                `Max open positions slots filled (${latestOpenCount}/${settings.maxOpenPositions}). Pausing scan until a slot opens.`
+              );
+              break;
+            }
           }
         } else {
           this.db.markMintAttempted(candidate.mint, this.mode, 'PAPER_SIMULATING');
@@ -958,6 +1000,16 @@ export class BotOrchestrator {
                 });
               }
             }
+
+            const latestOpenCount = this.db.getPositions(this.mode, false).length;
+            if (latestOpenCount >= settings.maxOpenPositions && !settings.allowSlotRotation) {
+              this.log(
+                'INFO',
+                'SCAN',
+                `Max open positions slots filled (${latestOpenCount}/${settings.maxOpenPositions}). Pausing scan until a slot opens.`
+              );
+              break;
+            }
           } else {
             this.recordRejection(
               candidate,
@@ -1022,6 +1074,86 @@ export class BotOrchestrator {
     this.broadcast({ type: 'rejection', data: rej });
   }
 
+  async refreshOpenPositionPricesTick(): Promise<void> {
+    if (this.runState !== 'stopped' || this.priceMonitorTickInFlight || this.exitTickInFlight) {
+      return;
+    }
+    this.priceMonitorTickInFlight = true;
+    try {
+      const openPositions = this.db
+        .getPositions(this.mode, false)
+        .filter((p) => p.status === 'OPEN' && !this.sellingPositionIds.has(p.id));
+      if (openPositions.length === 0) return;
+
+      const shouldRefreshSol =
+        !this.solPriceUsd || Date.now() - this.lastSolPriceRefreshMs >= 10_000;
+      const solPriceUsd = shouldRefreshSol
+        ? await this.refreshSolPrice()
+        : this.solPriceUsd;
+      if (!solPriceUsd) return;
+
+      const mints = openPositions.map((p) => p.mint);
+      const [jupPrices, dsMap] = await Promise.all([
+        this.jupiter.getLivePricesUsd(mints).catch(() => ({} as Record<string, number>)),
+        this.dexScreener.enrichMintsBatch(mints).catch(() => new Map()),
+      ]);
+
+      const deltas: Array<{
+        id: string;
+        currentPriceUsd: number;
+        currentLiquidityUsd: number;
+        peakPnlPct: number;
+        trailingArmed: boolean;
+        trailingFloorPct: number | null;
+        isStaleData: boolean;
+      }> = [];
+
+      const nowMs = Date.now();
+      for (const pos of openPositions) {
+        const ds = dsMap.get(pos.mint);
+        const livePrice = jupPrices[pos.mint] ?? ds?.priceUsd ?? pos.currentPriceUsd;
+        const liveLiquidity = ds?.liquidityUsd ?? pos.currentLiquidityUsd;
+        const isStale = !jupPrices[pos.mint] && !ds;
+
+        const nextHistory =
+          livePrice !== pos.currentPriceUsd
+            ? [...pos.priceHistory, livePrice].slice(-60)
+            : pos.priceHistory;
+
+        this.db.upsertPosition({
+          ...pos,
+          currentPriceUsd: livePrice,
+          currentPriceSol: livePrice / solPriceUsd,
+          currentLiquidityUsd: liveLiquidity,
+          isStaleData: isStale,
+          updatedAtMs: nowMs,
+          priceHistory: nextHistory,
+        });
+
+        deltas.push({
+          id: pos.id,
+          currentPriceUsd: livePrice,
+          currentLiquidityUsd: liveLiquidity,
+          peakPnlPct: pos.peakPnlPct,
+          trailingArmed: pos.trailingArmed,
+          trailingFloorPct: pos.trailingFloorPct,
+          isStaleData: isStale,
+        });
+      }
+
+      if (deltas.length > 0) {
+        this.broadcast({ type: 'positions_batch_update', data: deltas });
+      }
+      if (shouldRefreshSol) {
+        this.broadcastStatus();
+      }
+    } catch {
+      // Stopped-mode price monitor should stay silent on transient provider hiccups
+    } finally {
+      this.priceMonitorTickInFlight = false;
+    }
+  }
+
   async evaluateOpenPositionsTick(): Promise<void> {
     if (this.exitTickInFlight) return;
     this.exitTickInFlight = true;
@@ -1031,13 +1163,17 @@ export class BotOrchestrator {
         .filter((p) => p.status === 'OPEN' && !this.sellingPositionIds.has(p.id));
       if (openPositions.length === 0) return;
 
-      const solPriceUsd = this.solPriceUsd ?? (await this.refreshSolPrice());
+      const shouldRefreshSol =
+        !this.solPriceUsd || Date.now() - this.lastSolPriceRefreshMs >= 10_000;
+      const solPriceUsd = shouldRefreshSol
+        ? await this.refreshSolPrice()
+        : this.solPriceUsd;
       if (!solPriceUsd) return;
 
       const mints = openPositions.map((p) => p.mint);
       const [jupPrices, dsMap] = await Promise.all([
-        this.jupiter.getLivePricesUsd(mints),
-        this.dexScreener.enrichMintsBatch(mints),
+        this.jupiter.getLivePricesUsd(mints).catch(() => ({} as Record<string, number>)),
+        this.dexScreener.enrichMintsBatch(mints).catch(() => new Map()),
       ]);
 
       const settings = this.db.getSettings();
@@ -1056,8 +1192,20 @@ export class BotOrchestrator {
         if (this.sellingPositionIds.has(pos.id)) continue;
 
         if (this.mode === 'live') {
-          const reconciled = await this.liveEngine.verifyBalanceAndExternalSell(pos);
-          if (reconciled.status !== 'OPEN') continue;
+          const lastSync = this.lastLiveBalanceSyncByPos.get(pos.id) ?? 0;
+          if (Date.now() - lastSync >= 20_000) {
+            this.lastLiveBalanceSyncByPos.set(pos.id, Date.now());
+            try {
+              const reconciled = await this.liveEngine.verifyBalanceAndExternalSell(pos);
+              if (reconciled.status !== 'OPEN') continue;
+            } catch (err) {
+              this.log(
+                'WARN',
+                'RECONCILE',
+                `Live balance sync error for ${pos.symbol}: ${err instanceof Error ? err.message : String(err)}`
+              );
+            }
+          }
         }
 
         const ds = dsMap.get(pos.mint);
@@ -1077,12 +1225,14 @@ export class BotOrchestrator {
           pos.quantity > 0
         ) {
           const rawUnits = Math.max(1, Math.floor(pos.quantity * 10 ** pos.decimals));
-          const sellQuote = await this.jupiter.getQuote({
-            inputMint: pos.mint,
-            outputMint: WSOL_MINT,
-            amountRaw: String(rawUnits),
-            slippageBps: settings.slippageBps,
-          });
+          const sellQuote = await this.jupiter
+            .getQuote({
+              inputMint: pos.mint,
+              outputMint: WSOL_MINT,
+              amountRaw: String(rawUnits),
+              slippageBps: settings.slippageBps,
+            })
+            .catch(() => null);
           if (sellQuote && Number(sellQuote.outAmount) > 0) {
             const execSol = Number(sellQuote.outAmount) / LAMPORTS_PER_SOL;
             const execPriceUsd = (execSol / pos.quantity) * solPriceUsd;
@@ -1148,6 +1298,15 @@ export class BotOrchestrator {
       if (deltas.length > 0) {
         this.broadcast({ type: 'positions_batch_update', data: deltas });
       }
+      if (shouldRefreshSol) {
+        this.broadcastStatus();
+      }
+    } catch (err) {
+      this.log(
+        'WARN',
+        'EXIT_TICK',
+        `Monitor tick recovered from transient error: ${err instanceof Error ? err.message : String(err)}`
+      );
     } finally {
       this.exitTickInFlight = false;
     }
@@ -1195,6 +1354,7 @@ export class BotOrchestrator {
           liquiditySource2Usd: pos.currentLiquidityUsd,
         });
         if (res.ok && res.trade) {
+          this.lastLiveBalanceSyncByPos.delete(positionId);
           this.broadcast({ type: 'trade_event', data: { kind: 'SELL', trade: res.trade } });
           this.broadcastStatus();
         }

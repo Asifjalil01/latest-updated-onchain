@@ -113,7 +113,7 @@ export function HistoryView() {
             Trade History &amp; Analytics
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Itemized fees, ATA rent, and gross vs net P&amp;L. Live records are immutable.
+            Itemized fees, ATA rent, and Total P&amp;L. Live records are immutable.
           </p>
         </div>
 
@@ -254,7 +254,7 @@ export function HistoryView() {
                       <HoverTip text="Total Solana network + priority fees plus any un-reclaimed ATA rent."><span>Fees + Rent</span></HoverTip>
                     </th>
                     <th className="py-2.5 px-2 font-medium text-right">
-                      <HoverTip text="Final take-home profit or loss after all fees and rent."><span>Net P&amp;L</span></HoverTip>
+                      <HoverTip text="Total final profit or loss after all fees and rent."><span>Total P&amp;L</span></HoverTip>
                     </th>
                     <th className="py-2.5 px-2 font-medium text-right">
                       <HoverTip text="Total time the coin was held from entry to exit, shown in minutes."><span>Hold</span></HoverTip>
@@ -515,13 +515,15 @@ export function HistoryView() {
                     : '—'}
                 </div>
               </div>
+              {/* Gross P&L commented out per single Total P&L display
               <div>
                 <span className="font-sans text-slate-500 block">Gross P&amp;L</span>
                 {selectedTrade.grossPnlSol.toFixed(5)} SOL
               </div>
+              */}
               <div>
                 <span className="font-sans text-slate-500 block">
-                  Net P&amp;L ({selectedTrade.confirmed})
+                  Total P&amp;L ({selectedTrade.confirmed})
                 </span>
                 <PnlText
                   valueSol={selectedTrade.pnlSol}

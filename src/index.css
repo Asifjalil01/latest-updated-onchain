@@ -1,4 +1,9 @@
 @import "tailwindcss";
+@source not "../data";
+@source not "../sniper";
+@source not "../.playwright-cli";
+@source not "../server";
+@source not "../CHANGELOG.md";
 @custom-variant dark (&:where(.dark, .dark *));
 
 @layer base {

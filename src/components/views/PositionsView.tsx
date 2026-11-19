@@ -180,12 +180,14 @@ export function PositionsView() {
         </div>
       </div>
 
+      {/* Commented out Gross vs Net explainer banner per single Total P&L display
       <div className="rounded-2xl border border-teal-500/30 bg-teal-500/5 p-4 text-xs text-slate-700 dark:text-slate-300 space-y-1">
         <p className="font-semibold text-teal-600 dark:text-teal-400">Understanding Gross vs Net P&amp;L (Take-Home)</p>
         <p>
           <strong>Net P&amp;L</strong> is your true take-home earnings after Jupiter route DEX fees, Solana base/priority fees{autoReclaimRent ? ' (ATA rent auto-reclaimed on 100% sell)' : ', and ATA rent'}. <strong>Gross P&amp;L</strong> reflects price movement only.
         </p>
       </div>
+      */}
 
       {positions.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-slate-200 dark:border-slate-800 p-12 text-center space-y-2">
@@ -206,18 +208,11 @@ export function PositionsView() {
                 : 0;
             const currentSolVal =
               solUsd > 0 ? (pos.quantity * pos.currentPriceUsd) / solUsd : pos.solIn;
-            const grossPnlSol = currentSolVal - pos.solIn;
+            // const grossPnlSol = currentSolVal - pos.solIn;
             const rentCostSol = autoReclaimRent ? 0 : pos.entryRentSol;
-            const baseWalletFeesSol = pos.entryFeesSol * 2 + rentCostSol;
-            const estRoundTripCostSol =
-              pos.exitParams?.roundTripCostPct > 0
-                ? Math.max(
-                    baseWalletFeesSol,
-                    pos.solIn * (pos.exitParams.roundTripCostPct / 100)
-                  )
-                : baseWalletFeesSol;
-            const netPnlSol = grossPnlSol - estRoundTripCostSol;
-            const netPct = pos.solIn > 0 ? (netPnlSol / pos.solIn) * 100 : 0;
+            const estFeesSol = pos.entryFeesSol * 2 + rentCostSol;
+            const totalPnlSol = currentSolVal - pos.solIn - estFeesSol;
+            const totalPct = pos.solIn > 0 ? (totalPnlSol / pos.solIn) * 100 : 0;
 
             return (
               <article
@@ -320,7 +315,7 @@ export function PositionsView() {
                   </div>
                 )}
 
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-100 dark:border-slate-800/70">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-slate-100 dark:border-slate-800/70">
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 flex items-center mb-1">
                       <HoverTip text="Effective buy fill price per token (includes Paper execution delay & competition slippage in Paper mode, or confirmed on-chain fill in Live mode).">
@@ -341,6 +336,7 @@ export function PositionsView() {
                       {formatTokenPriceUsd(pos.currentPriceUsd)}
                     </div>
                   </div>
+                  {/* Gross P&L commented out in favor of a single clear Total P&L
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 flex items-center mb-1">
                       <HoverTip text="Pure token price movement P&L before subtracting Solana gas, priority tips, DEX fees, and ATA rent.">
@@ -355,18 +351,20 @@ export function PositionsView() {
                       />
                     </div>
                   </div>
+                  */}
                   <div>
                     <span className="text-[11px] font-sans text-slate-500 flex items-center mb-1">
-                      <HoverTip text="True take-home P&L after deducting entry + exit fees, priority tips, and un-reclaimed ATA rent (if Auto-Reclaim Rent is off).">
-                        <span className="cursor-help">Net P&amp;L ({pos.confirmationLabel})</span>
+                      <HoverTip text="Single Total P&L after subtracting entry + exit network fees and un-reclaimed ATA rent.">
+                        <span className="cursor-help">Total P&amp;L ({pos.confirmationLabel})</span>
                       </HoverTip>
                     </span>
                     <div className="text-xs font-semibold font-mono tabular-nums min-h-5 leading-snug">
                       <PnlText
-                        valueSol={netPnlSol}
-                        valuePct={netPct}
+                        valueSol={totalPnlSol}
+                        valuePct={totalPct}
                         label={pos.confirmationLabel}
                         colorBlindSafe={colorBlindSafe}
+                        solUsd={solUsd}
                       />
                     </div>
                   </div>
@@ -642,7 +640,7 @@ export function PositionsView() {
                   <HoverTip text="Minimum exit price needed to cover round-trip costs."><span>Break-Even</span></HoverTip>
                 </th>
                 <th className="py-3 px-4 font-medium text-right">
-                  <HoverTip text="Estimated take-home P&L after fees and rent."><span>Net P&amp;L</span></HoverTip>
+                  <HoverTip text="Single total profit or loss after estimated fees and rent."><span>Total P&amp;L</span></HoverTip>
                 </th>
                 <th className="py-3 px-4 font-medium text-right">
                   <HoverTip text="Current stepped trailing profit floor status."><span>Profit Lock Floor</span></HoverTip>
@@ -655,16 +653,9 @@ export function PositionsView() {
                 const currentSolVal =
                   solUsd > 0 ? (pos.quantity * pos.currentPriceUsd) / solUsd : pos.solIn;
                 const rentCostSol = autoReclaimRent ? 0 : pos.entryRentSol;
-                const baseWalletFeesSol = pos.entryFeesSol * 2 + rentCostSol;
-                const estRoundTripCostSol =
-                  pos.exitParams?.roundTripCostPct > 0
-                    ? Math.max(
-                        baseWalletFeesSol,
-                        pos.solIn * (pos.exitParams.roundTripCostPct / 100)
-                      )
-                    : baseWalletFeesSol;
-                const netPnlSol = currentSolVal - pos.solIn - estRoundTripCostSol;
-                const netPct = pos.solIn > 0 ? (netPnlSol / pos.solIn) * 100 : 0;
+                const estFeesSol = pos.entryFeesSol * 2 + rentCostSol;
+                const totalPnlSol = currentSolVal - pos.solIn - estFeesSol;
+                const totalPct = pos.solIn > 0 ? (totalPnlSol / pos.solIn) * 100 : 0;
                 return (
                   <tr key={pos.id} className="hover:bg-slate-50 dark:hover:bg-slate-900/40">
                     <td className="py-3 px-4">
@@ -689,8 +680,8 @@ export function PositionsView() {
                     </td>
                     <td className="py-3 px-4 text-right">
                       <PnlText
-                        valueSol={netPnlSol}
-                        valuePct={netPct}
+                        valueSol={totalPnlSol}
+                        valuePct={totalPct}
                         label={pos.confirmationLabel}
                         colorBlindSafe={colorBlindSafe}
                         solUsd={solUsd}

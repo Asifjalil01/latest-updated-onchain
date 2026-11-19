@@ -190,7 +190,7 @@ export class DexScreenerProvider {
   /**
    * Batch enriches up to 30 mints per request, consolidating multiple pools into the highest-liquidity pool.
    */
-  async enrichMintsBatch(mints: string[]): Promise<Map<string, CandidateToken>> {
+  async enrichMintsBatch(mints: string[], cacheTtlMs = 4_000): Promise<Map<string, CandidateToken>> {
     const consolidated = new Map<string, CandidateToken>();
     const unique = Array.from(new Set(mints.filter((m) => m && m !== WSOL_MINT)));
 
@@ -201,7 +201,7 @@ export class DexScreenerProvider {
           `https://api.dexscreener.com/tokens/v1/solana/${chunk.join(',')}`,
           undefined,
           `ds_batch_${chunk.join('_').slice(0, 64)}`,
-          10_000
+          cacheTtlMs
         );
         if (!Array.isArray(pairs)) continue;
         for (const pair of pairs) {

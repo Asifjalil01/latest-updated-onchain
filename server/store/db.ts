@@ -385,8 +385,17 @@ export class BotDatabase {
           status = excluded.status,
           updated_at_ms = excluded.updated_at_ms,
           quantity = excluded.quantity,
+          entry_price_usd = excluded.entry_price_usd,
+          entry_price_sol = excluded.entry_price_sol,
+          break_even_price_usd = excluded.break_even_price_usd,
+          break_even_price_sol = excluded.break_even_price_sol,
           sol_in = excluded.sol_in,
           entry_fees_sol = excluded.entry_fees_sol,
+          entry_rent_sol = excluded.entry_rent_sol,
+          sol_price_usd_at_entry = excluded.sol_price_usd_at_entry,
+          exit_params_json = excluded.exit_params_json,
+          tx_buy = COALESCE(excluded.tx_buy, positions.tx_buy),
+          confirmation_label = excluded.confirmation_label,
           current_price_usd = excluded.current_price_usd,
           current_price_sol = excluded.current_price_sol,
           current_liquidity_usd = excluded.current_liquidity_usd,
@@ -620,6 +629,15 @@ export class BotDatabase {
   isMintAttempted(mint: string, mode: ExecutionMode): boolean {
     const row = this.db
       .prepare('SELECT 1 FROM attempted_mints WHERE mint = ? AND mode = ?')
+      .get(mint, mode);
+    return row !== undefined;
+  }
+
+  hasTradedMint(mint: string, mode: ExecutionMode): boolean {
+    const row = this.db
+      .prepare(
+        'SELECT 1 FROM trades WHERE mint = ? AND mode = ? AND archived_session_id IS NULL LIMIT 1'
+      )
       .get(mint, mode);
     return row !== undefined;
   }
