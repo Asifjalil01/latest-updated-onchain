@@ -2,6 +2,18 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.28.2 — Python Sniper Force-Delete / Rugpull Position Clear & Trade History Write-off (`sniperManager.ts`, `api.ts`, `PythonSniperView.tsx`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Force Delete / Clear Rugged Positions (`sniperManager.ts`, `api.ts`, `PythonSniperView.tsx`)**:
+  - Added a **Force Delete** button alongside "Sell now" on every open position in the Python Sniper Bot.
+  - Allows manually clearing positions that have been rugged, abandoned, or lack sell routes on-chain, immediately freeing up trade slots (`max_open_positions`) and resuming candidate scanning.
+  - Automatically records a trade history entry in `trades.csv` / `live_trades.csv` with reason `rugpull_writeoff`, noting the manual clearance and recording the cost basis loss so trade history and analytics remain fully updated.
+
+---
+
 ## v1.28.1 — Python Sniper Take-Profit Instant Retry & Rugpull Liquidity Protection (`bot.py`)
 
 **Risk Warning: Trading can lose all of your money.**

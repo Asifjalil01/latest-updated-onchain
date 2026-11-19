@@ -182,6 +182,7 @@ export function PythonSniperView() {
   const [historySearch, setHistorySearch] = useState('');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [confirmSellMint, setConfirmSellMint] = useState<string | null>(null);
+  const [confirmDeleteMint, setConfirmDeleteMint] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
 
   const fetchStatus = async () => {
@@ -376,6 +377,32 @@ export function PythonSniperView() {
       }
     } catch (err) {
       pushToast({ kind: 'error', title: 'Sell failed', body: err instanceof Error ? err.message : 'Error' });
+    }
+  };
+
+  const handleForceDelete = async (mint: string) => {
+    if (confirmDeleteMint !== mint) {
+      setConfirmDeleteMint(mint);
+      setTimeout(() => {
+        setConfirmDeleteMint((cur) => (cur === mint ? null : cur));
+      }, 4000);
+      return;
+    }
+    setConfirmDeleteMint(null);
+    try {
+      const data = await apiFetch<any>('/api/sniper/delete-position', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mint, reason: 'rugpull_writeoff' }),
+      });
+      if (data.ok) {
+        pushToast({ kind: 'success', title: data.message });
+        void fetchStatus();
+      } else {
+        pushToast({ kind: 'error', title: data.message || 'Failed to clear position' });
+      }
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Delete failed', body: err instanceof Error ? err.message : 'Error' });
     }
   };
 
@@ -848,6 +875,18 @@ export function PythonSniperView() {
                             }`}
                           >
                             {isConfirmingSell ? 'Confirm Sell?' : 'Sell now'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleForceDelete(p.mint)}
+                            className={`px-2 py-1 rounded text-[11px] font-bold transition-colors ${
+                              confirmDeleteMint === p.mint
+                                ? 'bg-amber-600 text-white hover:bg-amber-500'
+                                : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20'
+                            }`}
+                            title="Manually clear stuck or rugged position and free slot"
+                          >
+                            {confirmDeleteMint === p.mint ? 'Confirm Delete?' : 'Force Delete'}
                           </button>
                         </td>
                       </tr>

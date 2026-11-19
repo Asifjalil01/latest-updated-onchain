@@ -1452,6 +1452,55 @@ export class SniperManager {
     }
   }
 
+  public forceDeletePosition(mint: string, reason = 'rugpull_writeoff') {
+    try {
+      const settings = this.readSettings();
+      const mode = this.getMode(settings);
+      const { stateFile, tradesCsv } = getSniperFilePaths(mode, this.baseDir);
+
+      if (!fs.existsSync(stateFile)) return { ok: false, message: 'No active state' };
+      const state = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+      if (!state.positions || !state.positions[mint]) {
+        return { ok: false, message: 'Position not found' };
+      }
+      const pos = state.positions[mint];
+      const maxSlots = Math.max(1, Number(settings.max_open_positions || 3));
+      const nowIso = new Date().toISOString();
+      const costUsd = Number(pos.cost || 0);
+      const pnlUsd = -costUsd;
+      const pnlPct = -100.0;
+      const cleanReason = reason === 'manual_delete' ? 'manual_delete' : 'rugpull_writeoff';
+
+      delete state.positions[mint];
+      state.closed = (state.closed || 0) + 1;
+      state.total_pnl = (state.total_pnl || 0) + pnlUsd;
+      state.day_pnl = (state.day_pnl || 0) + pnlUsd;
+      if (Object.keys(state.positions).length < maxSlots) {
+        state.scan_paused = false;
+      }
+      fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf-8');
+
+      if (!fs.existsSync(tradesCsv)) {
+        fs.writeFileSync(
+          tradesCsv,
+          'time,action,symbol,mint,price,usd,pnl_usd,pnl_pct,reason,dexscreener,age_s,dex,source,entry_price,sol_price_usd,tx_sig\n',
+          'utf-8'
+        );
+      }
+      const solPxStr = this.solPriceUsd ? this.solPriceUsd.toFixed(4) : '';
+      const csvLine = `${nowIso},SELL,${pos.symbol},${mint},0.00000000,0.0000,${pnlUsd.toFixed(4)},${pnlPct.toFixed(2)},${cleanReason},${pos.url || `https://dexscreener.com/solana/${mint}`},${pos.age_at_entry || 0},${pos.dex || '?'},${pos.source || '?'},${Number(pos.entry_price || 0).toFixed(8)},${solPxStr},\n`;
+      fs.appendFileSync(tradesCsv, csvLine, 'utf-8');
+
+      this.appendLog(
+        'WARN',
+        `Force-cleared stuck/rugged position for ${pos.symbol} (${cleanReason}, recorded loss -$${costUsd.toFixed(2)}, slot freed)`
+      );
+      return { ok: true, message: `Force-cleared ${pos.symbol} position (${cleanReason}) and freed slot.` };
+    } catch (err) {
+      return { ok: false, message: err instanceof Error ? err.message : 'Error clearing position' };
+    }
+  }
+
   private parseAndLogStdout(line: string) {
     const low = line.toLowerCase();
     let tag: SniperLogEntry['tag'] = 'info';

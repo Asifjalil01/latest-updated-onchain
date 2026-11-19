@@ -821,5 +821,15 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.json(await sniperManager.sellPosition(mint));
   });
 
+  router.post('/sniper/delete-position', (req: Request, res: Response) => {
+    const mint = req.body?.mint;
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'rugpull_writeoff';
+    if (!mint) {
+      res.status(400).json({ error: 'Mint required' });
+      return;
+    }
+    res.json(sniperManager.forceDeletePosition(mint, reason));
+  });
+
   return router;
 }
