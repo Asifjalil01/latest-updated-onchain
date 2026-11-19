@@ -2,6 +2,17 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.28.1 — Python Sniper Take-Profit Instant Retry & Rugpull Liquidity Protection (`bot.py`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Fixed Python Sniper Bot Not Selling on Take-Profit (`bot.py`)**:
+  - Removed the 5-second `last_sell_attempt` cooldown for `take_profit` triggers inside `TradingAccount.check_exits()`. When price hits or exceeds `take_profit_pct` (e.g. 60% TP), the bot now attempts to sell on **every 1-second tick** without delay until successfully filled.
+  - Paired with progressive slippage escalation up to 5000 bps (50%) and `dynamicSlippage: true`, ensuring fast-moving pump tokens and volatility spikes lock in profits instantly before any liquidity drain or rugpull.
+
+---
+
 ## v1.28.0 — Python Sniper Live Trading Mode, Reliable Bot Stop (Process Tree & Signal Halting) & Live Wallet/Tx Visibility
 
 **Risk Warning: Trading can lose all of your money.**

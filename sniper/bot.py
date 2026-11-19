@@ -887,9 +887,6 @@ class TradingAccount:
             pos["peak_pct"] = round((pos["peak_price"] / entry - 1) * 100, 2)
             pos["low_pct"] = round((pos["low_price"] / entry - 1) * 100, 2)
 
-            if self.mode == "live" and now_ts - float(pos.get("last_sell_attempt") or 0.0) < 5.0:
-                continue
-
             peak_chg = (pos["peak_price"] / entry - 1) * 100
             reason = None
             if tp > 0 and change >= tp: reason = f"take_profit_{tp:g}"
@@ -897,9 +894,13 @@ class TradingAccount:
                 reason = f"trailing_stop_{trail:g}"
             elif (now_ts - pos["opened"]) / 60 >= self.cfg.get("max_hold_minutes", 120):
                 reason = "max_hold"
+
             if reason:
                 if _should_stop():
                     break
+                # Bypass 5s lockout for take_profit so TP executes instantly every 1s tick until filled
+                if not str(reason).startswith("take_profit") and self.mode == "live" and now_ts - float(pos.get("last_sell_attempt") or 0.0) < 5.0:
+                    continue
                 if self.sell(mint, price, reason):
                     exits += 1
         if exits == 0:

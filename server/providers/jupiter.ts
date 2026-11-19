@@ -318,6 +318,7 @@ export class JupiterProvider {
     quoteResponse: JupiterQuoteResponse;
     userPublicKey: string;
     priorityFeeLamports: number | 'auto';
+    dynamicSlippage?: boolean;
   }): Promise<JupiterSwapResponse> {
     return this.swapHttp.fetchJson<JupiterSwapResponse>(
       `${this.baseUrl}/swap/v1/swap`,
@@ -332,6 +333,7 @@ export class JupiterProvider {
           userPublicKey: params.userPublicKey,
           wrapAndUnwrapSol: true,
           dynamicComputeUnitLimit: true,
+          ...(params.dynamicSlippage ? { dynamicSlippage: true } : {}),
           prioritizationFeeLamports:
             params.priorityFeeLamports === 'auto'
               ? { autoMultiplier: 2 }

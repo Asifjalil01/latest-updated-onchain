@@ -539,7 +539,10 @@ export class SniperManager {
       max_open_positions: 3,
       daily_loss_limit_usd: 10.0,
       take_profit_pct: 50.0,
+      stop_loss_pct: 0.0,
       trailing_stop_pct: 0.0,
+      auto_rug_exit: true,
+      rug_liq_drop_pct: 75.0,
       max_hold_minutes: 120,
       max_age_minutes: 2.0,
       ultra_early_grace_sec: 10,
@@ -1141,6 +1144,7 @@ export class SniperManager {
   }): Promise<{
     ok: boolean;
     error?: string;
+    noRoute?: boolean;
     txSig?: string;
     proceedsUsd?: number;
     proceedsSol?: number;
@@ -1171,7 +1175,7 @@ export class SniperManager {
       solPriceUsd = (await jupiter.getLiveSolPriceUsd()) ?? (await this.refreshSolPrice()) ?? 100;
     }
 
-    // 1. Resolve exact on-chain raw integer token balance & decimals
+    // 1. Resolve exact on-chain raw integer token balance & decimals (even if 1 RPC is 429 rate-limited)
     let effectiveDecimals = typeof params.decimals === 'number' && params.decimals >= 0 ? params.decimals : 6;
     let soldQty = Number(params.qty || 0);
     let exactRawAmount: string | null =
@@ -1182,11 +1186,12 @@ export class SniperManager {
     const bal = await rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => ({
       agreed: false,
       balanceUi: null,
-      readings: [],
+      readings: [] as number[],
       decimals: undefined,
       rawAmount: undefined,
     }));
-    if (bal.agreed && bal.balanceUi !== null && bal.balanceUi > 0) {
+    const hasReliableBal = bal.agreed || (Array.isArray(bal.readings) && bal.readings.length > 0 && bal.balanceUi !== null);
+    if (hasReliableBal && bal.balanceUi !== null && bal.balanceUi > 0) {
       if (typeof bal.decimals === 'number' && bal.decimals >= 0) {
         effectiveDecimals = bal.decimals;
       }
@@ -1200,78 +1205,97 @@ export class SniperManager {
 
     const amountRaw =
       exactRawAmount ?? String(Math.max(1, Math.floor(soldQty * 10 ** effectiveDecimals)));
-    const baseSlippageBps = Math.min(2500, Math.max(50, Math.round((params.slippagePct ?? 2.0) * 100)));
+    const baseSlippageBps = Math.min(2500, Math.max(100, Math.round((params.slippagePct ?? 2.0) * 100)));
+    const slippageTiers = Array.from(
+      new Set([
+        baseSlippageBps,
+        Math.max(baseSlippageBps, 800),
+        Math.max(baseSlippageBps, 2000),
+        5000,
+      ])
+    ).sort((a, b) => a - b);
 
-    let quote = await jupiter.getQuote({
-      inputMint: params.mint,
-      outputMint: WSOL_MINT,
-      amountRaw,
-      slippageBps: baseSlippageBps,
-      allowRelaxFallback: true,
-    });
+    let quote: any = null;
+    let sig: string | null = null;
+    let lastError = 'Sell failed';
+    let hadAnyRoute = false;
 
-    if (!quote || Number(quote.outAmount) <= 0) {
-      const retrySlippageBps = Math.min(5000, Math.max(baseSlippageBps + 500, 2500));
-      quote = await jupiter.getQuote({
+    // 2. Progressive slippage escalation across quote + build + sign + send so tight slippage never blocks TP/rug exits
+    for (let idx = 0; idx < slippageTiers.length; idx += 1) {
+      const slipBps = slippageTiers[idx];
+      const relax = idx > 0 || params.reason === 'rug_liquidity_drop' || params.reason === 'manual_exit';
+      const q = await jupiter.getQuote({
         inputMint: params.mint,
         outputMint: WSOL_MINT,
         amountRaw,
-        slippageBps: retrySlippageBps,
-        restrictIntermediateTokens: false,
+        slippageBps: slipBps,
+        restrictIntermediateTokens: !relax,
         allowRelaxFallback: true,
       });
-    }
 
-    if (!quote || Number(quote.outAmount) <= 0) {
-      const detail = typeof jupiter.getLastQuoteError === 'function' ? jupiter.getLastQuoteError() : null;
-      return {
-        ok: false,
-        error: `No sell route available${detail ? ` (${detail})` : ''}; keeping position open`,
-      };
-    }
-
-    // 2. Build, sign, send, confirm swap
-    let swapTxResp;
-    try {
-      swapTxResp = await jupiter.buildSwapTransaction({
-        quoteResponse: quote,
-        userPublicKey: owner,
-        priorityFeeLamports: 'auto',
-      });
-    } catch (err) {
-      return {
-        ok: false,
-        error: `Jupiter sell build failed: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-
-    const txBytes = Buffer.from(swapTxResp.swapTransaction, 'base64');
-    const versionedTx = VersionedTransaction.deserialize(txBytes);
-    await signer.signVersionedTransaction(versionedTx);
-    const rawSigned = versionedTx.serialize();
-
-    let sig: string;
-    try {
-      sig = await this.txAdapter.sendSignedTransaction(rawSigned, 3);
-    } catch (err) {
-      return {
-        ok: false,
-        error: `Live sell submission failed: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-
-    const conf = await this.txAdapter.pollConfirmation(sig, 25_000);
-    if (conf.status === 'failed') {
-      return { ok: false, error: conf.err || 'Sell transaction failed on-chain' };
-    }
-    if (conf.status === 'timeout') {
-      const late = await this.txAdapter.pollConfirmation(sig, 90_000);
-      if (late.status === 'failed') {
-        return { ok: false, error: late.err || 'Sell confirmation failed on-chain' };
+      if (!q || Number(q.outAmount) <= 0) {
+        const detail = typeof jupiter.getLastQuoteError === 'function' ? jupiter.getLastQuoteError() : null;
+        lastError = `No sell route available${detail ? ` (${detail})` : ''}`;
+        continue;
       }
-      if (late.status === 'timeout') {
-        return { ok: false, error: `Sell confirmation timed out (tx ${sig}); keeping position open until verified.` };
+      hadAnyRoute = true;
+      quote = q;
+
+      let swapTxResp;
+      try {
+        swapTxResp = await jupiter.buildSwapTransaction({
+          quoteResponse: q,
+          userPublicKey: owner,
+          priorityFeeLamports: 'auto',
+          dynamicSlippage: true,
+        });
+      } catch (err) {
+        lastError = `Jupiter sell build failed: ${err instanceof Error ? err.message : String(err)}`;
+        continue;
       }
+
+      const txBytes = Buffer.from(swapTxResp.swapTransaction, 'base64');
+      const versionedTx = VersionedTransaction.deserialize(txBytes);
+      await signer.signVersionedTransaction(versionedTx);
+      const rawSigned = versionedTx.serialize();
+
+      let sentSig: string;
+      try {
+        sentSig = await this.txAdapter.sendSignedTransaction(rawSigned, 3);
+      } catch (err) {
+        lastError = `Live sell submission failed (${(slipBps / 100).toFixed(1)}% slip): ${err instanceof Error ? err.message : String(err)}`;
+        continue;
+      }
+
+      const conf = await this.txAdapter.pollConfirmation(sentSig, 25_000);
+      if (conf.status === 'failed') {
+        lastError = conf.err || `Sell failed on-chain at ${(slipBps / 100).toFixed(1)}% slippage`;
+        continue;
+      }
+      if (conf.status === 'timeout') {
+        const late = await this.txAdapter.pollConfirmation(sentSig, 90_000);
+        if (late.status === 'failed') {
+          lastError = late.err || 'Sell confirmation failed on-chain';
+          continue;
+        }
+        if (late.status === 'timeout') {
+          return {
+            ok: false,
+            error: `Sell confirmation timed out (tx ${sentSig}); keeping position open until verified.`,
+          };
+        }
+      }
+
+      sig = sentSig;
+      break;
+    }
+
+    if (!sig || !quote) {
+      return {
+        ok: false,
+        noRoute: !hadAnyRoute,
+        error: `${lastError}; keeping position open for retry`,
+      };
     }
 
     // 3. Reconcile exact SOL proceeds
