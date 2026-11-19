@@ -14,12 +14,15 @@ export interface RawSniperCsvRow {
   source?: string;
   entryPrice?: string;
   solPriceUsd?: string;
+  txSig?: string;
 }
 
 export interface EnrichedSniperTrade extends RawSniperCsvRow {
   entryPrice: string;
   exitPrice: string;
   solPriceUsd?: string;
+  txBuy?: string;
+  txSell?: string;
 }
 
 export function usdToSol(usd: number, solPriceUsd: number | null | undefined): number | null {
@@ -102,35 +105,46 @@ export function pairTradesWithEntryAndExit(
   limit = 200
 ): EnrichedSniperTrade[] {
   const lastBuyPriceByMint = new Map<string, string>();
+  const lastBuyTxByMint = new Map<string, string>();
   const enriched: EnrichedSniperTrade[] = [];
 
   for (const row of chronologicalRows) {
     const action = (row.action || '').toUpperCase();
     const mint = row.mint || '';
+    const rowTx = (row.txSig || '').trim();
     if (action === 'BUY') {
       if (mint && row.price) {
         lastBuyPriceByMint.set(mint, row.price);
+      }
+      if (mint && rowTx) {
+        lastBuyTxByMint.set(mint, rowTx);
       }
       enriched.push({
         ...row,
         entryPrice: row.entryPrice || row.price || '',
         exitPrice: '',
+        txBuy: rowTx || undefined,
       });
     } else if (action === 'SELL') {
       const matchedEntry = row.entryPrice || (mint ? lastBuyPriceByMint.get(mint) : '') || '';
+      const matchedBuyTx = mint ? lastBuyTxByMint.get(mint) : undefined;
       if (mint) {
         lastBuyPriceByMint.delete(mint);
+        lastBuyTxByMint.delete(mint);
       }
       enriched.push({
         ...row,
         entryPrice: matchedEntry,
         exitPrice: row.price || '',
+        txBuy: matchedBuyTx || undefined,
+        txSell: rowTx || undefined,
       });
     } else {
       enriched.push({
         ...row,
         entryPrice: row.entryPrice || row.price || '',
         exitPrice: '',
+        txBuy: rowTx || undefined,
       });
     }
   }

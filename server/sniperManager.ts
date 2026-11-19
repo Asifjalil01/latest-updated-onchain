@@ -2,20 +2,113 @@ import { spawn, spawnSync, ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
+import { LAMPORTS_PER_SOL, VersionedTransaction } from '@solana/web3.js';
 import { pairTradesWithEntryAndExit, type RawSniperCsvRow } from '../src/utils/sniperFormat.ts';
+import { loadAppEnv } from './config/env';
+import type { BotOrchestrator } from './engine/pipeline';
+import { DefaultLiveTxAdapter, type LiveTxAdapter } from './engine/liveEngine';
+import { WSOL_MINT } from './providers/jupiter';
 
 const SNIPER_DIR = path.resolve(process.cwd(), 'sniper');
-const STATE_FILE = path.join(SNIPER_DIR, 'state.json');
-const TRADES_CSV = path.join(SNIPER_DIR, 'trades.csv');
-const SETTINGS_FILE = path.join(SNIPER_DIR, 'settings.json');
-const SELL_QUEUE_FILE = path.join(SNIPER_DIR, 'sell_queue.json');
-const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+
+export type SniperMode = 'paper' | 'live';
 
 export interface SniperLogEntry {
   id: string;
   timestamp: string;
   message: string;
   tag: string;
+}
+
+export interface SniperFilePaths {
+  stateFile: string;
+  tradesCsv: string;
+  sellQueueFile: string;
+}
+
+export function getSniperFilePaths(mode: SniperMode, baseDir = SNIPER_DIR): SniperFilePaths {
+  if (mode === 'live') {
+    return {
+      stateFile: path.join(baseDir, 'live_state.json'),
+      tradesCsv: path.join(baseDir, 'live_trades.csv'),
+      sellQueueFile: path.join(baseDir, 'live_sell_queue.json'),
+    };
+  }
+  return {
+    stateFile: path.join(baseDir, 'state.json'),
+    tradesCsv: path.join(baseDir, 'trades.csv'),
+    sellQueueFile: path.join(baseDir, 'sell_queue.json'),
+  };
+}
+
+export function writeStopSignal(reason = 'user_stop', baseDir = SNIPER_DIR): void {
+  if (!fs.existsSync(baseDir)) {
+    fs.mkdirSync(baseDir, { recursive: true });
+  }
+  fs.writeFileSync(
+    path.join(baseDir, 'stop.flag'),
+    JSON.stringify({ stoppedAt: Date.now(), reason }),
+    'utf-8'
+  );
+}
+
+export function clearStopSignal(baseDir = SNIPER_DIR): void {
+  const fp = path.join(baseDir, 'stop.flag');
+  if (fs.existsSync(fp)) {
+    try {
+      fs.unlinkSync(fp);
+    } catch {}
+  }
+}
+
+export function isStopFlagActive(baseDir = SNIPER_DIR): boolean {
+  return fs.existsSync(path.join(baseDir, 'stop.flag'));
+}
+
+export function readPidFile(baseDir = SNIPER_DIR): { pid?: number; run_id?: string; mode?: string } | null {
+  const pf = path.join(baseDir, 'bot.pid');
+  if (!fs.existsSync(pf)) return null;
+  try {
+    const raw = fs.readFileSync(pf, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function removePidFile(baseDir = SNIPER_DIR): void {
+  const pf = path.join(baseDir, 'bot.pid');
+  if (fs.existsSync(pf)) {
+    try {
+      fs.unlinkSync(pf);
+    } catch {}
+  }
+}
+
+export function killProcessTreeSync(pid: number | undefined): void {
+  if (!pid || !Number.isFinite(pid) || pid <= 0) return;
+  if (process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        timeout: 4000,
+      });
+    } catch {}
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGTERM');
+  } catch {}
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {}
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {}
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {}
 }
 
 export function detectPythonCommand(customPath?: string): { command: string; args: string[]; info: string } {
@@ -53,8 +146,6 @@ export function detectPythonCommand(customPath?: string): { command: string; arg
   }
 
   // 3. Platform-specific candidate probing
-  // On Windows: 'py' (Windows Python Launcher) is the official python.org launcher installed in C:\Windows.
-  // It handles Python 3.14 / 3.12 / 3.11 seamlessly and bypasses the Microsoft Store stub alias!
   const candidates: Array<{ cmd: string; args: string[]; label: string }> = isWin
     ? [
         { cmd: 'py', args: ['-3'], label: 'Windows Python Launcher (py -3)' },
@@ -67,7 +158,6 @@ export function detectPythonCommand(customPath?: string): { command: string; arg
         { cmd: 'python', args: [], label: 'python' },
       ];
 
-  // On Windows, also inspect standard user and system installation directories
   if (isWin) {
     const localAppData = process.env.LOCALAPPDATA || '';
     const programFiles = process.env.ProgramFiles || '';
@@ -96,7 +186,6 @@ export function detectPythonCommand(customPath?: string): { command: string; arg
     }
   }
 
-  // Test candidates sequentially
   for (const cand of candidates) {
     try {
       const testArgs = [...cand.args, '-c', 'import sys; print(sys.version.split()[0])'];
@@ -107,7 +196,6 @@ export function detectPythonCommand(customPath?: string): { command: string; arg
       });
       const out = (res.stdout || '').trim();
       const err = (res.stderr || '').trim();
-      // Code 0 and not Microsoft Store stub warning
       if (res.status === 0 && out.length > 0 && !err.includes('Microsoft Store') && !out.includes('Microsoft Store')) {
         return {
           command: cand.cmd,
@@ -118,14 +206,16 @@ export function detectPythonCommand(customPath?: string): { command: string; arg
     } catch {}
   }
 
-  // Safe fallback
   return isWin
     ? { command: 'py', args: [], info: 'Default Windows Python (py)' }
     : { command: 'python3', args: [], info: 'Default Python (python3)' };
 }
 
-class SniperManager {
+export class SniperManager {
+  private readonly baseDir: string;
+  private readonly settingsFile: string;
   private process: ChildProcess | null = null;
+  private activeRunId: string | null = null;
   private running = false;
   private logs: SniperLogEntry[] = [];
   private maxLogs = 1000;
@@ -133,27 +223,61 @@ class SniperManager {
   private solPriceUpdatedAt = 0; // epoch ms
   private refreshingSol = false;
   private refreshingPositions = false;
+  private orchestrator: BotOrchestrator | null = null;
+  private txAdapter: LiveTxAdapter | null = null;
+  private liveWalletBalanceSol: number | null = null;
+  private liveWalletUpdatedAt = 0;
+  private refreshingLiveWallet = false;
 
-  constructor() {
-    if (!fs.existsSync(SNIPER_DIR)) {
-      fs.mkdirSync(SNIPER_DIR, { recursive: true });
+  constructor(options?: { baseDir?: string; startTimers?: boolean }) {
+    this.baseDir = options?.baseDir || SNIPER_DIR;
+    this.settingsFile = path.join(this.baseDir, 'settings.json');
+    if (!fs.existsSync(this.baseDir)) {
+      fs.mkdirSync(this.baseDir, { recursive: true });
     }
-    if (!fs.existsSync(SETTINGS_FILE)) {
+    if (!fs.existsSync(this.settingsFile)) {
       this.saveDefaultSettings();
     }
-    void this.refreshSolPrice();
-    const solTimer = setInterval(() => {
+    if (options?.startTimers !== false) {
       void this.refreshSolPrice();
-    }, 12_000);
-    solTimer.unref();
+      const solTimer = setInterval(() => {
+        void this.refreshSolPrice();
+      }, 12_000);
+      solTimer.unref();
 
-    // When Python process is stopped but paper positions remain open, keep 1s live prices warm
-    const posTimer = setInterval(() => {
-      if (!this.running) {
-        void this.refreshStoppedOpenPositions();
-      }
-    }, 1_000);
-    posTimer.unref();
+      const posTimer = setInterval(() => {
+        if (!this.running) {
+          void this.refreshStoppedOpenPositions();
+        }
+        if (this.getMode() === 'live') {
+          void this.refreshLiveWalletInfo(false);
+        }
+      }, 1_000);
+      posTimer.unref();
+    }
+  }
+
+  public attachOrchestrator(orchestrator: BotOrchestrator, customTxAdapter?: LiveTxAdapter): void {
+    this.orchestrator = orchestrator;
+    this.txAdapter = customTxAdapter ?? new DefaultLiveTxAdapter(orchestrator.rpcPool);
+    if (this.getMode() === 'live') {
+      void this.refreshLiveWalletInfo(true);
+    }
+  }
+
+  private readSettings(): Record<string, any> {
+    if (!fs.existsSync(this.settingsFile)) return {};
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.settingsFile, 'utf-8'));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  public getMode(settings?: Record<string, any>): SniperMode {
+    const s = settings ?? this.readSettings();
+    return String(s.mode || 'paper').toLowerCase() === 'live' ? 'live' : 'paper';
   }
 
   private async fetchJsonWithTimeout(url: string, timeoutMs = 4000, headers?: Record<string, string>): Promise<any | null> {
@@ -212,21 +336,129 @@ class SniperManager {
     }
   }
 
+  public async refreshLiveWalletInfo(force = false): Promise<{
+    ok: boolean;
+    unlocked: boolean;
+    publicKey: string | null;
+    maskedPublicKey: string;
+    balanceSol: number | null;
+    balanceUsd: number | null;
+    healthyRpcs: number;
+    solPriceUsd: number | null;
+  }> {
+    if (!this.orchestrator) {
+      return {
+        ok: false,
+        unlocked: false,
+        publicKey: null,
+        maskedPublicKey: 'Not initialized',
+        balanceSol: null,
+        balanceUsd: null,
+        healthyRpcs: 0,
+        solPriceUsd: this.solPriceUsd,
+      };
+    }
+
+    const { signer, rpcPool } = this.orchestrator;
+    const unlocked = signer.isUnlocked();
+    const publicKey = signer.getPublicKey();
+    const maskedPublicKey = signer.getMaskedPublicKey();
+    let healthyRpcs = rpcPool.getHealthSnapshot().filter((r) => r.healthy).length;
+
+    const now = Date.now();
+    if (
+      this.refreshingLiveWallet === false &&
+      (force || now - this.liveWalletUpdatedAt > 9_000)
+    ) {
+      this.refreshingLiveWallet = true;
+      try {
+        if (healthyRpcs < 2) {
+          const checked = await rpcPool.checkAllEndpoints().catch(() => []);
+          healthyRpcs = checked.filter((r) => r.healthy).length;
+        }
+        if (publicKey && typeof rpcPool.getAgreedBalanceSol === 'function') {
+          const bal = await rpcPool.getAgreedBalanceSol(publicKey).catch(() => ({
+            agreed: false,
+            balanceSol: null,
+            readings: [],
+          }));
+          if (bal.agreed && bal.balanceSol !== null) {
+            this.liveWalletBalanceSol = bal.balanceSol;
+            this.liveWalletUpdatedAt = Date.now();
+          } else if (bal.readings.length > 0 && this.liveWalletBalanceSol === null) {
+            this.liveWalletBalanceSol = bal.readings[0];
+            this.liveWalletUpdatedAt = Date.now();
+          }
+        }
+        if (!this.solPriceUsd) {
+          await this.refreshSolPrice();
+        }
+      } finally {
+        this.refreshingLiveWallet = false;
+      }
+    }
+
+    const balanceSol = this.liveWalletBalanceSol;
+    const balanceUsd =
+      balanceSol !== null && this.solPriceUsd && this.solPriceUsd > 0
+        ? Number((balanceSol * this.solPriceUsd).toFixed(4))
+        : null;
+
+    return {
+      ok: true,
+      unlocked,
+      publicKey,
+      maskedPublicKey,
+      balanceSol,
+      balanceUsd,
+      healthyRpcs,
+      solPriceUsd: this.solPriceUsd,
+    };
+  }
+
+  public getLiveWalletSnapshot() {
+    if (!this.orchestrator) {
+      return {
+        unlocked: false,
+        publicKey: null,
+        maskedPublicKey: 'Not connected',
+        balanceSol: null,
+        balanceUsd: null,
+        healthyRpcs: 0,
+      };
+    }
+    const unlocked = this.orchestrator.signer.isUnlocked();
+    const publicKey = this.orchestrator.signer.getPublicKey();
+    const maskedPublicKey = this.orchestrator.signer.getMaskedPublicKey();
+    const healthyRpcs = this.orchestrator.rpcPool.getHealthSnapshot().filter((r) => r.healthy).length;
+    const balanceSol = this.liveWalletBalanceSol;
+    const balanceUsd =
+      balanceSol !== null && this.solPriceUsd && this.solPriceUsd > 0
+        ? Number((balanceSol * this.solPriceUsd).toFixed(4))
+        : null;
+    return {
+      unlocked,
+      publicKey,
+      maskedPublicKey,
+      balanceSol,
+      balanceUsd,
+      healthyRpcs,
+    };
+  }
+
   private async refreshStoppedOpenPositions(): Promise<void> {
-    if (this.refreshingPositions || this.running || !fs.existsSync(STATE_FILE)) return;
+    const mode = this.getMode();
+    const { stateFile } = getSniperFilePaths(mode, this.baseDir);
+    if (this.refreshingPositions || this.running || !fs.existsSync(stateFile)) return;
     this.refreshingPositions = true;
     try {
-      const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
+      const state = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
       const positions = state?.positions;
       if (!positions || typeof positions !== 'object') return;
       const mints = Object.keys(positions);
       if (mints.length === 0) return;
 
-      let settings: any = {};
-      if (fs.existsSync(SETTINGS_FILE)) {
-        try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8')); } catch {}
-      }
-
+      const settings = this.readSettings();
       const prices: Record<string, number> = {};
       if (settings.use_jupiter_price !== false) {
         const jupUrl = settings.jupiter_api_key
@@ -266,7 +498,6 @@ class SniperManager {
         }
       }
 
-      // Re-verify bot wasn't started during async network fetch
       if (this.running) return;
       const nowSec = Date.now() / 1000;
       state.last_price_time = nowSec;
@@ -292,7 +523,7 @@ class SniperManager {
         state.sol_price_usd = this.solPriceUsd;
         state.sol_price_updated_at = this.solPriceUpdatedAt / 1000;
       }
-      fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
+      fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf-8');
     } catch {
       // Ignore transient errors
     } finally {
@@ -302,6 +533,7 @@ class SniperManager {
 
   private saveDefaultSettings() {
     const defaults = {
+      mode: 'paper',
       start_balance_usd: 50.0,
       trade_size_usd: 5.0,
       max_open_positions: 3,
@@ -336,20 +568,27 @@ class SniperManager {
       jupiter_api_key: '',
       python_binary_path: 'auto',
     };
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(defaults, null, 2), 'utf-8');
+    fs.writeFileSync(this.settingsFile, JSON.stringify(defaults, null, 2), 'utf-8');
   }
 
   public getStatus() {
-    let settings: any = {};
-    if (fs.existsSync(SETTINGS_FILE)) {
-      try {
-        settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
-      } catch {}
-    }
+    const settings = this.readSettings();
+    const mode = this.getMode(settings);
+    const { stateFile, tradesCsv } = getSniperFilePaths(mode, this.baseDir);
 
-    const defaultCash = typeof settings.start_balance_usd === 'number' ? settings.start_balance_usd : 50.0;
+    const defaultCash =
+      mode === 'live'
+        ? this.liveWalletBalanceSol !== null && this.solPriceUsd
+          ? Number((this.liveWalletBalanceSol * this.solPriceUsd).toFixed(4))
+          : 0.0
+        : typeof settings.start_balance_usd === 'number'
+          ? settings.start_balance_usd
+          : 50.0;
+
     let state: any = {
+      mode,
       cash: defaultCash,
+      wallet_sol: mode === 'live' ? this.liveWalletBalanceSol : null,
       positions: {},
       closed: 0,
       wins: 0,
@@ -358,10 +597,15 @@ class SniperManager {
       last_price_time: 0,
       scan_paused: false,
     };
-    if (fs.existsSync(STATE_FILE)) {
+    if (fs.existsSync(stateFile)) {
       try {
-        state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
+        state = { ...state, ...JSON.parse(fs.readFileSync(stateFile, 'utf-8')) };
       } catch {}
+    }
+
+    if (mode === 'live' && this.liveWalletBalanceSol !== null && this.solPriceUsd && this.solPriceUsd > 0) {
+      state.wallet_sol = this.liveWalletBalanceSol;
+      state.cash = Number((this.liveWalletBalanceSol * this.solPriceUsd).toFixed(4));
     }
 
     if (state.positions) {
@@ -393,9 +637,9 @@ class SniperManager {
     }
 
     const rawRows: RawSniperCsvRow[] = [];
-    if (fs.existsSync(TRADES_CSV)) {
+    if (fs.existsSync(tradesCsv)) {
       try {
-        const content = fs.readFileSync(TRADES_CSV, 'utf-8');
+        const content = fs.readFileSync(tradesCsv, 'utf-8');
         const lines = content.replace(/\r/g, '').split('\n').filter((l) => l.trim().length > 0);
         for (let i = 1; i < lines.length; i++) {
           const parts = lines[i].split(',').map((p) => p.trim());
@@ -416,6 +660,7 @@ class SniperManager {
               source: parts[12] || '',
               entryPrice: parts[13] || '',
               solPriceUsd: parts[14] || '',
+              txSig: parts[15] || '',
             });
           }
         }
@@ -439,41 +684,119 @@ class SniperManager {
     const priceAgeSec = lastPriceSec > 0 ? Math.max(0, Date.now() / 1000 - lastPriceSec) : null;
 
     return {
+      mode,
       running: this.running,
       state,
-      settings,
+      settings: { ...settings, mode },
       trades,
       logs: this.logs.slice(-200),
       sol_price_usd: effectiveSolPrice,
       sol_price_updated_at: effectiveSolUpdatedAt,
       price_age_sec: priceAgeSec,
       scan_paused: Boolean(state.scan_paused),
+      live_wallet: this.getLiveWalletSnapshot(),
     };
+  }
+
+  public async switchMode(targetMode: SniperMode) {
+    const cleanMode: SniperMode = targetMode === 'live' ? 'live' : 'paper';
+    if (this.running) {
+      this.stop();
+    }
+    const current = this.readSettings();
+    const updated = { ...current, mode: cleanMode };
+    fs.writeFileSync(this.settingsFile, JSON.stringify(updated, null, 2), 'utf-8');
+    if (cleanMode === 'live') {
+      await this.refreshLiveWalletInfo(true);
+      this.appendLog('INFO', 'Switched Python Sniper Bot to LIVE mode (real Solana wallet via Jupiter Swap).');
+    } else {
+      this.appendLog('INFO', 'Switched Python Sniper Bot to PAPER mode (simulated trading).');
+    }
+    return {
+      ok: true,
+      mode: cleanMode,
+      live_wallet: this.getLiveWalletSnapshot(),
+      message: cleanMode === 'live' ? 'Switched Python Sniper to LIVE mode' : 'Switched Python Sniper to PAPER mode',
+    };
+  }
+
+  private terminateAnyExistingBot(): boolean {
+    let killed = false;
+    if (this.process && this.process.pid) {
+      killProcessTreeSync(this.process.pid);
+      this.process = null;
+      killed = true;
+    }
+    const pidInfo = readPidFile(this.baseDir);
+    if (pidInfo?.pid && Number.isFinite(pidInfo.pid)) {
+      killProcessTreeSync(pidInfo.pid);
+      killed = true;
+    }
+    removePidFile(this.baseDir);
+    return killed;
   }
 
   public start() {
     if (this.running) return { ok: true, message: 'Already running' };
 
-    const botPath = path.join(SNIPER_DIR, 'bot.py');
+    const botPath = path.join(this.baseDir, 'bot.py');
     if (!fs.existsSync(botPath)) {
       return { ok: false, message: 'bot.py not found in sniper directory' };
     }
 
-    let settings: any = {};
-    if (fs.existsSync(SETTINGS_FILE)) {
-      try {
-        settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
-      } catch {}
+    const settings = this.readSettings();
+    const mode = this.getMode(settings);
+
+    if (mode === 'live') {
+      if (!this.orchestrator?.signer.isUnlocked() || !this.orchestrator.signer.getPublicKey()) {
+        return {
+          ok: false,
+          message: 'Live wallet signer is locked. Open Wallets & Signer to unlock your wallet first.',
+        };
+      }
+      if (this.liveWalletBalanceSol !== null && this.liveWalletBalanceSol <= 0.001) {
+        this.appendLog(
+          'WARN',
+          `Live wallet balance is ${this.liveWalletBalanceSol.toFixed(4)} SOL ($${((this.liveWalletBalanceSol || 0) * (this.solPriceUsd || 0)).toFixed(2)}). Buys will alert until funded.`
+        );
+      }
     }
 
-    const detected = detectPythonCommand(settings.python_binary_path);
-    this.appendLog('INFO', `Starting Python New-Launch Sniper Bot using: ${detected.info}...`);
+    // Ensure zero orphaned background python process remains before starting
+    this.terminateAnyExistingBot();
+    clearStopSignal(this.baseDir);
 
-    const spawnArgs = [...detected.args, botPath];
+    const detected = detectPythonCommand(settings.python_binary_path);
+    const runId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    this.activeRunId = runId;
+
+    let bridgeUrl = '';
+    let bridgeToken = '';
+    try {
+      const env = loadAppEnv();
+      const connectHost = env.host === '0.0.0.0' || env.host === '::' ? '127.0.0.1' : env.host;
+      bridgeUrl = `http://${connectHost}:${env.port}`;
+      bridgeToken = env.apiToken;
+    } catch {}
+
+    this.appendLog(
+      'INFO',
+      `Starting Python New-Launch Sniper Bot [${mode.toUpperCase()}] using: ${detected.info}...`
+    );
+
+    const spawnArgs = [...detected.args, botPath, `--run-id=${runId}`];
     this.process = spawn(detected.command, spawnArgs, {
-      cwd: SNIPER_DIR,
+      cwd: this.baseDir,
       shell: process.platform === 'win32',
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      detached: process.platform !== 'win32',
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: '1',
+        SNIPER_MODE: mode,
+        SNIPER_RUN_ID: runId,
+        SNIPER_BRIDGE_URL: bridgeUrl,
+        SNIPER_BRIDGE_TOKEN: bridgeToken,
+      },
     });
 
     this.running = true;
@@ -493,7 +816,11 @@ class SniperManager {
     }
 
     this.process.on('exit', (code) => {
-      this.running = false;
+      if (this.activeRunId === runId) {
+        this.running = false;
+        this.process = null;
+        this.activeRunId = null;
+      }
       if (code === 9009) {
         this.appendLog(
           'WARN',
@@ -501,37 +828,43 @@ class SniperManager {
         );
       }
       this.appendLog('INFO', `Python bot exited with code ${code}`);
-      this.process = null;
     });
 
-    return { ok: true, message: `Python sniper bot started (${detected.info})` };
+    return { ok: true, message: `Python sniper bot started (${mode.toUpperCase()} · ${detected.info})` };
   }
 
   public stop() {
-    if (!this.running || !this.process) {
-      return { ok: true, message: 'Not running' };
-    }
-    this.appendLog('INFO', 'Stopping Python sniper bot...');
-    try {
-      this.process.kill('SIGTERM');
-    } catch {
-      try {
-        this.process.kill('SIGKILL');
-      } catch {}
-    }
+    const pidPath = path.join(this.baseDir, 'bot.pid');
+    const wasRunning = this.running || Boolean(this.process) || fs.existsSync(pidPath);
+    // 1. Signal cooperative immediate halt across all scan/buy/sell/monitor loops
+    writeStopSignal('user_stop', this.baseDir);
+    // 2. Hard-kill process tree + child Python PID stored in bot.pid (critical on Windows)
+    const killedPid = this.terminateAnyExistingBot();
+
     this.running = false;
     this.process = null;
-    return { ok: true, message: 'Python sniper bot stopped' };
+    this.activeRunId = null;
+
+    if (wasRunning || killedPid) {
+      this.appendLog('INFO', 'Python sniper bot stopped cleanly (all scan, buy & sell loops halted).');
+      return { ok: true, message: 'Python sniper bot stopped' };
+    }
+    return { ok: true, message: 'Python sniper bot stopped (no active process)' };
   }
 
   public updateSettings(newSettings: Record<string, any>) {
     try {
-      let current = {};
-      if (fs.existsSync(SETTINGS_FILE)) {
-        current = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
-      }
-      const updated = { ...current, ...newSettings };
-      fs.writeFileSync(SETTINGS_FILE, JSON.stringify(updated, null, 2), 'utf-8');
+      const current = this.readSettings();
+      const updated = {
+        ...current,
+        ...newSettings,
+        mode: newSettings.mode === 'live' || current.mode === 'live'
+          ? newSettings.mode === 'paper'
+            ? 'paper'
+            : 'live'
+          : 'paper',
+      };
+      fs.writeFileSync(this.settingsFile, JSON.stringify(updated, null, 2), 'utf-8');
       this.appendLog('INFO', 'Python bot settings updated and saved.');
       return { ok: true, settings: updated };
     } catch (err) {
@@ -541,15 +874,20 @@ class SniperManager {
 
   public resetAccount() {
     try {
-      let settings: any = {};
-      if (fs.existsSync(SETTINGS_FILE)) {
-        try {
-          settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
-        } catch {}
+      const settings = this.readSettings();
+      const mode = this.getMode(settings);
+      if (mode === 'live') {
+        return {
+          ok: false,
+          message: 'Live trade ledger and real wallet balance cannot be reset. Switch to PAPER mode to reset simulated funds.',
+        };
       }
+      const { stateFile, tradesCsv, sellQueueFile } = getSniperFilePaths('paper', this.baseDir);
       const startCash = typeof settings.start_balance_usd === 'number' ? settings.start_balance_usd : 50.0;
       const freshState = {
+        mode: 'paper',
         cash: startCash,
+        wallet_sol: null,
         positions: {},
         day: new Date().toISOString().slice(0, 10),
         day_pnl: 0.0,
@@ -562,80 +900,529 @@ class SniperManager {
         sol_price_usd: this.solPriceUsd,
         sol_price_updated_at: this.solPriceUpdatedAt ? this.solPriceUpdatedAt / 1000 : 0,
       };
-      fs.writeFileSync(STATE_FILE, JSON.stringify(freshState, null, 2), 'utf-8');
-      if (fs.existsSync(TRADES_CSV)) fs.unlinkSync(TRADES_CSV);
-      if (fs.existsSync(SELL_QUEUE_FILE)) fs.unlinkSync(SELL_QUEUE_FILE);
-      this.appendLog('INFO', `Python bot account reset (cash set to $${startCash.toFixed(2)}, trades cleared).`);
-      return { ok: true, message: `Account reset with $${startCash.toFixed(2)} start balance` };
+      fs.writeFileSync(stateFile, JSON.stringify(freshState, null, 2), 'utf-8');
+      if (fs.existsSync(tradesCsv)) fs.unlinkSync(tradesCsv);
+      if (fs.existsSync(sellQueueFile)) fs.unlinkSync(sellQueueFile);
+      this.appendLog('INFO', `Python bot paper account reset (cash set to $${startCash.toFixed(2)}, trades cleared).`);
+      return { ok: true, message: `Paper account reset with $${startCash.toFixed(2)} start balance` };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : 'Error resetting account' };
     }
   }
 
-  public sellPosition(mint: string) {
+  public async executeLiveBuy(params: {
+    mint: string;
+    symbol: string;
+    tradeSizeUsd: number;
+    slippagePct?: number;
+    solPriceUsd?: number | null;
+  }): Promise<{
+    ok: boolean;
+    error?: string;
+    insufficientFunds?: boolean;
+    blacklist?: boolean;
+    walletBalanceSol?: number | null;
+    txSig?: string;
+    qty?: number;
+    rawAmount?: string;
+    decimals?: number;
+    entryPriceUsd?: number;
+    costUsd?: number;
+    costSol?: number;
+    feeSol?: number;
+    rentSol?: number;
+    solPriceUsd?: number;
+  }> {
+    if (!this.orchestrator || !this.txAdapter) {
+      return { ok: false, error: 'Live trading bridge not attached to server orchestrator.' };
+    }
+
+    const { signer, rpcPool, jupiter } = this.orchestrator;
+    const owner = signer.getPublicKey();
+    if (!signer.isUnlocked() || !owner) {
+      return { ok: false, error: 'Live wallet signer is locked. Unlock your wallet in Wallets & Signer first.' };
+    }
+
+    let solPriceUsd =
+      params.solPriceUsd && Number.isFinite(params.solPriceUsd) && params.solPriceUsd > 0
+        ? params.solPriceUsd
+        : this.solPriceUsd;
+    if (!solPriceUsd || solPriceUsd <= 0) {
+      solPriceUsd = (await jupiter.getLiveSolPriceUsd()) ?? (await this.refreshSolPrice());
+    }
+    if (!solPriceUsd || solPriceUsd <= 0) {
+      return { ok: false, error: 'Unable to fetch live SOL/USD price for trade sizing.' };
+    }
+
+    const tradeSizeUsd = Number(params.tradeSizeUsd || 0);
+    if (!Number.isFinite(tradeSizeUsd) || tradeSizeUsd <= 0) {
+      return { ok: false, error: 'Invalid trade size USD.' };
+    }
+    const solAmount = tradeSizeUsd / solPriceUsd;
+    const minRequiredSol = solAmount + 0.001;
+
+    // 1. Check live wallet SOL balance
+    if (typeof rpcPool.getAgreedBalanceSol === 'function') {
+      const bal = await rpcPool.getAgreedBalanceSol(owner).catch(() => ({
+        agreed: false,
+        balanceSol: null,
+        readings: [],
+      }));
+      const knownBal = bal.agreed ? bal.balanceSol : bal.readings.length > 0 ? bal.readings[0] : null;
+      if (knownBal !== null) {
+        this.liveWalletBalanceSol = knownBal;
+        this.liveWalletUpdatedAt = Date.now();
+        if (knownBal < minRequiredSol) {
+          const availUsd = knownBal * solPriceUsd;
+          const needUsd = minRequiredSol * solPriceUsd;
+          return {
+            ok: false,
+            insufficientFunds: true,
+            walletBalanceSol: knownBal,
+            error: `There is no SOL (${knownBal.toFixed(4)} SOL / $${availUsd.toFixed(2)}) in the wallet to trade ${params.symbol}: need ~${minRequiredSol.toFixed(4)} SOL ($${needUsd.toFixed(2)}).`,
+          };
+        }
+      }
+    }
+
+    // 2. Check existing on-chain balance + decimals
+    const [preBal, mintInfo] = await Promise.all([
+      rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => ({ agreed: false, balanceUi: null, readings: [], decimals: undefined, rawAmount: undefined })),
+      typeof rpcPool.inspectTokenOnChain === 'function'
+        ? rpcPool.inspectTokenOnChain(params.mint).catch(() => null)
+        : Promise.resolve(null),
+    ]);
+
+    if (preBal.agreed && (preBal.balanceUi ?? 0) > 0) {
+      return {
+        ok: false,
+        blacklist: true,
+        error: `On-chain balance already held for ${params.symbol}; skipping rebuy.`,
+      };
+    }
+
+    const decimals = mintInfo?.decimals ?? preBal.decimals ?? 6;
+    const amountRaw = String(Math.max(10_000, Math.round(solAmount * LAMPORTS_PER_SOL)));
+    const slippageBps = Math.min(2500, Math.max(50, Math.round((params.slippagePct ?? 2.0) * 100)));
+
+    // 3. Get Jupiter swap quote
+    const quote = await jupiter.getQuote({
+      inputMint: WSOL_MINT,
+      outputMint: params.mint,
+      amountRaw,
+      slippageBps,
+      allowRelaxFallback: true,
+    });
+    if (!quote || Number(quote.outAmount) <= 0) {
+      const detail = typeof jupiter.getLastQuoteError === 'function' ? jupiter.getLastQuoteError() : null;
+      return {
+        ok: false,
+        error: `No Jupiter buy route available (${detail || 'route not found'})`,
+      };
+    }
+
+    // 4. Build, sign, send, confirm
+    let swapTxResp;
     try {
-      if (!fs.existsSync(STATE_FILE)) return { ok: false, message: 'No active state' };
-      const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
+      swapTxResp = await jupiter.buildSwapTransaction({
+        quoteResponse: quote,
+        userPublicKey: owner,
+        priorityFeeLamports: 'auto',
+      });
+    } catch (err) {
+      return {
+        ok: false,
+        error: `Jupiter buy build failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    const txBytes = Buffer.from(swapTxResp.swapTransaction, 'base64');
+    const versionedTx = VersionedTransaction.deserialize(txBytes);
+    await signer.signVersionedTransaction(versionedTx);
+    const rawSigned = versionedTx.serialize();
+
+    let sig: string;
+    try {
+      sig = await this.txAdapter.sendSignedTransaction(rawSigned, 3);
+    } catch (err) {
+      return {
+        ok: false,
+        error: `Live buy submission failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    const conf = await this.txAdapter.pollConfirmation(sig, 25_000);
+    if (conf.status === 'failed') {
+      return { ok: false, error: conf.err || 'Buy transaction failed on-chain' };
+    }
+    if (conf.status === 'timeout') {
+      const late = await this.txAdapter.pollConfirmation(sig, 90_000);
+      if (late.status === 'failed') {
+        return { ok: false, error: late.err || 'Buy transaction failed during confirmation' };
+      }
+      if (late.status === 'timeout') {
+        const postCheck = await rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => ({ agreed: false, balanceUi: null }));
+        if (!postCheck.agreed || (postCheck.balanceUi ?? 0) <= 0) {
+          return { ok: false, error: `Buy confirmation timed out (tx ${sig}); verify on Solscan.` };
+        }
+      }
+    }
+
+    // 5. Reconcile exact on-chain quantities & SOL spent
+    const [balCheck, txDelta] = await Promise.all([
+      rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => ({ agreed: false, balanceUi: null, decimals: undefined, rawAmount: undefined })),
+      this.txAdapter.reconcileParsedSwapSolDelta(sig, owner, params.mint),
+    ]);
+
+    const quotedQty = Number(quote.outAmount) / 10 ** decimals;
+    const realDecimals = typeof balCheck.decimals === 'number' ? balCheck.decimals : decimals;
+    const realQty =
+      balCheck.agreed && (balCheck.balanceUi ?? 0) > 0
+        ? balCheck.balanceUi!
+        : txDelta.tokenDeltaUi && txDelta.tokenDeltaUi > 0
+          ? txDelta.tokenDeltaUi
+          : quotedQty;
+    const realRawAmount =
+      balCheck.rawAmount && /^\d+$/.test(balCheck.rawAmount)
+        ? balCheck.rawAmount
+        : String(quote.outAmount);
+
+    let realSolSpent = solAmount;
+    let feeSol = 0.0001;
+    let rentSol = 0;
+    if (txDelta.found && txDelta.solDeltaLamports < 0) {
+      const totalOutSol = Math.abs(txDelta.solDeltaLamports) / LAMPORTS_PER_SOL;
+      feeSol = txDelta.feeLamports / LAMPORTS_PER_SOL;
+      rentSol = (txDelta.createdAtaRentLamports ?? 0) / LAMPORTS_PER_SOL;
+      realSolSpent = Math.max(0.0001, totalOutSol - feeSol - rentSol);
+    }
+
+    const costUsd = realSolSpent * solPriceUsd;
+    const entryPriceUsd = realQty > 0 ? costUsd / realQty : 0;
+
+    // Refresh wallet SOL balance
+    if (typeof rpcPool.getAgreedBalanceSol === 'function') {
+      const newBal = await rpcPool.getAgreedBalanceSol(owner).catch(() => null);
+      if (newBal?.agreed && newBal.balanceSol !== null) {
+        this.liveWalletBalanceSol = newBal.balanceSol;
+        this.liveWalletUpdatedAt = Date.now();
+      } else if (this.liveWalletBalanceSol !== null) {
+        this.liveWalletBalanceSol = Math.max(0, this.liveWalletBalanceSol - realSolSpent - feeSol - rentSol);
+      }
+    }
+
+    return {
+      ok: true,
+      txSig: sig,
+      qty: realQty,
+      rawAmount: realRawAmount,
+      decimals: realDecimals,
+      entryPriceUsd,
+      costUsd,
+      costSol: realSolSpent,
+      feeSol,
+      rentSol,
+      solPriceUsd,
+      walletBalanceSol: this.liveWalletBalanceSol,
+    };
+  }
+
+  public async executeLiveSell(params: {
+    mint: string;
+    symbol: string;
+    qty: number;
+    rawAmount?: string | null;
+    decimals?: number | null;
+    costUsd: number;
+    costSol?: number | null;
+    slippagePct?: number;
+    solPriceUsd?: number | null;
+    reason?: string;
+  }): Promise<{
+    ok: boolean;
+    error?: string;
+    txSig?: string;
+    proceedsUsd?: number;
+    proceedsSol?: number;
+    pnlUsd?: number;
+    pnlSol?: number;
+    pnlPct?: number;
+    exitPriceUsd?: number;
+    feeSol?: number;
+    reclaimedRentSol?: number;
+    solPriceUsd?: number;
+    walletBalanceSol?: number | null;
+  }> {
+    if (!this.orchestrator || !this.txAdapter) {
+      return { ok: false, error: 'Live trading bridge not attached to server orchestrator.' };
+    }
+
+    const { signer, rpcPool, jupiter } = this.orchestrator;
+    const owner = signer.getPublicKey();
+    if (!signer.isUnlocked() || !owner) {
+      return { ok: false, error: 'Live wallet signer is locked. Unlock your wallet in Wallets & Signer first.' };
+    }
+
+    let solPriceUsd =
+      params.solPriceUsd && Number.isFinite(params.solPriceUsd) && params.solPriceUsd > 0
+        ? params.solPriceUsd
+        : this.solPriceUsd;
+    if (!solPriceUsd || solPriceUsd <= 0) {
+      solPriceUsd = (await jupiter.getLiveSolPriceUsd()) ?? (await this.refreshSolPrice()) ?? 100;
+    }
+
+    // 1. Resolve exact on-chain raw integer token balance & decimals
+    let effectiveDecimals = typeof params.decimals === 'number' && params.decimals >= 0 ? params.decimals : 6;
+    let soldQty = Number(params.qty || 0);
+    let exactRawAmount: string | null =
+      params.rawAmount && /^\d+$/.test(params.rawAmount) && BigInt(params.rawAmount) > 0n
+        ? params.rawAmount
+        : null;
+
+    const bal = await rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => ({
+      agreed: false,
+      balanceUi: null,
+      readings: [],
+      decimals: undefined,
+      rawAmount: undefined,
+    }));
+    if (bal.agreed && bal.balanceUi !== null && bal.balanceUi > 0) {
+      if (typeof bal.decimals === 'number' && bal.decimals >= 0) {
+        effectiveDecimals = bal.decimals;
+      }
+      if (soldQty <= 0 || bal.balanceUi < soldQty) {
+        soldQty = bal.balanceUi;
+      }
+      if (bal.rawAmount && /^\d+$/.test(bal.rawAmount) && BigInt(bal.rawAmount) > 0n) {
+        exactRawAmount = bal.rawAmount;
+      }
+    }
+
+    const amountRaw =
+      exactRawAmount ?? String(Math.max(1, Math.floor(soldQty * 10 ** effectiveDecimals)));
+    const baseSlippageBps = Math.min(2500, Math.max(50, Math.round((params.slippagePct ?? 2.0) * 100)));
+
+    let quote = await jupiter.getQuote({
+      inputMint: params.mint,
+      outputMint: WSOL_MINT,
+      amountRaw,
+      slippageBps: baseSlippageBps,
+      allowRelaxFallback: true,
+    });
+
+    if (!quote || Number(quote.outAmount) <= 0) {
+      const retrySlippageBps = Math.min(5000, Math.max(baseSlippageBps + 500, 2500));
+      quote = await jupiter.getQuote({
+        inputMint: params.mint,
+        outputMint: WSOL_MINT,
+        amountRaw,
+        slippageBps: retrySlippageBps,
+        restrictIntermediateTokens: false,
+        allowRelaxFallback: true,
+      });
+    }
+
+    if (!quote || Number(quote.outAmount) <= 0) {
+      const detail = typeof jupiter.getLastQuoteError === 'function' ? jupiter.getLastQuoteError() : null;
+      return {
+        ok: false,
+        error: `No sell route available${detail ? ` (${detail})` : ''}; keeping position open`,
+      };
+    }
+
+    // 2. Build, sign, send, confirm swap
+    let swapTxResp;
+    try {
+      swapTxResp = await jupiter.buildSwapTransaction({
+        quoteResponse: quote,
+        userPublicKey: owner,
+        priorityFeeLamports: 'auto',
+      });
+    } catch (err) {
+      return {
+        ok: false,
+        error: `Jupiter sell build failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    const txBytes = Buffer.from(swapTxResp.swapTransaction, 'base64');
+    const versionedTx = VersionedTransaction.deserialize(txBytes);
+    await signer.signVersionedTransaction(versionedTx);
+    const rawSigned = versionedTx.serialize();
+
+    let sig: string;
+    try {
+      sig = await this.txAdapter.sendSignedTransaction(rawSigned, 3);
+    } catch (err) {
+      return {
+        ok: false,
+        error: `Live sell submission failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    const conf = await this.txAdapter.pollConfirmation(sig, 25_000);
+    if (conf.status === 'failed') {
+      return { ok: false, error: conf.err || 'Sell transaction failed on-chain' };
+    }
+    if (conf.status === 'timeout') {
+      const late = await this.txAdapter.pollConfirmation(sig, 90_000);
+      if (late.status === 'failed') {
+        return { ok: false, error: late.err || 'Sell confirmation failed on-chain' };
+      }
+      if (late.status === 'timeout') {
+        return { ok: false, error: `Sell confirmation timed out (tx ${sig}); keeping position open until verified.` };
+      }
+    }
+
+    // 3. Reconcile exact SOL proceeds
+    const txDelta = await this.txAdapter.reconcileParsedSwapSolDelta(sig, owner, params.mint);
+    const quotedSolOut = Number(quote.outAmount) / LAMPORTS_PER_SOL;
+    let solOut = quotedSolOut;
+    let feeSol = 0.0001;
+    let reclaimedRentSol = 0;
+
+    if (txDelta.found) {
+      feeSol = txDelta.feeLamports / LAMPORTS_PER_SOL;
+      reclaimedRentSol = (txDelta.closedAtaRentLamports ?? 0) / LAMPORTS_PER_SOL;
+      if (txDelta.solDeltaLamports > 0) {
+        solOut = Math.max(0, txDelta.solDeltaLamports / LAMPORTS_PER_SOL + feeSol - reclaimedRentSol);
+      }
+    }
+
+    const proceedsUsd = solOut * solPriceUsd;
+    const costSol =
+      params.costSol && params.costSol > 0 ? params.costSol : solPriceUsd > 0 ? params.costUsd / solPriceUsd : 0;
+    const netSolDelta = solOut + reclaimedRentSol - costSol - feeSol;
+    const pnlUsd = netSolDelta * solPriceUsd;
+    const pnlPct = params.costUsd > 0 ? (pnlUsd / params.costUsd) * 100 : 0;
+    const exitPriceUsd = soldQty > 0 ? proceedsUsd / soldQty : 0;
+
+    if (typeof rpcPool.getAgreedBalanceSol === 'function') {
+      const newBal = await rpcPool.getAgreedBalanceSol(owner).catch(() => null);
+      if (newBal?.agreed && newBal.balanceSol !== null) {
+        this.liveWalletBalanceSol = newBal.balanceSol;
+        this.liveWalletUpdatedAt = Date.now();
+      } else if (this.liveWalletBalanceSol !== null) {
+        this.liveWalletBalanceSol = Math.max(0, this.liveWalletBalanceSol + solOut + reclaimedRentSol - feeSol);
+      }
+    }
+
+    return {
+      ok: true,
+      txSig: sig,
+      proceedsUsd,
+      proceedsSol: solOut,
+      pnlUsd,
+      pnlSol: netSolDelta,
+      pnlPct,
+      exitPriceUsd,
+      feeSol,
+      reclaimedRentSol,
+      solPriceUsd,
+      walletBalanceSol: this.liveWalletBalanceSol,
+    };
+  }
+
+  public async sellPosition(mint: string) {
+    try {
+      const settings = this.readSettings();
+      const mode = this.getMode(settings);
+      const { stateFile, tradesCsv, sellQueueFile } = getSniperFilePaths(mode, this.baseDir);
+
+      if (!fs.existsSync(stateFile)) return { ok: false, message: 'No active state' };
+      const state = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
       if (!state.positions || !state.positions[mint]) {
         return { ok: false, message: 'Position not found' };
       }
       const pos = state.positions[mint];
 
       // If Python bot is actively running, delegate the sell to bot.py's monitor thread
-      // via sell_queue.json so state.json is never overwritten by a race condition.
       if (this.running) {
         let queue: string[] = [];
-        if (fs.existsSync(SELL_QUEUE_FILE)) {
+        if (fs.existsSync(sellQueueFile)) {
           try {
-            const parsed = JSON.parse(fs.readFileSync(SELL_QUEUE_FILE, 'utf-8'));
+            const parsed = JSON.parse(fs.readFileSync(sellQueueFile, 'utf-8'));
             if (Array.isArray(parsed)) queue = parsed;
           } catch {}
         }
         if (!queue.includes(mint)) queue.push(mint);
-        fs.writeFileSync(SELL_QUEUE_FILE, JSON.stringify(queue), 'utf-8');
+        fs.writeFileSync(sellQueueFile, JSON.stringify(queue), 'utf-8');
         this.appendLog('INFO', `Queued manual sell for ${pos.symbol} at live market price...`);
         return { ok: true, message: `Closing ${pos.symbol} at live price...` };
       }
 
-      let settings: any = {};
-      if (fs.existsSync(SETTINGS_FILE)) {
-        try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8')); } catch {}
+      const maxSlots = Math.max(1, Number(settings.max_open_positions || 3));
+      const nowIso = new Date().toISOString();
+      let fill = pos.current_price || pos.entry_price;
+      let proceeds = 0;
+      let pnlUsd = 0;
+      let pnlPct = 0;
+      let txSig = '';
+
+      if (mode === 'live') {
+        const res = await this.executeLiveSell({
+          mint,
+          symbol: pos.symbol,
+          qty: Number(pos.qty || 0),
+          rawAmount: pos.raw_amount,
+          decimals: pos.decimals,
+          costUsd: Number(pos.cost || 0),
+          costSol: pos.cost_sol,
+          slippagePct: settings.slippage_pct ?? 2.0,
+          solPriceUsd: this.solPriceUsd,
+          reason: 'manual_exit',
+        });
+        if (!res.ok) {
+          this.appendLog('WARN', `Manual live sell failed for ${pos.symbol}: ${res.error}`);
+          return { ok: false, message: res.error || 'Live sell failed' };
+        }
+        fill = res.exitPriceUsd ?? fill;
+        proceeds = res.proceedsUsd ?? 0;
+        pnlUsd = res.pnlUsd ?? 0;
+        pnlPct = res.pnlPct ?? 0;
+        txSig = res.txSig ?? '';
+        if (res.walletBalanceSol !== undefined && res.walletBalanceSol !== null && this.solPriceUsd) {
+          state.wallet_sol = res.walletBalanceSol;
+          state.cash = Number((res.walletBalanceSol * this.solPriceUsd).toFixed(4));
+        }
+      } else {
+        const currentPrice = pos.current_price || pos.entry_price;
+        const slippage = (settings.slippage_pct ?? 2.0) / 100;
+        const fee = (settings.fee_pct ?? 1.0) / 100;
+        fill = currentPrice * (1 - slippage);
+        proceeds = pos.qty * fill * (1 - fee);
+        pnlUsd = proceeds - pos.cost;
+        pnlPct = (pnlUsd / pos.cost) * 100;
+        state.cash = (state.cash || 50) + proceeds;
       }
+
       delete state.positions[mint];
       state.closed = (state.closed || 0) + 1;
-      const currentPrice = pos.current_price || pos.entry_price;
-      const slippage = (settings.slippage_pct ?? 2.0) / 100;
-      const fee = (settings.fee_pct ?? 1.0) / 100;
-      const fill = currentPrice * (1 - slippage);
-      const proceeds = pos.qty * fill * (1 - fee);
-      const pnlUsd = proceeds - pos.cost;
-      const pnlPct = (pnlUsd / pos.cost) * 100;
-      const maxSlots = Math.max(1, Number(settings.max_open_positions || 3));
-
-      state.cash = (state.cash || 50) + proceeds;
       state.total_pnl = (state.total_pnl || 0) + pnlUsd;
       state.day_pnl = (state.day_pnl || 0) + pnlUsd;
       if (pnlUsd > 0) state.wins = (state.wins || 0) + 1;
       if (Object.keys(state.positions).length < maxSlots) {
         state.scan_paused = false;
       }
-      fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
+      fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf-8');
 
-      // Append to CSV (create header if missing)
-      const nowIso = new Date().toISOString();
-      if (!fs.existsSync(TRADES_CSV)) {
+      if (!fs.existsSync(tradesCsv)) {
         fs.writeFileSync(
-          TRADES_CSV,
-          'time,action,symbol,mint,price,usd,pnl_usd,pnl_pct,reason,dexscreener,age_s,dex,source,entry_price,sol_price_usd\n',
+          tradesCsv,
+          'time,action,symbol,mint,price,usd,pnl_usd,pnl_pct,reason,dexscreener,age_s,dex,source,entry_price,sol_price_usd,tx_sig\n',
           'utf-8'
         );
       }
       const solPxStr = this.solPriceUsd ? this.solPriceUsd.toFixed(4) : '';
-      const csvLine = `${nowIso},SELL,${pos.symbol},${mint},${fill.toFixed(8)},${proceeds.toFixed(4)},${pnlUsd.toFixed(4)},${pnlPct.toFixed(2)},manual_exit,${pos.url || `https://dexscreener.com/solana/${mint}`},${pos.age_at_entry || 0},${pos.dex || '?'},${pos.source || '?'},${Number(pos.entry_price || 0).toFixed(8)},${solPxStr}\n`;
-      fs.appendFileSync(TRADES_CSV, csvLine, 'utf-8');
+      const csvLine = `${nowIso},SELL,${pos.symbol},${mint},${Number(fill).toFixed(8)},${proceeds.toFixed(4)},${pnlUsd.toFixed(4)},${pnlPct.toFixed(2)},manual_exit,${pos.url || `https://dexscreener.com/solana/${mint}`},${pos.age_at_entry || 0},${pos.dex || '?'},${pos.source || '?'},${Number(pos.entry_price || 0).toFixed(8)},${solPxStr},${txSig}\n`;
+      fs.appendFileSync(tradesCsv, csvLine, 'utf-8');
 
-      this.appendLog('INFO', `Manual sell executed for ${pos.symbol} (entry $${Number(pos.entry_price).toFixed(8)} -> exit $${fill.toFixed(8)}, PnL $${pnlUsd.toFixed(2)})`);
-      return { ok: true, message: `Sold ${pos.symbol} manually` };
+      const txNote = txSig ? ` tx=${txSig.slice(0, 8)}...` : '';
+      this.appendLog(
+        'INFO',
+        `Manual ${mode.toUpperCase()} sell executed for ${pos.symbol} (entry $${Number(pos.entry_price).toFixed(8)} -> exit $${Number(fill).toFixed(8)}, PnL $${pnlUsd.toFixed(2)})${txNote}`
+      );
+      return { ok: true, message: `Sold ${pos.symbol} manually${txNote}`, txSig: txSig || undefined };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : 'Error selling position' };
     }
@@ -644,10 +1431,10 @@ class SniperManager {
   private parseAndLogStdout(line: string) {
     const low = line.toLowerCase();
     let tag: SniperLogEntry['tag'] = 'info';
-    if (low.includes('sniper buy') || low.includes('✓')) tag = 'buy';
+    if (low.includes('sniper buy') || low.includes('live buy ') || low.includes('✓')) tag = 'buy';
     else if (low.includes('reject') || low.includes('rug') || low.includes('filtered')) tag = 'reject';
-    else if (low.includes('✗ sell') || low.includes('sell ') || low.includes('queued manual sell') || low.includes('manual sell')) tag = 'sell';
-    else if (low.includes('error') || low.includes('warn') || low.includes('⚠') || low.includes('paused')) tag = 'warn';
+    else if (low.includes('✗ sell') || low.includes('live sell') || low.includes('sell ') || low.includes('queued manual sell') || low.includes('manual sell')) tag = 'sell';
+    else if (low.includes('error') || low.includes('warn') || low.includes('⚠') || low.includes('paused') || low.includes('failed')) tag = 'warn';
 
     this.appendLog(tag, line);
   }

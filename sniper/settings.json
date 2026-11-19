@@ -1,4 +1,5 @@
 {
+  "mode": "paper",
   "start_balance_usd": 50,
   "trade_size_usd": 5,
   "max_open_positions": 3,

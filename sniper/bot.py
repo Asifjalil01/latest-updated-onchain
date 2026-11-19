@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-source new-launch sniper (PAPER MODE).
+Multi-source new-launch sniper (PAPER & LIVE MODES).
 Sources: GeckoTerminal new pools (ALL Solana DEXes), Jupiter recent, DexScreener
 profiles (+optional boosted), PumpPortal new launches.
 Rug screen: on-chain mint/freeze authority (Solana RPC) + Jupiter audit + RugCheck.
@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import sys
 import threading
 import time
@@ -28,6 +29,7 @@ if sys.stdout.encoding != 'utf-8':
         pass
 
 CONFIG = {
+    "mode": "paper",
     "start_balance_usd": 50.0, "trade_size_usd": 5.0, "max_open_positions": 3,
     "daily_loss_limit_usd": 10.0,
     "take_profit_pct": 50.0, "trailing_stop_pct": 0.0, "max_hold_minutes": 120,
@@ -62,9 +64,68 @@ CONFIG = {
 _settings_mtime = 0.0
 _settings_lock = threading.Lock()
 _scan_wake = threading.Event()
+_stop_event = threading.Event()
+_run_id = ""
+_last_pid_check = 0.0
+_cached_pid_alive = True
+
+def _base_dir():
+    return os.path.dirname(os.path.abspath(__file__))
 
 def _settings_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+    return os.path.join(_base_dir(), "settings.json")
+
+def _stop_flag_path():
+    return os.path.join(_base_dir(), "stop.flag")
+
+def _pid_file_path():
+    return os.path.join(_base_dir(), "bot.pid")
+
+def _resolve_arg_run_id():
+    for arg in sys.argv[1:]:
+        if arg.startswith("--run-id="):
+            return arg.split("=", 1)[1].strip()
+    return (os.environ.get("SNIPER_RUN_ID") or "").strip()
+
+def _should_stop():
+    global _last_pid_check, _cached_pid_alive
+    if _stop_event.is_set():
+        return True
+    if os.path.exists(_stop_flag_path()):
+        _stop_event.set()
+        return True
+    if _run_id:
+        now_ts = time.time()
+        if now_ts - _last_pid_check >= 0.2:
+            _last_pid_check = now_ts
+            pf = _pid_file_path()
+            try:
+                if os.path.exists(pf):
+                    with open(pf, "r", encoding="utf-8") as f:
+                        info = json.load(f)
+                    if isinstance(info, dict) and info.get("run_id") and info.get("run_id") != _run_id:
+                        _cached_pid_alive = False
+                        _stop_event.set()
+                        return True
+            except Exception:
+                pass
+        if not _cached_pid_alive:
+            return True
+    return False
+
+def _interruptible_wait(seconds, wake_event=None):
+    deadline = time.time() + max(0.0, seconds)
+    while not _should_stop():
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        step = min(0.15, remaining)
+        if wake_event is not None:
+            if wake_event.wait(step):
+                wake_event.clear()
+                break
+        else:
+            time.sleep(step)
 
 def load_settings():
     global _settings_mtime
@@ -153,6 +214,36 @@ def get_json(url, params=None, timeout=6, headers=None):
         return r.json()
     except Exception:
         return None
+
+def _bridge_headers():
+    token = (os.environ.get("SNIPER_BRIDGE_TOKEN") or "").strip()
+    h = {**HEADERS, "Content-Type": "application/json"}
+    if token:
+        h["x-api-token"] = token
+    return h
+
+def _bridge_base_url():
+    return (os.environ.get("SNIPER_BRIDGE_URL") or "").strip().rstrip("/")
+
+def bridge_get(path, timeout=8):
+    base = _bridge_base_url()
+    if not base:
+        return {"ok": False, "error": "Live bridge URL not configured"}
+    try:
+        r = _session.get(f"{base}{path}", headers=_bridge_headers(), timeout=timeout)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": f"Bridge request failed: {e}"}
+
+def bridge_post(path, payload, timeout=45):
+    base = _bridge_base_url()
+    if not base:
+        return {"ok": False, "error": "Live bridge URL not configured"}
+    try:
+        r = _session.post(f"{base}{path}", json=payload, headers=_bridge_headers(), timeout=timeout)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": f"Bridge request failed: {e}"}
 
 _sol_cache = {"price": None, "updated_at": 0.0}
 _sol_lock = threading.Lock()
@@ -406,20 +497,33 @@ def hard_rug_check(mint, cfg, age_s):
         _rug_cache[mint] = (time.time(), verdict)
     return verdict
 
-# ---------------------------------------------------------------- paper account
+# ---------------------------------------------------------------- account (paper & live)
 def locked(fn):
     def wrapper(self, *args, **kwargs):
         with self.lock: return fn(self, *args, **kwargs)
     return wrapper
 
-class PaperAccount:
-    def __init__(self, cfg):
+class TradingAccount:
+    def __init__(self, cfg, mode=None):
         load_settings()
         self.cfg = cfg
+        env_mode = (os.environ.get("SNIPER_MODE") or cfg.get("mode") or "paper").strip().lower()
+        self.mode = "live" if (mode or env_mode) == "live" else "paper"
         self.lock = threading.RLock()
-        self.path = cfg["state_file"]
+        base = _base_dir()
+        if self.mode == "live":
+            self.path = os.path.join(base, "live_state.json")
+            self.csv_path = os.path.join(base, "live_trades.csv")
+            self.sell_queue_path = os.path.join(base, "live_sell_queue.json")
+        else:
+            self.path = os.path.join(base, cfg.get("state_file") or "state.json")
+            self.csv_path = os.path.join(base, cfg.get("trades_csv") or "trades.csv")
+            self.sell_queue_path = os.path.join(base, "sell_queue.json")
+
         self.state = {
-            "cash": cfg["start_balance_usd"],
+            "mode": self.mode,
+            "cash": 0.0 if self.mode == "live" else cfg["start_balance_usd"],
+            "wallet_sol": None,
             "positions": {},
             "day": now().strftime("%Y-%m-%d"),
             "day_pnl": 0.0,
@@ -432,17 +536,24 @@ class PaperAccount:
             "sol_price_usd": None,
             "sol_price_updated_at": 0.0,
         }
+        self._last_wallet_sync = 0.0
+        self._last_insufficient_log = 0.0
         self.load()
 
     def load(self):
         if os.path.exists(self.path):
-            with open(self.path, encoding="utf-8") as f:
-                self.state.update(json.load(f))
-            self.state.setdefault("blacklist", [])
-            self.state.setdefault("last_price_time", 0.0)
-            self.state.setdefault("scan_paused", False)
-            self.state.setdefault("sol_price_usd", None)
-            self.state.setdefault("sol_price_updated_at", 0.0)
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    self.state.update(json.load(f))
+            except Exception:
+                pass
+        self.state["mode"] = self.mode
+        self.state.setdefault("wallet_sol", None)
+        self.state.setdefault("blacklist", [])
+        self.state.setdefault("last_price_time", 0.0)
+        self.state.setdefault("scan_paused", False)
+        self.state.setdefault("sol_price_usd", None)
+        self.state.setdefault("sol_price_updated_at", 0.0)
 
     @locked
     def save(self):
@@ -450,13 +561,11 @@ class PaperAccount:
         payload = json.dumps(self.state, indent=2, ensure_ascii=False)
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(payload)
-        for attempt in range(6):
+        for _attempt in range(6):
             try:
                 os.replace(tmp, self.path)
                 return
-            except PermissionError:
-                time.sleep(0.025)
-            except OSError:
+            except (PermissionError, OSError):
                 time.sleep(0.025)
         try:
             with open(self.path, "w", encoding="utf-8") as f:
@@ -473,22 +582,53 @@ class PaperAccount:
         max_pos = max(1, int(self.cfg.get("max_open_positions", 3)))
         return len(self.state["positions"]) >= max_pos, len(self.state["positions"]), max_pos
 
+    def sync_live_wallet(self, force=False):
+        if self.mode != "live":
+            return None
+        now_ts = time.time()
+        if not force and now_ts - self._last_wallet_sync < 8.0:
+            return None
+        self._last_wallet_sync = now_ts
+        resp = bridge_get("/api/sniper/live-wallet", timeout=6)
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            return resp
+        bal_sol = _f(resp.get("balanceSol"))
+        sol_px = _f(resp.get("solPriceUsd")) or self.state.get("sol_price_usd")
+        with self.lock:
+            if bal_sol is not None:
+                self.state["wallet_sol"] = bal_sol
+                if sol_px and sol_px > 0:
+                    self.state["cash"] = round(bal_sol * sol_px, 4)
+                    self.state["sol_price_usd"] = sol_px
+                    self.state["sol_price_updated_at"] = now_ts
+            self.save()
+        return resp
+
     def can_open(self):
         self._roll_day()
         c = self.cfg
         max_pos = max(1, int(c.get("max_open_positions", 3)))
         if len(self.state["positions"]) >= max_pos: return False, "max positions"
-        if self.state["cash"] < c["trade_size_usd"]: return False, "no cash"
         if self.state["day_pnl"] <= -c["daily_loss_limit_usd"]: return False, "daily loss limit"
+        if self.mode == "live":
+            sol_px = self.state.get("sol_price_usd") or 0.0
+            bal_sol = self.state.get("wallet_sol")
+            if bal_sol is not None:
+                avail_usd = float(bal_sol) * float(sol_px or 0.0)
+                if float(bal_sol) <= 0.001 or (sol_px > 0 and avail_usd < c["trade_size_usd"]):
+                    return False, f"no SOL/USD in wallet ({float(bal_sol):.4f} SOL / ${avail_usd:.2f})"
+        else:
+            if self.state["cash"] < c["trade_size_usd"]:
+                return False, f"no cash (${self.state['cash']:.2f})"
         return True, "ok"
 
     def _log_trade(self, row):
-        csv_path = self.cfg["trades_csv"]
+        csv_path = self.csv_path
         new = not os.path.exists(csv_path)
         with open(csv_path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             if new:
-                w.writerow(["time", "action", "symbol", "mint", "price", "usd", "pnl_usd", "pnl_pct", "reason", "dexscreener", "age_s", "dex", "source", "entry_price", "sol_price_usd"])
+                w.writerow(["time", "action", "symbol", "mint", "price", "usd", "pnl_usd", "pnl_pct", "reason", "dexscreener", "age_s", "dex", "source", "entry_price", "sol_price_usd", "tx_sig"])
             w.writerow(row)
 
     @locked
@@ -500,16 +640,83 @@ class PaperAccount:
 
     @locked
     def buy(self, mint, symbol, price, url=None, meta=None):
+        if _should_stop():
+            return False
         meta = meta or {}
         c = self.cfg
         url = url or f"https://dexscreener.com/solana/{mint}"
         ok, why = self.can_open()
-        if not ok or mint in self.state["positions"]: return False
+        if not ok or mint in self.state["positions"]:
+            return False
         size = c["trade_size_usd"]
-        fill = price * (1 + c["slippage_pct"] / 100)
-        qty = (size * (1 - c["fee_pct"] / 100)) / fill
         sol_px = self.state.get("sol_price_usd")
-        self.state["cash"] -= size
+        tx_buy = ""
+        cost_sol = (size / sol_px) if sol_px and sol_px > 0 else 0.0
+        extra_pos = {}
+
+        if self.mode == "live":
+            log(f"⚡ LIVE BUY REQUEST {symbol} (${size:.2f}) via Jupiter...")
+            res = bridge_post("/api/sniper/live-buy", {
+                "mint": mint,
+                "symbol": symbol,
+                "tradeSizeUsd": size,
+                "slippagePct": c.get("slippage_pct", 2.0),
+                "solPriceUsd": sol_px,
+                "dex": meta.get("dex", "?"),
+                "source": meta.get("source", "?"),
+                "age_s": meta.get("age_s", 0),
+                "url": url,
+            }, timeout=55)
+            if _should_stop():
+                if not isinstance(res, dict) or not res.get("ok"):
+                    return False
+            if not isinstance(res, dict) or not res.get("ok"):
+                err = (res or {}).get("error") or "Live swap failed"
+                if (res or {}).get("insufficientFunds"):
+                    if time.time() - self._last_insufficient_log > 10:
+                        self._last_insufficient_log = time.time()
+                        log(f"⚠ {err}")
+                    bal_sol = _f((res or {}).get("walletBalanceSol"))
+                    if bal_sol is not None:
+                        self.state["wallet_sol"] = bal_sol
+                        if sol_px:
+                            self.state["cash"] = round(bal_sol * sol_px, 4)
+                        self.save()
+                else:
+                    log(f"✗ LIVE BUY FAILED {symbol}: {err}")
+                    if (res or {}).get("blacklist"):
+                        self.note_rejected(mint)
+                return False
+
+            qty = float(res.get("qty") or 0.0)
+            fill = float(res.get("entryPriceUsd") or price)
+            size = float(res.get("costUsd") or size)
+            cost_sol = float(res.get("costSol") or cost_sol)
+            tx_buy = str(res.get("txSig") or "")
+            if _f(res.get("solPriceUsd")):
+                sol_px = _f(res.get("solPriceUsd"))
+                self.state["sol_price_usd"] = sol_px
+            if _f(res.get("walletBalanceSol")) is not None:
+                bal_sol = float(res["walletBalanceSol"])
+                self.state["wallet_sol"] = bal_sol
+                if sol_px:
+                    self.state["cash"] = round(bal_sol * sol_px, 4)
+            else:
+                self.state["cash"] = max(0.0, float(self.state.get("cash") or 0.0) - size)
+            extra_pos = {
+                "raw_amount": str(res.get("rawAmount") or ""),
+                "decimals": int(res.get("decimals") if res.get("decimals") is not None else 6),
+                "cost_sol": cost_sol,
+                "fee_sol": float(res.get("feeSol") or 0.0),
+                "rent_sol": float(res.get("rentSol") or 0.0),
+                "tx_buy": tx_buy,
+                "last_sell_attempt": 0.0,
+            }
+        else:
+            fill = price * (1 + c["slippage_pct"] / 100)
+            qty = (size * (1 - c["fee_pct"] / 100)) / fill
+            self.state["cash"] -= size
+
         self.state["positions"][mint] = {
             "symbol": symbol,
             "qty": qty,
@@ -528,6 +735,7 @@ class PaperAccount:
             "dex": meta.get("dex", "?"),
             "source": meta.get("source", "?"),
             "age_at_entry": round(meta.get("age_s", 0), 1),
+            **extra_pos,
         }
         self.state["blacklist"].append(mint)
         self._log_trade([
@@ -536,7 +744,7 @@ class PaperAccount:
             symbol,
             mint,
             fmt_price(fill),
-            size,
+            round(size, 4),
             "",
             "",
             "sniper_entry",
@@ -546,9 +754,12 @@ class PaperAccount:
             meta.get("source", "?"),
             fmt_price(fill),
             round(sol_px, 4) if sol_px else "",
+            tx_buy,
         ])
-        sol_hint = f" ({size / sol_px:.4f} SOL)" if sol_px else ""
-        log(f"✓ SNIPER BUY {symbol} [{meta.get('dex', '?')}/{meta.get('source', '?')}] age {meta.get('age_s', 0):.0f}s @ ${fmt_price(fill)}{sol_hint}")
+        sol_hint = f" ({cost_sol:.4f} SOL)" if cost_sol else (f" ({size / sol_px:.4f} SOL)" if sol_px else "")
+        mode_tag = "LIVE BUY" if self.mode == "live" else "SNIPER BUY"
+        tx_hint = f" tx={tx_buy[:8]}..." if tx_buy else ""
+        log(f"✓ {mode_tag} {symbol} [{meta.get('dex', '?')}/{meta.get('source', '?')}] age {meta.get('age_s', 0):.0f}s @ ${fmt_price(fill)}{sol_hint}{tx_hint}")
         full, cnt, max_pos = self.is_slots_full()
         if full and not self.state.get("scan_paused"):
             self.state["scan_paused"] = True
@@ -558,16 +769,61 @@ class PaperAccount:
 
     @locked
     def sell(self, mint, price, reason):
+        if _should_stop():
+            return False
         c = self.cfg
-        pos = self.state["positions"].pop(mint, None)
+        pos = self.state["positions"].get(mint)
         if not pos:
             return False
-        fill = price * (1 - c["slippage_pct"] / 100)
-        proceeds = pos["qty"] * fill * (1 - c["fee_pct"] / 100)
-        pnl = proceeds - pos["cost"]
-        pnl_pct = pnl / pos["cost"] * 100
+
         sol_px = self.state.get("sol_price_usd")
-        self.state["cash"] += proceeds
+        tx_sell = ""
+
+        if self.mode == "live":
+            log(f"⚡ LIVE SELL {pos['symbol']} [{reason}] via Jupiter...")
+            res = bridge_post("/api/sniper/live-sell", {
+                "mint": mint,
+                "symbol": pos["symbol"],
+                "qty": pos.get("qty", 0),
+                "rawAmount": pos.get("raw_amount"),
+                "decimals": pos.get("decimals"),
+                "costUsd": pos.get("cost", 0),
+                "costSol": pos.get("cost_sol"),
+                "slippagePct": c.get("slippage_pct", 2.0),
+                "solPriceUsd": sol_px,
+                "reason": reason,
+            }, timeout=55)
+            if not isinstance(res, dict) or not res.get("ok"):
+                err = (res or {}).get("error") or "No live sell route available"
+                pos["last_sell_attempt"] = time.time()
+                self.save()
+                log(f"✗ LIVE SELL FAILED {pos['symbol']} [{reason}]: {err} (keeping position open)")
+                return False
+
+            self.state["positions"].pop(mint, None)
+            fill = float(res.get("exitPriceUsd") or price)
+            proceeds = float(res.get("proceedsUsd") or 0.0)
+            pnl = float(res.get("pnlUsd") or (proceeds - pos["cost"]))
+            pnl_pct = float(res.get("pnlPct") or (pnl / pos["cost"] * 100 if pos["cost"] else 0.0))
+            tx_sell = str(res.get("txSig") or "")
+            if _f(res.get("solPriceUsd")):
+                sol_px = _f(res.get("solPriceUsd"))
+                self.state["sol_price_usd"] = sol_px
+            if _f(res.get("walletBalanceSol")) is not None:
+                bal_sol = float(res["walletBalanceSol"])
+                self.state["wallet_sol"] = bal_sol
+                if sol_px:
+                    self.state["cash"] = round(bal_sol * sol_px, 4)
+            else:
+                self.state["cash"] = float(self.state.get("cash") or 0.0) + proceeds
+        else:
+            self.state["positions"].pop(mint, None)
+            fill = price * (1 - c["slippage_pct"] / 100)
+            proceeds = pos["qty"] * fill * (1 - c["fee_pct"] / 100)
+            pnl = proceeds - pos["cost"]
+            pnl_pct = pnl / pos["cost"] * 100
+            self.state["cash"] += proceeds
+
         self._roll_day()
         self.state["day_pnl"] += pnl
         self.state["total_pnl"] += pnl
@@ -589,9 +845,12 @@ class PaperAccount:
             pos.get("source", "?"),
             fmt_price(pos["entry_price"]),
             round(sol_px, 4) if sol_px else "",
+            tx_sell,
         ])
         sol_hint = f" ({pnl / sol_px:+.4f} SOL)" if sol_px else ""
-        log(f"✗ SELL {pos['symbol']} entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} pnl ${pnl:.2f}{sol_hint} ({pnl_pct:.1f}%) [{reason}]")
+        mode_tag = "LIVE SELL" if self.mode == "live" else "SELL"
+        tx_hint = f" tx={tx_sell[:8]}..." if tx_sell else ""
+        log(f"✗ {mode_tag} {pos['symbol']} entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} pnl ${pnl:.2f}{sol_hint} ({pnl_pct:.1f}%) [{reason}]{tx_hint}")
         full, cnt, max_pos = self.is_slots_full()
         if not full and self.state.get("scan_paused"):
             self.state["scan_paused"] = False
@@ -602,12 +861,16 @@ class PaperAccount:
 
     @locked
     def check_exits(self, prices):
+        if _should_stop():
+            return 0
         exits = 0
         tp = self.cfg.get("take_profit_pct", 50)
         trail = self.cfg.get("trailing_stop_pct", 0)
         now_ts = time.time()
         self.state["last_price_time"] = now_ts
         for mint, pos in list(self.state["positions"].items()):
+            if _should_stop():
+                break
             price = prices.get(mint)
             if price is None:
                 continue
@@ -624,6 +887,9 @@ class PaperAccount:
             pos["peak_pct"] = round((pos["peak_price"] / entry - 1) * 100, 2)
             pos["low_pct"] = round((pos["low_price"] / entry - 1) * 100, 2)
 
+            if self.mode == "live" and now_ts - float(pos.get("last_sell_attempt") or 0.0) < 5.0:
+                continue
+
             peak_chg = (pos["peak_price"] / entry - 1) * 100
             reason = None
             if tp > 0 and change >= tp: reason = f"take_profit_{tp:g}"
@@ -632,11 +898,16 @@ class PaperAccount:
             elif (now_ts - pos["opened"]) / 60 >= self.cfg.get("max_hold_minutes", 120):
                 reason = "max_hold"
             if reason:
-                self.sell(mint, price, reason)
-                exits += 1
+                if _should_stop():
+                    break
+                if self.sell(mint, price, reason):
+                    exits += 1
         if exits == 0:
             self.save()
         return exits
+
+# Keep backwards compatibility alias
+PaperAccount = TradingAccount
 
 # ---------------------------------------------------------------- scan / monitor
 _stats_lock = threading.Lock()
@@ -657,7 +928,11 @@ def _maybe_summary():
         log("⚠ all candidate sources returned nothing for 60s — check internet / VPN / rate limits")
 
 def scan_and_buy(acct, cfg):
+    if _should_stop():
+        return
     maybe_reload_settings()
+    if acct.mode == "live":
+        acct.sync_live_wallet()
     full, cnt, max_pos = acct.is_slots_full()
     if full:
         if not acct.state.get("scan_paused"):
@@ -678,13 +953,17 @@ def scan_and_buy(acct, cfg):
             _last_block_log[0] = time.time()
             log(f"Cannot trade: {why}")
         return
+    if _should_stop():
+        return
     fresh = fetch_candidate_mints(cfg)
-    if not fresh: return
+    if not fresh or _should_stop(): return
     with _stats_lock: _stats["cands"] += len(fresh)
 
     now_ms = int(time.time() * 1000)
     pairs = {}
     for i in range(0, len(fresh), 30):
+        if _should_stop():
+            return
         chunk = fresh[i:i + 30]
         data = get_json(f"{DEX}/tokens/v1/solana/{','.join(chunk)}")
         if not isinstance(data, list): continue
@@ -697,6 +976,8 @@ def scan_and_buy(acct, cfg):
     with _stats_lock: _stats["no_pair"] += max(0, len(fresh) - len(pairs))
 
     for mint, (_liq, pair) in pairs.items():
+        if _should_stop():
+            return
         if acct.is_slots_full()[0]:
             break
         if not acct.can_open()[0]: break
@@ -708,6 +989,8 @@ def scan_and_buy(acct, cfg):
             with _stats_lock: _stats["rejects"][code] = _stats["rejects"].get(code, 0) + 1
             if cfg.get("log_rejects"): log(f"– {symbol} filtered: {code} ({detail})")
             continue
+        if _should_stop():
+            return
         age_s = max(0.0, (now_ms - int(pair.get("pairCreatedAt") or 0)) / 1000.0)
         rok, rwhy = hard_rug_check(mint, cfg, age_s)
         if not rok:
@@ -715,6 +998,8 @@ def scan_and_buy(acct, cfg):
             log(f"✗ RUG REJECT {symbol}: {rwhy}")
             acct.note_rejected(mint)
             continue
+        if _should_stop():
+            return
         price = _f(pair.get("priceUsd"))
         if price is None: continue
         meta = {"dex": pair.get("dexId") or "?", "source": _src_of.get(mint, "?"), "age_s": age_s}
@@ -743,7 +1028,9 @@ def _jupiter_prices(mints, cfg):
     return prices
 
 def _process_sell_queue(acct, prices):
-    qpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sell_queue.json")
+    if _should_stop():
+        return
+    qpath = acct.sell_queue_path
     if not os.path.exists(qpath):
         return
     try:
@@ -757,6 +1044,8 @@ def _process_sell_queue(acct, prices):
         if not isinstance(mints, list):
             return
         for mint in mints:
+            if _should_stop():
+                return
             with acct.lock:
                 pos = acct.state["positions"].get(mint)
                 if not pos:
@@ -768,6 +1057,8 @@ def _process_sell_queue(acct, prices):
         pass
 
 def monitor(acct):
+    if _should_stop():
+        return {}
     maybe_reload_settings()
     sol_px, sol_ts = get_sol_price_usd(acct.cfg)
     if sol_px and sol_px > 0:
@@ -777,6 +1068,8 @@ def monitor(acct):
             acct.state["sol_price_updated_at"] = sol_ts
             if changed and not acct.state["positions"]:
                 acct.save()
+    if acct.mode == "live":
+        acct.sync_live_wallet()
 
     pos = acct.state["positions"]
     if not pos:
@@ -794,6 +1087,8 @@ def monitor(acct):
     prices = _jupiter_prices(mints, acct.cfg)
     missing = [mint for mint in mints if mint not in prices]
     for i in range(0, len(missing), 30):
+        if _should_stop():
+            return prices
         chunk = missing[i:i + 30]
         data = get_json(f"{DEX}/tokens/v1/solana/{','.join(chunk)}", timeout=4)
         if isinstance(data, list):
@@ -811,6 +1106,8 @@ def monitor(acct):
             for mint, (_liq, price) in best_by_mint.items():
                 prices[mint] = price
 
+    if _should_stop():
+        return prices
     _process_sell_queue(acct, prices)
     acct.check_exits(prices)
     return prices
@@ -851,46 +1148,116 @@ def probe(cfg):
     if shown == 0:
         log("probe: 0 pairs found on DexScreener for current candidates.")
 
+def _register_stop_signals():
+    def _handle_signal(_signum, _frame):
+        _stop_event.set()
+        _scan_wake.set()
+    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _handle_signal)
+            except Exception:
+                pass
+
+def _write_pid_file(mode):
+    pf = _pid_file_path()
+    try:
+        with open(pf, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "run_id": _run_id, "mode": mode, "started_at": time.time()}, f)
+    except Exception:
+        pass
+
+def _cleanup_pid_file():
+    pf = _pid_file_path()
+    try:
+        if os.path.exists(pf):
+            with open(pf, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            if not isinstance(info, dict) or not _run_id or info.get("run_id") == _run_id:
+                os.remove(pf)
+    except Exception:
+        pass
+
 def run(once=False):
+    global _run_id
     load_settings()
-    acct = PaperAccount(CONFIG)
+    _run_id = _resolve_arg_run_id()
+    if not _run_id:
+        # Standalone CLI run: clear any stale stop flag from previous UI session
+        try:
+            if os.path.exists(_stop_flag_path()):
+                os.remove(_stop_flag_path())
+        except Exception:
+            pass
+    elif os.path.exists(_stop_flag_path()):
+        log("Stop flag already present at launch — exiting cleanly.")
+        return
+
+    _register_stop_signals()
+    mode = (os.environ.get("SNIPER_MODE") or CONFIG.get("mode") or "paper").strip().lower()
+    mode = "live" if mode == "live" else "paper"
+    if not once:
+        _write_pid_file(mode)
+
+    acct = TradingAccount(CONFIG, mode=mode)
     sol_px, sol_ts = get_sol_price_usd(CONFIG, force=True)
     if sol_px and sol_px > 0:
         with acct.lock:
             acct.state["sol_price_usd"] = sol_px
             acct.state["sol_price_updated_at"] = sol_ts
             acct.save()
+    if mode == "live":
+        acct.sync_live_wallet(force=True)
     sol_banner = f" | SOL=${sol_px:.2f}" if sol_px else ""
-    log("=== MULTI-SOURCE SNIPER STARTED (PAPER MODE) ===")
+    mode_banner = "LIVE MODE — REAL SOLANA WALLET" if mode == "live" else "PAPER MODE"
+    log(f"=== MULTI-SOURCE SNIPER STARTED ({mode_banner}) ===")
+    if mode == "live":
+        bal_sol = acct.state.get("wallet_sol")
+        bal_usd = acct.state.get("cash") or 0.0
+        if bal_sol is not None:
+            log(f"Wallet balance: {float(bal_sol):.4f} SOL (${float(bal_usd):.2f}) | trade size ${CONFIG['trade_size_usd']:.2f}")
     log(f"Sources: gecko={CONFIG['use_gecko']} jupiter={CONFIG['use_jupiter_recent']} profiles={CONFIG['use_dex_profiles']} pumpportal={CONFIG['use_pumpportal']} boosts={CONFIG['use_promoted_feeds']}{sol_banner}")
     log(f"Window: coins < {CONFIG['max_age_minutes'] * 60:.0f}s old (grace <{CONFIG['ultra_early_grace_sec']}s skips liquidity/buy floors) | TP {CONFIG['take_profit_pct']}% | liq>=${CONFIG['min_liquidity_usd']:.0f} after grace | buys>=sells(5m) | pump cap +{CONFIG['max_price_change_m5_pct']:.0f}% | rug check {'ON' if CONFIG['use_rugcheck'] else 'OFF'}")
     if once:
-        scan_and_buy(acct, CONFIG)
-        monitor(acct)
+        try:
+            scan_and_buy(acct, CONFIG)
+            monitor(acct)
+        finally:
+            _cleanup_pid_file()
         return
-    stop = threading.Event()
+
     def scan_loop():
-        while not stop.is_set():
+        while not _should_stop():
             started = time.time()
             try:
                 scan_and_buy(acct, CONFIG)
             except Exception as e:
-                log(f"scan error: {e}")
+                if not _should_stop():
+                    log(f"scan error: {e}")
             wait_sec = max(0.1, float(CONFIG.get("scan_interval_sec", 1)) - (time.time() - started))
-            _scan_wake.wait(wait_sec)
-            _scan_wake.clear()
+            _interruptible_wait(wait_sec, _scan_wake)
+
     threading.Thread(target=scan_loop, daemon=True).start()
-    while not stop.is_set():
-        started = time.time()
-        try:
-            monitor(acct)
-        except KeyboardInterrupt:
-            stop.set()
-            _scan_wake.set()
-            break
-        except Exception as e:
-            log(f"monitor error: {e}")
-        time.sleep(max(0.1, float(CONFIG.get("monitor_interval_sec", 1.0)) - (time.time() - started)))
+    try:
+        while not _should_stop():
+            started = time.time()
+            try:
+                monitor(acct)
+            except KeyboardInterrupt:
+                _stop_event.set()
+                _scan_wake.set()
+                break
+            except Exception as e:
+                if not _should_stop():
+                    log(f"monitor error: {e}")
+            wait_sec = max(0.1, float(CONFIG.get("monitor_interval_sec", 1.0)) - (time.time() - started))
+            _interruptible_wait(wait_sec)
+    finally:
+        _stop_event.set()
+        _scan_wake.set()
+        _cleanup_pid_file()
+        log("Python sniper loop exited cleanly.")
 
 if __name__ == "__main__":
     if "--probe" in sys.argv: probe(CONFIG)

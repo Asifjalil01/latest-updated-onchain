@@ -13,6 +13,9 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   PauseCircle,
+  Wallet,
+  ShieldAlert,
+  RefreshCw,
 } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import {
@@ -32,6 +35,8 @@ interface SniperPosition {
   entry_price: number;
   current_price?: number;
   cost: number;
+  cost_sol?: number;
+  tx_buy?: string;
   opened: number;
   url: string;
   pnl_pct?: number;
@@ -44,6 +49,15 @@ interface SniperPosition {
   source?: string;
   age_at_entry?: number;
   last_updated?: number;
+}
+
+interface SniperLiveWallet {
+  unlocked: boolean;
+  publicKey: string | null;
+  maskedPublicKey: string;
+  balanceSol: number | null;
+  balanceUsd: number | null;
+  healthyRpcs: number;
 }
 
 interface SniperLog {
@@ -119,10 +133,21 @@ function fmtDate(isoStr: string): string {
 }
 
 export function PythonSniperView() {
-  const { apiFetch, pushToast } = useBotStore();
+  const { apiFetch, pushToast, setActiveTab: setAppViewTab } = useBotStore();
+  const [mode, setMode] = useState<'paper' | 'live'>('paper');
+  const [switchingMode, setSwitchingMode] = useState(false);
   const [running, setRunning] = useState(false);
+  const [liveWallet, setLiveWallet] = useState<SniperLiveWallet>({
+    unlocked: false,
+    publicKey: null,
+    maskedPublicKey: 'Not connected',
+    balanceSol: null,
+    balanceUsd: null,
+    healthyRpcs: 0,
+  });
   const [state, setState] = useState<{
     cash: number;
+    wallet_sol?: number | null;
     positions: Record<string, SniperPosition>;
     closed: number;
     wins: number;
@@ -132,6 +157,7 @@ export function PythonSniperView() {
     scan_paused?: boolean;
   }>({
     cash: 50.0,
+    wallet_sol: null,
     positions: {},
     closed: 0,
     wins: 0,
@@ -162,8 +188,12 @@ export function PythonSniperView() {
     try {
       const data = await apiFetch<any>('/api/sniper/status');
       if (data) {
+        setMode(data.mode === 'live' ? 'live' : 'paper');
         setRunning(Boolean(data.running));
         setState(data.state || {});
+        if (data.live_wallet) {
+          setLiveWallet(data.live_wallet);
+        }
         const fetchedSettings = data.settings || {};
         setServerSettings(fetchedSettings);
 
@@ -201,6 +231,53 @@ export function PythonSniperView() {
     pushToast({ kind: 'info', title: 'Coin key copied to clipboard' });
   };
 
+  const handleSwitchMode = async (targetMode: 'paper' | 'live') => {
+    if (targetMode === mode || switchingMode) return;
+    setSwitchingMode(true);
+    try {
+      const data = await apiFetch<any>('/api/sniper/mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: targetMode }),
+      });
+      if (data?.ok) {
+        setMode(data.mode === 'live' ? 'live' : 'paper');
+        setRunning(false);
+        if (data.live_wallet) {
+          setLiveWallet(data.live_wallet);
+        }
+        pushToast({
+          kind: targetMode === 'live' ? 'info' : 'success',
+          title: data.message || `Switched to ${targetMode.toUpperCase()} mode`,
+        });
+        void fetchStatus();
+      } else {
+        pushToast({ kind: 'error', title: 'Mode switch failed', body: data?.message || 'Error switching mode' });
+      }
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Mode switch failed', body: err instanceof Error ? err.message : 'Error' });
+    } finally {
+      setSwitchingMode(false);
+    }
+  };
+
+  const handleRefreshWallet = async () => {
+    try {
+      const res = await apiFetch<any>('/api/sniper/live-wallet?force=true');
+      if (res) {
+        setLiveWallet({
+          unlocked: Boolean(res.unlocked),
+          publicKey: res.publicKey || null,
+          maskedPublicKey: res.maskedPublicKey || 'Not connected',
+          balanceSol: res.balanceSol ?? null,
+          balanceUsd: res.balanceUsd ?? null,
+          healthyRpcs: res.healthyRpcs ?? 0,
+        });
+        void fetchStatus();
+      }
+    } catch {}
+  };
+
   const handleToggle = async () => {
     try {
       const action = running ? 'stop' : 'start';
@@ -212,6 +289,7 @@ export function PythonSniperView() {
       if (data.ok) {
         setRunning(action === 'start');
         pushToast({ kind: 'success', title: data.message });
+        void fetchStatus();
       } else {
         pushToast({ kind: 'error', title: 'Control error', body: data.message });
       }
@@ -314,14 +392,21 @@ export function PythonSniperView() {
   }, 0);
 
   const openCost = positionsList.reduce((acc, p) => acc + (p.cost || 0), 0);
-  const totalValue = (state.cash || 0) + openCost + openPnl;
   const closedCount = state.closed || 0;
   const winsCount = state.wins || 0;
   const winRateText = closedCount > 0 ? `${((winsCount / closedCount) * 100).toFixed(0)}% (${winsCount}/${closedCount})` : 'no closed trades';
   const maxSlots = Math.max(1, Number(serverSettings.max_open_positions || draftSettings.max_open_positions || 3));
   const slotsFull = positionsList.length >= maxSlots || scanPaused;
 
-  const cashDisp = fmtUnsignedUsdAndSol(state.cash || 0, solPriceUsd, 2);
+  const isLiveMode = mode === 'live';
+  const effectiveWalletSol = isLiveMode ? (liveWallet.balanceSol ?? state.wallet_sol ?? null) : null;
+  const effectiveCashUsd = isLiveMode
+    ? effectiveWalletSol !== null && solPriceUsd
+      ? effectiveWalletSol * solPriceUsd
+      : state.cash || 0
+    : state.cash || 0;
+  const cashDisp = fmtUnsignedUsdAndSol(effectiveCashUsd, solPriceUsd, 2);
+  const totalValue = effectiveCashUsd + openCost + openPnl;
   const totalValDisp = fmtUnsignedUsdAndSol(totalValue, solPriceUsd, 2);
   const openPnlDisp = fmtSignedUsdAndSol(openPnl, solPriceUsd, 2);
   const dayPnlDisp = fmtSignedUsdAndSol(state.day_pnl || 0, solPriceUsd, 2);
@@ -376,18 +461,62 @@ export function PythonSniperView() {
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="font-display text-2xl font-bold text-slate-900 dark:text-slate-100 flex flex-wrap items-center gap-3">
-            <span>Solana Paper Trader - New Launch Sniper</span>
+            <span>{isLiveMode ? 'Solana Live Trader - New Launch Sniper' : 'Solana Paper Trader - New Launch Sniper'}</span>
+            <span
+              className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-xs font-mono font-bold tracking-wider uppercase ${
+                isLiveMode
+                  ? 'bg-rose-600 text-white shadow-sm shadow-rose-600/25'
+                  : 'bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+              }`}
+            >
+              {isLiveMode ? 'LIVE' : 'PAPER'}
+            </span>
             <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-mono font-bold tracking-wider uppercase ${statusBadgeClass}`}>
               <span className={`w-2 h-2 rounded-full ${dotClass}`} />
               {statusText}
             </span>
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            All DEXes | Brand-new coins only | Hard RPC &amp; RugCheck screen | PAPER MODE: no wallet, no real money risk.
+            {isLiveMode
+              ? 'All DEXes | Brand-new coins only | Hard RPC & RugCheck screen | LIVE MODE: executes real swaps via Jupiter & server wallet.'
+              : 'All DEXes | Brand-new coins only | Hard RPC & RugCheck screen | PAPER MODE: no wallet, no real money risk.'}
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Paper / Live Mode Toggle */}
+          <div
+            className="inline-flex p-1 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-900 shadow-sm"
+            role="group"
+            aria-label="Python sniper trading mode"
+          >
+            <button
+              type="button"
+              disabled={switchingMode}
+              onClick={() => void handleSwitchMode('paper')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold uppercase transition-all ${
+                !isLiveMode
+                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-sm'
+                  : 'text-slate-500 hover:text-slate-900 dark:hover:text-slate-200'
+              }`}
+            >
+              Paper
+            </button>
+            <button
+              type="button"
+              disabled={switchingMode}
+              onClick={() => void handleSwitchMode('live')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold uppercase flex items-center gap-1.5 transition-all ${
+                isLiveMode
+                  ? 'bg-rose-600 text-white shadow-sm'
+                  : 'text-slate-500 hover:text-rose-500 dark:hover:text-rose-400'
+              }`}
+            >
+              {isLiveMode && <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />}
+              <span>Live</span>
+            </button>
+          </div>
+
           <div
             className="px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] text-xs font-mono flex items-center gap-2 shadow-sm"
             title="Live SOL/USD reference rate updated periodically from Jupiter & DexScreener"
@@ -411,16 +540,71 @@ export function PythonSniperView() {
         </div>
       </div>
 
+      {/* Live Wallet Status Strip (shown in LIVE mode) */}
+      {isLiveMode && (
+        <div
+          className={`rounded-2xl border p-4 flex flex-wrap items-center justify-between gap-3 text-xs ${
+            !liveWallet.unlocked
+              ? 'border-rose-500/40 bg-rose-500/5 text-rose-700 dark:text-rose-300'
+              : (effectiveWalletSol ?? 0) <= 0.001
+                ? 'border-amber-500/40 bg-amber-500/5 text-amber-800 dark:text-amber-300'
+                : 'border-emerald-500/30 bg-emerald-500/5 text-slate-800 dark:text-slate-200'
+          }`}
+        >
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2 font-semibold">
+              {liveWallet.unlocked ? (
+                <Wallet className="w-4 h-4 text-emerald-500" />
+              ) : (
+                <ShieldAlert className="w-4 h-4 text-rose-500" />
+              )}
+              <span>Live Wallet:</span>
+              <span className="font-mono font-bold">{liveWallet.maskedPublicKey}</span>
+            </div>
+            <span className="font-mono px-2 py-0.5 rounded bg-slate-900/10 dark:bg-white/10">
+              {liveWallet.unlocked ? 'Signer Unlocked' : 'Signer Locked'}
+            </span>
+            <span className="font-mono text-slate-600 dark:text-slate-300">
+              RPCs healthy: {liveWallet.healthyRpcs}
+            </span>
+            {liveWallet.unlocked && effectiveWalletSol !== null && effectiveWalletSol <= 0.001 && (
+              <span className="font-semibold text-amber-600 dark:text-amber-400">
+                No SOL ({effectiveWalletSol.toFixed(4)} SOL / $0.00) in wallet — buys will alert until funded.
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void handleRefreshWallet()}
+              className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-white/60 dark:hover:bg-slate-800 font-semibold flex items-center gap-1.5 transition-colors"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Refresh Balance</span>
+            </button>
+            {!liveWallet.unlocked && (
+              <button
+                type="button"
+                onClick={() => setAppViewTab('wallets')}
+                className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-semibold transition-colors"
+              >
+                Unlock Wallet
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* KPI Cards with USD + SOL side by side */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-4 shadow-sm">
-          <span className="text-xs text-slate-500 font-medium block">Cash</span>
+          <span className="text-xs text-slate-500 font-medium block">{isLiveMode ? 'Wallet balance' : 'Cash (Paper)'}</span>
           <div className="mt-1 flex flex-wrap items-baseline gap-x-2">
             <span className="font-mono text-lg font-bold tabular-nums text-slate-900 dark:text-slate-100">
               {cashDisp.usdText}
             </span>
             <span className="font-mono text-xs font-semibold tabular-nums text-slate-500 dark:text-slate-400">
-              {cashDisp.solText}
+              {effectiveWalletSol !== null ? fmtSolAmount(effectiveWalletSol) : cashDisp.solText}
             </span>
           </div>
         </div>
@@ -633,6 +817,18 @@ export function PythonSniperView() {
 
                         {/* Actions */}
                         <td className="py-2.5 px-2 text-right space-x-1.5 whitespace-nowrap">
+                          {p.tx_buy && (
+                            <a
+                              href={`https://solscan.io/tx/${p.tx_buy}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-500/10 text-slate-600 dark:text-slate-300 hover:bg-slate-500/20 text-[11px] font-semibold transition-colors"
+                              title="Inspect buy transaction on Solscan"
+                            >
+                              <span>TX</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                          )}
                           <a
                             href={p.url || `https://dexscreener.com/solana/${p.mint}`}
                             target="_blank"
@@ -690,7 +886,7 @@ export function PythonSniperView() {
           <div className="flex flex-wrap items-center justify-between gap-4 pb-2 border-b border-slate-100 dark:border-slate-800">
             <div className="flex items-center gap-3">
               <h2 className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
-                Full Paper Trade Ledger ({trades.length} events)
+                {isLiveMode ? `Live Wallet Trade Ledger (${trades.length} events)` : `Full Paper Trade Ledger (${trades.length} events)`}
               </h2>
               <span className="text-[11px] text-slate-500">
                 Win Rate: <strong className="text-slate-900 dark:text-slate-100">{winRateText}</strong>
@@ -891,22 +1087,36 @@ export function PythonSniperView() {
                           </span>
                         </td>
 
-                        {/* DexScreener button */}
+                        {/* DexScreener & Solscan TX links */}
                         <td className="py-2 px-2 text-center">
-                          {chartUrl ? (
-                            <a
-                              href={chartUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-1 px-2 py-1 rounded bg-teal-500/10 text-teal-600 dark:text-teal-400 hover:bg-teal-500/20 text-[11px] font-semibold transition-colors whitespace-nowrap"
-                              title="Inspect chart on DexScreener"
-                            >
-                              <span>DexScreener</span>
-                              <ExternalLink className="w-3 h-3" />
-                            </a>
-                          ) : (
-                            <span className="text-slate-600">—</span>
-                          )}
+                          <div className="inline-flex items-center gap-1 justify-center">
+                            {(t.txSell || t.txBuy) && (
+                              <a
+                                href={`https://solscan.io/tx/${t.txSell || t.txBuy}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-500/10 text-slate-600 dark:text-slate-300 hover:bg-slate-500/20 text-[11px] font-semibold transition-colors whitespace-nowrap"
+                                title="Inspect transaction on Solscan"
+                              >
+                                <span>Solscan</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            )}
+                            {chartUrl ? (
+                              <a
+                                href={chartUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded bg-teal-500/10 text-teal-600 dark:text-teal-400 hover:bg-teal-500/20 text-[11px] font-semibold transition-colors whitespace-nowrap"
+                                title="Inspect chart on DexScreener"
+                              >
+                                <span>DexScreener</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            ) : (
+                              !t.txSell && !t.txBuy && <span className="text-slate-600">—</span>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     );
@@ -985,16 +1195,22 @@ export function PythonSniperView() {
                   Discard Changes
                 </button>
               )}
-              <button
-                type="button"
-                onClick={() => void handleReset()}
-                className={`px-3.5 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 transition-colors shadow-sm ${
-                  confirmReset ? 'bg-rose-600 hover:bg-rose-500' : 'bg-amber-600 hover:bg-amber-500'
-                }`}
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>{confirmReset ? 'Confirm Reset Account?' : 'Reset Account & History'}</span>
-              </button>
+              {!isLiveMode ? (
+                <button
+                  type="button"
+                  onClick={() => void handleReset()}
+                  className={`px-3.5 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 transition-colors shadow-sm ${
+                    confirmReset ? 'bg-rose-600 hover:bg-rose-500' : 'bg-amber-600 hover:bg-amber-500'
+                  }`}
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>{confirmReset ? 'Confirm Reset Account?' : 'Reset Account & History'}</span>
+                </button>
+              ) : (
+                <span className="px-3 py-1.5 rounded-xl text-[11px] font-mono bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
+                  Live ledger is immutable
+                </span>
+              )}
             </div>
           </div>
 

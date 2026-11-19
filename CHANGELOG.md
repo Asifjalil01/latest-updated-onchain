@@ -2,6 +2,23 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.28.0 — Python Sniper Live Trading Mode, Reliable Bot Stop (Process Tree & Signal Halting) & Live Wallet/Tx Visibility
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Live Trading Option in Python Sniper Bot (`bot.py`, `sniperManager.ts`, `api.ts`, `PythonSniperView.tsx`, `sniperFormat.ts`)**:
+  - Added a direct **Paper / Live** mode switcher right in the Python Sniper Bot header (`POST /api/sniper/mode`), plus `PAPER` / `LIVE` mode badges and `Live Wallet` status bar showing the connected server wallet public key, Signer Unlocked/Locked status, RPC health count, and one-click `Refresh Balance` or `Unlock Wallet`.
+  - Connected `bot.py` and `sniperManager` manual sells to your active **Server Wallet (`ServerSignerManager`)**, **Solana RPC Pool**, and **Jupiter Swap (`JupiterProvider` + `DefaultLiveTxAdapter`)** via an authenticated internal loopback bridge (`/api/sniper/live-wallet`, `/api/sniper/live-buy`, `/api/sniper/live-sell`), keeping private keys strictly inside Node without requiring extra Windows native Python packages.
+  - Isolated Live and Paper ledgers cleanly (`live_state.json`, `live_trades.csv`, `live_sell_queue.json` vs `state.json`, `trades.csv`, `sell_queue.json`) so Live real-money history cannot be wiped by `Reset Account & History`.
+  - Emits clear no-balance alerts showing both **SOL and USD** (`There is no SOL (0.0000 SOL / $0.00) in the wallet to trade...`) without blacklisting coins, verifies exact on-chain raw integer token balances & ATA rent/fees on swap reconciliation, keeps Live positions open with retry backoff if a sell route temporarily fails, and renders direct **Solscan TX** links on both Open Positions and Trade History rows.
+- **Fixed Python Bot Continuing to Buy, Sell & Fill Slots After Clicking Stop (`bot.py`, `sniperManager.ts`, `server.ts`)**:
+  - Fixed Windows & POSIX orphaned child-process leaks where `SIGTERM` terminated only the shell/`py.exe` launcher while leaving the underlying `python.exe` process running in the background.
+  - `SniperManager.stop()` now writes a cooperative `stop.flag` halt signal, terminates the full OS process tree (`taskkill /PID <pid> /T /F` on Windows and negative-PID process group kill on POSIX), cleans up any orphaned PID recorded in `bot.pid`, and guards delayed child exit callbacks via `runId`.
+  - Added cooperative stop checking (`SIGINT`/`SIGTERM`/`SIGBREAK` handlers, `stop.flag` checks before every scan, rug check, buy, monitor tick, sell queue drain, and exit execution, plus 150ms interruptible waits) inside `bot.py`, and ensured `server.ts` cleanly halts the sniper subprocess on shutdown.
+
+---
+
 ## v1.27.0 — Reliable Live Sell Routing, Direct Live Mode Switching (No ENABLE LIVE Modal / Gas Reserve Blocker), RPC Self-Healing & Clear No-Balance Buy Alerts
 
 **Risk Warning: Trading can lose all of your money.**

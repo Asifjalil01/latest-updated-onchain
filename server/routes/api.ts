@@ -115,6 +115,7 @@ function csvEscape(val: unknown): string {
 export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string): express.Router {
   const router = express.Router();
   const requireToken = createApiTokenMiddleware(apiToken);
+  sniperManager.attachOrchestrator(orchestrator);
 
   // Public health & auth setup routes
   router.get('/health', (_req: Request, res: Response) => {
@@ -733,6 +734,60 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.json(sniperManager.getStatus());
   });
 
+  router.post('/sniper/mode', async (req: Request, res: Response) => {
+    const mode = req.body?.mode === 'live' ? 'live' : req.body?.mode === 'paper' ? 'paper' : null;
+    if (!mode) {
+      res.status(400).json({ error: 'Invalid mode (expected paper | live)' });
+      return;
+    }
+    res.json(await sniperManager.switchMode(mode));
+  });
+
+  router.get('/sniper/live-wallet', async (req: Request, res: Response) => {
+    const force = req.query.force === 'true';
+    res.json(await sniperManager.refreshLiveWalletInfo(force));
+  });
+
+  router.post('/sniper/live-buy', async (req: Request, res: Response) => {
+    const mint = typeof req.body?.mint === 'string' ? req.body.mint.trim() : '';
+    const symbol = typeof req.body?.symbol === 'string' ? req.body.symbol : '?';
+    const tradeSizeUsd = Number(req.body?.tradeSizeUsd || 0);
+    if (!mint || !Number.isFinite(tradeSizeUsd) || tradeSizeUsd <= 0) {
+      res.status(400).json({ ok: false, error: 'mint and positive tradeSizeUsd required' });
+      return;
+    }
+    const result = await sniperManager.executeLiveBuy({
+      mint,
+      symbol,
+      tradeSizeUsd,
+      slippagePct: req.body?.slippagePct !== undefined ? Number(req.body.slippagePct) : undefined,
+      solPriceUsd: req.body?.solPriceUsd !== undefined ? Number(req.body.solPriceUsd) : undefined,
+    });
+    res.json(result);
+  });
+
+  router.post('/sniper/live-sell', async (req: Request, res: Response) => {
+    const mint = typeof req.body?.mint === 'string' ? req.body.mint.trim() : '';
+    const symbol = typeof req.body?.symbol === 'string' ? req.body.symbol : '?';
+    if (!mint) {
+      res.status(400).json({ ok: false, error: 'mint required' });
+      return;
+    }
+    const result = await sniperManager.executeLiveSell({
+      mint,
+      symbol,
+      qty: Number(req.body?.qty || 0),
+      rawAmount: typeof req.body?.rawAmount === 'string' ? req.body.rawAmount : null,
+      decimals: req.body?.decimals !== undefined && req.body?.decimals !== null ? Number(req.body.decimals) : null,
+      costUsd: Number(req.body?.costUsd || 0),
+      costSol: req.body?.costSol !== undefined && req.body?.costSol !== null ? Number(req.body.costSol) : null,
+      slippagePct: req.body?.slippagePct !== undefined ? Number(req.body.slippagePct) : undefined,
+      solPriceUsd: req.body?.solPriceUsd !== undefined ? Number(req.body.solPriceUsd) : undefined,
+      reason: typeof req.body?.reason === 'string' ? req.body.reason : 'sniper_exit',
+    });
+    res.json(result);
+  });
+
   router.post('/sniper/control', (req: Request, res: Response) => {
     const action = req.body?.action;
     if (action === 'start') {
@@ -757,13 +812,13 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.json(sniperManager.resetAccount());
   });
 
-  router.post('/sniper/sell', (req: Request, res: Response) => {
+  router.post('/sniper/sell', async (req: Request, res: Response) => {
     const mint = req.body?.mint;
     if (!mint) {
       res.status(400).json({ error: 'Mint required' });
       return;
     }
-    res.json(sniperManager.sellPosition(mint));
+    res.json(await sniperManager.sellPosition(mint));
   });
 
   return router;

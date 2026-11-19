@@ -13,6 +13,7 @@ import { RugCheckProvider } from './server/providers/rugcheck';
 import { PumpPortalWsProvider } from './server/providers/pumpportal';
 import { BotOrchestrator } from './server/engine/pipeline';
 import { createApiRouter } from './server/routes/api';
+import { sniperManager } from './server/sniperManager';
 
 async function bootstrapServer() {
   const env = loadAppEnv();
@@ -40,6 +41,7 @@ async function bootstrapServer() {
     rugCheck,
     pumpPortal
   );
+  sniperManager.attachOrchestrator(orchestrator);
 
   // Non-blocking initial health + price check
   void orchestrator.refreshSolPrice();
@@ -77,6 +79,7 @@ async function bootstrapServer() {
   });
 
   const shutdown = () => {
+    sniperManager.stop();
     orchestrator.shutdown();
     db.close();
     server.close(() => process.exit(0));
