@@ -2,6 +2,16 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.22.0 — Python Requests Dependency Installation
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Python `requests` Package Installation**:
+  - Installed `python3-requests` in the container environment so `bot.py` imports `requests` successfully without `ModuleNotFoundError`.
+
+---
+
 ## v1.21.0 — Python Bot Authentication & Full gui.py Settings Integration
 
 **Risk Warning: Trading can lose all of your money.**
