@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, spawnSync, ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
@@ -13,6 +13,112 @@ export interface SniperLogEntry {
   timestamp: string;
   message: string;
   tag: string;
+}
+
+export function detectPythonCommand(customPath?: string): { command: string; args: string[]; info: string } {
+  const isWin = process.platform === 'win32';
+
+  // 1. If user configured a custom path / binary in Settings
+  if (customPath && typeof customPath === 'string' && customPath.trim() && customPath.trim().toLowerCase() !== 'auto') {
+    const trimmed = customPath.trim();
+    try {
+      const res = spawnSync(trimmed, ['-c', 'import sys; print(sys.version)'], {
+        encoding: 'utf-8',
+        timeout: 4000,
+        shell: isWin,
+      });
+      if (res.status === 0 && !res.stderr?.includes('Microsoft Store') && !res.stdout?.includes('Microsoft Store')) {
+        const ver = (res.stdout || '').split('\n')[0].trim();
+        return { command: trimmed, args: [], info: `Configured path: "${trimmed}" (${ver})` };
+      }
+    } catch {}
+  }
+
+  // 2. If PYTHON_PATH environment variable is set
+  if (process.env.PYTHON_PATH) {
+    try {
+      const res = spawnSync(process.env.PYTHON_PATH, ['-c', 'import sys; print(sys.version)'], {
+        encoding: 'utf-8',
+        timeout: 4000,
+        shell: isWin,
+      });
+      if (res.status === 0 && !res.stderr?.includes('Microsoft Store') && !res.stdout?.includes('Microsoft Store')) {
+        const ver = (res.stdout || '').split('\n')[0].trim();
+        return { command: process.env.PYTHON_PATH, args: [], info: `Env PYTHON_PATH (${ver})` };
+      }
+    } catch {}
+  }
+
+  // 3. Platform-specific candidate probing
+  // On Windows: 'py' (Windows Python Launcher) is the official python.org launcher installed in C:\Windows.
+  // It handles Python 3.14 / 3.12 / 3.11 seamlessly and bypasses the Microsoft Store stub alias!
+  const candidates: Array<{ cmd: string; args: string[]; label: string }> = isWin
+    ? [
+        { cmd: 'py', args: ['-3'], label: 'Windows Python Launcher (py -3)' },
+        { cmd: 'py', args: [], label: 'Windows Python Launcher (py)' },
+        { cmd: 'python', args: [], label: 'System Python (python)' },
+        { cmd: 'python3', args: [], label: 'python3' },
+      ]
+    : [
+        { cmd: 'python3', args: [], label: 'python3' },
+        { cmd: 'python', args: [], label: 'python' },
+      ];
+
+  // On Windows, also inspect standard user and system installation directories
+  if (isWin) {
+    const localAppData = process.env.LOCALAPPDATA || '';
+    const programFiles = process.env.ProgramFiles || '';
+    const programFilesX86 = process.env['ProgramFiles(x86)'] || '';
+
+    const searchDirs = [
+      path.join(localAppData, 'Programs', 'Python'),
+      programFiles,
+      programFilesX86,
+    ];
+
+    for (const baseDir of searchDirs) {
+      if (baseDir && fs.existsSync(baseDir)) {
+        try {
+          const entries = fs.readdirSync(baseDir);
+          for (const entry of entries) {
+            if (entry.toLowerCase().startsWith('python')) {
+              const fullExe = path.join(baseDir, entry, 'python.exe');
+              if (fs.existsSync(fullExe)) {
+                candidates.push({ cmd: fullExe, args: [], label: `Direct Path: ${fullExe}` });
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+  }
+
+  // Test candidates sequentially
+  for (const cand of candidates) {
+    try {
+      const testArgs = [...cand.args, '-c', 'import sys; print(sys.version.split()[0])'];
+      const res = spawnSync(cand.cmd, testArgs, {
+        encoding: 'utf-8',
+        timeout: 4000,
+        shell: isWin,
+      });
+      const out = (res.stdout || '').trim();
+      const err = (res.stderr || '').trim();
+      // Code 0 and not Microsoft Store stub warning
+      if (res.status === 0 && out.length > 0 && !err.includes('Microsoft Store') && !out.includes('Microsoft Store')) {
+        return {
+          command: cand.cmd,
+          args: cand.args,
+          info: `${cand.label} [Python ${out}]`,
+        };
+      }
+    } catch {}
+  }
+
+  // Safe fallback
+  return isWin
+    ? { command: 'py', args: [], info: 'Default Windows Python (py)' }
+    : { command: 'python3', args: [], info: 'Default Python (python3)' };
 }
 
 class SniperManager {
@@ -63,22 +169,24 @@ class SniperManager {
       fee_pct: 1.0,
       log_rejects: true,
       jupiter_api_key: '',
+      python_binary_path: 'auto',
     };
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(defaults, null, 2), 'utf-8');
   }
 
   public getStatus() {
-    let state: any = { cash: 50.0, positions: {}, closed: 0, wins: 0, total_pnl: 0.0, day_pnl: 0.0 };
-    if (fs.existsSync(STATE_FILE)) {
-      try {
-        state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
-      } catch {}
-    }
-
     let settings: any = {};
     if (fs.existsSync(SETTINGS_FILE)) {
       try {
         settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+      } catch {}
+    }
+
+    const defaultCash = typeof settings.start_balance_usd === 'number' ? settings.start_balance_usd : 50.0;
+    let state: any = { cash: defaultCash, positions: {}, closed: 0, wins: 0, total_pnl: 0.0, day_pnl: 0.0 };
+    if (fs.existsSync(STATE_FILE)) {
+      try {
+        state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
       } catch {}
     }
 
@@ -155,10 +263,20 @@ class SniperManager {
       return { ok: false, message: 'bot.py not found in sniper directory' };
     }
 
-    this.appendLog('INFO', 'Starting Python New-Launch Sniper Bot...');
+    let settings: any = {};
+    if (fs.existsSync(SETTINGS_FILE)) {
+      try {
+        settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+      } catch {}
+    }
 
-    this.process = spawn('python3', [botPath], {
+    const detected = detectPythonCommand(settings.python_binary_path);
+    this.appendLog('INFO', `Starting Python New-Launch Sniper Bot using: ${detected.info}...`);
+
+    const spawnArgs = [...detected.args, botPath];
+    this.process = spawn(detected.command, spawnArgs, {
       cwd: SNIPER_DIR,
+      shell: process.platform === 'win32',
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
 
@@ -180,11 +298,17 @@ class SniperManager {
 
     this.process.on('exit', (code) => {
       this.running = false;
+      if (code === 9009) {
+        this.appendLog(
+          'WARN',
+          'Exit code 9009: Windows could not find Python. Set your Python executable in Settings > "Python executable / path" (e.g. py, python, or full path to python.exe).'
+        );
+      }
       this.appendLog('INFO', `Python bot exited with code ${code}`);
       this.process = null;
     });
 
-    return { ok: true, message: 'Python sniper bot started' };
+    return { ok: true, message: `Python sniper bot started (${detected.info})` };
   }
 
   public stop() {
@@ -221,10 +345,27 @@ class SniperManager {
 
   public resetAccount() {
     try {
-      if (fs.existsSync(STATE_FILE)) fs.unlinkSync(STATE_FILE);
+      let settings: any = {};
+      if (fs.existsSync(SETTINGS_FILE)) {
+        try {
+          settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+        } catch {}
+      }
+      const startCash = typeof settings.start_balance_usd === 'number' ? settings.start_balance_usd : 50.0;
+      const freshState = {
+        cash: startCash,
+        positions: {},
+        day: new Date().toISOString().slice(0, 10),
+        day_pnl: 0.0,
+        total_pnl: 0.0,
+        closed: 0,
+        wins: 0,
+        blacklist: [],
+      };
+      fs.writeFileSync(STATE_FILE, JSON.stringify(freshState, null, 2), 'utf-8');
       if (fs.existsSync(TRADES_CSV)) fs.unlinkSync(TRADES_CSV);
-      this.appendLog('INFO', 'Python bot account reset (state and trades cleared).');
-      return { ok: true, message: 'Account reset successfully' };
+      this.appendLog('INFO', `Python bot account reset (cash set to $${startCash.toFixed(2)}, trades cleared).`);
+      return { ok: true, message: `Account reset with $${startCash.toFixed(2)} start balance` };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : 'Error resetting account' };
     }

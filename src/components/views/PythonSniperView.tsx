@@ -77,6 +77,7 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['fee_pct', 'Simulated fee %', 'float'],
   ['log_rejects', 'Log filtered-out coins (debug)', 'bool'],
   ['jupiter_api_key', 'Jupiter API Key (optional)', 'string'],
+  ['python_binary_path', 'Python executable / path (auto, py, python, or full path to python.exe)', 'string'],
 ];
 
 function fmtPrice(val: number | string | undefined | null): string {
@@ -126,7 +127,13 @@ export function PythonSniperView() {
     total_pnl: 0.0,
     day_pnl: 0.0,
   });
-  const [settings, setSettings] = useState<Record<string, any>>({});
+
+  // Separate committed server settings from draft user inputs to prevent snap-back while editing
+  const [serverSettings, setServerSettings] = useState<Record<string, any>>({});
+  const [draftSettings, setDraftSettings] = useState<Record<string, any>>({});
+  const [isSettingsDirty, setIsSettingsDirty] = useState(false);
+  const settingsLoadedRef = useRef(false);
+
   const [trades, setTrades] = useState<SniperTrade[]>([]);
   const [logs, setLogs] = useState<SniperLog[]>([]);
   const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'logs' | 'settings'>('positions');
@@ -141,7 +148,17 @@ export function PythonSniperView() {
       if (data) {
         setRunning(data.running);
         setState(data.state || {});
-        setSettings(data.settings || {});
+        const fetchedSettings = data.settings || {};
+        setServerSettings(fetchedSettings);
+
+        // Only overwrite draft settings if user is not actively editing
+        if (!settingsLoadedRef.current) {
+          setDraftSettings(fetchedSettings);
+          settingsLoadedRef.current = true;
+        } else if (!isSettingsDirty) {
+          setDraftSettings(fetchedSettings);
+        }
+
         setTrades(data.trades || []);
         setLogs(data.logs || []);
         setLastUpdated(new Date());
@@ -156,7 +173,7 @@ export function PythonSniperView() {
       void fetchStatus();
     }, 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [isSettingsDirty]);
 
   const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -189,7 +206,8 @@ export function PythonSniperView() {
     try {
       const data = await apiFetch<any>('/api/sniper/reset', { method: 'POST' });
       if (data.ok) {
-        pushToast({ kind: 'info', title: 'Account reset successfully' });
+        setIsSettingsDirty(false);
+        pushToast({ kind: 'info', title: data.message || 'Account reset successfully' });
         void fetchStatus();
       }
     } catch (err) {
@@ -200,13 +218,34 @@ export function PythonSniperView() {
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
+      // Parse values according to metadata types
+      const payload: Record<string, any> = {};
+      for (const [key, _, kind] of PYTHON_SETTINGS_METADATA) {
+        const raw = draftSettings[key];
+        if (kind === 'bool') {
+          payload[key] = raw === true || raw === 'true';
+        } else if (kind === 'int') {
+          const parsed = parseInt(String(raw ?? 0), 10);
+          payload[key] = isNaN(parsed) ? 0 : parsed;
+        } else if (kind === 'float') {
+          const parsed = parseFloat(String(raw ?? 0));
+          payload[key] = isNaN(parsed) ? 0.0 : parsed;
+        } else {
+          payload[key] = String(raw ?? '');
+        }
+      }
+
       const data = await apiFetch<any>('/api/sniper/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ settings }),
+        body: JSON.stringify({ settings: payload }),
       });
       if (data.ok) {
+        setServerSettings(payload);
+        setDraftSettings(payload);
+        setIsSettingsDirty(false);
         pushToast({ kind: 'success', title: 'Python sniper settings saved' });
+        void fetchStatus();
       }
     } catch (err) {
       pushToast({ kind: 'error', title: 'Save failed', body: err instanceof Error ? err.message : 'Error' });
@@ -250,7 +289,7 @@ export function PythonSniperView() {
   const closedCount = state.closed || 0;
   const winsCount = state.wins || 0;
   const winRateText = closedCount > 0 ? `${((winsCount / closedCount) * 100).toFixed(0)}% (${winsCount}/${closedCount})` : 'no closed trades';
-  const maxSlots = settings.max_open_positions || 3;
+  const maxSlots = serverSettings.max_open_positions || draftSettings.max_open_positions || 3;
 
   const filteredTrades = trades.filter((t) => {
     if (!historySearch.trim()) return true;
@@ -335,7 +374,7 @@ export function PythonSniperView() {
           { id: 'positions', label: `Open positions (${positionsList.length})`, icon: Activity },
           { id: 'history', label: `Trade history (${trades.length})`, icon: History },
           { id: 'logs', label: 'Scan log', icon: Terminal },
-          { id: 'settings', label: 'Settings', icon: Sliders },
+          { id: 'settings', label: `Settings${isSettingsDirty ? ' •' : ''}`, icon: Sliders },
         ].map((tab) => {
           const Icon = tab.icon;
           return (
@@ -636,7 +675,7 @@ export function PythonSniperView() {
                                 className="hover:text-slate-300"
                                 title="Copy mint"
                               >
-                                {copiedKey === t.mint ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                                {copiedKey === t.mint ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
                               </button>
                             </div>
                           )}
@@ -754,29 +793,51 @@ export function PythonSniperView() {
       {/* Tab Content: Settings matching gui.py */}
       {activeTab === 'settings' && (
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6 shadow-sm">
-          <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-4">
             <div>
-              <h2 className="font-display text-lg font-bold text-slate-900 dark:text-slate-100">
-                Python Bot Configuration (settings.json)
-              </h2>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                Exact settings from python gui.py for slippage, fees, rugcheck, age windows, and sources.
+              <div className="flex items-center gap-3">
+                <h2 className="font-display text-lg font-bold text-slate-900 dark:text-slate-100">
+                  Python Bot Configuration (settings.json)
+                </h2>
+                {isSettingsDirty && (
+                  <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/20 text-amber-500 border border-amber-500/30">
+                    Unsaved edits
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                Configure your trade sizing, slippage, rug screen, age windows, Python executable path, and candidate sources.
               </p>
             </div>
-            <button
-              type="button"
-              onClick={() => void handleReset()}
-              className="px-3 py-2 rounded-xl text-xs font-semibold bg-amber-600 hover:bg-amber-500 text-white flex items-center gap-1.5 transition-colors"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>Reset Account &amp; History</span>
-            </button>
+            <div className="flex items-center gap-2">
+              {isSettingsDirty && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDraftSettings({ ...serverSettings });
+                    setIsSettingsDirty(false);
+                    pushToast({ kind: 'info', title: 'Edits discarded' });
+                  }}
+                  className="px-3 py-2 rounded-xl text-xs font-semibold border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition-colors"
+                >
+                  Discard Changes
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => void handleReset()}
+                className="px-3.5 py-2 rounded-xl text-xs font-semibold bg-amber-600 hover:bg-amber-500 text-white flex items-center gap-1.5 transition-colors shadow-sm"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Reset Account &amp; History</span>
+              </button>
+            </div>
           </div>
 
           <form onSubmit={handleSaveSettings} className="space-y-6">
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 text-xs">
               {PYTHON_SETTINGS_METADATA.map(([key, label, kind]) => {
-                const val = settings[key];
+                const val = draftSettings[key];
                 return (
                   <div key={key} className="space-y-1">
                     <label htmlFor={`py-set-${key}`} className="font-sans font-medium text-slate-700 dark:text-slate-300 block">
@@ -785,9 +846,12 @@ export function PythonSniperView() {
                     {kind === 'bool' ? (
                       <select
                         id={`py-set-${key}`}
-                        value={val ? 'true' : 'false'}
-                        onChange={(e) => setSettings({ ...settings, [key]: e.target.value === 'true' })}
-                        className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono"
+                        value={val === true || val === 'true' ? 'true' : 'false'}
+                        onChange={(e) => {
+                          setDraftSettings({ ...draftSettings, [key]: e.target.value === 'true' });
+                          setIsSettingsDirty(true);
+                        }}
+                        className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100"
                       >
                         <option value="true">True (Enabled)</option>
                         <option value="false">False (Disabled)</option>
@@ -799,10 +863,10 @@ export function PythonSniperView() {
                         step={kind === 'float' ? 'any' : '1'}
                         value={val ?? ''}
                         onChange={(e) => {
-                          const parsed = kind === 'int' ? parseInt(e.target.value, 10) : kind === 'float' ? parseFloat(e.target.value) : e.target.value;
-                          setSettings({ ...settings, [key]: isNaN(parsed as number) ? e.target.value : parsed });
+                          setDraftSettings({ ...draftSettings, [key]: e.target.value });
+                          setIsSettingsDirty(true);
                         }}
-                        className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono"
+                        className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-teal-500"
                       />
                     )}
                   </div>
@@ -810,10 +874,13 @@ export function PythonSniperView() {
               })}
             </div>
 
-            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 flex justify-end">
+            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between">
+              <span className="text-xs text-slate-500">
+                {isSettingsDirty ? 'You have unsaved changes. Click Apply to save.' : 'Settings are synced with settings.json.'}
+              </span>
               <button
                 type="submit"
-                className="px-6 py-2.5 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white transition-colors"
+                className="px-6 py-2.5 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white transition-colors shadow-sm"
               >
                 Apply and Save Python Settings
               </button>

@@ -2,6 +2,28 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.24.0 — Cross-Platform Python Detection & Isolated Settings Draft State
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Automatic Cross-Platform Python Detection & Windows App Execution Alias Bypass (`sniperManager.ts`, `bot.py`)**:
+  - Implemented `detectPythonCommand()` in `server/sniperManager.ts`. On Windows, it automatically probes the official Windows Python Launcher (`py -3`, `py`), system `python`, standard user install directories (`%LOCALAPPDATA%\Programs\Python\Python3*\python.exe`), and `%ProgramFiles%`.
+  - Automatically identifies and skips Windows Microsoft Store stub aliases (which cause error 9009: *"Python was not found; run without arguments to install from the Microsoft Store"*).
+  - Runs with `shell: true` on Windows, guaranteeing smooth execution for local Python installations (such as Python 3.14.7).
+  - Added `python_binary_path` setting allowing manual override (e.g. `auto`, `py`, `python`, or a custom path).
+  - Logs the exact detected Python command and runtime version directly to the scan log console.
+- **Fixed Settings Input Reversion / Snap-Back Bug (`PythonSniperView.tsx`)**:
+  - Separated committed `serverSettings` from local `draftSettings` state with dirty-tracking (`isSettingsDirty`).
+  - Previously, 1-second price polling called `setSettings(data.settings)`, overwriting draft values (e.g. changing 50 to 1 snapped back to 50 every second before saving).
+  - Form edits are now completely isolated from polling, allowing you to backspace, type, and modify any configuration field without interruptions.
+  - Added an **Unsaved edits** badge, a **Discard Changes** button, and an auto-sync mechanism after successful save.
+- **Dynamic Start Balance Reset (`sniperManager.ts`, `bot.py`)**:
+  - `resetAccount()` now reads `settings.start_balance_usd` dynamically and initializes `state.json` with your custom cash balance (e.g. $1.00 instead of always defaulting to $50.00).
+  - `bot.py` now loads and hot-reloads `settings.json` on startup and on paper account initialization.
+
+---
+
 ## v1.23.0 — Python Sniper 1-Second Live Price, Green/Red Profit Styling, DexScreener Chart Buttons & Profit/Loss Result Badges
 
 **Risk Warning: Trading can lose all of your money.**

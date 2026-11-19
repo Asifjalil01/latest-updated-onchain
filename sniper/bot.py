@@ -59,6 +59,19 @@ CONFIG = {
     "use_jupiter_price": True, "pool_keep_hours": 1, "pool_max_size": 500,
 }
 
+def load_settings():
+    sf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+    if os.path.exists(sf):
+        try:
+            with open(sf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    CONFIG.update(data)
+        except Exception:
+            pass
+
+load_settings()
+
 DEX = "https://api.dexscreener.com"
 GECKO = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
 JUP = "https://api.jup.ag/tokens/v2"
@@ -332,6 +345,7 @@ def locked(fn):
 
 class PaperAccount:
     def __init__(self, cfg):
+        load_settings()
         self.cfg = cfg
         self.lock = threading.RLock()
         self.path = cfg["state_file"]
@@ -595,6 +609,7 @@ def probe(cfg):
         log("probe: 0 pairs found on DexScreener for current candidates.")
 
 def run(once=False):
+    load_settings()
     acct = PaperAccount(CONFIG)
     log("=== MULTI-SOURCE SNIPER STARTED (PAPER MODE) ===")
     log(f"Sources: gecko={CONFIG['use_gecko']} jupiter={CONFIG['use_jupiter_recent']} profiles={CONFIG['use_dex_profiles']} pumpportal={CONFIG['use_pumpportal']} boosts={CONFIG['use_promoted_feeds']}")
