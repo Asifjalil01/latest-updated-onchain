@@ -14,6 +14,7 @@ import {
   Terminal,
   TrendingUp,
   Wallet,
+  Zap,
 } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import { HoverTip } from '../ui/Primitives';
@@ -90,6 +91,12 @@ const NAV_ITEMS: Array<{
     label: 'Avg Win / Avg Loss',
     description: 'Detailed analysis of average winning vs losing trades in SOL and USD side by side.',
     icon: TrendingUp,
+  },
+  {
+    id: 'python_sniper',
+    label: 'Python Sniper Bot',
+    description: 'Integrated Python New-Launch Sniper Bot with live controls, trade history, console logs, and settings editor.',
+    icon: Zap,
   },
 ];
 

@@ -59,4 +59,5 @@ export type AppTab =
   | 'logs'
   | 'pipeline'
   | 'risk'
-  | 'avgwin';
+  | 'avgwin'
+  | 'python_sniper';

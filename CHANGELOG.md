@@ -2,6 +2,18 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.20.0 — Integrated Python New-Launch Sniper Bot Section
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Integrated Python New-Launch Sniper Bot (`PythonSniperView.tsx`, `sniperManager.ts`, `api.ts`, `Sidebar.tsx`, `App.tsx`)**:
+  - Added a brand new **Python Sniper Bot** section in the sidebar immediately after **Avg Win / Avg Loss**.
+  - Fully integrated your uploaded Python sniper script (`bot.py`) into the backend orchestrator via child process management.
+  - Provides a complete desktop UI matching `gui.py`: start/stop bot controls, live KPI cards (Cash, Est. Total Value, Open Positions, Today's PnL, Realized PnL, Win Rate), Open Positions tab (with manual Sell and DexScreener links), Trade History tab, Live Scan Console Log, and Settings JSON editor with account reset.
+
+---
+
 ## v1.19.0 — Side-by-Side USD ($) P&L, Complete Scanner Funnel Reset Cache, and Dedicated Avg Win / Avg Loss Tab
 
 **Risk Warning: Trading can lose all of your money.**

@@ -7,6 +7,7 @@ import { createApiTokenMiddleware, constantTimeTokenEqual } from '../auth/middle
 import { computeAnalyticsSummary } from '../engine/fees';
 import type { BotOrchestrator } from '../engine/pipeline';
 import type { BotSettings, ExecutionMode, LogSeverity, SseEventPayload } from '../types';
+import { sniperManager } from '../sniperManager';
 
 function readPackageVersion(): string {
   try {
@@ -726,6 +727,43 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       `${requestedMode.toUpperCase()} ledger archived (${archiveId}) and reset to ${initialBal} SOL. Live rows untouched.`
     );
     res.json({ ok: true, archiveId, status: orchestrator.getStatusSnapshot() });
+  });
+
+  router.get('/sniper/status', (_req: Request, res: Response) => {
+    res.json(sniperManager.getStatus());
+  });
+
+  router.post('/sniper/control', (req: Request, res: Response) => {
+    const action = req.body?.action;
+    if (action === 'start') {
+      res.json(sniperManager.start());
+    } else if (action === 'stop') {
+      res.json(sniperManager.stop());
+    } else {
+      res.status(400).json({ error: 'Invalid action' });
+    }
+  });
+
+  router.post('/sniper/settings', (req: Request, res: Response) => {
+    const settings = req.body?.settings;
+    if (!settings || typeof settings !== 'object') {
+      res.status(400).json({ error: 'Invalid settings payload' });
+      return;
+    }
+    res.json(sniperManager.updateSettings(settings));
+  });
+
+  router.post('/sniper/reset', (_req: Request, res: Response) => {
+    res.json(sniperManager.resetAccount());
+  });
+
+  router.post('/sniper/sell', (req: Request, res: Response) => {
+    const mint = req.body?.mint;
+    if (!mint) {
+      res.status(400).json({ error: 'Mint required' });
+      return;
+    }
+    res.json(sniperManager.sellPosition(mint));
   });
 
   return router;
