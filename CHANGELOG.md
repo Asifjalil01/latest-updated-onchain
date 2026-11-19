@@ -2,6 +2,32 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.23.0 — Python Sniper 1-Second Live Price, Green/Red Profit Styling, DexScreener Chart Buttons & Profit/Loss Result Badges
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **1-Second Live Price Updates on Open Positions (`bot.py`, `sniperManager.ts`, `PythonSniperView.tsx`)**:
+  - `bot.py`'s exit monitor loop now continuously updates `pos["current_price"]`, `pos["pnl_pct"]`, `pos["pnl_usd"]`, `pos["peak_pct"]`, and `pos["low_pct"]`, saving state atomically to `state.json` on every tick.
+  - Open positions in `PythonSniperView` refresh every 1 second (1000ms polling) with live Jupiter and DexScreener pricing.
+  - Added visual color coding for Current Price / Price now:
+    - **Bold Green** (`text-emerald-500`) when current price is greater than or equal to entry price (in profit).
+    - **Bold Red** (`text-rose-500`) when current price drops below entry price (in loss).
+  - Added a live pulsing indicator on the table header and status bar (`RUNNING - prices updated 1s ago`).
+  - Added dedicated **PnL %**, **PnL $ (est.)**, **Peak %**, and **Low %** columns with signed values and green/red highlights matching the Python GUI screenshot.
+- **Fixed Trade History PnL Color Bug & Added Profit/Loss Result Badges (`PythonSniperView.tsx`, `sniperManager.ts`)**:
+  - Fixed bug where profitable sell trades (e.g. +$2.37, +$2.21, +$2.62) were rendered in red text because `trades.csv` outputs raw numeric PnL values rather than a string starting with `+`.
+  - Converted PnL calculations to robust numeric parsing (`parseFloat`), correctly coloring positive gains in bright emerald green (`+$2.3697`, `+47.39%`) and losses in rose red.
+  - Added a prominent **Result / Outcome** badge column:
+    - `✓ PROFIT (+47.4%)` in glowing emerald badge for profitable exits.
+    - `✗ LOSS (-8.5%)` in glowing rose badge for stopped-out exits.
+    - `BOUGHT (ENTRY)` in sky blue badge for new sniper entries.
+    - `BREAKEVEN` in neutral slate badge.
+  - Added a dedicated **DexScreener** chart link button (`DexScreener ↗`) to every trade row so you can open and review the historical chart for any token anytime.
+  - Added instant search/filtering in Trade History by coin symbol, token mint, action, or exit reason.
+
+---
+
 ## v1.22.0 — Python Requests Dependency Installation
 
 **Risk Warning: Trading can lose all of your money.**

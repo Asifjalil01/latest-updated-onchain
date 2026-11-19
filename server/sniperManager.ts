@@ -82,24 +82,56 @@ class SniperManager {
       } catch {}
     }
 
+    if (state.positions) {
+      for (const [mint, pos] of Object.entries<any>(state.positions)) {
+        if (!pos.current_price || pos.current_price <= 0) {
+          pos.current_price = pos.entry_price;
+        }
+        if (pos.current_price && pos.entry_price) {
+          if (pos.pnl_pct === undefined || pos.pnl_pct === null) {
+            pos.pnl_pct = Number(((pos.current_price / pos.entry_price - 1) * 100).toFixed(2));
+          }
+          if (pos.pnl_usd === undefined || pos.pnl_usd === null) {
+            const slippage = (settings.slippage_pct ?? 2.0) / 100;
+            const fee = (settings.fee_pct ?? 1.0) / 100;
+            const fill = pos.current_price * (1 - slippage);
+            const proceeds = (pos.qty || 0) * fill * (1 - fee);
+            pos.pnl_usd = Number((proceeds - (pos.cost || 0)).toFixed(4));
+          }
+          if (pos.peak_pct === undefined) {
+            const peak = pos.peak_price || pos.entry_price;
+            pos.peak_pct = Number(((peak / pos.entry_price - 1) * 100).toFixed(2));
+          }
+          if (pos.low_pct === undefined) {
+            const low = pos.low_price || pos.entry_price;
+            pos.low_pct = Number(((low / pos.entry_price - 1) * 100).toFixed(2));
+          }
+        }
+      }
+    }
+
     const trades: any[] = [];
     if (fs.existsSync(TRADES_CSV)) {
       try {
         const content = fs.readFileSync(TRADES_CSV, 'utf-8');
-        const lines = content.split('\n').filter((l) => l.trim().length > 0);
+        const lines = content.replace(/\r/g, '').split('\n').filter((l) => l.trim().length > 0);
         for (let i = lines.length - 1; i >= 1 && trades.length < 200; i--) {
-          const parts = lines[i].split(',');
-          if (parts.length >= 9) {
+          const parts = lines[i].split(',').map((p) => p.trim());
+          if (parts.length >= 6) {
             trades.push({
-              time: parts[0],
-              action: parts[1],
-              symbol: parts[2],
-              mint: parts[3],
-              price: parts[4],
-              amount: parts[5],
-              pnlUsd: parts[6],
-              pnlPct: parts[7],
-              reason: parts[8],
+              time: parts[0] || '',
+              action: parts[1] || '',
+              symbol: parts[2] || '',
+              mint: parts[3] || '',
+              price: parts[4] || '',
+              amount: parts[5] || '',
+              pnlUsd: parts[6] || '',
+              pnlPct: parts[7] || '',
+              reason: parts[8] || '',
+              dexscreener: parts[9] || (parts[3] ? `https://dexscreener.com/solana/${parts[3]}` : ''),
+              age_s: parts[10] || '',
+              dex: parts[11] || '',
+              source: parts[12] || '',
             });
           }
         }
@@ -199,29 +231,39 @@ class SniperManager {
   }
 
   public sellPosition(mint: string) {
-    // We can write a trigger or call bot method or modify state.json directly for manual paper sell
     try {
       if (!fs.existsSync(STATE_FILE)) return { ok: false, message: 'No active state' };
       const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
       if (!state.positions || !state.positions[mint]) {
         return { ok: false, message: 'Position not found' };
       }
+      let settings: any = {};
+      if (fs.existsSync(SETTINGS_FILE)) {
+        try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8')); } catch {}
+      }
       const pos = state.positions[mint];
       delete state.positions[mint];
       state.closed = (state.closed || 0) + 1;
-      const dummyPnl = pos.cost * 0.05; // 5% simulated profit on manual exit
-      state.cash = (state.cash || 50) + pos.cost + dummyPnl;
-      state.total_pnl = (state.total_pnl || 0) + dummyPnl;
-      state.day_pnl = (state.day_pnl || 0) + dummyPnl;
-      if (dummyPnl > 0) state.wins = (state.wins || 0) + 1;
+      const currentPrice = pos.current_price || pos.entry_price;
+      const slippage = (settings.slippage_pct ?? 2.0) / 100;
+      const fee = (settings.fee_pct ?? 1.0) / 100;
+      const fill = currentPrice * (1 - slippage);
+      const proceeds = pos.qty * fill * (1 - fee);
+      const pnlUsd = proceeds - pos.cost;
+      const pnlPct = (pnlUsd / pos.cost) * 100;
+
+      state.cash = (state.cash || 50) + proceeds;
+      state.total_pnl = (state.total_pnl || 0) + pnlUsd;
+      state.day_pnl = (state.day_pnl || 0) + pnlUsd;
+      if (pnlUsd > 0) state.wins = (state.wins || 0) + 1;
       fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
 
       // Append to CSV
       const nowIso = new Date().toISOString();
-      const csvLine = `${nowIso},SELL,${pos.symbol},${mint},${pos.entry_price},${pos.cost + dummyPnl},${dummyPnl.toFixed(4)},5.0,manual_exit\n`;
+      const csvLine = `${nowIso},SELL,${pos.symbol},${mint},${fill.toFixed(8)},${proceeds.toFixed(4)},${pnlUsd.toFixed(4)},${pnlPct.toFixed(2)},manual_exit,${pos.url || `https://dexscreener.com/solana/${mint}`},${pos.age_at_entry || 0},${pos.dex || '?'},${pos.source || '?'}\n`;
       fs.appendFileSync(TRADES_CSV, csvLine, 'utf-8');
 
-      this.appendLog('INFO', `Manual sell executed for ${pos.symbol}`);
+      this.appendLog('INFO', `Manual sell executed for ${pos.symbol} at $${fill.toFixed(8)} (PnL $${pnlUsd.toFixed(2)})`);
       return { ok: true, message: `Sold ${pos.symbol} manually` };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : 'Error selling position' };

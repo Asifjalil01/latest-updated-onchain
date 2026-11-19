@@ -388,9 +388,11 @@ class PaperAccount:
         fill = price * (1 + c["slippage_pct"] / 100)
         qty = (size * (1 - c["fee_pct"] / 100)) / fill
         self.state["cash"] -= size
-        self.state["positions"][mint] = {"symbol": symbol, "qty": qty, "entry_price": fill, "cost": size,
+        self.state["positions"][mint] = {"symbol": symbol, "qty": qty, "entry_price": fill, "current_price": fill, "cost": size,
                                          "opened": time.time(), "url": url,
                                          "peak_price": fill, "low_price": fill,
+                                         "pnl_pct": 0.0, "pnl_usd": 0.0,
+                                         "peak_pct": 0.0, "low_pct": 0.0,
                                          "dex": meta.get("dex", "?"), "source": meta.get("source", "?"),
                                          "age_at_entry": round(meta.get("age_s", 0), 1)}
         self.state["blacklist"].append(mint)
@@ -414,7 +416,7 @@ class PaperAccount:
         self.state["total_pnl"] += pnl
         self.state["closed"] += 1
         if pnl > 0: self.state["wins"] += 1
-        self._log_trade([now().isoformat(), "SELL", pos["symbol"], mint, fmt_price(fill), proceeds, round(pnl, 4), round(pnl_pct, 2), reason, pos.get("url", "")])
+        self._log_trade([now().isoformat(), "SELL", pos["symbol"], mint, fmt_price(fill), round(proceeds, 4), round(pnl, 4), round(pnl_pct, 2), reason, pos.get("url", ""), pos.get("age_at_entry", 0), pos.get("dex", "?"), pos.get("source", "?")])
         log(f"✗ SELL {pos['symbol']} @ ${fmt_price(fill)} pnl ${pnl:.2f} ({pnl_pct:.1f}%) [{reason}]")
         self.save()
 
@@ -423,13 +425,24 @@ class PaperAccount:
         exits = 0
         tp = self.cfg.get("take_profit_pct", 50)
         trail = self.cfg.get("trailing_stop_pct", 0)
+        has_updates = False
         for mint, pos in list(self.state["positions"].items()):
             price = prices.get(mint)
             if price is None: continue
             entry = pos["entry_price"]
+            pos["current_price"] = price
+            pos["last_updated"] = time.time()
             pos["peak_price"] = max(pos.get("peak_price", entry), price)
             pos["low_price"] = min(pos.get("low_price", entry), price)
             change = (price / entry - 1) * 100
+            pos["pnl_pct"] = round(change, 2)
+            fill = price * (1 - self.cfg.get("slippage_pct", 2.0) / 100)
+            proceeds = pos["qty"] * fill * (1 - self.cfg.get("fee_pct", 1.0) / 100)
+            pos["pnl_usd"] = round(proceeds - pos["cost"], 4)
+            pos["peak_pct"] = round((pos["peak_price"] / entry - 1) * 100, 2)
+            pos["low_pct"] = round((pos["low_price"] / entry - 1) * 100, 2)
+            has_updates = True
+
             peak_chg = (pos["peak_price"] / entry - 1) * 100
             reason = None
             if tp > 0 and change >= tp: reason = f"take_profit_{tp:g}"
@@ -440,6 +453,8 @@ class PaperAccount:
             if reason:
                 self.sell(mint, price, reason)
                 exits += 1
+        if has_updates and exits == 0:
+            self.save()
         return exits
 
 # ---------------------------------------------------------------- scan / monitor
