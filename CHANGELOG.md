@@ -2,6 +2,18 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.21.0 — Python Bot Authentication & Full gui.py Settings Integration
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Python Bot API Token Authentication (`PythonSniperView.tsx`)**:
+  - Replaced raw `fetch` calls with `apiFetch` in `PythonSniperView` so the required `x-api-token` header is automatically passed for all Python bot control, status, reset, sell, and settings endpoints.
+- **Complete `gui.py` Settings Fields (`PythonSniperView.tsx`)**:
+  - Integrated all 31 settings fields from the original Python `gui.py` / `bot.py` configuration (`start_balance_usd`, `trade_size_usd`, `max_open_positions`, `daily_loss_limit_usd`, `take_profit_pct`, `trailing_stop_pct`, `max_hold_minutes`, `max_age_minutes`, `scan_interval_sec`, `monitor_interval_sec`, `min_liquidity_usd`, `min_buys_m5`, `min_buy_sell_ratio_m5`, `max_price_change_m5_pct`, `min_volume_m5_usd`, `min_holders`, `use_rugcheck`, `strict_rugcheck`, `rugcheck_max_score`, `max_top10_holder_pct`, `rug_recheck_minutes`, `use_gecko`, `use_jupiter_recent`, `use_jupiter_price`, `use_dex_profiles`, `use_pumpportal`, `use_promoted_feeds`, `slippage_pct`, `fee_pct`, `log_rejects`, `jupiter_api_key`) with proper labels and input types.
+
+---
+
 ## v1.20.0 — Integrated Python New-Launch Sniper Bot Section
 
 **Risk Warning: Trading can lose all of your money.**

@@ -1,7 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { Play, Square, RotateCcw, Copy, ExternalLink, RefreshCw, Terminal, Sliders, Activity, History } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
-import { HoverTip, InfoTooltip } from '../ui/Primitives';
 
 interface SniperPosition {
   symbol: string;
@@ -33,11 +32,45 @@ interface SniperLog {
   id: string;
   timestamp: string;
   message: string;
-  tag: 'buy' | 'sell' | 'reject' | 'warn' | 'info';
+  tag: string;
 }
 
+const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' | 'string']> = [
+  ['start_balance_usd', 'Start balance $ (used on reset)', 'float'],
+  ['trade_size_usd', 'Trade size $', 'float'],
+  ['max_open_positions', 'Max open positions', 'int'],
+  ['daily_loss_limit_usd', 'Daily loss limit $', 'float'],
+  ['take_profit_pct', 'Take profit % (0 = off)', 'float'],
+  ['trailing_stop_pct', 'Trailing stop % from peak (0 = off)', 'float'],
+  ['max_hold_minutes', 'Max hold (minutes)', 'int'],
+  ['max_age_minutes', 'Sniper window: max coin age (minutes)', 'float'],
+  ['scan_interval_sec', 'Scan for new coins every (sec)', 'int'],
+  ['monitor_interval_sec', 'Price check every (sec)', 'float'],
+  ['min_liquidity_usd', 'Min liquidity $', 'float'],
+  ['min_buys_m5', 'Min buys last 5 min', 'int'],
+  ['min_buy_sell_ratio_m5', 'Min buy/sell ratio (5 min)', 'float'],
+  ['max_price_change_m5_pct', 'Skip if pumped +X% in 5 min', 'float'],
+  ['min_volume_m5_usd', 'Min 5-min volume $ (0 = off)', 'float'],
+  ['min_holders', 'Min buys in last 1h (0 = off)', 'int'],
+  ['use_rugcheck', 'Hard RugCheck (score + risks)', 'bool'],
+  ['strict_rugcheck', 'Strict: reject ANY danger risk', 'bool'],
+  ['rugcheck_max_score', 'Max RugCheck risk score (0-100)', 'float'],
+  ['max_top10_holder_pct', 'Max top-10 holders %', 'float'],
+  ['rug_recheck_minutes', 'Recheck rug score every (min)', 'int'],
+  ['use_gecko', 'Source: GeckoTerminal new pools (all DEXes)', 'bool'],
+  ['use_jupiter_recent', 'Source: Jupiter recent tokens', 'bool'],
+  ['use_jupiter_price', 'Use Jupiter live prices', 'bool'],
+  ['use_dex_profiles', 'Source: DexScreener token profiles', 'bool'],
+  ['use_pumpportal', 'Source: PumpPortal new launches', 'bool'],
+  ['use_promoted_feeds', 'Source: DexScreener boosted (promoted)', 'bool'],
+  ['slippage_pct', 'Simulated slippage %', 'float'],
+  ['fee_pct', 'Simulated fee %', 'float'],
+  ['log_rejects', 'Log filtered-out coins (debug)', 'bool'],
+  ['jupiter_api_key', 'Jupiter API Key (optional)', 'string'],
+];
+
 export function PythonSniperView() {
-  const { pushToast } = useBotStore();
+  const { apiFetch, pushToast } = useBotStore();
   const [running, setRunning] = useState(false);
   const [state, setState] = useState<{ cash: number; positions: Record<string, SniperPosition>; closed: number; wins: number; total_pnl: number; day_pnl: number }>({
     cash: 50.0,
@@ -51,14 +84,12 @@ export function PythonSniperView() {
   const [trades, setTrades] = useState<SniperTrade[]>([]);
   const [logs, setLogs] = useState<SniperLog[]>([]);
   const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'logs' | 'settings'>('positions');
-  const [selectedMint, setSelectedMint] = useState<string | null>(null);
   const logEndRef = useRef<HTMLDivElement | null>(null);
 
   const fetchStatus = async () => {
     try {
-      const res = await fetch('/api/sniper/status');
-      if (res.ok) {
-        const data = await res.json();
+      const data = await apiFetch<any>('/api/sniper/status');
+      if (data) {
         setRunning(data.running);
         setState(data.state || {});
         setSettings(data.settings || {});
@@ -79,12 +110,11 @@ export function PythonSniperView() {
   const handleToggle = async () => {
     try {
       const action = running ? 'stop' : 'start';
-      const res = await fetch('/api/sniper/control', {
+      const data = await apiFetch<any>('/api/sniper/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
       });
-      const data = await res.json();
       if (data.ok) {
         setRunning(action === 'start');
         pushToast({ kind: 'success', title: data.message });
@@ -92,60 +122,62 @@ export function PythonSniperView() {
         pushToast({ kind: 'error', title: 'Control error', body: data.message });
       }
     } catch (err) {
-      pushToast({ kind: 'error', title: 'Request failed' });
+      pushToast({ kind: 'error', title: 'Request failed', body: err instanceof Error ? err.message : 'Error' });
     }
   };
 
   const handleReset = async () => {
     if (!window.confirm('Reset Python sniper paper account and clear trade history?')) return;
     try {
-      const res = await fetch('/api/sniper/reset', { method: 'POST' });
-      const data = await res.json();
+      const data = await apiFetch<any>('/api/sniper/reset', { method: 'POST' });
       if (data.ok) {
         pushToast({ kind: 'info', title: 'Account reset successfully' });
         void fetchStatus();
       }
-    } catch {}
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Reset failed', body: err instanceof Error ? err.message : 'Error' });
+    }
   };
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const res = await fetch('/api/sniper/settings', {
+      const data = await apiFetch<any>('/api/sniper/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ settings }),
       });
-      const data = await res.json();
       if (data.ok) {
         pushToast({ kind: 'success', title: 'Python sniper settings saved' });
       }
-    } catch {}
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Save failed', body: err instanceof Error ? err.message : 'Error' });
+    }
   };
 
   const handleSellNow = async (mint: string) => {
     if (!window.confirm('Close this position immediately?')) return;
     try {
-      const res = await fetch('/api/sniper/sell', {
+      const data = await apiFetch<any>('/api/sniper/sell', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mint }),
       });
-      const data = await res.json();
       if (data.ok) {
         pushToast({ kind: 'success', title: data.message });
         void fetchStatus();
       } else {
         pushToast({ kind: 'error', title: data.message });
       }
-    } catch {}
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Sell failed', body: err instanceof Error ? err.message : 'Error' });
+    }
   };
 
-  const positionsList = Object.entries(state.positions || {}).map(([mint, p]) => {
-    const entry = p.entry_price;
-    const cost = p.cost;
-    return { mint, ...p };
-  });
+  const positionsList = Object.entries(state.positions || {}).map(([mint, p]) => ({
+    mint,
+    ...p,
+  }));
 
   const openValue = positionsList.reduce((acc, p) => acc + p.cost, 0);
   const totalValue = (state.cash || 0) + openValue;
@@ -399,7 +431,7 @@ export function PythonSniperView() {
         </div>
       )}
 
-      {/* Tab Content: Settings */}
+      {/* Tab Content: Settings matching gui.py */}
       {activeTab === 'settings' && (
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6">
           <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-4">
@@ -408,7 +440,7 @@ export function PythonSniperView() {
                 Python Bot Configuration (settings.json)
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Adjust snipping parameters, take-profit %, age windows, and RPC rug checks.
+                Exact settings from python gui.py for slippage, fees, rugcheck, age windows, and sources.
               </p>
             </div>
             <button
@@ -421,38 +453,41 @@ export function PythonSniperView() {
             </button>
           </div>
 
-          <form onSubmit={handleSaveSettings} className="space-y-4">
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 text-xs">
-              {Object.entries(settings).map(([key, val]) => (
-                <div key={key} className="space-y-1">
-                  <label htmlFor={`setting-${key}`} className="font-mono text-slate-500 dark:text-slate-400 block truncate" title={key}>
-                    {key}
-                  </label>
-                  {typeof val === 'boolean' ? (
-                    <select
-                      id={`setting-${key}`}
-                      value={val ? 'true' : 'false'}
-                      onChange={(e) => setSettings({ ...settings, [key]: e.target.value === 'true' })}
-                      className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono"
-                    >
-                      <option value="true">True (Enabled)</option>
-                      <option value="false">False (Disabled)</option>
-                    </select>
-                  ) : (
-                    <input
-                      id={`setting-${key}`}
-                      type={typeof val === 'number' ? 'number' : 'text'}
-                      step="any"
-                      value={val ?? ''}
-                      onChange={(e) => {
-                        const parsed = typeof val === 'number' ? parseFloat(e.target.value) : e.target.value;
-                        setSettings({ ...settings, [key]: isNaN(parsed as number) ? e.target.value : parsed });
-                      }}
-                      className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono"
-                    />
-                  )}
-                </div>
-              ))}
+          <form onSubmit={handleSaveSettings} className="space-y-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 text-xs">
+              {PYTHON_SETTINGS_METADATA.map(([key, label, kind]) => {
+                const val = settings[key];
+                return (
+                  <div key={key} className="space-y-1">
+                    <label htmlFor={`py-set-${key}`} className="font-sans font-medium text-slate-700 dark:text-slate-300 block">
+                      {label}
+                    </label>
+                    {kind === 'bool' ? (
+                      <select
+                        id={`py-set-${key}`}
+                        value={val ? 'true' : 'false'}
+                        onChange={(e) => setSettings({ ...settings, [key]: e.target.value === 'true' })}
+                        className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono"
+                      >
+                        <option value="true">True (Enabled)</option>
+                        <option value="false">False (Disabled)</option>
+                      </select>
+                    ) : (
+                      <input
+                        id={`py-set-${key}`}
+                        type={kind === 'int' || kind === 'float' ? 'number' : 'text'}
+                        step={kind === 'float' ? 'any' : '1'}
+                        value={val ?? ''}
+                        onChange={(e) => {
+                          const parsed = kind === 'int' ? parseInt(e.target.value, 10) : kind === 'float' ? parseFloat(e.target.value) : e.target.value;
+                          setSettings({ ...settings, [key]: isNaN(parsed as number) ? e.target.value : parsed });
+                        }}
+                        className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono"
+                      />
+                    )}
+                  </div>
+                );
+              })}
             </div>
 
             <div className="pt-4 border-t border-slate-200 dark:border-slate-800 flex justify-end">
@@ -460,7 +495,7 @@ export function PythonSniperView() {
                 type="submit"
                 className="px-6 py-2.5 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white"
               >
-                Save Python Settings
+                Apply and Save Python Settings
               </button>
             </div>
           </form>
