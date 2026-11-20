@@ -128,7 +128,10 @@ export function pairTradesWithEntryAndExit(
     } else if (action === 'SELL') {
       const matchedEntry = row.entryPrice || (mint ? lastBuyPriceByMint.get(mint) : '') || '';
       const matchedBuyTx = mint ? lastBuyTxByMint.get(mint) : undefined;
-      if (mint) {
+      const isPartialSell =
+        (row.reason || '').startsWith('principal_recovery') ||
+        (row.reason || '').startsWith('scale_out');
+      if (mint && !isPartialSell) {
         lastBuyPriceByMint.delete(mint);
         lastBuyTxByMint.delete(mint);
       }
@@ -179,4 +182,116 @@ export function formatTrailingModeHint(takeProfitPct: number, trailingStopPct: n
   }
   return 'Disabled';
 }
+
+export interface RecoveryThresholdResult {
+  tradeSizeUsd: number;
+  recoverSellPct: number;
+  targetRecoveryUsd: number;
+  minTpPct: number;
+  estimatedTxFeeUsd: number;
+}
+
+/**
+ * Calculates the minimum Take Profit % required so selling `recoverSellPct`%
+ * of a position returns at least 100% of the invested `tradeSizeUsd` PLUS
+ * buy/sell fees, slippage, and live Solana tx fees.
+ */
+export function calcMinRecoveryTakeProfitPct(params: {
+  tradeSizeUsd: number;
+  recoverSellPct?: number;
+  feePct?: number;
+  slippagePct?: number;
+  mode?: 'paper' | 'live' | string;
+  solPriceUsd?: number | null;
+}): RecoveryThresholdResult {
+  const tradeSizeUsd = Math.max(0.01, Number(params.tradeSizeUsd) || 0);
+  const recoverSellPct = Math.min(95, Math.max(5, Number(params.recoverSellPct ?? 50) || 50));
+  const fee = Math.min(0.45, Math.max(0, (Number(params.feePct ?? 1) || 0) / 100));
+  const slip = Math.min(0.45, Math.max(0, (Number(params.slippagePct ?? 2) || 0) / 100));
+
+  const sellFraction = recoverSellPct / 100;
+  const isLive = String(params.mode || 'paper').toLowerCase() === 'live';
+  const solPx = params.solPriceUsd && Number.isFinite(params.solPriceUsd) && params.solPriceUsd > 0 ? params.solPriceUsd : 0;
+  // In live mode include estimated buy+sell Solana priority/tx fee (~0.0002 SOL total, capped reasonably relative to position)
+  const estimatedTxFeeUsd = isLive && solPx > 0 ? Math.min(tradeSizeUsd * 0.25, 0.0002 * solPx) : 0;
+  const targetRecoveryUsd = tradeSizeUsd + estimatedTxFeeUsd;
+
+  // Net proceeds factor on selling fraction f at gain G:
+  // Paper: f * tradeSize * (1 - fee_buy) * (1 - slip_sell) * (1 - fee_sell) * (1 + G)
+  // Live:  f * tradeSize * (1 - slip_sell) * (1 - fee_sell) * (1 + G) [plus buy/sell tx fee covered by targetRecoveryUsd]
+  const retentionFactor = isLive
+    ? (1 - slip) * (1 - fee)
+    : (1 - fee) * (1 - slip) * (1 - fee);
+
+  const safeRetention = Math.max(0.05, sellFraction * retentionFactor);
+  const multiplierNeeded = targetRecoveryUsd / (tradeSizeUsd * safeRetention);
+  const rawPct = Math.max(0, (multiplierNeeded - 1) * 100);
+  // Round UP to nearest 0.1% so net return strictly >= targetRecoveryUsd
+  const minTpPct = Math.ceil(rawPct * 10) / 10;
+
+  return {
+    tradeSizeUsd,
+    recoverSellPct,
+    targetRecoveryUsd: Number(targetRecoveryUsd.toFixed(4)),
+    minTpPct,
+    estimatedTxFeeUsd: Number(estimatedTxFeeUsd.toFixed(4)),
+  };
+}
+
+export interface SniperSettingsValidation {
+  valid: boolean;
+  error: string | null;
+  recovery: RecoveryThresholdResult | null;
+}
+
+export function validatePythonSniperSettings(
+  settings: Record<string, any>,
+  solPriceUsd?: number | null
+): SniperSettingsValidation {
+  const recoverEnabled =
+    settings.recover_principal_enabled === true || settings.recover_principal_enabled === 'true';
+  if (!recoverEnabled) {
+    return { valid: true, error: null, recovery: null };
+  }
+
+  const tradeSizeUsd = parseFloat(String(settings.trade_size_usd ?? 0));
+  if (!Number.isFinite(tradeSizeUsd) || tradeSizeUsd <= 0) {
+    return {
+      valid: false,
+      error: 'Trade size $ must be greater than $0 when Principal Recovery is enabled.',
+      recovery: null,
+    };
+  }
+
+  const recoverSellPct = parseFloat(String(settings.recover_principal_sell_pct ?? 50));
+  if (!Number.isFinite(recoverSellPct) || recoverSellPct < 5 || recoverSellPct > 95) {
+    return {
+      valid: false,
+      error: 'Step 1 Principal Recovery sell % must be between 5% and 95%.',
+      recovery: null,
+    };
+  }
+
+  const recovery = calcMinRecoveryTakeProfitPct({
+    tradeSizeUsd,
+    recoverSellPct,
+    feePct: parseFloat(String(settings.fee_pct ?? 1)),
+    slippagePct: parseFloat(String(settings.slippage_pct ?? 2)),
+    mode: settings.mode,
+    solPriceUsd,
+  });
+
+  const tpPct = parseFloat(String(settings.take_profit_pct ?? 0));
+  if (!Number.isFinite(tpPct) || tpPct <= 0 || tpPct + 1e-9 < recovery.minTpPct) {
+    const tpDisplay = Number.isFinite(tpPct) && tpPct > 0 ? `+${tpPct}%` : '0% (off)';
+    return {
+      valid: false,
+      error: `Your investment is $${recovery.tradeSizeUsd.toFixed(2)} (requires ~$${recovery.targetRecoveryUsd.toFixed(2)} back incl. fees & slippage). To sell ${recovery.recoverSellPct}% and recover your money, you must set Take profit % to at least +${recovery.minTpPct.toFixed(1)}% (currently ${tpDisplay}).`,
+      recovery,
+    };
+  }
+
+  return { valid: true, error: null, recovery };
+}
+
 

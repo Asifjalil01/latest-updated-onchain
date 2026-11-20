@@ -15,6 +15,8 @@ import {
   orderLogsNewestFirst,
   formatBotUptime,
   formatTrailingModeHint,
+  calcMinRecoveryTakeProfitPct,
+  validatePythonSniperSettings,
 } from '../../src/utils/sniperFormat.ts';
 import {
   SniperManager,
@@ -664,5 +666,408 @@ test('Python sniper evaluate_exit_signal waits for TP before arming trailing sto
   assert.equal(res.trail_only_sells_in_profit[0], 'trailing_stop_15');
   assert.equal(res.trail_only_sells_in_profit[1], true);
 });
+
+test('calcMinRecoveryTakeProfitPct and validatePythonSniperSettings block saving/starting when TP cannot cover investment + fees', () => {
+  // Paper mode: $5 trade, 50% sell, 1% fee, 2% slippage => retention 0.99 * 0.98 * 0.99 = 0.960498
+  // Needed TP = (1 / (0.5 * 0.960498) - 1) * 100 = 108.225% -> rounded up to +108.3%
+  const paperCalc = calcMinRecoveryTakeProfitPct({
+    tradeSizeUsd: 5,
+    recoverSellPct: 50,
+    feePct: 1,
+    slippagePct: 2,
+    mode: 'paper',
+  });
+  assert.equal(paperCalc.minTpPct, 108.3);
+  assert.equal(paperCalc.targetRecoveryUsd, 5);
+
+  const invalidRes = validatePythonSniperSettings({
+    mode: 'paper',
+    trade_size_usd: 5,
+    take_profit_pct: 50,
+    recover_principal_enabled: true,
+    recover_principal_sell_pct: 50,
+    fee_pct: 1,
+    slippage_pct: 2,
+  });
+  assert.equal(invalidRes.valid, false);
+  assert.match(invalidRes.error || '', /\$5\.00/);
+  assert.match(invalidRes.error || '', /108\.3%/);
+
+  const validRes = validatePythonSniperSettings({
+    mode: 'paper',
+    trade_size_usd: 5,
+    take_profit_pct: 108.3,
+    recover_principal_enabled: true,
+    recover_principal_sell_pct: 50,
+    fee_pct: 1,
+    slippage_pct: 2,
+  });
+  assert.equal(validRes.valid, true);
+  assert.equal(validRes.error, null);
+
+  // Disabled recovery allows any TP
+  const disabledRes = validatePythonSniperSettings({
+    mode: 'paper',
+    trade_size_usd: 5,
+    take_profit_pct: 20,
+    recover_principal_enabled: false,
+    recover_principal_sell_pct: 50,
+  });
+  assert.equal(disabledRes.valid, true);
+});
+
+test('pairTradesWithEntryAndExit preserves entryPrice & txBuy across partial principal_recovery and scale_out sells', () => {
+  const rows = [
+    {
+      time: '2026-11-20T10:00:00Z',
+      action: 'BUY',
+      symbol: 'MOON',
+      mint: 'mintMOON',
+      price: '0.00010000',
+      amount: '5.00',
+      pnlUsd: '',
+      pnlPct: '',
+      reason: 'sniper_entry',
+      txSig: 'txBuyMoon1',
+    },
+    {
+      time: '2026-11-20T10:01:00Z',
+      action: 'SELL',
+      symbol: 'MOON',
+      mint: 'mintMOON',
+      price: '0.00022000',
+      amount: '5.20',
+      pnlUsd: '2.70',
+      pnlPct: '108.00',
+      reason: 'principal_recovery_50pct',
+      txSig: 'txRecMoon2',
+    },
+    {
+      time: '2026-11-20T10:02:00Z',
+      action: 'SELL',
+      symbol: 'MOON',
+      mint: 'mintMOON',
+      price: '0.00032000',
+      amount: '2.00',
+      pnlUsd: '1.38',
+      pnlPct: '220.00',
+      reason: 'scale_out_25pct',
+      txSig: 'txScaleMoon3',
+    },
+    {
+      time: '2026-11-20T10:03:00Z',
+      action: 'SELL',
+      symbol: 'MOON',
+      mint: 'mintMOON',
+      price: '0.00030500',
+      amount: '5.50',
+      pnlUsd: '3.63',
+      pnlPct: '194.00',
+      reason: 'trailing_stop_15',
+      txSig: 'txTrailMoon4',
+    },
+  ];
+
+  const paired = pairTradesWithEntryAndExit(rows);
+  assert.equal(paired.length, 4);
+  // Newest first: final trailing_stop, scale_out, principal_recovery, BUY
+  assert.equal(paired[0].reason, 'trailing_stop_15');
+  assert.equal(paired[0].entryPrice, '0.00010000');
+  assert.equal(paired[0].txBuy, 'txBuyMoon1');
+  assert.equal(paired[0].txSell, 'txTrailMoon4');
+
+  assert.equal(paired[1].reason, 'scale_out_25pct');
+  assert.equal(paired[1].entryPrice, '0.00010000');
+  assert.equal(paired[1].txBuy, 'txBuyMoon1');
+  assert.equal(paired[1].txSell, 'txScaleMoon3');
+
+  assert.equal(paired[2].reason, 'principal_recovery_50pct');
+  assert.equal(paired[2].entryPrice, '0.00010000');
+  assert.equal(paired[2].txBuy, 'txBuyMoon1');
+  assert.equal(paired[2].txSell, 'txRecMoon2');
+});
+
+test('SniperManager Force Delete does not resurrect position during slow refreshStoppedOpenPositions & blocks invalid recovery settings', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-forcedel-race-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    await mgr.switchMode('live');
+    const { stateFile, tradesCsv } = getSniperFilePaths('live', tmpDir);
+
+    const rugMint = '3q8rM96dFRugPin1111111111111111111111111111';
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({
+        mode: 'live',
+        cash: 12.2,
+        positions: {
+          [rugMint]: {
+            symbol: 'Clawd Pin',
+            qty: 46600,
+            entry_price: 0.00001072,
+            current_price: 0.00001409,
+            cost: 0.5,
+            opened: Date.now() / 1000 - 300,
+            url: `https://dexscreener.com/solana/${rugMint}`,
+            dex: 'meteora',
+            source: 'gecko',
+          },
+        },
+        blacklist: [],
+        closed: 0,
+        wins: 0,
+        total_pnl: 0,
+        day_pnl: 0,
+      }),
+      'utf-8'
+    );
+
+    // Simulate slow background quote refresh that started BEFORE Force Delete
+    let resolveFetch!: (val: Record<string, number>) => void;
+    const slowRefreshPromise = mgr.refreshStoppedOpenPositions(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve;
+        })
+    );
+
+    // User clicks Force Delete while async price fetch is in flight
+    const del1 = mgr.forceDeletePosition(rugMint, 'rugpull_writeoff');
+    assert.equal(del1.ok, true);
+
+    // Second click must report already removed and not duplicate CSV rows
+    const del2 = mgr.forceDeletePosition(rugMint, 'rugpull_writeoff');
+    assert.equal(del2.ok, false);
+
+    // Complete slow price fetch AFTER delete
+    resolveFetch({ [rugMint]: 0.000015 });
+    await slowRefreshPromise;
+
+    // Position must remain deleted on disk AND in getStatus(), and only 1 writeoff row written
+    const afterState = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+    assert.equal(Object.keys(afterState.positions || {}).length, 0);
+    assert.equal(afterState.blacklist.includes(rugMint), true);
+    const status = mgr.getStatus();
+    assert.equal(Object.keys(status.state.positions || {}).length, 0);
+    assert.equal(status.trades.length, 1);
+    assert.equal(status.trades[0].reason, 'rugpull_writeoff');
+    assert.equal(fs.existsSync(tradesCsv), true);
+
+    // Validation blocks saving invalid recovery TP < minTpPct
+    const badSave = mgr.updateSettings({
+      trade_size_usd: 5,
+      take_profit_pct: 50,
+      recover_principal_enabled: true,
+      recover_principal_sell_pct: 50,
+      fee_pct: 1,
+      slippage_pct: 2,
+    });
+    assert.equal(badSave.ok, false);
+    assert.match(badSave.message || '', /recover your money/i);
+
+    // Valid TP succeeds
+    const goodSave = mgr.updateSettings({
+      trade_size_usd: 5,
+      take_profit_pct: 115,
+      recover_principal_enabled: true,
+      recover_principal_sell_pct: 50,
+      scale_out_sell_pct: 25,
+      scale_out_step_gain_pct: 100,
+      fee_pct: 1,
+      slippage_pct: 2,
+    });
+    assert.equal(goodSave.ok, true);
+
+    // If settings.json has invalid TP manually written, start() also blocks starting
+    fs.writeFileSync(path.join(tmpDir, 'bot.py'), '# test stub\n', 'utf-8');
+    const settingsPath = path.join(tmpDir, 'settings.json');
+    const curSettings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+    curSettings.take_profit_pct = 40;
+    fs.writeFileSync(settingsPath, JSON.stringify(curSettings, null, 2), 'utf-8');
+    const startBlocked = mgr.start();
+    assert.equal(startBlocked.ok, false);
+    assert.match(startBlocked.message || '', /recover your money/i);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('SniperManager executeLiveSell supports partial sellFraction (50%) and prorates remaining cost & qty', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-partial-live-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const kp = await Keypair.generate();
+    const signer = new ServerSignerManager(path.join(tmpDir, 'ks.json'));
+    await signer.initFromEnv(JSON.stringify(Array.from(kp.secretKey)));
+    const mockTxBase64 = createBase64MockTx(kp);
+
+    let quotedInRaw = '';
+    let tokenBalUi = 250;
+    let tokenRaw = '250000000';
+
+    const mockOrchestrator = {
+      signer,
+      rpcPool: {
+        getAgreedBalanceSol: async () => ({ agreed: true, balanceSol: 0.5, readings: [0.5, 0.5] }),
+        getAgreedTokenBalanceUi: async () => ({
+          agreed: true,
+          balanceUi: tokenBalUi,
+          rawAmount: tokenRaw,
+          decimals: 6,
+          readings: [tokenBalUi, tokenBalUi],
+        }),
+        inspectTokenOnChain: async () => ({ decimals: 6 }),
+      },
+      jupiter: {
+        getLiveSolPriceUsd: async () => 100,
+        getLastQuoteError: () => null,
+        getQuote: async (params: any) => {
+          quotedInRaw = params.amountRaw;
+          return {
+            inputMint: params.inputMint,
+            inAmount: params.amountRaw,
+            outputMint: params.outputMint,
+            outAmount: '52000000', // 0.052 SOL ($5.20 at $100/SOL)
+            slippageBps: params.slippageBps,
+            priceImpactPct: '0.001',
+            routePlan: [],
+          };
+        },
+        buildSwapTransaction: async () => ({ swapTransaction: mockTxBase64 }),
+      },
+    } as unknown as BotOrchestrator;
+
+    const mockAdapter: LiveTxAdapter = {
+      sendSignedTransaction: async () => {
+        tokenBalUi = 125;
+        tokenRaw = '125000000';
+        return 'sigPartialSell50';
+      },
+      pollConfirmation: async () => ({ status: 'confirmed' }),
+      reconcileParsedSwapSolDelta: async () => ({
+        found: true,
+        solDeltaLamports: 52_000_000,
+        feeLamports: 10_000,
+      }),
+      findRecentSellSignature: async () => null,
+    };
+
+    mgr.attachOrchestrator(mockOrchestrator, mockAdapter);
+
+    const res = await mgr.executeLiveSell({
+      mint: 'MintLivePartial111111111111111111111111111',
+      symbol: 'MOON',
+      qty: 250,
+      rawAmount: '250000000',
+      decimals: 6,
+      costUsd: 5.0,
+      costSol: 0.05,
+      solPriceUsd: 100,
+      reason: 'principal_recovery_50pct',
+      sellFraction: 0.5,
+    });
+
+    assert.equal(res.ok, true);
+    assert.equal(quotedInRaw, '125000000');
+    assert.equal(res.isPartial, true);
+    assert.equal(res.remainingQty, 125);
+    assert.equal(res.remainingRawAmount, '125000000');
+    assert.ok(Math.abs((res.soldFraction || 0) - 0.5) < 0.001);
+    // Prorated cost of 50% sold is $2.50, proceeds $5.20 -> pnlUsd ~$2.70
+    assert.ok((res.proceedsUsd || 0) > 5.1);
+    assert.ok((res.pnlUsd || 0) > 2.6);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Python bot principal recovery + scale-out ladder + trailing stop + young-coin rug check', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-py-ladder-'));
+  try {
+    const pyScript = [
+      'import sys, types, json, os, time',
+      'req = types.ModuleType("requests")',
+      'class DummySess:',
+      '    def get(self, *a, **k): raise RuntimeError("no net")',
+      'req.Session = lambda: DummySess()',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      'bot.log = lambda *a, **k: None',
+      `base = ${JSON.stringify(tmpDir)}`,
+      'bot._base_dir = lambda: base',
+      'bot.SETTINGS_PATH = os.path.join(base, "settings.json")',
+      'cfg = dict(bot.CONFIG)',
+      'cfg.update({',
+      '  "mode": "paper",',
+      '  "start_balance_usd": 50.0,',
+      '  "trade_size_usd": 5.0,',
+      '  "take_profit_pct": 115.0,',
+      '  "trailing_stop_pct": 15.0,',
+      '  "recover_principal_enabled": True,',
+      '  "recover_principal_sell_pct": 50.0,',
+      '  "scale_out_sell_pct": 25.0,',
+      '  "scale_out_step_gain_pct": 100.0,',
+      '  "fee_pct": 1.0,',
+      '  "slippage_pct": 2.0,',
+      '  "max_hold_minutes": 120,',
+      '  "max_top10_holder_pct": 60.0,',
+      '})',
+      'with open(bot.SETTINGS_PATH, "w") as f: json.dump(cfg, f)',
+      'acct = bot.TradingAccount(cfg, mode="paper")',
+      'acct.buy("MintLadder1", "LAD", 1.0, meta={"age_s": 10, "dex": "raydium", "source": "gecko"})',
+      'entry = acct.state["positions"]["MintLadder1"]["entry_price"]',
+      // 1. At +50% (below +115% TP): must NOT trigger recovery or trailing
+      'acct.check_exits({"MintLadder1": entry * 1.50})',
+      'pos_after_50 = dict(acct.state["positions"]["MintLadder1"])',
+      // 2. At +115%: triggers principal_recovery_50pct, leaves 50% bag open & marks principal_recovered
+      'acct.check_exits({"MintLadder1": entry * 2.15})',
+      'pos_after_rec = dict(acct.state["positions"]["MintLadder1"])',
+      // 3. Pumps +220% (>= next_scale_out_pct 215%): triggers scale_out_25pct of remaining (25% of 50% = 12.5% original)
+      'acct.check_exits({"MintLadder1": entry * 3.20})',
+      'pos_after_scale = dict(acct.state["positions"]["MintLadder1"])',
+      // 4. Drops -16% PnL from +220% peak to +204% (entry * 3.04): triggers trailing_stop_15 closing remaining position & incrementing wins
+      'acct.check_exits({"MintLadder1": entry * 3.04})',
+      'remaining_count = len(acct.state["positions"])',
+      // 5. Young coin (age_s=15) with 85% top-10 concentration (> max_top10_holder_pct 60%) MUST BE REJECTED
+      'bot._rpc_mint_authorities = lambda m: (True, None, None)',
+      'bot.get_json = lambda url, params=None, headers=None, timeout=8: {"score_normalised": 10, "risks": [{"level": "warn", "name": "Top 10 holders high ownership", "description": "Top 10 holders hold 85% of supply"}]} if "rugcheck" in url else None',
+      'rug_ok, rug_reason = bot.hard_rug_check("MintConcentrated1", cfg, age_s=15)',
+      'print(json.dumps({',
+      '  "pos_after_50_recovered": pos_after_50["principal_recovered"],',
+      '  "pos_after_rec_recovered": pos_after_rec["principal_recovered"],',
+      '  "pos_after_rec_qty_ratio": round(pos_after_rec["qty"] / pos_after_50["qty"], 4),',
+      '  "pos_after_rec_recovered_usd": pos_after_rec["recovered_usd"],',
+      '  "pos_after_rec_next_scale": pos_after_rec["next_scale_out_pct"],',
+      '  "pos_after_scale_count": pos_after_scale["scale_out_count"],',
+      '  "pos_after_scale_qty_ratio": round(pos_after_scale["qty"] / pos_after_rec["qty"], 4),',
+      '  "remaining_count": remaining_count,',
+      '  "closed": acct.state["closed"],',
+      '  "wins": acct.state["wins"],',
+      '  "rug_ok": rug_ok,',
+      '  "rug_reason": rug_reason,',
+      '}))',
+    ].join('\n');
+
+    const raw = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const lastLine = raw.trim().split('\n').pop() || '{}';
+    const out = JSON.parse(lastLine);
+    assert.equal(out.pos_after_50_recovered, false);
+    assert.equal(out.pos_after_rec_recovered, true);
+    assert.equal(out.pos_after_rec_qty_ratio, 0.5);
+    assert.ok(out.pos_after_rec_recovered_usd >= 5.0, `Expected >= $5 recovered, got ${out.pos_after_rec_recovered_usd}`);
+    assert.equal(out.pos_after_rec_next_scale, 215);
+    assert.equal(out.pos_after_scale_count, 1);
+    assert.equal(out.pos_after_scale_qty_ratio, 0.75);
+    assert.equal(out.remaining_count, 0);
+    assert.equal(out.closed, 1);
+    assert.equal(out.wins, 1);
+    assert.equal(out.rug_ok, false);
+    assert.match(out.rug_reason, /85% > 60% limit/i);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 

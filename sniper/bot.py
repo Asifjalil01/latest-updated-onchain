@@ -33,6 +33,10 @@ CONFIG = {
     "start_balance_usd": 50.0, "trade_size_usd": 5.0, "max_open_positions": 3,
     "daily_loss_limit_usd": 10.0,
     "take_profit_pct": 50.0, "trailing_stop_pct": 0.0, "max_hold_minutes": 120,
+    "recover_principal_enabled": False,
+    "recover_principal_sell_pct": 50.0,
+    "scale_out_sell_pct": 25.0,
+    "scale_out_step_gain_pct": 100.0,
     # sniper window: buy ONLY coins younger than this
     "max_age_minutes": 2.0,
     # coins younger than this skip the liquidity / buy-volume floors (first-seconds entries)
@@ -557,19 +561,26 @@ def hard_rug_check(mint, cfg, age_s):
                         verdict = (False, f"rugcheck risk score {sn:.0f}/100")
             if verdict[0]:
                 strict = cfg.get("strict_rugcheck", True)
+                max_top10 = float(cfg.get("max_top10_holder_pct", 75) or 75)
                 for risk in risks:
                     level = str(risk.get("level") or "").lower()
                     name = str(risk.get("name") or ""); low = name.lower()
+                    desc = str(risk.get("description") or "")
+                    # Always reject high top-10 / single-holder concentration even on brand-new (<3m) coins
+                    if "holder" in low:
+                        m = re.search(r"([\d.]+)\s*%", desc + " " + name)
+                        if m and float(m.group(1)) > max_top10:
+                            verdict = (False, f"{name} ({m.group(1)}% > {max_top10:.0f}% limit)")
+                            break
                     if level != "danger":
-                        if "holder" in low and not young:
-                            m = re.search(r"([\d.]+)\s*%", str(risk.get("description") or "") + " " + name)
-                            if m and float(m.group(1)) > cfg.get("max_top10_holder_pct", 75):
-                                verdict = (False, f"{name} ({m.group(1)}%)")
-                                break
+                        # Still block critical Token-2022 / rug hooks regardless of level/age
+                        if ("transfer fee" in low or "permanent delegate" in low) and strict:
+                            verdict = (False, f"rugcheck risk: {name}")
+                            break
                         continue
-                    if young and (("liquidity" in low) or ("lp" in low)):
+                    if young and (("liquidity" in low) or ("lp" in low)) and "unlocked" not in low:
                         continue
-                    if not strict and not (("mint" in low) or ("freeze" in low) or ("authorit" in low) or ("holder" in low)):
+                    if not strict and not (("mint" in low) or ("freeze" in low) or ("authorit" in low) or ("holder" in low) or ("transfer fee" in low) or ("delegate" in low)):
                         continue
                     verdict = (False, f"rugcheck danger: {name or 'unknown risk'}")
                     break
@@ -600,11 +611,13 @@ class TradingAccount:
             self.csv_path = os.path.join(base, "live_trades.csv")
             self.pnl_csv_path = os.path.join(base, "live_pnl_history.csv")
             self.sell_queue_path = os.path.join(base, "live_sell_queue.json")
+            self.delete_queue_path = os.path.join(base, "live_delete_queue.json")
         else:
             self.path = os.path.join(base, cfg.get("state_file") or "state.json")
             self.csv_path = os.path.join(base, cfg.get("trades_csv") or "trades.csv")
             self.pnl_csv_path = os.path.join(base, "pnl_history.csv")
             self.sell_queue_path = os.path.join(base, "sell_queue.json")
+            self.delete_queue_path = os.path.join(base, "delete_queue.json")
 
         self.state = {
             "mode": self.mode,
@@ -646,7 +659,34 @@ class TradingAccount:
         self.state.setdefault("cooldown_remaining_sec", 0)
 
     @locked
+    def _drain_delete_queue(self):
+        dpath = getattr(self, "delete_queue_path", None)
+        if not dpath or not os.path.exists(dpath):
+            return False
+        try:
+            with open(dpath, "r", encoding="utf-8") as f:
+                mints = json.load(f)
+            try:
+                os.remove(dpath)
+            except Exception:
+                with open(dpath, "w", encoding="utf-8") as f:
+                    f.write("[]")
+            changed = False
+            if isinstance(mints, list):
+                bl = self.state.setdefault("blacklist", [])
+                for mint in mints:
+                    if mint in self.state.get("positions", {}):
+                        self.state["positions"].pop(mint, None)
+                        changed = True
+                    if mint and mint not in bl:
+                        bl.append(mint)
+            return changed
+        except Exception:
+            return False
+
+    @locked
     def save(self):
+        self._drain_delete_queue()
         tmp = self.path + ".tmp"
         payload = json.dumps(self.state, indent=2, ensure_ascii=False)
         with open(tmp, "w", encoding="utf-8") as f:
@@ -827,6 +867,7 @@ class TradingAccount:
             "entry_price": fill,
             "current_price": fill,
             "cost": size,
+            "original_cost": size,
             "opened": time.time(),
             "last_updated": time.time(),
             "url": url,
@@ -837,6 +878,12 @@ class TradingAccount:
             "peak_pct": 0.0,
             "low_pct": 0.0,
             "trailing_active": False,
+            "trailing_floor_pct": None,
+            "principal_recovered": False,
+            "recovered_usd": 0.0,
+            "realized_pnl_usd": 0.0,
+            "next_scale_out_pct": None,
+            "scale_out_count": 0,
             "dex": meta.get("dex", "?"),
             "source": meta.get("source", "?"),
             "age_at_entry": round(meta.get("age_s", 0), 1),
@@ -873,7 +920,7 @@ class TradingAccount:
         return True
 
     @locked
-    def sell(self, mint, price, reason):
+    def sell(self, mint, price, reason, sell_fraction=1.0):
         if _should_stop():
             return False
         c = self.cfg
@@ -883,20 +930,36 @@ class TradingAccount:
 
         sol_px = self.state.get("sol_price_usd")
         tx_sell = ""
+        req_frac = float(sell_fraction if sell_fraction is not None else 1.0)
+        is_partial = 0.01 < req_frac < 0.999
+        req_frac = min(1.0, max(0.05, req_frac)) if is_partial else 1.0
+
+        prev_qty = float(pos.get("qty") or 0.0)
+        prev_cost = float(pos.get("cost") or 0.0)
+        prev_cost_sol = float(pos.get("cost_sol") or 0.0)
+
+        # Avoid leaving microscopic unswappable dust on partial sells
+        if is_partial:
+            est_rem_usd = (prev_qty * (1.0 - req_frac)) * float(price or 0.0) * (1.0 - float(c.get("fee_pct", 1.0)) / 100.0)
+            if est_rem_usd < 0.15:
+                req_frac = 1.0
+                is_partial = False
 
         if self.mode == "live":
-            log(f"⚡ LIVE SELL {pos['symbol']} [{reason}] via Jupiter...")
+            frac_label = f" ({req_frac * 100:.0f}%)" if is_partial else ""
+            log(f"⚡ LIVE SELL {pos['symbol']}{frac_label} [{reason}] via Jupiter...")
             res = bridge_post("/api/sniper/live-sell", {
                 "mint": mint,
                 "symbol": pos["symbol"],
-                "qty": pos.get("qty", 0),
+                "qty": prev_qty,
                 "rawAmount": pos.get("raw_amount"),
                 "decimals": pos.get("decimals"),
-                "costUsd": pos.get("cost", 0),
-                "costSol": pos.get("cost_sol"),
+                "costUsd": prev_cost,
+                "costSol": prev_cost_sol,
                 "slippagePct": c.get("slippage_pct", 2.0),
                 "solPriceUsd": sol_px,
                 "reason": reason,
+                "sellFraction": req_frac if is_partial else 1.0,
             }, timeout=55)
             if not isinstance(res, dict) or not res.get("ok"):
                 err = (res or {}).get("error") or "No live sell route available"
@@ -905,11 +968,13 @@ class TradingAccount:
                 log(f"✗ LIVE SELL FAILED {pos['symbol']} [{reason}]: {err} (keeping position open)")
                 return False
 
-            self.state["positions"].pop(mint, None)
             fill = float(res.get("exitPriceUsd") or price)
             proceeds = float(res.get("proceedsUsd") or 0.0)
-            pnl = float(res.get("pnlUsd") or (proceeds - pos["cost"]))
-            pnl_pct = float(res.get("pnlPct") or (pnl / pos["cost"] * 100 if pos["cost"] else 0.0))
+            sold_frac = float(res.get("soldFraction") or req_frac)
+            actual_partial = bool(res.get("isPartial")) and float(res.get("remainingQty") or 0.0) > 0.0
+            allocated_cost = prev_cost * sold_frac if actual_partial else prev_cost
+            pnl = float(res.get("pnlUsd") if res.get("pnlUsd") is not None else (proceeds - allocated_cost))
+            pnl_pct = float(res.get("pnlPct") if res.get("pnlPct") is not None else (pnl / allocated_cost * 100 if allocated_cost else 0.0))
             tx_sell = str(res.get("txSig") or "")
             if _f(res.get("solPriceUsd")):
                 sol_px = _f(res.get("solPriceUsd"))
@@ -921,19 +986,52 @@ class TradingAccount:
                     self.state["cash"] = round(bal_sol * sol_px, 4)
             else:
                 self.state["cash"] = float(self.state.get("cash") or 0.0) + proceeds
+
+            if actual_partial:
+                is_partial = True
+                pos["qty"] = float(res.get("remainingQty") or 0.0)
+                if res.get("remainingRawAmount"):
+                    pos["raw_amount"] = str(res.get("remainingRawAmount"))
+                pos["cost"] = round(max(0.0, prev_cost - allocated_cost), 6)
+                if prev_cost_sol > 0:
+                    pos["cost_sol"] = max(0.0, prev_cost_sol * (1.0 - sold_frac))
+                pos["recovered_usd"] = round(float(pos.get("recovered_usd") or 0.0) + proceeds, 4)
+                pos["realized_pnl_usd"] = round(float(pos.get("realized_pnl_usd") or 0.0) + pnl, 4)
+                pos["last_sell_attempt"] = time.time()
+            else:
+                is_partial = False
+                self.state["positions"].pop(mint, None)
         else:
-            self.state["positions"].pop(mint, None)
             fill = price * (1 - c["slippage_pct"] / 100)
-            proceeds = pos["qty"] * fill * (1 - c["fee_pct"] / 100)
-            pnl = proceeds - pos["cost"]
-            pnl_pct = pnl / pos["cost"] * 100
-            self.state["cash"] += proceeds
+            if is_partial:
+                sold_qty = prev_qty * req_frac
+                rem_qty = max(0.0, prev_qty - sold_qty)
+                allocated_cost = prev_cost * req_frac
+                proceeds = sold_qty * fill * (1 - c["fee_pct"] / 100)
+                pnl = proceeds - allocated_cost
+                pnl_pct = (pnl / allocated_cost * 100) if allocated_cost > 0 else 0.0
+                self.state["cash"] += proceeds
+                pos["qty"] = rem_qty
+                pos["cost"] = round(max(0.0, prev_cost - allocated_cost), 6)
+                pos["recovered_usd"] = round(float(pos.get("recovered_usd") or 0.0) + proceeds, 4)
+                pos["realized_pnl_usd"] = round(float(pos.get("realized_pnl_usd") or 0.0) + pnl, 4)
+            else:
+                allocated_cost = prev_cost
+                self.state["positions"].pop(mint, None)
+                proceeds = prev_qty * fill * (1 - c["fee_pct"] / 100)
+                pnl = proceeds - allocated_cost
+                pnl_pct = (pnl / allocated_cost * 100) if allocated_cost > 0 else 0.0
+                self.state["cash"] += proceeds
 
         self._roll_day()
         self.state["day_pnl"] += pnl
         self.state["total_pnl"] += pnl
-        self.state["closed"] += 1
-        if pnl > 0: self.state["wins"] += 1
+        if not is_partial:
+            self.state["closed"] += 1
+            cumulative_pnl = float(pos.get("realized_pnl_usd") or 0.0) + pnl
+            if cumulative_pnl > 0:
+                self.state["wins"] += 1
+
         self._log_trade([
             now().isoformat(),
             "SELL",
@@ -953,8 +1051,6 @@ class TradingAccount:
             tx_sell,
         ])
         now_ts = time.time()
-        self.state["last_sell_time"] = now_ts
-        rescan_delay = max(0, int(self.cfg.get("rescan_delay_after_sell_sec", 0)))
         outcome = "PROFIT" if pnl >= 0 else "LOSS"
         hold_sec = round(now_ts - pos.get("opened", now_ts), 1)
         pnl_sol = round(pnl / sol_px, 6) if sol_px and sol_px > 0 else 0.0
@@ -965,7 +1061,7 @@ class TradingAccount:
             outcome,
             fmt_price(pos["entry_price"]),
             fmt_price(fill),
-            round(pos["cost"], 4),
+            round(allocated_cost, 4),
             round(proceeds, 4),
             round(pnl, 4),
             pnl_sol,
@@ -980,32 +1076,49 @@ class TradingAccount:
             pos.get("url", f"https://dexscreener.com/solana/{mint}")
         ])
         sol_hint = f" ({pnl / sol_px:+.4f} SOL)" if sol_px else ""
-        mode_tag = "LIVE SELL" if self.mode == "live" else "SELL"
         tx_hint = f" tx={tx_sell[:8]}..." if tx_sell else ""
-        log(f"✗ {mode_tag} {pos['symbol']} entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} pnl ${pnl:.2f}{sol_hint} ({pnl_pct:.1f}%) [{reason}]{tx_hint}")
-        full, cnt, max_pos = self.is_slots_full()
-        if rescan_delay > 0:
-            self.state["cooldown_remaining_sec"] = rescan_delay
-            log(f"⏳ Rescan delay active: will wait {rescan_delay}s before searching for new coins.")
+        if is_partial:
+            mode_tag = "LIVE PARTIAL SELL" if self.mode == "live" else "PARTIAL SELL"
+            log(f"💰 {mode_tag} {pos['symbol']} ({req_frac * 100:.0f}%) entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} proceeds ${proceeds:.2f} pnl ${pnl:+.2f}{sol_hint} [{reason}]{tx_hint}")
         else:
-            self.state["cooldown_remaining_sec"] = 0
-            if not full and self.state.get("scan_paused"):
-                self.state["scan_paused"] = False
-                log(f"▶ Slot freed ({cnt}/{max_pos}) — resuming scan for new coins.")
-                _scan_wake.set()
+            self.state["last_sell_time"] = now_ts
+            mode_tag = "LIVE SELL" if self.mode == "live" else "SELL"
+            log(f"✗ {mode_tag} {pos['symbol']} entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} pnl ${pnl:.2f}{sol_hint} ({pnl_pct:.1f}%) [{reason}]{tx_hint}")
+            rescan_delay = max(0, int(self.cfg.get("rescan_delay_after_sell_sec", 0)))
+            full, cnt, max_pos = self.is_slots_full()
+            if rescan_delay > 0:
+                self.state["cooldown_remaining_sec"] = rescan_delay
+                log(f"⏳ Rescan delay active: will wait {rescan_delay}s before searching for new coins.")
+            else:
+                self.state["cooldown_remaining_sec"] = 0
+                if not full and self.state.get("scan_paused"):
+                    self.state["scan_paused"] = False
+                    log(f"▶ Slot freed ({cnt}/{max_pos}) — resuming scan for new coins.")
+                    _scan_wake.set()
         self.save()
         return True
 
     @staticmethod
-    def trailing_stop_arm_pct(tp, trail):
-        """Minimum peak gain (%) needed before trailing stop becomes active.
+    def calc_min_recovery_tp_pct(cfg, sol_price_usd=None):
+        """Mirror of calcMinRecoveryTakeProfitPct in sniperFormat.ts."""
+        trade_size = max(0.01, float(cfg.get("trade_size_usd", 5.0) or 5.0))
+        sell_pct = min(95.0, max(5.0, float(cfg.get("recover_principal_sell_pct", 50.0) or 50.0)))
+        fee = min(0.45, max(0.0, float(cfg.get("fee_pct", 1.0) or 0.0) / 100.0))
+        slip = min(0.45, max(0.0, float(cfg.get("slippage_pct", 2.0) or 0.0) / 100.0))
+        sell_frac = sell_pct / 100.0
+        is_live = str(cfg.get("mode") or "paper").strip().lower() == "live"
+        sol_px = float(sol_price_usd or 0.0)
+        extra_tx_usd = min(trade_size * 0.25, 0.0002 * sol_px) if (is_live and sol_px > 0) else 0.0
+        target_usd = trade_size + extra_tx_usd
+        retention = ((1.0 - slip) * (1.0 - fee)) if is_live else ((1.0 - fee) * (1.0 - slip) * (1.0 - fee))
+        safe_ret = max(0.05, sell_frac * retention)
+        mult_needed = target_usd / (trade_size * safe_ret)
+        raw_pct = max(0.0, (mult_needed - 1.0) * 100.0)
+        return math.ceil(raw_pct * 10.0) / 10.0, round(target_usd, 4)
 
-        - When both take_profit_pct (tp > 0) and trailing_stop_pct (trail > 0) are set,
-          take_profit_pct acts as the arm threshold: wait until peak >= +tp% before
-          activating trailing stop so runners are not sold early at +tp% or in a loss.
-        - When take_profit_pct == 0 and trailing_stop_pct > 0, wait until peak reaches at
-          least trail + 5% so the trailing floor (peak - trail) is already +5%+ in profit.
-        """
+    @staticmethod
+    def trailing_stop_arm_pct(tp, trail):
+        """Minimum peak gain (%) needed before trailing stop becomes active."""
         tp = float(tp or 0.0)
         trail = float(trail or 0.0)
         if trail <= 0.0:
@@ -1015,22 +1128,51 @@ class TradingAccount:
         return max(10.0, trail + 5.0)
 
     @classmethod
-    def evaluate_exit_signal(cls, entry, price, peak_price, tp, trail, held_minutes, max_hold_minutes):
+    def evaluate_exit_signal(
+        cls,
+        entry,
+        price,
+        peak_price,
+        tp,
+        trail,
+        held_minutes,
+        max_hold_minutes,
+        recover_principal_enabled=False,
+        principal_recovered=False,
+        recover_sell_pct=50.0,
+        scale_out_sell_pct=25.0,
+        scale_out_step_gain_pct=100.0,
+        next_scale_out_pct=None,
+    ):
         """Return (reason_or_none, trailing_active, drop_from_peak_pnl_pct)."""
         if not entry or entry <= 0 or not price or price <= 0:
             return None, False, 0.0
         tp = float(tp or 0.0)
         trail = float(trail or 0.0)
         peak = max(float(entry), float(peak_price or entry), float(price))
-        change_pct = (price / entry - 1.0) * 100.0
-        peak_chg_pct = (peak / entry - 1.0) * 100.0
-        # Pullback from peak gain in percentage points (matches Spot Bot trailing floor: peak_pnl - trail)
-        drop_from_peak_pct = max(0.0, peak_chg_pct - change_pct)
+        change_pct = round((price / entry - 1.0) * 100.0, 6)
+        peak_chg_pct = round((peak / entry - 1.0) * 100.0, 6)
+        drop_from_peak_pct = max(0.0, round(peak_chg_pct - change_pct, 6))
 
-        if trail > 0.0:
+        if recover_principal_enabled:
+            if not principal_recovered:
+                # Wait for Take Profit / Principal Recovery target before selling initial % or arming trail
+                trailing_active = tp > 0.0 and peak_chg_pct >= tp
+                if tp > 0.0 and change_pct >= tp:
+                    pct_int = int(round(max(5.0, min(95.0, float(recover_sell_pct or 50.0)))))
+                    return f"principal_recovery_{pct_int}pct", True, drop_from_peak_pct
+            else:
+                # Principal is safely recovered — remaining bag rides with trailing stop + optional scale-out ladder
+                trailing_active = trail > 0.0
+                if trail > 0.0 and change_pct > 0.0 and drop_from_peak_pct >= trail:
+                    return f"trailing_stop_{trail:g}", True, drop_from_peak_pct
+                step = float(scale_out_step_gain_pct or 0.0)
+                sell_pct = float(scale_out_sell_pct or 0.0)
+                if step > 0.0 and sell_pct > 0.0 and next_scale_out_pct is not None and change_pct >= float(next_scale_out_pct):
+                    return f"scale_out_{int(round(sell_pct))}pct", trailing_active, drop_from_peak_pct
+        elif trail > 0.0:
             arm_pct = cls.trailing_stop_arm_pct(tp, trail)
             trailing_active = peak_chg_pct >= arm_pct
-            # Trailing stop can only sell while the position is actually in profit above entry
             if trailing_active and change_pct > 0.0 and drop_from_peak_pct >= trail:
                 return f"trailing_stop_{trail:g}", True, drop_from_peak_pct
         else:
@@ -1048,10 +1190,15 @@ class TradingAccount:
     def check_exits(self, prices):
         if _should_stop():
             return 0
+        self._drain_delete_queue()
         exits = 0
         tp = float(self.cfg.get("take_profit_pct", 50) or 0.0)
         trail = float(self.cfg.get("trailing_stop_pct", 0) or 0.0)
         max_hold = float(self.cfg.get("max_hold_minutes", 120) or 0.0)
+        recover_enabled = bool(self.cfg.get("recover_principal_enabled", False))
+        recover_sell_pct = float(self.cfg.get("recover_principal_sell_pct", 50.0) or 50.0)
+        scale_sell_pct = float(self.cfg.get("scale_out_sell_pct", 25.0) or 25.0)
+        scale_step = float(self.cfg.get("scale_out_step_gain_pct", 100.0) or 0.0)
         now_ts = time.time()
         self.state["last_price_time"] = now_ts
         for mint, pos in list(self.state["positions"].items()):
@@ -1075,24 +1222,58 @@ class TradingAccount:
 
             held_min = max(0.0, (now_ts - pos["opened"]) / 60.0)
             reason, trailing_active, _drop_pct = self.evaluate_exit_signal(
-                entry, price, pos["peak_price"], tp, trail, held_min, max_hold
+                entry,
+                price,
+                pos["peak_price"],
+                tp,
+                trail,
+                held_min,
+                max_hold,
+                recover_principal_enabled=recover_enabled,
+                principal_recovered=bool(pos.get("principal_recovered", False)),
+                recover_sell_pct=recover_sell_pct,
+                scale_out_sell_pct=scale_sell_pct,
+                scale_out_step_gain_pct=scale_step,
+                next_scale_out_pct=pos.get("next_scale_out_pct"),
             )
             was_active = bool(pos.get("trailing_active"))
             pos["trailing_active"] = trailing_active
             pos["trailing_floor_pct"] = round(max(0.01, pos["peak_pct"] - trail), 2) if (trailing_active and trail > 0) else None
-            if trailing_active and not was_active:
+            if trailing_active and not was_active and not str(reason or "").startswith("principal_recovery"):
                 log(f"🎯 Trailing stop ARMED for {pos['symbol']}: peak +{pos['peak_pct']:.1f}% | exit floor +{pos['trailing_floor_pct']:.1f}% (-{trail:g}% from peak PnL)")
 
             if reason:
                 if _should_stop():
                     break
-                # Bypass 5s lockout for take_profit so TP executes instantly every 1s tick until filled
-                if not str(reason).startswith("take_profit") and self.mode == "live":
-                    cooldown = 2.0 if str(reason).startswith("trailing_stop") else 5.0
+                reason_str = str(reason)
+                is_recovery = reason_str.startswith("principal_recovery")
+                is_scale_out = reason_str.startswith("scale_out")
+                if not reason_str.startswith("take_profit") and not is_recovery and not is_scale_out and self.mode == "live":
+                    cooldown = 2.0 if reason_str.startswith("trailing_stop") else 5.0
                     if now_ts - float(pos.get("last_sell_attempt") or 0.0) < cooldown:
                         continue
-                if self.sell(mint, price, reason):
+                sell_frac = (
+                    recover_sell_pct / 100.0
+                    if is_recovery
+                    else (scale_sell_pct / 100.0 if is_scale_out else 1.0)
+                )
+                if self.sell(mint, price, reason_str, sell_fraction=sell_frac):
                     exits += 1
+                    cur_pos = self.state["positions"].get(mint)
+                    if cur_pos is not None:
+                        if is_recovery:
+                            cur_pos["principal_recovered"] = True
+                            cur_pos["trailing_active"] = trail > 0.0
+                            cur_pos["trailing_floor_pct"] = round(max(0.01, cur_pos["peak_pct"] - trail), 2) if trail > 0 else None
+                            cur_pos["next_scale_out_pct"] = round(tp + scale_step, 2) if (scale_step > 0 and scale_sell_pct > 0) else None
+                            log(f"🛡️ PRINCIPAL RECOVERED for {cur_pos['symbol']}: initial cost + fees returned · {100 - recover_sell_pct:.0f}% moonbag riding with {trail:g}% trailing stop!")
+                            self.save()
+                        elif is_scale_out:
+                            cur_pos["scale_out_count"] = int(cur_pos.get("scale_out_count") or 0) + 1
+                            prev_target = float(cur_pos.get("next_scale_out_pct") or tp)
+                            cur_pos["next_scale_out_pct"] = round(max(prev_target + scale_step, change + scale_step), 2)
+                            log(f"📈 SCALE-OUT #{cur_pos['scale_out_count']} for {cur_pos['symbol']}: next ladder trigger at +{cur_pos['next_scale_out_pct']:.1f}%")
+                            self.save()
         if exits == 0:
             self.save()
         return exits
@@ -1281,6 +1462,8 @@ def monitor(acct):
     if _should_stop():
         return {}
     maybe_reload_settings()
+    if acct._drain_delete_queue():
+        acct.save()
     sol_px, sol_ts = get_sol_price_usd(acct.cfg)
     if sol_px and sol_px > 0:
         with acct.lock:
@@ -1441,7 +1624,21 @@ def run(once=False):
     log(f"Sources: gecko={CONFIG['use_gecko']} jupiter={CONFIG['use_jupiter_recent']} profiles={CONFIG['use_dex_profiles']} pumpportal={CONFIG['use_pumpportal']} boosts={CONFIG['use_promoted_feeds']}{sol_banner}")
     tp_cfg = float(CONFIG.get("take_profit_pct", 50) or 0.0)
     tr_cfg = float(CONFIG.get("trailing_stop_pct", 0) or 0.0)
-    if tp_cfg > 0 and tr_cfg > 0:
+    rec_enabled = bool(CONFIG.get("recover_principal_enabled", False))
+    rec_sell_pct = float(CONFIG.get("recover_principal_sell_pct", 50.0) or 50.0)
+    scale_sell_pct = float(CONFIG.get("scale_out_sell_pct", 25.0) or 25.0)
+    scale_step_pct = float(CONFIG.get("scale_out_step_gain_pct", 100.0) or 0.0)
+
+    if rec_enabled:
+        min_tp, target_usd = TradingAccount.calc_min_recovery_tp_pct({**CONFIG, "mode": mode}, sol_px)
+        if tp_cfg <= 0 or tp_cfg + 1e-9 < min_tp:
+            log(f"✗ INVALID SETTINGS: Investment is ${float(CONFIG.get('trade_size_usd', 0)):.2f} (requires ~${target_usd:.2f} back incl. fees). Selling {rec_sell_pct:g}% requires Take Profit >= +{min_tp:.1f}% (got +{tp_cfg:g}%). Exiting.")
+            _cleanup_pid_file()
+            return
+        scale_note = f" + {scale_sell_pct:g}% scale-out every +{scale_step_pct:g}%" if (scale_step_pct > 0 and scale_sell_pct > 0) else ""
+        trail_note = f" + {tr_cfg:g}% trail" if tr_cfg > 0 else ""
+        exit_banner = f"Recover {rec_sell_pct:g}% @ +{tp_cfg:g}% TP{scale_note}{trail_note}"
+    elif tp_cfg > 0 and tr_cfg > 0:
         exit_banner = f"TP +{tp_cfg:g}% arms {tr_cfg:g}% trail (profit-only)"
     elif tp_cfg > 0:
         exit_banner = f"TP +{tp_cfg:g}%"

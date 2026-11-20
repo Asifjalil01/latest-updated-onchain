@@ -2,6 +2,26 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.31.0 — Force-Delete Resurrection Fix, Principal Recovery & Scale-Out Ladder, and Tighter New-Coin Rug Filters (`bot.py`, `sniperManager.ts`, `api.ts`, `PythonSniperView.tsx`, `sniperFormat.ts`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed
+- **Rugged / Deleted Positions No Longer Reappear After `Force Delete` (`sniperManager.ts`, `bot.py`, `PythonSniperView.tsx`)**:
+  - Fixed a stopped-mode race condition where the 1-second background quote refresher (`refreshStoppedOpenPositions`) read `live_state.json` / `state.json` before slow Jupiter/DexScreener HTTP fetches and overwrote the state file afterward, resurrecting a position in Open Positions even after `Force Delete` recorded `rugpull_writeoff` in Trade History.
+  - Added atomic temp-file writes (`writeStateAtomic`), `stateRevision` abort checks, a `recentlyDeletedMints` grace filter inside both `refreshStoppedOpenPositions` and `getStatus`, and a cross-process `delete_queue.json` / `live_delete_queue.json` drained by `bot.py` (`_drain_delete_queue`), plus a double-click guard and optimistic UI removal on `Force Delete`.
+
+### Added & Improved
+- **Principal Recovery & Partial Scale-Out Ladder Linked to Take Profit Validation (`bot.py`, `sniperManager.ts`, `sniperFormat.ts`, `PythonSniperView.tsx`)**:
+  - Added `recover_principal_enabled`, `recover_principal_sell_pct` (default `50%`), `scale_out_sell_pct` (default `25%`), and `scale_out_step_gain_pct` (default `+100%`) to Python Sniper Bot settings across both Paper and Live modes.
+  - **Step 1 (Money-Back Exit)**: Once a coin hits `take_profit_pct`, sells `recover_principal_sell_pct` (e.g. `50%`) to recover 100% of invested capital plus buy/sell fees, slippage, and live Solana tx costs, marks the position `Principal Safe`, and arms the trailing stop on the remaining bag.
+  - **Step 2 (Free-Roll Ladder)**: On further upside pumps (e.g. every additional `+100%`), sells `scale_out_sell_pct` (e.g. `25%`) of the remaining balance (`scale_out_<pct>` in Trade History) while trailing stop protects the remainder (`trailing_stop_<pct>`).
+  - **Math-Backed TP Validation & Blocker**: Both UI and server/bot block saving or starting if `take_profit_pct` is too low for the chosen sell % to recover your invested USD + fees + slippage, displaying the exact minimum required percentage and a 1-click quick-fix button.
+- **Stronger Young-Coin Rug Screening (`bot.py`, `PythonSniperView.tsx`)**:
+  - `hard_rug_check` now always enforces `max_top10_holder_pct`, unlocked LP checks, and Token-2022 transfer-fee / permanent-delegate checks even on `< 3m` coins instead of skipping them, and exposes `ultra_early_grace_sec` directly in Settings.
+
+---
+
 ## v1.30.2 — Trailing Stop Pullback Measured from Peak PnL % + Live Floor Badge (`bot.py`, `PythonSniperView.tsx`, `sniperFormat.ts`)
 
 **Risk Warning: Trading can lose all of your money.**

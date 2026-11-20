@@ -800,6 +800,10 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       slippagePct: req.body?.slippagePct !== undefined ? Number(req.body.slippagePct) : undefined,
       solPriceUsd: req.body?.solPriceUsd !== undefined ? Number(req.body.solPriceUsd) : undefined,
       reason: typeof req.body?.reason === 'string' ? req.body.reason : 'sniper_exit',
+      sellFraction:
+        req.body?.sellFraction !== undefined && req.body?.sellFraction !== null
+          ? Number(req.body.sellFraction)
+          : undefined,
     });
     res.json(result);
   });

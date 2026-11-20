@@ -3,7 +3,11 @@ import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
 import { LAMPORTS_PER_SOL, VersionedTransaction } from '@solana/web3.js';
-import { pairTradesWithEntryAndExit, type RawSniperCsvRow } from '../src/utils/sniperFormat.ts';
+import {
+  pairTradesWithEntryAndExit,
+  validatePythonSniperSettings,
+  type RawSniperCsvRow,
+} from '../src/utils/sniperFormat.ts';
 import { loadAppEnv } from './config/env';
 import type { BotOrchestrator } from './engine/pipeline';
 import { DefaultLiveTxAdapter, type LiveTxAdapter } from './engine/liveEngine';
@@ -25,6 +29,7 @@ export interface SniperFilePaths {
   tradesCsv: string;
   pnlCsv: string;
   sellQueueFile: string;
+  deleteQueueFile: string;
 }
 
 export function getSniperFilePaths(mode: SniperMode, baseDir = SNIPER_DIR): SniperFilePaths {
@@ -34,6 +39,7 @@ export function getSniperFilePaths(mode: SniperMode, baseDir = SNIPER_DIR): Snip
       tradesCsv: path.join(baseDir, 'live_trades.csv'),
       pnlCsv: path.join(baseDir, 'live_pnl_history.csv'),
       sellQueueFile: path.join(baseDir, 'live_sell_queue.json'),
+      deleteQueueFile: path.join(baseDir, 'live_delete_queue.json'),
     };
   }
   return {
@@ -41,6 +47,7 @@ export function getSniperFilePaths(mode: SniperMode, baseDir = SNIPER_DIR): Snip
     tradesCsv: path.join(baseDir, 'trades.csv'),
     pnlCsv: path.join(baseDir, 'pnl_history.csv'),
     sellQueueFile: path.join(baseDir, 'sell_queue.json'),
+    deleteQueueFile: path.join(baseDir, 'delete_queue.json'),
   };
 }
 
@@ -227,6 +234,8 @@ export class SniperManager {
   private solPriceUpdatedAt = 0; // epoch ms
   private refreshingSol = false;
   private refreshingPositions = false;
+  private stateRevision = 0;
+  private recentlyDeletedMints = new Map<string, number>();
   private orchestrator: BotOrchestrator | null = null;
   private txAdapter: LiveTxAdapter | null = null;
   private liveWalletBalanceSol: number | null = null;
@@ -450,67 +459,108 @@ export class SniperManager {
     };
   }
 
-  private async refreshStoppedOpenPositions(): Promise<void> {
+  private writeStateAtomic(stateFile: string, state: any): void {
+    const tmp = `${stateFile}.tmp.${process.pid}.${Date.now()}`;
+    const payload = JSON.stringify(state, null, 2);
+    fs.writeFileSync(tmp, payload, 'utf-8');
+    try {
+      fs.renameSync(tmp, stateFile);
+    } catch {
+      fs.writeFileSync(stateFile, payload, 'utf-8');
+      try {
+        if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+      } catch {}
+    }
+  }
+
+  public async refreshStoppedOpenPositions(
+    customFetcher?: (mints: string[]) => Promise<Record<string, number>>
+  ): Promise<void> {
     const mode = this.getMode();
     const { stateFile } = getSniperFilePaths(mode, this.baseDir);
     if (this.refreshingPositions || this.running || !fs.existsSync(stateFile)) return;
     this.refreshingPositions = true;
+    const startRevision = this.stateRevision;
     try {
-      const state = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
-      const positions = state?.positions;
-      if (!positions || typeof positions !== 'object') return;
-      const mints = Object.keys(positions);
+      const initialState = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+      const initialPositions = initialState?.positions;
+      if (!initialPositions || typeof initialPositions !== 'object') return;
+      const nowMs = Date.now();
+      const mints = Object.keys(initialPositions).filter((m) => {
+        const deletedAt = this.recentlyDeletedMints.get(m);
+        return !deletedAt || nowMs - deletedAt > 30_000;
+      });
       if (mints.length === 0) return;
 
       const settings = this.readSettings();
-      const prices: Record<string, number> = {};
-      if (settings.use_jupiter_price !== false) {
-        const jupUrl = settings.jupiter_api_key
-          ? `https://api.jup.ag/price/v3?ids=${encodeURIComponent(mints.join(','))}`
-          : `https://lite-api.jup.ag/price/v3?ids=${encodeURIComponent(mints.join(','))}`;
-        const jup = await this.fetchJsonWithTimeout(
-          jupUrl,
-          3500,
-          settings.jupiter_api_key ? { 'x-api-key': settings.jupiter_api_key } : undefined
-        );
-        if (jup && typeof jup === 'object') {
-          const map = jup.data && typeof jup.data === 'object' ? jup.data : jup;
-          for (const mint of mints) {
-            const px = Number(map?.[mint]?.usdPrice ?? map?.[mint]?.price);
-            if (Number.isFinite(px) && px > 0) prices[mint] = px;
+      const prices: Record<string, number> = customFetcher ? await customFetcher(mints) : {};
+      if (!customFetcher) {
+        if (settings.use_jupiter_price !== false) {
+          const jupUrl = settings.jupiter_api_key
+            ? `https://api.jup.ag/price/v3?ids=${encodeURIComponent(mints.join(','))}`
+            : `https://lite-api.jup.ag/price/v3?ids=${encodeURIComponent(mints.join(','))}`;
+          const jup = await this.fetchJsonWithTimeout(
+            jupUrl,
+            3500,
+            settings.jupiter_api_key ? { 'x-api-key': settings.jupiter_api_key } : undefined
+          );
+          if (jup && typeof jup === 'object') {
+            const map = jup.data && typeof jup.data === 'object' ? jup.data : jup;
+            for (const mint of mints) {
+              const px = Number(map?.[mint]?.usdPrice ?? map?.[mint]?.price);
+              if (Number.isFinite(px) && px > 0) prices[mint] = px;
+            }
           }
         }
-      }
 
-      const missing = mints.filter((m) => !prices[m]);
-      for (let i = 0; i < missing.length; i += 30) {
-        const chunk = missing.slice(i, i + 30);
-        const ds = await this.fetchJsonWithTimeout(`https://api.dexscreener.com/tokens/v1/solana/${chunk.join(',')}`, 3500);
-        if (Array.isArray(ds)) {
-          const bestLiq: Record<string, number> = {};
-          for (const pair of ds) {
-            const mint = pair?.baseToken?.address;
-            const px = Number(pair?.priceUsd);
-            const liq = Number(pair?.liquidity?.usd || 0);
-            if (mint && positions[mint] && !prices[mint] && Number.isFinite(px) && px > 0) {
-              if (bestLiq[mint] === undefined || liq > bestLiq[mint]) {
-                bestLiq[mint] = liq;
-                prices[mint] = px;
+        const missing = mints.filter((m) => !prices[m]);
+        for (let i = 0; i < missing.length; i += 30) {
+          const chunk = missing.slice(i, i + 30);
+          const ds = await this.fetchJsonWithTimeout(`https://api.dexscreener.com/tokens/v1/solana/${chunk.join(',')}`, 3500);
+          if (Array.isArray(ds)) {
+            const bestLiq: Record<string, number> = {};
+            for (const pair of ds) {
+              const mint = pair?.baseToken?.address;
+              const px = Number(pair?.priceUsd);
+              const liq = Number(pair?.liquidity?.usd || 0);
+              if (mint && initialPositions[mint] && !prices[mint] && Number.isFinite(px) && px > 0) {
+                if (bestLiq[mint] === undefined || liq > bestLiq[mint]) {
+                  bestLiq[mint] = liq;
+                  prices[mint] = px;
+                }
               }
             }
           }
         }
       }
 
-      if (this.running) return;
+      // Abort or re-read fresh state after async network calls so deleted/sold positions can NEVER be resurrected
+      if (this.running || this.stateRevision !== startRevision || !fs.existsSync(stateFile)) {
+        return;
+      }
+
+      const freshState = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+      const freshPositions = freshState?.positions;
+      if (!freshPositions || typeof freshPositions !== 'object' || Object.keys(freshPositions).length === 0) {
+        return;
+      }
+
       const nowSec = Date.now() / 1000;
-      state.last_price_time = nowSec;
+      freshState.last_price_time = nowSec;
       const slippage = (settings.slippage_pct ?? 2.0) / 100;
       const fee = (settings.fee_pct ?? 1.0) / 100;
-      for (const mint of mints) {
-        const pos = positions[mint];
+      let anyUpdated = false;
+      for (const mint of Object.keys(freshPositions)) {
+        const deletedAt = this.recentlyDeletedMints.get(mint);
+        if (deletedAt && Date.now() - deletedAt <= 30_000) {
+          delete freshPositions[mint];
+          anyUpdated = true;
+          continue;
+        }
+        const pos = freshPositions[mint];
         const px = prices[mint];
         if (!pos || !px) continue;
+        anyUpdated = true;
         const entry = Number(pos.entry_price || px);
         pos.current_price = px;
         pos.last_updated = nowSec;
@@ -523,11 +573,13 @@ export class SniperManager {
         pos.peak_pct = Number((((pos.peak_price / entry) - 1) * 100).toFixed(2));
         pos.low_pct = Number((((pos.low_price / entry) - 1) * 100).toFixed(2));
       }
+      if (!anyUpdated) return;
       if (this.solPriceUsd) {
-        state.sol_price_usd = this.solPriceUsd;
-        state.sol_price_updated_at = this.solPriceUpdatedAt / 1000;
+        freshState.sol_price_usd = this.solPriceUsd;
+        freshState.sol_price_updated_at = this.solPriceUpdatedAt / 1000;
       }
-      fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf-8');
+      if (this.running || this.stateRevision !== startRevision) return;
+      this.writeStateAtomic(stateFile, freshState);
     } catch {
       // Ignore transient errors
     } finally {
@@ -545,6 +597,10 @@ export class SniperManager {
       take_profit_pct: 50.0,
       stop_loss_pct: 0.0,
       trailing_stop_pct: 0.0,
+      recover_principal_enabled: false,
+      recover_principal_sell_pct: 50.0,
+      scale_out_sell_pct: 25.0,
+      scale_out_step_gain_pct: 100.0,
       auto_rug_exit: true,
       rug_liq_drop_pct: 75.0,
       max_hold_minutes: 120,
@@ -617,6 +673,17 @@ export class SniperManager {
     }
 
     if (state.positions) {
+      const nowMs = Date.now();
+      for (const mint of Object.keys(state.positions)) {
+        const deletedAt = this.recentlyDeletedMints.get(mint);
+        if (deletedAt) {
+          if (nowMs - deletedAt <= 30_000) {
+            delete state.positions[mint];
+            continue;
+          }
+          this.recentlyDeletedMints.delete(mint);
+        }
+      }
       for (const [_mint, pos] of Object.entries<any>(state.positions)) {
         if (!pos.current_price || pos.current_price <= 0) {
           pos.current_price = pos.entry_price;
@@ -773,6 +840,13 @@ export class SniperManager {
 
     const settings = this.readSettings();
     const mode = this.getMode(settings);
+    const validation = validatePythonSniperSettings({ ...settings, mode }, this.solPriceUsd);
+    if (!validation.valid) {
+      return {
+        ok: false,
+        message: validation.error || 'Invalid Python Sniper settings: raise Take Profit % before starting.',
+      };
+    }
 
     if (mode === 'live') {
       if (!this.orchestrator?.signer.isUnlocked() || !this.orchestrator.signer.getPublicKey()) {
@@ -914,6 +988,13 @@ export class SniperManager {
             : 'live'
           : 'paper',
       };
+      const validation = validatePythonSniperSettings(updated, this.solPriceUsd);
+      if (!validation.valid) {
+        return {
+          ok: false,
+          message: validation.error || 'Take profit % is too low to recover invested capital.',
+        };
+      }
       fs.writeFileSync(this.settingsFile, JSON.stringify(updated, null, 2), 'utf-8');
       this.appendLog('INFO', 'Python bot settings updated and saved.');
       return { ok: true, settings: updated };
@@ -932,7 +1013,8 @@ export class SniperManager {
           message: 'Live trade ledger and real wallet balance cannot be reset. Switch to PAPER mode to reset simulated funds.',
         };
       }
-      const { stateFile, tradesCsv, sellQueueFile } = getSniperFilePaths('paper', this.baseDir);
+      this.stateRevision += 1;
+      const { stateFile, tradesCsv, sellQueueFile, deleteQueueFile } = getSniperFilePaths('paper', this.baseDir);
       const startCash = typeof settings.start_balance_usd === 'number' ? settings.start_balance_usd : 50.0;
       const freshState = {
         mode: 'paper',
@@ -950,9 +1032,10 @@ export class SniperManager {
         sol_price_usd: this.solPriceUsd,
         sol_price_updated_at: this.solPriceUpdatedAt ? this.solPriceUpdatedAt / 1000 : 0,
       };
-      fs.writeFileSync(stateFile, JSON.stringify(freshState, null, 2), 'utf-8');
+      this.writeStateAtomic(stateFile, freshState);
       if (fs.existsSync(tradesCsv)) fs.unlinkSync(tradesCsv);
       if (fs.existsSync(sellQueueFile)) fs.unlinkSync(sellQueueFile);
+      if (fs.existsSync(deleteQueueFile)) fs.unlinkSync(deleteQueueFile);
       this.appendLog('INFO', `Python bot paper account reset (cash set to $${startCash.toFixed(2)}, trades cleared).`);
       return { ok: true, message: `Paper account reset with $${startCash.toFixed(2)} start balance` };
     } catch (err) {
@@ -1198,6 +1281,7 @@ export class SniperManager {
     slippagePct?: number;
     solPriceUsd?: number | null;
     reason?: string;
+    sellFraction?: number | null;
   }): Promise<{
     ok: boolean;
     error?: string;
@@ -1213,6 +1297,11 @@ export class SniperManager {
     reclaimedRentSol?: number;
     solPriceUsd?: number;
     walletBalanceSol?: number | null;
+    soldQty?: number;
+    soldFraction?: number;
+    isPartial?: boolean;
+    remainingQty?: number;
+    remainingRawAmount?: string | null;
   }> {
     if (!this.orchestrator || !this.txAdapter) {
       return { ok: false, error: 'Live trading bridge not attached to server orchestrator.' };
@@ -1234,8 +1323,8 @@ export class SniperManager {
 
     // 1. Resolve exact on-chain raw integer token balance & decimals (even if 1 RPC is 429 rate-limited)
     let effectiveDecimals = typeof params.decimals === 'number' && params.decimals >= 0 ? params.decimals : 6;
-    let soldQty = Number(params.qty || 0);
-    let exactRawAmount: string | null =
+    let totalHeldQty = Number(params.qty || 0);
+    let exactTotalRaw: string | null =
       params.rawAmount && /^\d+$/.test(params.rawAmount) && BigInt(params.rawAmount) > 0n
         ? params.rawAmount
         : null;
@@ -1252,16 +1341,43 @@ export class SniperManager {
       if (typeof bal.decimals === 'number' && bal.decimals >= 0) {
         effectiveDecimals = bal.decimals;
       }
-      if (soldQty <= 0 || bal.balanceUi < soldQty) {
-        soldQty = bal.balanceUi;
+      if (totalHeldQty <= 0 || bal.balanceUi < totalHeldQty) {
+        totalHeldQty = bal.balanceUi;
       }
       if (bal.rawAmount && /^\d+$/.test(bal.rawAmount) && BigInt(bal.rawAmount) > 0n) {
-        exactRawAmount = bal.rawAmount;
+        exactTotalRaw = bal.rawAmount;
       }
     }
 
-    const amountRaw =
-      exactRawAmount ?? String(Math.max(1, Math.floor(soldQty * 10 ** effectiveDecimals)));
+    const totalRawBig =
+      exactTotalRaw !== null
+        ? BigInt(exactTotalRaw)
+        : BigInt(Math.max(1, Math.floor(totalHeldQty * 10 ** effectiveDecimals)));
+
+    const requestedFraction =
+      params.sellFraction !== undefined &&
+      params.sellFraction !== null &&
+      Number.isFinite(params.sellFraction) &&
+      params.sellFraction > 0 &&
+      params.sellFraction < 0.999
+        ? Math.max(0.05, Math.min(0.99, params.sellFraction))
+        : 1.0;
+
+    let rawToSellBig = totalRawBig;
+    let isPartial = false;
+    if (requestedFraction < 0.999 && totalRawBig > 1n) {
+      const scaled = (totalRawBig * BigInt(Math.round(requestedFraction * 10_000))) / 10_000n;
+      if (scaled > 0n && scaled < totalRawBig) {
+        rawToSellBig = scaled;
+        isPartial = true;
+      }
+    }
+
+    const actualSoldFraction =
+      totalRawBig > 0n ? Number(rawToSellBig) / Number(totalRawBig) : 1.0;
+    const soldQty = Number(rawToSellBig) / 10 ** effectiveDecimals;
+    const amountRaw = rawToSellBig.toString();
+
     const baseSlippageBps = Math.min(2500, Math.max(100, Math.round((params.slippagePct ?? 2.0) * 100)));
     const slippageTiers = Array.from(
       new Set([
@@ -1355,7 +1471,7 @@ export class SniperManager {
       };
     }
 
-    // 3. Reconcile exact SOL proceeds
+    // 3. Reconcile exact SOL proceeds & remaining balance (when partial sell)
     const txDelta = await this.txAdapter.reconcileParsedSwapSolDelta(sig, owner, params.mint);
     const quotedSolOut = Number(quote.outAmount) / LAMPORTS_PER_SOL;
     let solOut = quotedSolOut;
@@ -1370,12 +1486,34 @@ export class SniperManager {
       }
     }
 
+    let remainingQty = Math.max(0, totalHeldQty - soldQty);
+    let remainingRawAmount: string | null =
+      totalRawBig > rawToSellBig ? (totalRawBig - rawToSellBig).toString() : null;
+    if (isPartial) {
+      const postBal = await rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => null);
+      if (postBal && (postBal.agreed || (postBal.readings?.length ?? 0) > 0) && postBal.balanceUi !== null) {
+        remainingQty = Math.max(0, postBal.balanceUi);
+        if (postBal.rawAmount && /^\d+$/.test(postBal.rawAmount)) {
+          remainingRawAmount = postBal.rawAmount;
+        }
+      }
+      if (remainingQty <= 0) {
+        isPartial = false;
+        remainingRawAmount = null;
+      }
+    } else {
+      remainingQty = 0;
+      remainingRawAmount = null;
+    }
+
     const proceedsUsd = solOut * solPriceUsd;
-    const costSol =
+    const totalCostSol =
       params.costSol && params.costSol > 0 ? params.costSol : solPriceUsd > 0 ? params.costUsd / solPriceUsd : 0;
-    const netSolDelta = solOut + reclaimedRentSol - costSol - feeSol;
+    const allocatedCostUsd = params.costUsd * actualSoldFraction;
+    const allocatedCostSol = totalCostSol * actualSoldFraction;
+    const netSolDelta = solOut + reclaimedRentSol - allocatedCostSol - feeSol;
     const pnlUsd = netSolDelta * solPriceUsd;
-    const pnlPct = params.costUsd > 0 ? (pnlUsd / params.costUsd) * 100 : 0;
+    const pnlPct = allocatedCostUsd > 0 ? (pnlUsd / allocatedCostUsd) * 100 : 0;
     const exitPriceUsd = soldQty > 0 ? proceedsUsd / soldQty : 0;
 
     if (typeof rpcPool.getAgreedBalanceSol === 'function') {
@@ -1401,6 +1539,11 @@ export class SniperManager {
       reclaimedRentSol,
       solPriceUsd,
       walletBalanceSol: this.liveWalletBalanceSol,
+      soldQty,
+      soldFraction: actualSoldFraction,
+      isPartial,
+      remainingQty,
+      remainingRawAmount,
     };
   }
 
@@ -1477,6 +1620,8 @@ export class SniperManager {
         state.cash = (state.cash || 50) + proceeds;
       }
 
+      this.stateRevision += 1;
+      this.recentlyDeletedMints.set(mint, Date.now());
       state.last_sell_time = Date.now() / 1000;
       delete state.positions[mint];
       state.closed = (state.closed || 0) + 1;
@@ -1486,7 +1631,7 @@ export class SniperManager {
       if (Object.keys(state.positions).length < maxSlots) {
         state.scan_paused = false;
       }
-      fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf-8');
+      this.writeStateAtomic(stateFile, state);
 
       if (!fs.existsSync(tradesCsv)) {
         fs.writeFileSync(
@@ -1539,13 +1684,23 @@ export class SniperManager {
     try {
       const settings = this.readSettings();
       const mode = this.getMode(settings);
-      const { stateFile, tradesCsv } = getSniperFilePaths(mode, this.baseDir);
+      const { stateFile, tradesCsv, sellQueueFile, deleteQueueFile } = getSniperFilePaths(mode, this.baseDir);
 
       if (!fs.existsSync(stateFile)) return { ok: false, message: 'No active state' };
       const state = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
       if (!state.positions || !state.positions[mint]) {
-        return { ok: false, message: 'Position not found' };
+        return { ok: false, message: 'Position already removed' };
       }
+
+      this.stateRevision += 1;
+      this.recentlyDeletedMints.set(mint, Date.now());
+      if (this.recentlyDeletedMints.size > 500) {
+        const cutoff = Date.now() - 60_000;
+        for (const [k, ts] of this.recentlyDeletedMints.entries()) {
+          if (ts < cutoff) this.recentlyDeletedMints.delete(k);
+        }
+      }
+
       const pos = state.positions[mint];
       const maxSlots = Math.max(1, Number(settings.max_open_positions || 3));
       const nowIso = new Date().toISOString();
@@ -1556,13 +1711,43 @@ export class SniperManager {
 
       state.last_sell_time = Date.now() / 1000;
       delete state.positions[mint];
+      if (!Array.isArray(state.blacklist)) state.blacklist = [];
+      if (!state.blacklist.includes(mint)) {
+        state.blacklist.push(mint);
+        if (state.blacklist.length > 5000) {
+          state.blacklist = state.blacklist.slice(-5000);
+        }
+      }
       state.closed = (state.closed || 0) + 1;
       state.total_pnl = (state.total_pnl || 0) + pnlUsd;
       state.day_pnl = (state.day_pnl || 0) + pnlUsd;
       if (Object.keys(state.positions).length < maxSlots) {
         state.scan_paused = false;
       }
-      fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf-8');
+      this.writeStateAtomic(stateFile, state);
+
+      // Remove mint from pending sell queue if present
+      if (fs.existsSync(sellQueueFile)) {
+        try {
+          const q = JSON.parse(fs.readFileSync(sellQueueFile, 'utf-8'));
+          if (Array.isArray(q) && q.includes(mint)) {
+            fs.writeFileSync(sellQueueFile, JSON.stringify(q.filter((m) => m !== mint)), 'utf-8');
+          }
+        } catch {}
+      }
+
+      // If Python bot process is running in memory, also signal delete_queue so it never overwrites disk state
+      if (this.running) {
+        try {
+          let dq: string[] = [];
+          if (fs.existsSync(deleteQueueFile)) {
+            const parsed = JSON.parse(fs.readFileSync(deleteQueueFile, 'utf-8'));
+            if (Array.isArray(parsed)) dq = parsed;
+          }
+          if (!dq.includes(mint)) dq.push(mint);
+          fs.writeFileSync(deleteQueueFile, JSON.stringify(dq), 'utf-8');
+        } catch {}
+      }
 
       if (!fs.existsSync(tradesCsv)) {
         fs.writeFileSync(

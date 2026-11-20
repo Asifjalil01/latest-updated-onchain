@@ -31,6 +31,7 @@ import {
   orderLogsNewestFirst,
   formatBotUptime,
   formatTrailingModeHint,
+  validatePythonSniperSettings,
   type EnrichedSniperTrade,
 } from '../../utils/sniperFormat';
 
@@ -41,6 +42,11 @@ interface SniperPosition {
   current_price?: number;
   cost: number;
   cost_sol?: number;
+  original_cost?: number;
+  principal_recovered?: boolean;
+  recovered_usd?: number;
+  next_scale_out_pct?: number;
+  scale_out_count?: number;
   tx_buy?: string;
   opened: number;
   url: string;
@@ -89,8 +95,13 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['daily_loss_limit_usd', 'Daily loss limit $', 'float'],
   ['take_profit_pct', 'Take profit % (0 = off)', 'float'],
   ['trailing_stop_pct', 'Trailing stop % from peak (0 = off)', 'float'],
+  ['recover_principal_enabled', 'Recover investment at TP (sell % + trailing ladder)', 'bool'],
+  ['recover_principal_sell_pct', 'Step 1: Sell % at TP to recover money (default 50)', 'float'],
+  ['scale_out_sell_pct', 'Step 2: Sell % of remaining on extra pumps (0 = off)', 'float'],
+  ['scale_out_step_gain_pct', 'Step 2: Extra pump step +% (e.g. 100 = every +100%)', 'float'],
   ['max_hold_minutes', 'Max hold (minutes)', 'int'],
   ['max_age_minutes', 'Sniper window: max coin age (minutes)', 'float'],
+  ['ultra_early_grace_sec', 'Ultra-early rug-filter bypass window (sec, 0 = strict)', 'int'],
   ['scan_interval_sec', 'Scan for new coins every (sec)', 'int'],
   ['rescan_delay_after_sell_sec', 'Delay before rescan after sell (sec)', 'int'],
   ['monitor_interval_sec', 'Price check every (sec)', 'float'],
@@ -205,6 +216,7 @@ export function PythonSniperView() {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [confirmSellMint, setConfirmSellMint] = useState<string | null>(null);
   const [confirmDeleteMint, setConfirmDeleteMint] = useState<string | null>(null);
+  const [deletingMint, setDeletingMint] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
 
   const fetchStatus = async () => {
@@ -383,17 +395,34 @@ export function PythonSniperView() {
         }
       }
 
+      const clientCheck = validatePythonSniperSettings({ ...payload, mode }, solPriceUsd);
+      if (!clientCheck.valid) {
+        pushToast({
+          kind: 'error',
+          title: 'Take Profit too low to recover investment',
+          body: clientCheck.error || 'Adjust Take profit % before saving.',
+        });
+        return;
+      }
+
       const data = await apiFetch<any>('/api/sniper/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ settings: payload }),
       });
-      if (data.ok) {
-        setServerSettings(payload);
-        setDraftSettings(payload);
+      if (data?.ok) {
+        const saved = data.settings ? { ...payload, ...data.settings } : payload;
+        setServerSettings(saved);
+        setDraftSettings(saved);
         markSettingsDirty(false);
         pushToast({ kind: 'success', title: 'Python sniper settings saved' });
         void fetchStatus();
+      } else {
+        pushToast({
+          kind: 'error',
+          title: 'Settings rejected',
+          body: data?.message || 'Unable to save settings.',
+        });
       }
     } catch (err) {
       pushToast({ kind: 'error', title: 'Save failed', body: err instanceof Error ? err.message : 'Error' });
@@ -427,6 +456,7 @@ export function PythonSniperView() {
   };
 
   const handleForceDelete = async (mint: string) => {
+    if (deletingMint === mint) return;
     if (confirmDeleteMint !== mint) {
       setConfirmDeleteMint(mint);
       setTimeout(() => {
@@ -435,6 +465,7 @@ export function PythonSniperView() {
       return;
     }
     setConfirmDeleteMint(null);
+    setDeletingMint(mint);
     try {
       const data = await apiFetch<any>('/api/sniper/delete-position', {
         method: 'POST',
@@ -442,6 +473,12 @@ export function PythonSniperView() {
         body: JSON.stringify({ mint, reason: 'rugpull_writeoff' }),
       });
       if (data.ok) {
+        // Immediately remove from optimistic React state so it clears even before next 1s poll
+        setState((prev) => {
+          const nextPositions = { ...(prev.positions || {}) };
+          delete nextPositions[mint];
+          return { ...prev, positions: nextPositions };
+        });
         pushToast({ kind: 'success', title: data.message });
         void fetchStatus();
       } else {
@@ -449,6 +486,8 @@ export function PythonSniperView() {
       }
     } catch (err) {
       pushToast({ kind: 'error', title: 'Delete failed', body: err instanceof Error ? err.message : 'Error' });
+    } finally {
+      setDeletingMint((cur) => (cur === mint ? null : cur));
     }
   };
 
@@ -554,6 +593,9 @@ export function PythonSniperView() {
   });
 
   const newestFirstLogs = orderLogsNewestFirst(logs);
+  const draftValidation = validatePythonSniperSettings({ ...draftSettings, mode }, solPriceUsd);
+  const recoverPrincipalOn =
+    draftSettings.recover_principal_enabled === true || draftSettings.recover_principal_enabled === 'true';
 
   let statusText = 'STOPPED';
   let statusBadgeClass = 'bg-slate-500/20 text-slate-500 dark:text-slate-400';
@@ -944,16 +986,28 @@ export function PythonSniperView() {
                             <span className="text-slate-500 mx-1">/</span>
                             <span className="text-rose-500/90">{lowPct.toFixed(1)}%</span>
                           </div>
-                          {p.trailing_active && (
-                            <span
-                              className="inline-block mt-0.5 px-1.5 py-0.2 rounded bg-emerald-500/15 text-emerald-500 border border-emerald-500/30 text-[9px] font-bold uppercase tracking-wider"
-                              title="Profit target reached — trailing stop is armed and tracking peak"
-                            >
-                              {typeof p.trailing_floor_pct === 'number'
-                                ? `Trail ≥ +${p.trailing_floor_pct.toFixed(1)}%`
-                                : 'Trail On'}
-                            </span>
-                          )}
+                          <div className="flex flex-wrap items-center justify-end gap-1 mt-0.5">
+                            {p.principal_recovered && (
+                              <span
+                                className="inline-block px-1.5 py-0.2 rounded bg-teal-500/15 text-teal-500 border border-teal-500/30 text-[9px] font-bold uppercase tracking-wider"
+                                title={`Principal recovered: $${(p.recovered_usd ?? 0).toFixed(2)}${typeof p.next_scale_out_pct === 'number' && p.next_scale_out_pct > 0 ? ` · Next partial sell at +${p.next_scale_out_pct.toFixed(0)}%` : ''}`}
+                              >
+                                {typeof p.next_scale_out_pct === 'number' && p.next_scale_out_pct > 0
+                                  ? `Principal Safe · Next +${p.next_scale_out_pct.toFixed(0)}%`
+                                  : 'Principal Safe'}
+                              </span>
+                            )}
+                            {p.trailing_active && (
+                              <span
+                                className="inline-block px-1.5 py-0.2 rounded bg-emerald-500/15 text-emerald-500 border border-emerald-500/30 text-[9px] font-bold uppercase tracking-wider"
+                                title="Profit target reached — trailing stop is armed and tracking peak"
+                              >
+                                {typeof p.trailing_floor_pct === 'number'
+                                  ? `Trail ≥ +${p.trailing_floor_pct.toFixed(1)}%`
+                                  : 'Trail On'}
+                              </span>
+                            )}
+                          </div>
                         </td>
 
                         {/* Held */}
@@ -1014,15 +1068,20 @@ export function PythonSniperView() {
                           </button>
                           <button
                             type="button"
+                            disabled={deletingMint === p.mint}
                             onClick={() => void handleForceDelete(p.mint)}
-                            className={`px-2 py-1 rounded text-[11px] font-bold transition-colors ${
+                            className={`px-2 py-1 rounded text-[11px] font-bold transition-colors disabled:opacity-50 ${
                               confirmDeleteMint === p.mint
                                 ? 'bg-amber-600 text-white hover:bg-amber-500'
                                 : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20'
                             }`}
                             title="Manually clear stuck or rugged position and free slot"
                           >
-                            {confirmDeleteMint === p.mint ? 'Confirm Delete?' : 'Force Delete'}
+                            {deletingMint === p.mint
+                              ? 'Deleting...'
+                              : confirmDeleteMint === p.mint
+                                ? 'Confirm Delete?'
+                                : 'Force Delete'}
                           </button>
                         </td>
                       </tr>
@@ -1259,13 +1318,19 @@ export function PythonSniperView() {
                         <td className="py-2 px-2">
                           <span
                             className={`px-2 py-0.5 rounded text-[10px] font-semibold whitespace-nowrap ${
-                              t.reason.startsWith('take_profit')
-                                ? 'bg-emerald-500/10 text-emerald-500'
-                                : t.reason.startsWith('trailing_stop')
-                                  ? 'bg-amber-500/10 text-amber-500'
-                                  : t.reason.startsWith('manual')
-                                    ? 'bg-blue-500/10 text-blue-500'
-                                    : 'bg-slate-500/10 text-slate-400'
+                              t.reason.startsWith('principal_recovery')
+                                ? 'bg-teal-500/15 text-teal-500 border border-teal-500/30'
+                                : t.reason.startsWith('scale_out')
+                                  ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                                  : t.reason.startsWith('take_profit')
+                                    ? 'bg-emerald-500/10 text-emerald-500'
+                                    : t.reason.startsWith('trailing_stop')
+                                      ? 'bg-amber-500/10 text-amber-500'
+                                      : t.reason.startsWith('manual')
+                                        ? 'bg-blue-500/10 text-blue-500'
+                                        : t.reason.startsWith('rugpull')
+                                          ? 'bg-rose-500/10 text-rose-400'
+                                          : 'bg-slate-500/10 text-slate-400'
                             }`}
                           >
                             {t.reason || '—'}
@@ -1435,73 +1500,143 @@ export function PythonSniperView() {
                       )
                     : null;
 
-                return (
-                  <div key={key} className="space-y-1">
-                    <div className="flex items-center justify-between gap-2">
-                      <label htmlFor={`py-set-${key}`} className="font-sans font-medium text-slate-700 dark:text-slate-300">
-                        {label}
-                      </label>
-                      {solEquivalent && (
-                        <span className="font-mono text-[11px] font-semibold text-teal-600 dark:text-teal-400 whitespace-nowrap">
-                          ≈ {solEquivalent}
-                        </span>
-                      )}
-                      {timeHelper && (
-                        <span className="font-mono text-[11px] font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap">
-                          {timeHelper}
+                    const hasTpRecoveryError =
+                      key === 'take_profit_pct' && recoverPrincipalOn && !draftValidation.valid;
+
+                    return (
+                      <div key={key} className="space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <label htmlFor={`py-set-${key}`} className="font-sans font-medium text-slate-700 dark:text-slate-300">
+                            {label}
+                          </label>
+                          {solEquivalent && (
+                            <span className="font-mono text-[11px] font-semibold text-teal-600 dark:text-teal-400 whitespace-nowrap">
+                              ≈ {solEquivalent}
+                            </span>
+                          )}
+                          {timeHelper && (
+                            <span className="font-mono text-[11px] font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap">
+                              {timeHelper}
+                            </span>
+                          )}
+                        </div>
+                        {kind === 'bool' ? (
+                          <select
+                            id={`py-set-${key}`}
+                            value={val === true || val === 'true' ? 'true' : 'false'}
+                            onChange={(e) => {
+                              setDraftSettings({ ...draftSettings, [key]: e.target.value === 'true' });
+                              markSettingsDirty(true);
+                            }}
+                            className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100"
+                          >
+                            <option value="true">True (Enabled)</option>
+                            <option value="false">False (Disabled)</option>
+                          </select>
+                        ) : (
+                          <input
+                            id={`py-set-${key}`}
+                            type={kind === 'int' || kind === 'float' ? 'number' : 'text'}
+                            step={kind === 'float' ? 'any' : '1'}
+                            value={val ?? ''}
+                            onChange={(e) => {
+                              setDraftSettings({ ...draftSettings, [key]: e.target.value });
+                              markSettingsDirty(true);
+                            }}
+                            className={`w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 ${
+                              hasTpRecoveryError
+                                ? 'border-rose-500 focus:ring-rose-500'
+                                : 'border-slate-200 dark:border-slate-800 focus:ring-teal-500'
+                            }`}
+                          />
+                        )}
+                        {trailHelper && (
+                          <p className="font-mono text-[11px] font-medium text-teal-600 dark:text-teal-400">
+                            {trailHelper}
+                          </p>
+                        )}
+                        {hasTpRecoveryError && draftValidation.error && (
+                          <div className="p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-600 dark:text-rose-400 text-[11px] space-y-1.5">
+                            <p className="font-semibold leading-snug">{draftValidation.error}</p>
+                            {draftValidation.recovery && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setDraftSettings({
+                                    ...draftSettings,
+                                    take_profit_pct: draftValidation.recovery!.minTpPct,
+                                  });
+                                  markSettingsDirty(true);
+                                }}
+                                className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-mono font-bold text-[10px] transition-colors"
+                              >
+                                Set Take profit to +{draftValidation.recovery.minTpPct.toFixed(1)}%
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {recoverPrincipalOn && (
+                  <div
+                    className={`rounded-xl border p-4 text-xs space-y-1.5 ${
+                      draftValidation.valid
+                        ? 'border-teal-500/30 bg-teal-500/5 text-slate-700 dark:text-slate-300'
+                        : 'border-rose-500/40 bg-rose-500/5 text-rose-700 dark:text-rose-300'
+                    }`}
+                  >
+                    <div className="font-bold flex items-center justify-between gap-2">
+                      <span>Principal Recovery &amp; Scale-Out Strategy Preview</span>
+                      {draftValidation.recovery && (
+                        <span className="font-mono text-[11px]">
+                          Min TP required: +{draftValidation.recovery.minTpPct.toFixed(1)}%
                         </span>
                       )}
                     </div>
-                    {kind === 'bool' ? (
-                      <select
-                        id={`py-set-${key}`}
-                        value={val === true || val === 'true' ? 'true' : 'false'}
-                        onChange={(e) => {
-                          setDraftSettings({ ...draftSettings, [key]: e.target.value === 'true' });
-                          markSettingsDirty(true);
-                        }}
-                        className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100"
-                      >
-                        <option value="true">True (Enabled)</option>
-                        <option value="false">False (Disabled)</option>
-                      </select>
+                    {draftValidation.valid && draftValidation.recovery ? (
+                      <p className="font-mono text-[11px] leading-relaxed">
+                        Invest <strong>${draftValidation.recovery.tradeSizeUsd.toFixed(2)}</strong> → at{' '}
+                        <strong>+{parseFloat(String(draftSettings.take_profit_pct || 0))}%</strong> sell{' '}
+                        <strong>{draftValidation.recovery.recoverSellPct}%</strong> (recovers your $
+                        {draftValidation.recovery.targetRecoveryUsd.toFixed(2)} incl. fees &amp; slippage)
+                        {parseFloat(String(draftSettings.scale_out_sell_pct || 0)) > 0 &&
+                        parseFloat(String(draftSettings.scale_out_step_gain_pct || 0)) > 0
+                          ? ` → then sell ${parseFloat(String(draftSettings.scale_out_sell_pct))}% of remaining every extra +${parseFloat(String(draftSettings.scale_out_step_gain_pct))}% pump`
+                          : ''}
+                        {parseFloat(String(draftSettings.trailing_stop_pct || 0)) > 0
+                          ? ` → trailing stop exits -${parseFloat(String(draftSettings.trailing_stop_pct))}% from peak on remaining bag.`
+                          : ' → remaining bag holds for scale-outs / max hold.'}
+                      </p>
                     ) : (
-                      <input
-                        id={`py-set-${key}`}
-                        type={kind === 'int' || kind === 'float' ? 'number' : 'text'}
-                        step={kind === 'float' ? 'any' : '1'}
-                        value={val ?? ''}
-                        onChange={(e) => {
-                          setDraftSettings({ ...draftSettings, [key]: e.target.value });
-                          markSettingsDirty(true);
-                        }}
-                        className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-teal-500"
-                      />
-                    )}
-                    {trailHelper && (
-                      <p className="font-mono text-[11px] font-medium text-teal-600 dark:text-teal-400">
-                        {trailHelper}
+                      <p className="text-[11px] font-medium">
+                        {draftValidation.error || 'Take Profit % must cover your investment + fees before saving.'}
                       </p>
                     )}
                   </div>
-                );
-              })}
-            </div>
+                )}
 
-            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between">
-              <span className="text-xs text-slate-500">
-                {isSettingsDirty ? 'You have unsaved changes. Click Apply to save.' : 'Settings are synced with settings.json.'}
-              </span>
-              <button
-                type="submit"
-                className="px-6 py-2.5 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white transition-colors shadow-sm"
-              >
-                Apply and Save Python Settings
-              </button>
+                <div className="pt-4 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
+                  <span className={`text-xs ${recoverPrincipalOn && !draftValidation.valid ? 'text-rose-500 font-semibold' : 'text-slate-500'}`}>
+                    {recoverPrincipalOn && !draftValidation.valid
+                      ? 'Fix Take profit % above to recover your invested money before saving or starting.'
+                      : isSettingsDirty
+                        ? 'You have unsaved changes. Click Apply to save.'
+                        : 'Settings are synced with settings.json.'}
+                  </span>
+                  <button
+                    type="submit"
+                    disabled={recoverPrincipalOn && !draftValidation.valid}
+                    className="px-6 py-2.5 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 disabled:bg-slate-400 disabled:cursor-not-allowed text-white transition-colors shadow-sm"
+                  >
+                    Apply and Save Python Settings
+                  </button>
+                </div>
+              </form>
             </div>
-          </form>
-        </div>
-      )}
+          )}
     </div>
   );
 }
