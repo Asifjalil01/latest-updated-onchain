@@ -847,5 +847,13 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.json(sniperManager.forceDeletePosition(mint, reason));
   });
 
+  router.post('/sniper/logs/clear', (_req: Request, res: Response) => {
+    res.json(sniperManager.clearLogs());
+  });
+
+  router.get('/sniper/pumpportal-mints', (_req: Request, res: Response) => {
+    res.json({ ok: true, mints: sniperManager.getPumpPortalMints() });
+  });
+
   return router;
 }

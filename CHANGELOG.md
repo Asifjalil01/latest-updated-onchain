@@ -2,6 +2,37 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.30.1 — Profit-Protected Trailing Stop & Take-Profit Activation (`bot.py`, `PythonSniperView.tsx`, `sniperFormat.ts`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed
+- **Trailing Stop No Longer Sells in a Loss or Cuts Upside Early at Take Profit (`bot.py`)**:
+  - Fixed a bug where `trailing_stop_pct` activated at a hardcoded `+10%` peak (`peak_chg >= 10`), causing a 15% pullback from `+10%` (`1.10 * 0.85 = -6.5%`) to trigger `trailing_stop_15` **at a loss** before reaching your Take Profit target.
+  - When **both** `take_profit_pct` (e.g., `50%`) and `trailing_stop_pct` (e.g., `15%`) are configured, Take Profit now acts as the **activation threshold**: the bot waits until `+50%` is reached before arming the trailing stop, does **not** force-sell right at `+50%` if momentum continues upward (`+80%`, `+120%`, etc.), and only exits via trailing stop when price pulls back `15%` from the highest peak while remaining strictly in profit above entry.
+  - When `take_profit_pct` is `0` (disabled) and `trailing_stop_pct > 0`, trailing stop automatically waits until peak profit exceeds breakeven + `5%` fee/slippage buffer before arming, and uses true drawdown from peak `(1 - price / peak_price) * 100 >= trailing_stop_pct`.
+- **UI Indicators & Settings Hints (`PythonSniperView.tsx`, `sniperFormat.ts`)**:
+  - Added a live inline rule hint beside `Trailing stop % from peak` in Settings (e.g. `Arms at +50% · exits -15% from peak (profit only)`) and a `Trail On` badge under `Peak / Low` in Open Positions once the profit target is reached and trailing stop is armed.
+
+---
+
+## v1.30.0 — Sub-Minute Launch Discovery Fix, Live Bot Runtime Timer & Clear Scan Logs (`bot.py`, `sniperManager.ts`, `api.ts`, `PythonSniperView.tsx`, `sniperFormat.ts`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed & Improved
+- **Fixed `pumpportal=0`, GeckoTerminal 429 Drop-Outs & Sub-Minute Pool Discovery (`bot.py`, `sniperManager.ts`, `api.ts`)**:
+  - Replaced the broken `api.pumpportal.fun/api/data/coins/new` HTTP call (which consistently returned `pumpportal=0`) with a live bridge endpoint (`/api/sniper/pumpportal-mints`) connected directly to Node's real-time `PumpPortalWsProvider` WebSocket stream (`subscribeNewToken` & `subscribeMigration`).
+  - Fixed GeckoTerminal `/new_pools` polling so it fetches `page=1` every 10s with automatic 429 backoff instead of hammering 2 pages every 5s and dropping to `gecko=0`.
+  - Cached GeckoTerminal pool metadata (`pool_created_at`, `base_token_price_usd`, `reserve_in_usd`, `transactions.m5`) as an immediate fallback when brand-new `<1m` coins are not yet indexed on DexScreener (`not-on-dexscreener`), and prioritized real-time `pumpportal` & `gecko` launches ahead of older lists so `max_age_minutes` windows (`1m`, `1.5m`, `2m`) actually catch sub-minute coins.
+  - Stopped repeatedly re-logging already-expired `too old` coins every 10 seconds while keeping them eligible for immediate re-evaluation whenever `settings.json` changes.
+- **Clear Scan Logs Button (`POST /api/sniper/logs/clear`, `PythonSniperView.tsx`)**:
+  - Added a **Clear logs** button right inside the Scan log header bar next to the event count to wipe console scan history on both the UI and backend buffer.
+- **Live Bot Runtime Timer (`sniperManager.ts`, `PythonSniperView.tsx`, `sniperFormat.ts`)**:
+  - Added a real-time `Runtime HH:MM:SS` timer badge in the Python Sniper Bot header (`started_at_ms` / `uptime_sec`) so you can immediately see how long the bot has been running.
+
+---
+
 ## v1.29.1 — Live Buy Entry Price & ExactIn Swap Cost Basis Fix (`sniperManager.ts`, `liveEngine.ts`)
 
 **Risk Warning: Trading can lose all of your money.**

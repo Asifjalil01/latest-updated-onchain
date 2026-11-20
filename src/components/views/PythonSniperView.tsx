@@ -17,6 +17,8 @@ import {
   ShieldAlert,
   RefreshCw,
   Download,
+  Trash2,
+  Clock,
 } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import {
@@ -27,6 +29,8 @@ import {
   fmtSolAmount,
   usdToSol,
   orderLogsNewestFirst,
+  formatBotUptime,
+  formatTrailingModeHint,
   type EnrichedSniperTrade,
 } from '../../utils/sniperFormat';
 
@@ -46,6 +50,7 @@ interface SniperPosition {
   low_price?: number;
   peak_pct?: number;
   low_pct?: number;
+  trailing_active?: boolean;
   dex?: string;
   source?: string;
   age_at_entry?: number;
@@ -185,7 +190,10 @@ export function PythonSniperView() {
   const [priceAgeSec, setPriceAgeSec] = useState<number | null>(null);
   const [scanPaused, setScanPaused] = useState(false);
   const [cooldownSec, setCooldownSec] = useState<number>(0);
+  const [startedAtMs, setStartedAtMs] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [exportingCsv, setExportingCsv] = useState(false);
+  const [clearingLogs, setClearingLogs] = useState(false);
   const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'logs' | 'settings'>('positions');
   const [historySearch, setHistorySearch] = useState('');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -199,6 +207,13 @@ export function PythonSniperView() {
       if (data) {
         setMode(data.mode === 'live' ? 'live' : 'paper');
         setRunning(Boolean(data.running));
+        setStartedAtMs(
+          Boolean(data.running) && typeof data.started_at_ms === 'number'
+            ? data.started_at_ms
+            : Boolean(data.running) && typeof data.uptime_sec === 'number'
+              ? Date.now() - data.uptime_sec * 1000
+              : null
+        );
         setState(data.state || {});
         if (data.live_wallet) {
           setLiveWallet(data.live_wallet);
@@ -239,6 +254,16 @@ export function PythonSniperView() {
     }, 1000);
     return () => clearInterval(interval);
   }, [isSettingsDirty]);
+
+  // Smooth 1s local tick for live bot runtime timer
+  useEffect(() => {
+    if (!running || !startedAtMs) return;
+    setNowMs(Date.now());
+    const timer = setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [running, startedAtMs]);
 
   const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -458,6 +483,25 @@ export function PythonSniperView() {
     }
   };
 
+  const handleClearLogs = async () => {
+    try {
+      setClearingLogs(true);
+      const data = await apiFetch<any>('/api/sniper/logs/clear', { method: 'POST' });
+      if (data?.ok) {
+        setLogs([]);
+        pushToast({ kind: 'info', title: 'Scan logs cleared' });
+      }
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Clear logs failed', body: err instanceof Error ? err.message : 'Error' });
+    } finally {
+      setClearingLogs(false);
+    }
+  };
+
+  const botRuntimeSec =
+    running && startedAtMs ? Math.max(0, Math.floor((nowMs - startedAtMs) / 1000)) : 0;
+  const botRuntimeText = formatBotUptime(botRuntimeSec);
+
   const positionsList = Object.entries(state.positions || {}).map(([mint, p]) => ({
     mint,
     ...p,
@@ -558,6 +602,17 @@ export function PythonSniperView() {
             <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-mono font-bold tracking-wider uppercase ${statusBadgeClass}`}>
               <span className={`w-2 h-2 rounded-full ${dotClass}`} />
               {statusText}
+            </span>
+            <span
+              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-mono font-semibold tabular-nums border ${
+                running
+                  ? 'bg-teal-500/10 text-teal-600 dark:text-teal-400 border-teal-500/30'
+                  : 'bg-slate-500/10 text-slate-500 dark:text-slate-400 border-slate-500/20'
+              }`}
+              title={running ? 'Elapsed time since Python bot started' : 'Bot is stopped'}
+            >
+              <Clock className="w-3.5 h-3.5" />
+              <span>Runtime {botRuntimeText}</span>
             </span>
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
@@ -878,9 +933,19 @@ export function PythonSniperView() {
 
                         {/* Peak / Low */}
                         <td className="py-2.5 px-2 text-right tabular-nums whitespace-nowrap text-[11px]">
-                          <span className="text-emerald-500/90">+{peakPct.toFixed(1)}%</span>
-                          <span className="text-slate-500 mx-1">/</span>
-                          <span className="text-rose-500/90">{lowPct.toFixed(1)}%</span>
+                          <div>
+                            <span className="text-emerald-500/90">+{peakPct.toFixed(1)}%</span>
+                            <span className="text-slate-500 mx-1">/</span>
+                            <span className="text-rose-500/90">{lowPct.toFixed(1)}%</span>
+                          </div>
+                          {p.trailing_active && (
+                            <span
+                              className="inline-block mt-0.5 px-1.5 py-0.2 rounded bg-emerald-500/15 text-emerald-500 border border-emerald-500/30 text-[9px] font-bold uppercase tracking-wider"
+                              title="Profit target reached — trailing stop is armed and tracking peak"
+                            >
+                              Trail On
+                            </span>
+                          )}
                         </td>
 
                         {/* Held */}
@@ -1243,9 +1308,21 @@ export function PythonSniperView() {
       {/* Tab Content: Scan Log (Newest at top) */}
       {activeTab === 'logs' && (
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-[#070B12] p-4 space-y-3 font-mono text-xs shadow-sm">
-          <div className="flex items-center justify-between text-slate-400 pb-2 border-b border-slate-800">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-slate-400 pb-2 border-b border-slate-800">
             <span>Live Python Sniper Console Output · Newest entries at top</span>
-            <span>{logs.length} log events</span>
+            <div className="flex items-center gap-3">
+              <span>{logs.length} log events</span>
+              <button
+                type="button"
+                onClick={() => void handleClearLogs()}
+                disabled={clearingLogs || logs.length === 0}
+                className="px-2.5 py-1 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 text-[11px] font-semibold flex items-center gap-1.5 transition-colors disabled:opacity-40 cursor-pointer"
+                title="Clear console scan log output"
+              >
+                <Trash2 className="w-3 h-3 text-rose-400" />
+                <span>{clearingLogs ? 'Clearing...' : 'Clear logs'}</span>
+              </button>
+            </div>
           </div>
           <div className="h-[450px] overflow-y-auto space-y-1 pr-2">
             {newestFirstLogs.length === 0 ? (
@@ -1342,6 +1419,13 @@ export function PythonSniperView() {
                       ? `≈ ${(numericVal / 60).toFixed(1)} min (${numericVal}s)`
                       : '0s (immediate)'
                     : null;
+                const trailHelper =
+                  key === 'trailing_stop_pct'
+                    ? formatTrailingModeHint(
+                        parseFloat(String(draftSettings.take_profit_pct ?? 0)) || 0,
+                        !isNaN(numericVal) ? numericVal : 0
+                      )
+                    : null;
 
                 return (
                   <div key={key} className="space-y-1">
@@ -1385,6 +1469,11 @@ export function PythonSniperView() {
                         }}
                         className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-teal-500"
                       />
+                    )}
+                    {trailHelper && (
+                      <p className="font-mono text-[11px] font-medium text-teal-600 dark:text-teal-400">
+                        {trailHelper}
+                      </p>
                     )}
                   </div>
                 );

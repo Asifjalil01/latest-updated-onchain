@@ -151,6 +151,9 @@ def maybe_reload_settings():
         mtime = os.stat(sf).st_mtime
         if mtime > _settings_mtime:
             load_settings()
+            with _seen_lock:
+                _seen.clear()
+                _too_old_mints.clear()
             return True
     except Exception:
         pass
@@ -291,7 +294,21 @@ def get_sol_price_usd(cfg=None, force=False):
 _src_last, _src_stats = {}, {}
 _src_lock = threading.Lock()
 _seen, _seen_lock = {}, threading.Lock()
+_too_old_mints = {}
 _src_of = {}
+_gecko_pairs = {}
+_gecko_backoff_until = 0.0
+
+def _parse_iso_ms(iso_str):
+    if not iso_str or not isinstance(iso_str, str):
+        return 0
+    try:
+        s = iso_str.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return int(datetime.fromisoformat(s).timestamp() * 1000)
+    except Exception:
+        return 0
 
 def _mark_seen(mints):
     t = time.time()
@@ -299,26 +316,78 @@ def _mark_seen(mints):
         for m in mints: _seen[m] = t
         if len(_seen) > 20000:
             for k in [k for k, v in _seen.items() if t - v > 600]: _seen.pop(k, None)
+        if len(_too_old_mints) > 10000:
+            for k in [k for k, v in _too_old_mints.items() if t - v > 1800]: _too_old_mints.pop(k, None)
 
 def _fresh_only(mints):
     t = time.time()
     with _seen_lock:
-        return [m for m in mints if t - _seen.get(m, 0) > SEEN_TTL_SEC]
+        return [
+            m for m in mints
+            if (t - _seen.get(m, 0) > SEEN_TTL_SEC) and (m not in _too_old_mints)
+        ]
 
 def _src_gecko(cfg):
+    global _gecko_backoff_until
+    if not cfg.get("use_gecko", True):
+        return []
+    now_ts = time.time()
+    if now_ts < _gecko_backoff_until:
+        return []
     out = []
-    for page in (1, 2):
-        data = get_json(GECKO, params={"page": page})
-        if not (isinstance(data, dict) and isinstance(data.get("data"), list)): continue
-        for pool in data["data"]:
-            try:
-                rel = pool.get("relationships") or {}
-                tid = ((rel.get("base_token") or {}).get("data") or {}).get("id", "")
-                if tid.startswith("solana_"):
-                    mint = tid[len("solana_"):]
-                    if mint and len(mint) > 20: out.append(mint)
-            except Exception:
+    try:
+        r = _session.get(GECKO, params={"page": 1}, headers=HEADERS, timeout=6)
+        if r.status_code == 429:
+            _gecko_backoff_until = time.time() + 45.0
+            return []
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return []
+    if not (isinstance(data, dict) and isinstance(data.get("data"), list)):
+        return []
+    for pool in data["data"]:
+        try:
+            rel = pool.get("relationships") or {}
+            tid = ((rel.get("base_token") or {}).get("data") or {}).get("id", "")
+            if not tid.startswith("solana_"):
                 continue
+            mint = tid[len("solana_"):]
+            if not mint or len(mint) <= 20:
+                continue
+            out.append(mint)
+            attrs = pool.get("attributes") or {}
+            created_ms = _parse_iso_ms(attrs.get("pool_created_at"))
+            px = attrs.get("base_token_price_usd")
+            if created_ms > 0 and px is not None:
+                liq_val = _f(attrs.get("reserve_in_usd")) or 0.0
+                txns = attrs.get("transactions") or {}
+                m5 = txns.get("m5") or {}
+                h1 = txns.get("h1") or {}
+                vol = attrs.get("volume_usd") or {}
+                pc = attrs.get("price_change_percentage") or {}
+                sym = str(attrs.get("name") or "?").split("/")[0].strip() or "?"
+                dex_id = ((rel.get("dex") or {}).get("data") or {}).get("id") or "geckoterminal"
+                _gecko_pairs[mint] = {
+                    "baseToken": {"address": mint, "symbol": sym},
+                    "dexId": dex_id,
+                    "pairCreatedAt": created_ms,
+                    "priceUsd": px,
+                    "liquidity": {"usd": liq_val},
+                    "txns": {
+                        "m5": {"buys": int(m5.get("buys") or 0), "sells": int(m5.get("sells") or 0)},
+                        "h1": {"buys": int(h1.get("buys") or 0), "sells": int(h1.get("sells") or 0)},
+                    },
+                    "volume": {"m5": _f(vol.get("m5")) or 0.0},
+                    "priceChange": {"m5": pc.get("m5")},
+                    "url": f"https://dexscreener.com/solana/{mint}",
+                    "_synthetic": True,
+                }
+        except Exception:
+            continue
+    if len(_gecko_pairs) > 500:
+        for k in list(_gecko_pairs.keys())[:250]:
+            _gecko_pairs.pop(k, None)
     return out
 
 def _src_jup(cfg):
@@ -346,20 +415,25 @@ def _src_boosts(cfg):
 
 def _src_pumpportal(cfg):
     if not cfg.get("use_pumpportal", True): return []
+    if _bridge_base_url():
+        resp = bridge_get("/api/sniper/pumpportal-mints", timeout=4)
+        if isinstance(resp, dict) and resp.get("ok") and isinstance(resp.get("mints"), list):
+            return [m for m in resp["mints"] if isinstance(m, str) and m]
     data = get_json(f"{PUMPP}/coins/new")
     if not isinstance(data, list): return []
     return [c.get("mint") for c in data if isinstance(c, dict) and c.get("mint")]
 
 SOURCES = [
-    ("gecko", 5.0, _src_gecko),
-    ("jup", 5.0, _src_jup),
-    ("profiles", 3.0, _src_profiles),
-    ("pumpportal", 3.0, _src_pumpportal),
+    ("pumpportal", 2.0, _src_pumpportal),
+    ("gecko", 10.0, _src_gecko),
+    ("jup", 6.0, _src_jup),
+    ("profiles", 4.0, _src_profiles),
     ("boosts", 10.0, _src_boosts),
 ]
 
 def fetch_candidate_mints(cfg, force=False):
-    mints, lock = set(), threading.Lock()
+    by_src = {}
+    lock = threading.Lock()
     def run(name, cd, fn):
         t = time.time()
         with _src_lock:
@@ -371,17 +445,27 @@ def fetch_candidate_mints(cfg, force=False):
         except Exception:
             _src_stats[name] = {"items": -1, "ok_at": 0.0}
             res = []
+        valid = []
+        for m in res:
+            if isinstance(m, str) and 39 <= len(m) <= 50:
+                valid.append(m)
+                if m not in _src_of: _src_of[m] = name
+                if len(_src_of) > 20000: _src_of.clear()
         with lock:
-            for m in res:
-                if isinstance(m, str) and 39 <= len(m) <= 50:
-                    mints.add(m)
-                    if m not in _src_of: _src_of[m] = name
-                    if len(_src_of) > 20000: _src_of.clear()
+            by_src[name] = valid
     ths = [threading.Thread(target=run, args=s, daemon=True) for s in SOURCES]
     for t in ths: t.start()
     for t in ths: t.join(timeout=5)
-    fresh = _fresh_only(list(mints))
-    _mark_seen(mints)
+    # Prioritize real-time launch streams (pumpportal, gecko) ahead of older profile/jupiter lists
+    ordered_mints = []
+    seen_batch = set()
+    for src_name in ("pumpportal", "gecko", "profiles", "jup", "boosts"):
+        for m in by_src.get(src_name, []):
+            if m not in seen_batch:
+                seen_batch.add(m)
+                ordered_mints.append(m)
+    fresh = _fresh_only(ordered_mints)
+    _mark_seen(ordered_mints)
     return fresh
 
 # ---------------------------------------------------------------- entry filters
@@ -752,6 +836,7 @@ class TradingAccount:
             "pnl_usd": 0.0,
             "peak_pct": 0.0,
             "low_pct": 0.0,
+            "trailing_active": False,
             "dex": meta.get("dex", "?"),
             "source": meta.get("source", "?"),
             "age_at_entry": round(meta.get("age_s", 0), 1),
@@ -911,20 +996,70 @@ class TradingAccount:
         self.save()
         return True
 
+    @staticmethod
+    def trailing_stop_arm_pct(tp, trail):
+        """Minimum peak gain (%) needed before trailing stop becomes active.
+
+        - When both take_profit_pct (tp > 0) and trailing_stop_pct (trail > 0) are set,
+          take_profit_pct acts as the arm threshold: wait until peak >= +tp% before
+          activating trailing stop so runners are not sold early at +tp% or in a loss.
+        - When take_profit_pct == 0 and trailing_stop_pct > 0, wait until peak reaches at
+          least enough profit that a trail% drop from peak remains profitable (+5% buffer).
+        """
+        tp = float(tp or 0.0)
+        trail = float(trail or 0.0)
+        if trail <= 0.0:
+            return 0.0
+        if tp > 0.0:
+            return tp
+        frac_left = max(0.05, 1.0 - trail / 100.0)
+        breakeven_peak = (1.0 / frac_left - 1.0) * 100.0
+        return max(10.0, breakeven_peak + 5.0)
+
+    @classmethod
+    def evaluate_exit_signal(cls, entry, price, peak_price, tp, trail, held_minutes, max_hold_minutes):
+        """Return (reason_or_none, trailing_active, drop_from_peak_pct)."""
+        if not entry or entry <= 0 or not price or price <= 0:
+            return None, False, 0.0
+        tp = float(tp or 0.0)
+        trail = float(trail or 0.0)
+        peak = max(float(entry), float(peak_price or entry), float(price))
+        change_pct = (price / entry - 1.0) * 100.0
+        peak_chg_pct = (peak / entry - 1.0) * 100.0
+        drop_from_peak_pct = max(0.0, (1.0 - price / peak) * 100.0)
+
+        if trail > 0.0:
+            arm_pct = cls.trailing_stop_arm_pct(tp, trail)
+            trailing_active = peak_chg_pct >= arm_pct
+            # Trailing stop can only sell while the position is actually in profit above entry
+            if trailing_active and change_pct > 0.0 and drop_from_peak_pct >= trail:
+                return f"trailing_stop_{trail:g}", True, drop_from_peak_pct
+        else:
+            trailing_active = False
+            if tp > 0.0 and change_pct >= tp:
+                return f"take_profit_{tp:g}", False, drop_from_peak_pct
+
+        max_hold = float(max_hold_minutes or 0.0)
+        if max_hold > 0.0 and held_minutes >= max_hold:
+            return "max_hold", trailing_active, drop_from_peak_pct
+
+        return None, trailing_active, drop_from_peak_pct
+
     @locked
     def check_exits(self, prices):
         if _should_stop():
             return 0
         exits = 0
-        tp = self.cfg.get("take_profit_pct", 50)
-        trail = self.cfg.get("trailing_stop_pct", 0)
+        tp = float(self.cfg.get("take_profit_pct", 50) or 0.0)
+        trail = float(self.cfg.get("trailing_stop_pct", 0) or 0.0)
+        max_hold = float(self.cfg.get("max_hold_minutes", 120) or 0.0)
         now_ts = time.time()
         self.state["last_price_time"] = now_ts
         for mint, pos in list(self.state["positions"].items()):
             if _should_stop():
                 break
             price = prices.get(mint)
-            if price is None:
+            if price is None or price <= 0:
                 continue
             entry = pos["entry_price"]
             pos["current_price"] = price
@@ -939,20 +1074,23 @@ class TradingAccount:
             pos["peak_pct"] = round((pos["peak_price"] / entry - 1) * 100, 2)
             pos["low_pct"] = round((pos["low_price"] / entry - 1) * 100, 2)
 
-            peak_chg = (pos["peak_price"] / entry - 1) * 100
-            reason = None
-            if tp > 0 and change >= tp: reason = f"take_profit_{tp:g}"
-            elif trail > 0 and peak_chg >= 10 and (pos["peak_price"] / price - 1) * 100 >= trail:
-                reason = f"trailing_stop_{trail:g}"
-            elif (now_ts - pos["opened"]) / 60 >= self.cfg.get("max_hold_minutes", 120):
-                reason = "max_hold"
+            held_min = max(0.0, (now_ts - pos["opened"]) / 60.0)
+            reason, trailing_active, _drop_pct = self.evaluate_exit_signal(
+                entry, price, pos["peak_price"], tp, trail, held_min, max_hold
+            )
+            was_active = bool(pos.get("trailing_active"))
+            pos["trailing_active"] = trailing_active
+            if trailing_active and not was_active:
+                log(f"🎯 Trailing stop ARMED for {pos['symbol']}: peak +{pos['peak_pct']:.1f}% (trailing -{trail:g}% from peak, profit-protected)")
 
             if reason:
                 if _should_stop():
                     break
                 # Bypass 5s lockout for take_profit so TP executes instantly every 1s tick until filled
-                if not str(reason).startswith("take_profit") and self.mode == "live" and now_ts - float(pos.get("last_sell_attempt") or 0.0) < 5.0:
-                    continue
+                if not str(reason).startswith("take_profit") and self.mode == "live":
+                    cooldown = 2.0 if str(reason).startswith("trailing_stop") else 5.0
+                    if now_ts - float(pos.get("last_sell_attempt") or 0.0) < cooldown:
+                        continue
                 if self.sell(mint, price, reason):
                     exits += 1
         if exits == 0:
@@ -1048,6 +1186,11 @@ def scan_and_buy(acct, cfg):
             liq = _f((p.get("liquidity") or {}).get("usd")) or 0.0
             cur = pairs.get(mint)
             if cur is None or liq > cur[0]: pairs[mint] = (liq, p)
+    for mint in fresh:
+        if mint not in pairs and mint in _gecko_pairs:
+            gp = _gecko_pairs[mint]
+            liq = _f((gp.get("liquidity") or {}).get("usd")) or 0.0
+            pairs[mint] = (liq, gp)
     with _stats_lock: _stats["no_pair"] += max(0, len(fresh) - len(pairs))
 
     for mint, (_liq, pair) in pairs.items():
@@ -1061,6 +1204,9 @@ def scan_and_buy(acct, cfg):
         okp, code, detail = passes_filters(pair, cfg, now_ms)
         with _stats_lock: _stats["checked"] += 1
         if not okp:
+            if code == "too old":
+                with _seen_lock:
+                    _too_old_mints[mint] = time.time()
             with _stats_lock: _stats["rejects"][code] = _stats["rejects"].get(code, 0) + 1
             if cfg.get("log_rejects"): log(f"– {symbol} filtered: {code} ({detail})")
             continue
@@ -1293,7 +1439,17 @@ def run(once=False):
         if bal_sol is not None:
             log(f"Wallet balance: {float(bal_sol):.4f} SOL (${float(bal_usd):.2f}) | trade size ${CONFIG['trade_size_usd']:.2f}")
     log(f"Sources: gecko={CONFIG['use_gecko']} jupiter={CONFIG['use_jupiter_recent']} profiles={CONFIG['use_dex_profiles']} pumpportal={CONFIG['use_pumpportal']} boosts={CONFIG['use_promoted_feeds']}{sol_banner}")
-    log(f"Window: coins < {CONFIG['max_age_minutes'] * 60:.0f}s old (grace <{CONFIG['ultra_early_grace_sec']}s skips liquidity/buy floors) | TP {CONFIG['take_profit_pct']}% | liq>=${CONFIG['min_liquidity_usd']:.0f} after grace | buys>=sells(5m) | pump cap +{CONFIG['max_price_change_m5_pct']:.0f}% | rug check {'ON' if CONFIG['use_rugcheck'] else 'OFF'}")
+    tp_cfg = float(CONFIG.get("take_profit_pct", 50) or 0.0)
+    tr_cfg = float(CONFIG.get("trailing_stop_pct", 0) or 0.0)
+    if tp_cfg > 0 and tr_cfg > 0:
+        exit_banner = f"TP +{tp_cfg:g}% arms {tr_cfg:g}% trail (profit-only)"
+    elif tp_cfg > 0:
+        exit_banner = f"TP +{tp_cfg:g}%"
+    elif tr_cfg > 0:
+        exit_banner = f"Profit-only Trail {tr_cfg:g}% (arms +{TradingAccount.trailing_stop_arm_pct(0, tr_cfg):.0f}%)"
+    else:
+        exit_banner = "TP/Trail OFF"
+    log(f"Window: coins < {CONFIG['max_age_minutes'] * 60:.0f}s old (grace <{CONFIG['ultra_early_grace_sec']}s skips liquidity/buy floors) | {exit_banner} | liq>=${CONFIG['min_liquidity_usd']:.0f} after grace | buys>=sells(5m) | pump cap +{CONFIG['max_price_change_m5_pct']:.0f}% | rug check {'ON' if CONFIG['use_rugcheck'] else 'OFF'}")
     if once:
         try:
             scan_and_buy(acct, CONFIG)

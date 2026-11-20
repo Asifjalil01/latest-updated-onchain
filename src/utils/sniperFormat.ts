@@ -155,3 +155,29 @@ export function pairTradesWithEntryAndExit(
 export function orderLogsNewestFirst<T>(logs: readonly T[]): T[] {
   return [...logs].reverse();
 }
+
+export function formatBotUptime(totalSec: number): string {
+  const safe = Number.isFinite(totalSec) && totalSec > 0 ? Math.floor(totalSec) : 0;
+  const h = Math.floor(safe / 3600);
+  const m = Math.floor((safe % 3600) / 60);
+  const s = safe % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+export function formatTrailingModeHint(takeProfitPct: number, trailingStopPct: number): string {
+  const tp = Number.isFinite(takeProfitPct) && takeProfitPct > 0 ? takeProfitPct : 0;
+  const trail = Number.isFinite(trailingStopPct) && trailingStopPct > 0 ? trailingStopPct : 0;
+  if (tp > 0 && trail > 0) {
+    return `Arms at +${tp}% · exits -${trail}% from peak (profit only)`;
+  }
+  if (tp <= 0 && trail > 0) {
+    const fracLeft = Math.max(0.05, 1 - trail / 100);
+    const arm = Math.max(10, (1 / fracLeft - 1) * 100 + 5);
+    return `Arms at +${Math.ceil(arm)}% · profit-only trail (-${trail}%)`;
+  }
+  if (tp > 0 && trail <= 0) {
+    return `Fixed TP at +${tp}% (trailing off)`;
+  }
+  return 'Disabled';
+}
+

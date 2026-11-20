@@ -220,6 +220,7 @@ export class SniperManager {
   private process: ChildProcess | null = null;
   private activeRunId: string | null = null;
   private running = false;
+  private startedAtMs: number | null = null;
   private logs: SniperLogEntry[] = [];
   private maxLogs = 1000;
   private solPriceUsd: number | null = null;
@@ -700,9 +701,16 @@ export class SniperManager {
 
     state.cooldown_remaining_sec = cooldownRemainingSec;
 
+    const uptimeSec =
+      this.running && this.startedAtMs
+        ? Math.max(0, Math.floor((Date.now() - this.startedAtMs) / 1000))
+        : 0;
+
     return {
       mode,
       running: this.running,
+      started_at_ms: this.running ? this.startedAtMs : null,
+      uptime_sec: uptimeSec,
       state,
       settings: { ...settings, mode },
       trades,
@@ -819,6 +827,10 @@ export class SniperManager {
     });
 
     this.running = true;
+    this.startedAtMs = Date.now();
+    if (settings.use_pumpportal !== false && this.orchestrator?.pumpPortal) {
+      this.orchestrator.pumpPortal.start();
+    }
 
     if (this.process.stdout) {
       const rl = readline.createInterface({ input: this.process.stdout });
@@ -837,6 +849,7 @@ export class SniperManager {
     this.process.on('exit', (code) => {
       if (this.activeRunId === runId) {
         this.running = false;
+        this.startedAtMs = null;
         this.process = null;
         this.activeRunId = null;
       }
@@ -861,14 +874,32 @@ export class SniperManager {
     const killedPid = this.terminateAnyExistingBot();
 
     this.running = false;
+    this.startedAtMs = null;
     this.process = null;
     this.activeRunId = null;
+    if (this.orchestrator && this.orchestrator.getStatusSnapshot().runState === 'stopped') {
+      this.orchestrator.pumpPortal.stop();
+    }
 
     if (wasRunning || killedPid) {
       this.appendLog('INFO', 'Python sniper bot stopped cleanly (all scan, buy & sell loops halted).');
       return { ok: true, message: 'Python sniper bot stopped' };
     }
     return { ok: true, message: 'Python sniper bot stopped (no active process)' };
+  }
+
+  public clearLogs() {
+    const count = this.logs.length;
+    this.logs = [];
+    return { ok: true, cleared: count, message: 'Scan logs cleared' };
+  }
+
+  public getPumpPortalMints(maxAgeMs = 180_000): string[] {
+    if (!this.orchestrator?.pumpPortal) return [];
+    const settings = this.readSettings();
+    if (settings.use_pumpportal === false) return [];
+    this.orchestrator.pumpPortal.start();
+    return this.orchestrator.pumpPortal.drainRecentMints(maxAgeMs);
   }
 
   public updateSettings(newSettings: Record<string, any>) {

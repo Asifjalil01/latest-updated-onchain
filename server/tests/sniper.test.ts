@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { Keypair, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import {
   usdToSol,
@@ -12,6 +13,8 @@ import {
   fmtUnsignedUsdAndSol,
   pairTradesWithEntryAndExit,
   orderLogsNewestFirst,
+  formatBotUptime,
+  formatTrailingModeHint,
 } from '../../src/utils/sniperFormat.ts';
 import {
   SniperManager,
@@ -535,4 +538,123 @@ test('SniperManager executeLiveBuy caps ExactIn swap cost at quote.inAmount so a
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('formatBotUptime formats elapsed seconds as HH:MM:SS cleanly', () => {
+  assert.equal(formatBotUptime(0), '00:00:00');
+  assert.equal(formatBotUptime(-5), '00:00:00');
+  assert.equal(formatBotUptime(65), '00:01:05');
+  assert.equal(formatBotUptime(3661), '01:01:01');
+});
+
+test('SniperManager clearLogs wipes scan logs, reports uptime_sec, and bridges PumpPortal mints', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-logs-pp-test-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+
+    // 1. Add logs via public updateSettings, then clearLogs()
+    mgr.updateSettings({ max_age_minutes: 1.5 });
+    const before = mgr.getStatus();
+    assert.ok(before.logs.length >= 1);
+    assert.equal(before.uptime_sec, 0);
+    assert.equal(before.started_at_ms, null);
+
+    const cleared = mgr.clearLogs();
+    assert.equal(cleared.ok, true);
+    assert.equal(mgr.getStatus().logs.length, 0);
+
+    // 2. Attach mock orchestrator with PumpPortal WS buffer and verify getPumpPortalMints()
+    let ppStarted = false;
+    const mockOrchestrator = {
+      pumpPortal: {
+        start: () => {
+          ppStarted = true;
+        },
+        drainRecentMints: () => ['MintPP11111111111111111111111111111111111111'],
+      },
+      signer: {
+        isUnlocked: () => false,
+        getPublicKey: () => null,
+        getMaskedPublicKey: () => 'Locked',
+      },
+      rpcPool: {
+        getHealthSnapshot: () => [],
+      },
+    } as unknown as BotOrchestrator;
+
+    mgr.attachOrchestrator(mockOrchestrator);
+    const ppMints = mgr.getPumpPortalMints();
+    assert.equal(ppStarted, true);
+    assert.deepEqual(ppMints, ['MintPP11111111111111111111111111111111111111']);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('formatTrailingModeHint describes TP + Trailing, Trail-only, TP-only, and Disabled modes', () => {
+  assert.equal(
+    formatTrailingModeHint(50, 15),
+    'Arms at +50% · exits -15% from peak (profit only)'
+  );
+  assert.match(formatTrailingModeHint(0, 15), /^Arms at \+\d+% · profit-only trail \(-15%\)$/);
+  assert.equal(formatTrailingModeHint(50, 0), 'Fixed TP at +50% (trailing off)');
+  assert.equal(formatTrailingModeHint(0, 0), 'Disabled');
+});
+
+test('Python sniper evaluate_exit_signal waits for TP before arming trailing stop and never sells at a loss', () => {
+  const pyScript = [
+    'import sys, types, json',
+    'req = types.ModuleType("requests")',
+    'req.Session = lambda: None',
+    'sys.modules["requests"] = req',
+    'sys.path.insert(0, "sniper")',
+    'import bot',
+    'ev = bot.TradingAccount.evaluate_exit_signal',
+    'cases = {}',
+    // 1. mihao screenshot regression: entry 0.00000833, peaked +12%, dropped to 0.00000781 (-6.24%) with TP=50, Trail=15 -> MUST HOLD (None, trailing_active=False)
+    'cases["mihao_no_loss_sell"] = ev(0.00000833, 0.00000781, 0.00000833 * 1.12, 50, 15, 0.5, 12000)',
+    // 2. Reaches +50% (arm threshold) with TP=50, Trail=15 -> MUST NOT sell at +50%, trailing arms!
+    'cases["arms_at_tp50"] = ev(1.0, 1.50, 1.50, 50, 15, 1.0, 12000)',
+    // 3. Rides to +120% (2.20), pulls back 10% to 1.98 -> still holds
+    'cases["rides_above_tp"] = ev(1.0, 1.98, 2.20, 50, 15, 2.0, 12000)',
+    // 4. From +120% peak (2.20), drops exact 15% to 1.87 (+87% profit) -> MUST SELL trailing_stop_15
+    'cases["sells_15pct_from_peak"] = ev(1.0, 1.87, 2.20, 50, 15, 2.1, 12000)',
+    // 5. Armed at +50% then flash crash below entry (-5%) -> MUST NOT sell in a loss via trailing_stop
+    'cases["flash_crash_no_loss_trail"] = ev(1.0, 0.95, 1.55, 50, 15, 2.5, 12000)',
+    // 6. Trail disabled (trail=0), TP=50 -> hits +50% -> immediate take_profit_50
+    'cases["fixed_tp_when_trail_off"] = ev(1.0, 1.50, 1.50, 50, 0, 1.0, 12000)',
+    // 7. TP disabled (tp=0), Trail=15 -> peak +12% then drop 15% (-4.8% loss) -> MUST NOT sell
+    'cases["trail_only_blocks_loss"] = ev(1.0, 0.952, 1.12, 0, 15, 1.0, 12000)',
+    // 8. TP disabled (tp=0), Trail=15 -> peak +30% then drop 15% (+10.5% profit) -> MUST SELL trailing_stop_15
+    'cases["trail_only_sells_in_profit"] = ev(1.0, 1.30 * 0.85, 1.30, 0, 15, 1.0, 12000)',
+    'print(json.dumps(cases))',
+  ].join('\n');
+
+  const raw = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+  const res = JSON.parse(raw) as Record<string, [string | null, boolean, number]>;
+
+  assert.equal(res.mihao_no_loss_sell[0], null);
+  assert.equal(res.mihao_no_loss_sell[1], false);
+
+  assert.equal(res.arms_at_tp50[0], null);
+  assert.equal(res.arms_at_tp50[1], true);
+
+  assert.equal(res.rides_above_tp[0], null);
+  assert.equal(res.rides_above_tp[1], true);
+
+  assert.equal(res.sells_15pct_from_peak[0], 'trailing_stop_15');
+  assert.equal(res.sells_15pct_from_peak[1], true);
+
+  assert.equal(res.flash_crash_no_loss_trail[0], null);
+  assert.equal(res.flash_crash_no_loss_trail[1], true);
+
+  assert.equal(res.fixed_tp_when_trail_off[0], 'take_profit_50');
+  assert.equal(res.fixed_tp_when_trail_off[1], false);
+
+  assert.equal(res.trail_only_blocks_loss[0], null);
+  assert.equal(res.trail_only_blocks_loss[1], false);
+
+  assert.equal(res.trail_only_sells_in_profit[0], 'trailing_stop_15');
+  assert.equal(res.trail_only_sells_in_profit[1], true);
+});
+
 
