@@ -23,6 +23,7 @@ export interface SniperLogEntry {
 export interface SniperFilePaths {
   stateFile: string;
   tradesCsv: string;
+  pnlCsv: string;
   sellQueueFile: string;
 }
 
@@ -31,12 +32,14 @@ export function getSniperFilePaths(mode: SniperMode, baseDir = SNIPER_DIR): Snip
     return {
       stateFile: path.join(baseDir, 'live_state.json'),
       tradesCsv: path.join(baseDir, 'live_trades.csv'),
+      pnlCsv: path.join(baseDir, 'live_pnl_history.csv'),
       sellQueueFile: path.join(baseDir, 'live_sell_queue.json'),
     };
   }
   return {
     stateFile: path.join(baseDir, 'state.json'),
     tradesCsv: path.join(baseDir, 'trades.csv'),
+    pnlCsv: path.join(baseDir, 'pnl_history.csv'),
     sellQueueFile: path.join(baseDir, 'sell_queue.json'),
   };
 }
@@ -570,6 +573,7 @@ export class SniperManager {
       log_rejects: true,
       jupiter_api_key: '',
       python_binary_path: 'auto',
+      rescan_delay_after_sell_sec: 0,
     };
     fs.writeFileSync(this.settingsFile, JSON.stringify(defaults, null, 2), 'utf-8');
   }
@@ -686,6 +690,16 @@ export class SniperManager {
     const lastPriceSec = typeof state.last_price_time === 'number' ? state.last_price_time : 0;
     const priceAgeSec = lastPriceSec > 0 ? Math.max(0, Date.now() / 1000 - lastPriceSec) : null;
 
+    const rescanDelaySec = Math.max(0, Number(settings.rescan_delay_after_sell_sec || 0));
+    const lastSellTimeSec = typeof state.last_sell_time === 'number' ? state.last_sell_time : 0;
+    const elapsedSinceSell = lastSellTimeSec > 0 ? Date.now() / 1000 - lastSellTimeSec : 9999999;
+    const cooldownRemainingSec =
+      rescanDelaySec > 0 && elapsedSinceSell < rescanDelaySec
+        ? Math.max(0, Math.ceil(rescanDelaySec - elapsedSinceSell))
+        : 0;
+
+    state.cooldown_remaining_sec = cooldownRemainingSec;
+
     return {
       mode,
       running: this.running,
@@ -696,7 +710,9 @@ export class SniperManager {
       sol_price_usd: effectiveSolPrice,
       sol_price_updated_at: effectiveSolUpdatedAt,
       price_age_sec: priceAgeSec,
-      scan_paused: Boolean(state.scan_paused),
+      scan_paused: Boolean(state.scan_paused) || cooldownRemainingSec > 0,
+      cooldown_remaining_sec: cooldownRemainingSec,
+      rescan_delay_sec: rescanDelaySec,
       live_wallet: this.getLiveWalletSnapshot(),
     };
   }
@@ -1090,14 +1106,24 @@ export class SniperManager {
         ? balCheck.rawAmount
         : String(quote.outAmount);
 
-    let realSolSpent = solAmount;
+    const quotedSolIn = Number(quote.inAmount) > 0 ? Number(quote.inAmount) / LAMPORTS_PER_SOL : solAmount;
+    let realSolSpent = quotedSolIn;
     let feeSol = 0.0001;
     let rentSol = 0;
     if (txDelta.found && txDelta.solDeltaLamports < 0) {
       const totalOutSol = Math.abs(txDelta.solDeltaLamports) / LAMPORTS_PER_SOL;
       feeSol = txDelta.feeLamports / LAMPORTS_PER_SOL;
-      rentSol = (txDelta.createdAtaRentLamports ?? 0) / LAMPORTS_PER_SOL;
-      realSolSpent = Math.max(0.0001, totalOutSol - feeSol - rentSol);
+      const detectedRentSol = (txDelta.createdAtaRentLamports ?? 0) / LAMPORTS_PER_SOL;
+      const candidateSpent = Math.max(0.0001, totalOutSol - feeSol - detectedRentSol);
+      if (quotedSolIn > 0 && candidateSpent > quotedSolIn) {
+        // ExactIn swaps cannot consume more than quote.inAmount on the token swap itself;
+        // any excess outflow is ancillary on-chain overhead (e.g., WSOL/PDA/accumulator rent, tips, protocol fees).
+        realSolSpent = quotedSolIn;
+        rentSol = detectedRentSol + (candidateSpent - quotedSolIn);
+      } else {
+        realSolSpent = candidateSpent;
+        rentSol = detectedRentSol;
+      }
     }
 
     const costUsd = realSolSpent * solPriceUsd;
@@ -1420,6 +1446,7 @@ export class SniperManager {
         state.cash = (state.cash || 50) + proceeds;
       }
 
+      state.last_sell_time = Date.now() / 1000;
       delete state.positions[mint];
       state.closed = (state.closed || 0) + 1;
       state.total_pnl = (state.total_pnl || 0) + pnlUsd;
@@ -1440,6 +1467,31 @@ export class SniperManager {
       const solPxStr = this.solPriceUsd ? this.solPriceUsd.toFixed(4) : '';
       const csvLine = `${nowIso},SELL,${pos.symbol},${mint},${Number(fill).toFixed(8)},${proceeds.toFixed(4)},${pnlUsd.toFixed(4)},${pnlPct.toFixed(2)},manual_exit,${pos.url || `https://dexscreener.com/solana/${mint}`},${pos.age_at_entry || 0},${pos.dex || '?'},${pos.source || '?'},${Number(pos.entry_price || 0).toFixed(8)},${solPxStr},${txSig}\n`;
       fs.appendFileSync(tradesCsv, csvLine, 'utf-8');
+
+      const solPxVal = this.solPriceUsd || null;
+      const pnlSolVal = solPxVal && solPxVal > 0 ? pnlUsd / solPxVal : null;
+      const holdSec = pos.opened ? Math.max(0, Date.now() / 1000 - pos.opened) : null;
+      this.appendPnlCsv(mode, {
+        time: nowIso,
+        symbol: pos.symbol,
+        mint,
+        outcome: pnlUsd >= 0 ? 'PROFIT' : 'LOSS',
+        entryPrice: Number(pos.entry_price || 0),
+        exitPrice: Number(fill || 0),
+        costUsd: Number(pos.cost || 0),
+        proceedsUsd: proceeds,
+        pnlUsd,
+        pnlSol: pnlSolVal,
+        pnlPct,
+        reason: 'manual_exit',
+        holdSeconds: holdSec,
+        dex: pos.dex,
+        source: pos.source,
+        solPriceUsd: solPxVal,
+        txBuy: pos.tx_buy,
+        txSell: txSig,
+        dexscreener: pos.url,
+      });
 
       const txNote = txSig ? ` tx=${txSig.slice(0, 8)}...` : '';
       this.appendLog(
@@ -1471,6 +1523,7 @@ export class SniperManager {
       const pnlPct = -100.0;
       const cleanReason = reason === 'manual_delete' ? 'manual_delete' : 'rugpull_writeoff';
 
+      state.last_sell_time = Date.now() / 1000;
       delete state.positions[mint];
       state.closed = (state.closed || 0) + 1;
       state.total_pnl = (state.total_pnl || 0) + pnlUsd;
@@ -1491,6 +1544,31 @@ export class SniperManager {
       const csvLine = `${nowIso},SELL,${pos.symbol},${mint},0.00000000,0.0000,${pnlUsd.toFixed(4)},${pnlPct.toFixed(2)},${cleanReason},${pos.url || `https://dexscreener.com/solana/${mint}`},${pos.age_at_entry || 0},${pos.dex || '?'},${pos.source || '?'},${Number(pos.entry_price || 0).toFixed(8)},${solPxStr},\n`;
       fs.appendFileSync(tradesCsv, csvLine, 'utf-8');
 
+      const solPxVal = this.solPriceUsd || null;
+      const pnlSolVal = solPxVal && solPxVal > 0 ? pnlUsd / solPxVal : null;
+      const holdSec = pos.opened ? Math.max(0, Date.now() / 1000 - pos.opened) : null;
+      this.appendPnlCsv(mode, {
+        time: nowIso,
+        symbol: pos.symbol,
+        mint,
+        outcome: 'LOSS',
+        entryPrice: Number(pos.entry_price || 0),
+        exitPrice: 0,
+        costUsd,
+        proceedsUsd: 0,
+        pnlUsd,
+        pnlSol: pnlSolVal,
+        pnlPct: -100.0,
+        reason: cleanReason,
+        holdSeconds: holdSec,
+        dex: pos.dex,
+        source: pos.source,
+        solPriceUsd: solPxVal,
+        txBuy: pos.tx_buy,
+        txSell: '',
+        dexscreener: pos.url,
+      });
+
       this.appendLog(
         'WARN',
         `Force-cleared stuck/rugged position for ${pos.symbol} (${cleanReason}, recorded loss -$${costUsd.toFixed(2)}, slot freed)`
@@ -1499,6 +1577,145 @@ export class SniperManager {
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : 'Error clearing position' };
     }
+  }
+
+  public appendPnlCsv(
+    mode: SniperMode,
+    trade: {
+      time: string;
+      symbol: string;
+      mint: string;
+      outcome: 'PROFIT' | 'LOSS';
+      entryPrice: number | string;
+      exitPrice: number | string;
+      costUsd: number;
+      proceedsUsd: number;
+      pnlUsd: number;
+      pnlSol?: number | null;
+      pnlPct: number;
+      reason: string;
+      holdSeconds?: number | null;
+      dex?: string;
+      source?: string;
+      solPriceUsd?: number | null;
+      txBuy?: string;
+      txSell?: string;
+      dexscreener?: string;
+    }
+  ) {
+    const { pnlCsv } = getSniperFilePaths(mode, this.baseDir);
+    if (!fs.existsSync(pnlCsv)) {
+      fs.writeFileSync(
+        pnlCsv,
+        'time,symbol,mint,outcome,entry_price,exit_price,cost_usd,proceeds_usd,pnl_usd,pnl_sol,pnl_pct,reason,hold_seconds,dex,source,sol_price_usd,tx_buy,tx_sell,dexscreener\n',
+        'utf-8'
+      );
+    }
+    const row = [
+      trade.time,
+      trade.symbol,
+      trade.mint,
+      trade.outcome,
+      typeof trade.entryPrice === 'number' ? trade.entryPrice.toFixed(8) : trade.entryPrice,
+      typeof trade.exitPrice === 'number' ? trade.exitPrice.toFixed(8) : trade.exitPrice,
+      trade.costUsd.toFixed(4),
+      trade.proceedsUsd.toFixed(4),
+      trade.pnlUsd.toFixed(4),
+      trade.pnlSol !== undefined && trade.pnlSol !== null ? trade.pnlSol.toFixed(6) : '',
+      trade.pnlPct.toFixed(2),
+      trade.reason,
+      trade.holdSeconds !== undefined && trade.holdSeconds !== null ? trade.holdSeconds.toFixed(1) : '',
+      trade.dex || '?',
+      trade.source || '?',
+      trade.solPriceUsd ? trade.solPriceUsd.toFixed(4) : '',
+      trade.txBuy || '',
+      trade.txSell || '',
+      trade.dexscreener || `https://dexscreener.com/solana/${trade.mint}`,
+    ].join(',');
+    fs.appendFileSync(pnlCsv, row + '\n', 'utf-8');
+  }
+
+  public exportPnlCsv(mode: SniperMode): string {
+    const { pnlCsv, tradesCsv } = getSniperFilePaths(mode, this.baseDir);
+    const header = 'time,symbol,mint,outcome,entry_price,exit_price,cost_usd,proceeds_usd,pnl_usd,pnl_sol,pnl_pct,reason,hold_seconds,dex,source,sol_price_usd,tx_buy,tx_sell,dexscreener\n';
+
+    if (fs.existsSync(pnlCsv)) {
+      const content = fs.readFileSync(pnlCsv, 'utf-8').trim();
+      if (content.length > 0 && content.includes('\n')) {
+        return content + '\n';
+      }
+    }
+
+    // Synthesize from tradesCsv if pnlCsv does not exist or only has header
+    const rawRows: RawSniperCsvRow[] = [];
+    if (fs.existsSync(tradesCsv)) {
+      try {
+        const content = fs.readFileSync(tradesCsv, 'utf-8');
+        const lines = content.replace(/\r/g, '').split('\n').filter((l) => l.trim().length > 0);
+        for (let i = 1; i < lines.length; i++) {
+          const parts = lines[i].split(',').map((p) => p.trim());
+          if (parts.length >= 6) {
+            rawRows.push({
+              time: parts[0] || '',
+              action: parts[1] || '',
+              symbol: parts[2] || '',
+              mint: parts[3] || '',
+              price: parts[4] || '',
+              amount: parts[5] || '',
+              pnlUsd: parts[6] || '',
+              pnlPct: parts[7] || '',
+              reason: parts[8] || '',
+              dexscreener: parts[9] || (parts[3] ? `https://dexscreener.com/solana/${parts[3]}` : ''),
+              age_s: parts[10] || '',
+              dex: parts[11] || '',
+              source: parts[12] || '',
+              entryPrice: parts[13] || '',
+              solPriceUsd: parts[14] || '',
+              txSig: parts[15] || '',
+            });
+          }
+        }
+      } catch {}
+    }
+
+    const paired = pairTradesWithEntryAndExit(rawRows, 10000);
+    const rows: string[] = [header.trim()];
+    for (const t of paired) {
+      if (t.action !== 'SELL') continue;
+      const pnl = Number(t.pnlUsd) || 0;
+      const outcome = pnl >= 0 ? 'PROFIT' : 'LOSS';
+      const solPx = Number(t.solPriceUsd) || this.solPriceUsd || 0;
+      const pnlSol = solPx > 0 ? pnl / solPx : 0;
+      const proceeds = Number(t.amount) || 0;
+      const cost = Math.max(0, proceeds - pnl);
+      rows.push([
+        t.time,
+        t.symbol,
+        t.mint,
+        outcome,
+        t.entryPrice || '',
+        t.exitPrice || t.price || '',
+        cost.toFixed(4),
+        proceeds.toFixed(4),
+        pnl.toFixed(4),
+        pnlSol ? pnlSol.toFixed(6) : '',
+        t.pnlPct || '0.00',
+        t.reason || 'manual_exit',
+        t.age_s || '',
+        t.dex || '?',
+        t.source || '?',
+        solPx ? solPx.toFixed(4) : '',
+        t.txBuy || '',
+        t.txSell || '',
+        t.dexscreener || `https://dexscreener.com/solana/${t.mint}`,
+      ].join(','));
+    }
+
+    const synthesized = rows.join('\n') + '\n';
+    try {
+      fs.writeFileSync(pnlCsv, synthesized, 'utf-8');
+    } catch {}
+    return synthesized;
   }
 
   private parseAndLogStdout(line: string) {

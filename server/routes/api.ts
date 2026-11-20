@@ -261,6 +261,22 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.send([header, ...lines].join('\n'));
   });
 
+  // Sniper PnL CSV export (supports ?token= for browser download or x-api-token)
+  router.get('/sniper/export/trades.csv', (req: Request, res: Response) => {
+    const token =
+      req.header('x-api-token') || (typeof req.query.token === 'string' ? req.query.token : '');
+    if (!token || !constantTimeTokenEqual(token, apiToken)) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const mode = req.query.mode === 'live' ? 'live' : 'paper';
+    const csvContent = sniperManager.exportPnlCsv(mode);
+    const dateStr = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="sniper_${mode}_pnl_${dateStr}.csv"`);
+    res.send(csvContent);
+  });
+
   // Protect all remaining routes with x-api-token
   router.use(requireToken);
 

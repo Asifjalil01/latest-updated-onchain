@@ -57,8 +57,8 @@ CONFIG = {
     # compatibility keys kept so old settings files still load
     "cooldown_minutes": 60, "min_volume_h1_usd": 0.0, "min_age_minutes": 0,
     "max_age_hours": 24, "min_buys_h1": 0, "min_buy_sell_ratio_h1": 0.0,
-    "min_price_change_h1_pct": -100.0, "max_price_change_h1_pct": 10000.0,
     "use_jupiter_price": True, "pool_keep_hours": 1, "pool_max_size": 500,
+    "rescan_delay_after_sell_sec": 0,
 }
 
 _settings_mtime = 0.0
@@ -514,10 +514,12 @@ class TradingAccount:
         if self.mode == "live":
             self.path = os.path.join(base, "live_state.json")
             self.csv_path = os.path.join(base, "live_trades.csv")
+            self.pnl_csv_path = os.path.join(base, "live_pnl_history.csv")
             self.sell_queue_path = os.path.join(base, "live_sell_queue.json")
         else:
             self.path = os.path.join(base, cfg.get("state_file") or "state.json")
             self.csv_path = os.path.join(base, cfg.get("trades_csv") or "trades.csv")
+            self.pnl_csv_path = os.path.join(base, "pnl_history.csv")
             self.sell_queue_path = os.path.join(base, "sell_queue.json")
 
         self.state = {
@@ -535,6 +537,8 @@ class TradingAccount:
             "scan_paused": False,
             "sol_price_usd": None,
             "sol_price_updated_at": 0.0,
+            "last_sell_time": 0.0,
+            "cooldown_remaining_sec": 0,
         }
         self._last_wallet_sync = 0.0
         self._last_insufficient_log = 0.0
@@ -554,6 +558,8 @@ class TradingAccount:
         self.state.setdefault("scan_paused", False)
         self.state.setdefault("sol_price_usd", None)
         self.state.setdefault("sol_price_updated_at", 0.0)
+        self.state.setdefault("last_sell_time", 0.0)
+        self.state.setdefault("cooldown_remaining_sec", 0)
 
     @locked
     def save(self):
@@ -629,6 +635,20 @@ class TradingAccount:
             w = csv.writer(f)
             if new:
                 w.writerow(["time", "action", "symbol", "mint", "price", "usd", "pnl_usd", "pnl_pct", "reason", "dexscreener", "age_s", "dex", "source", "entry_price", "sol_price_usd", "tx_sig"])
+            w.writerow(row)
+
+    def _log_pnl(self, row):
+        csv_path = self.pnl_csv_path
+        new = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow([
+                    "time", "symbol", "mint", "outcome", "entry_price", "exit_price",
+                    "cost_usd", "proceeds_usd", "pnl_usd", "pnl_sol", "pnl_pct",
+                    "reason", "hold_seconds", "dex", "source", "sol_price_usd",
+                    "tx_buy", "tx_sell", "dexscreener"
+                ])
             w.writerow(row)
 
     @locked
@@ -847,15 +867,47 @@ class TradingAccount:
             round(sol_px, 4) if sol_px else "",
             tx_sell,
         ])
+        now_ts = time.time()
+        self.state["last_sell_time"] = now_ts
+        rescan_delay = max(0, int(self.cfg.get("rescan_delay_after_sell_sec", 0)))
+        outcome = "PROFIT" if pnl >= 0 else "LOSS"
+        hold_sec = round(now_ts - pos.get("opened", now_ts), 1)
+        pnl_sol = round(pnl / sol_px, 6) if sol_px and sol_px > 0 else 0.0
+        self._log_pnl([
+            now().isoformat(),
+            pos["symbol"],
+            mint,
+            outcome,
+            fmt_price(pos["entry_price"]),
+            fmt_price(fill),
+            round(pos["cost"], 4),
+            round(proceeds, 4),
+            round(pnl, 4),
+            pnl_sol,
+            round(pnl_pct, 2),
+            reason,
+            hold_sec,
+            pos.get("dex", "?"),
+            pos.get("source", "?"),
+            round(sol_px, 4) if sol_px else "",
+            pos.get("tx_buy", ""),
+            tx_sell,
+            pos.get("url", f"https://dexscreener.com/solana/{mint}")
+        ])
         sol_hint = f" ({pnl / sol_px:+.4f} SOL)" if sol_px else ""
         mode_tag = "LIVE SELL" if self.mode == "live" else "SELL"
         tx_hint = f" tx={tx_sell[:8]}..." if tx_sell else ""
         log(f"✗ {mode_tag} {pos['symbol']} entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} pnl ${pnl:.2f}{sol_hint} ({pnl_pct:.1f}%) [{reason}]{tx_hint}")
         full, cnt, max_pos = self.is_slots_full()
-        if not full and self.state.get("scan_paused"):
-            self.state["scan_paused"] = False
-            log(f"▶ Slot freed ({cnt}/{max_pos}) — resuming scan for new coins.")
-            _scan_wake.set()
+        if rescan_delay > 0:
+            self.state["cooldown_remaining_sec"] = rescan_delay
+            log(f"⏳ Rescan delay active: will wait {rescan_delay}s before searching for new coins.")
+        else:
+            self.state["cooldown_remaining_sec"] = 0
+            if not full and self.state.get("scan_paused"):
+                self.state["scan_paused"] = False
+                log(f"▶ Slot freed ({cnt}/{max_pos}) — resuming scan for new coins.")
+                _scan_wake.set()
         self.save()
         return True
 
@@ -914,6 +966,7 @@ PaperAccount = TradingAccount
 _stats_lock = threading.Lock()
 _stats = {"since": time.time(), "cands": 0, "no_pair": 0, "checked": 0, "rejects": {}, "rug": 0, "bought": 0}
 _last_block_log = [0.0]
+_last_rescan_delay_log = [0.0]
 
 def _maybe_summary():
     with _stats_lock:
@@ -941,6 +994,27 @@ def scan_and_buy(acct, cfg):
             acct.save()
             log(f"⏸ Position slots full ({cnt}/{max_pos}) — stopped scanning for new coins until a slot frees up.")
         return
+
+    # Check post-sell rescan delay
+    rescan_delay = max(0, int(cfg.get("rescan_delay_after_sell_sec", 0)))
+    last_sell = float(acct.state.get("last_sell_time") or 0.0)
+    if rescan_delay > 0 and last_sell > 0:
+        elapsed = time.time() - last_sell
+        if elapsed < rescan_delay:
+            remaining = int(math.ceil(rescan_delay - elapsed))
+            with acct.lock:
+                if acct.state.get("cooldown_remaining_sec") != remaining:
+                    acct.state["cooldown_remaining_sec"] = remaining
+                    acct.save()
+            if time.time() - _last_rescan_delay_log[0] > 10:
+                _last_rescan_delay_log[0] = time.time()
+                log(f"⏳ Post-sell cooldown active: {remaining}s remaining before rescanning new coins (configured delay: {rescan_delay}s)")
+            return
+        else:
+            with acct.lock:
+                if acct.state.get("cooldown_remaining_sec", 0) > 0:
+                    acct.state["cooldown_remaining_sec"] = 0
+                    acct.save()
 
     if acct.state.get("scan_paused"):
         acct.state["scan_paused"] = False

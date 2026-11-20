@@ -559,9 +559,20 @@ export class LiveExecutionEngine {
             : 0;
       }
 
-      realSolSpent = Math.max(0.0001, totalOutSol - networkFeeSol - rentSol);
-      realFeesSol = networkFeeSol;
-      realEntryRentSol = rentSol;
+      const quotedSolIn =
+        quote && quote.inputMint === WSOL_MINT && Number(quote.inAmount) > 0
+          ? Number(quote.inAmount) / LAMPORTS_PER_SOL
+          : pendingPos.solIn;
+      const candidateSpent = Math.max(0.0001, totalOutSol - networkFeeSol - rentSol);
+      if (quotedSolIn > 0 && candidateSpent > quotedSolIn) {
+        realSolSpent = quotedSolIn;
+        realFeesSol = networkFeeSol;
+        realEntryRentSol = rentSol + (candidateSpent - quotedSolIn);
+      } else {
+        realSolSpent = candidateSpent;
+        realFeesSol = networkFeeSol;
+        realEntryRentSol = rentSol;
+      }
     }
 
     const realEntryPriceSol = realQuantity > 0 ? realSolSpent / realQuantity : pendingPos.entryPriceSol;

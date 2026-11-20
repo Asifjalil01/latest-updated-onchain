@@ -545,3 +545,133 @@ test('accounting: upsertPosition updates confirmed entry price, ATA rent handles
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('accounting: LiveExecutionEngine.executeLiveBuy caps ExactIn solIn at quote.inAmount when extra PDA/WSOL overhead occurs', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssb-acct-exactin-'));
+  const db = new BotDatabase(path.join(tmpDir, 'test.db'));
+  const kp = await Keypair.generate();
+  const signer = new ServerSignerManager(path.join(tmpDir, 'ks.json'));
+  await signer.initFromEnv(JSON.stringify(Array.from(kp.secretKey)));
+
+  try {
+    const mint = 'CowboyCat1111111111111111111111111111111111';
+    const solPriceUsd = 72.22;
+    const solAmount = 0.00692329; // $0.50 at $72.22
+    const quotedInLamports = 6_923_290;
+    const qty = 31936.708013;
+
+    const vtxMsg = new TransactionMessage({
+      payerKey: kp.publicKey,
+      recentBlockhash: '11111111111111111111111111111111' as unknown as ConstructorParameters<
+        typeof TransactionMessage
+      >[0]['recentBlockhash'],
+      instructions: [],
+    }).compileToV0Message();
+    const dummySwapBase64 = Buffer.from(new VersionedTransaction(vtxMsg).serialize()).toString('base64');
+
+    let tokenBalUi = 0;
+    const mockRpcPool = {
+      getAgreedBalanceSol: async () => ({ agreed: true, balanceSol: 0.2, readings: [0.2, 0.2] }),
+      getAgreedTokenBalanceUi: async () => ({ agreed: true, balanceUi: tokenBalUi, readings: [tokenBalUi, tokenBalUi] }),
+    } as unknown as SolanaRpcPool;
+
+    const buyQuote: JupiterQuoteResponse = {
+      inputMint: WSOL_MINT,
+      outputMint: mint,
+      inAmount: String(quotedInLamports),
+      outAmount: '31936708013',
+      slippageBps: 200,
+      priceImpactPct: '0.001',
+      routePlan: [],
+    };
+
+    const mockJupiter = {
+      getQuote: async () => buyQuote,
+      buildSwapTransaction: async () => ({ swapTransaction: dummySwapBase64 }),
+    } as unknown as JupiterProvider;
+
+    const mockAdapter: LiveTxAdapter = {
+      sendSignedTransaction: async () => {
+        tokenBalUi = qty;
+        return 'sig_cowboy_buy';
+      },
+      pollConfirmation: async () => ({ status: 'confirmed' }),
+      reconcileParsedSwapSolDelta: async () => ({
+        found: true,
+        solDeltaLamports: -(quotedInLamports + 2_039_280 + 2_977_430 + 100_000),
+        feeLamports: 100_000,
+        createdAtaRentLamports: 2_039_280,
+        tokenDeltaUi: qty,
+      }),
+      findRecentSellSignature: async () => null,
+    };
+
+    const engine = new LiveExecutionEngine(
+      db,
+      signer,
+      mockRpcPool,
+      mockJupiter,
+      () => undefined,
+      mockAdapter
+    );
+
+    const token: CandidateToken = {
+      mint,
+      symbol: 'Cowboy Cat',
+      name: 'Cowboy Cat',
+      source: 'jupiter',
+      dex: 'pumpswap',
+      pairAddress: 'PairCowboy111111111111111111111111111111111',
+      poolCreatedAtMs: Date.now() - 54_000,
+      priceUsd: 0.000015656,
+      priceSol: 0.000015656 / solPriceUsd,
+      liquidityUsd: 15_200,
+      volume24hUsd: 20_000,
+      fdvUsd: 16_000,
+      txCount24h: 120,
+      buys24h: 80,
+      sells24h: 40,
+      uniqueTraders24h: 50,
+      priceChange1hPct: 10,
+      priceChange24hPct: 10,
+      tokenDecimals: 6,
+      rawUpdatedAtMs: Date.now(),
+    };
+
+    const explanation: ExplanationRecord = {
+      mint,
+      symbol: 'Cowboy Cat',
+      tokenClass: 'meme',
+      qualityScore: 80,
+      tradeScore: 78,
+      combinedScore: 79,
+      sizeMultiplier: 1,
+      decision: 'BUY',
+      reasons: [],
+      warnings: [],
+      qualityBreakdown: {},
+      tradeBreakdown: {},
+      evaluatedAtMs: Date.now(),
+    };
+
+    const res = await engine.executeLiveBuy({
+      token,
+      solAmount,
+      solPriceUsd,
+      settings: DEFAULT_SETTINGS,
+      explanation,
+      decimals: 6,
+      quote: buyQuote,
+    });
+
+    assert.equal(res.ok, true);
+    assert.ok(res.position);
+    assert.ok(Math.abs(res.position.solIn - solAmount) < 1e-8);
+    assert.ok(Math.abs(res.position.entryPriceUsd - 0.000015656) < 0.00000005);
+    assert.ok(res.position.entryRentSol > 0.0049);
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+

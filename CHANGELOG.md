@@ -2,6 +2,37 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.29.1 — Live Buy Entry Price & ExactIn Swap Cost Basis Fix (`sniperManager.ts`, `liveEngine.ts`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed
+- **Live Buy Entry Price & SOL Cost Inflation on PumpSwap / Jupiter (`sniperManager.ts`, `liveEngine.ts`)**:
+  - Fixed a reconciliation bug where ancillary on-chain SOL outflows during Jupiter ExactIn swaps (such as PumpSwap accumulator/vault PDA creation, unclosed WSOL ATA rent, protocol fees, or priority tips outside `tx.meta.fee` and `createdAtaRentLamports`) were mistakenly added to `realSolSpent`.
+  - Previously, a `$0.50` (`0.0069 SOL`) live buy could record `0.0099 SOL` (`$0.72`) as the swap cost basis, inflating the displayed entry price (e.g., `$0.00002251` instead of Jupiter's true `$0.00001566` entry) and showing false negative PnL% even when the coin was in profit.
+  - `executeLiveBuy` (Python Sniper Bridge) and `LiveExecutionEngine.reconcileConfirmedBuy` now cap ExactIn swap cost at `quote.inAmount` (`quotedSolIn`) and track any extra on-chain overhead separately in `rentSol` so live entry price, cost USD, SOL spent, and Take-Profit triggers match actual Jupiter execution.
+
+---
+
+## v1.29.0 — Python Sniper Post-Sell Rescan Delay, Profit & Loss CSV Ledger & History CSV Export (`settings.json`, `bot.py`, `sniperManager.ts`, `api.ts`, `PythonSniperView.tsx`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Configurable Post-Sell Rescan Delay (`rescan_delay_after_sell_sec`)**:
+  - Added new setting `rescan_delay_after_sell_sec` to `settings.json`, `bot.py`, `sniperManager.ts`, and the Python Sniper Bot Settings UI tab.
+  - When a coin is sold (Take-Profit, Trailing Stop, Max Hold, or Manual Exit), the bot records the exit timestamp and pauses candidate scanning for the configured duration (e.g., 40 seconds, 60 seconds / 1 min, 180 seconds / 3 mins, etc.).
+  - Added live countdown visibility: displays `⏳ RESCAN DELAY (Xs) · SCAN PAUSED` pill in the header and a `Rescan delay: Xs left` badge in the Positions tab while cooldown is active so the user always knows why scanning is paused.
+  - Settings UI displays dynamic minute equivalent preview alongside input (e.g. `≈ 1.0 min (60s)`, `≈ 3.0 min (180s)`, or `0s (immediate)`).
+- **Dedicated Profit & Loss CSV Ledger (`pnl_history.csv` / `live_pnl_history.csv`)**:
+  - Automatically records every closed trade into an itemized PnL ledger with columns: `time`, `symbol`, `mint`, `outcome` (`PROFIT` / `LOSS`), `entry_price`, `exit_price`, `cost_usd`, `proceeds_usd`, `pnl_usd`, `pnl_sol`, `pnl_pct`, `reason`, `hold_seconds`, `dex`, `source`, `sol_price_usd`, `tx_buy`, `tx_sell`, and `dexscreener`.
+  - Both Python bot (`TradingAccount._log_pnl`) and Node manager (`appendPnlCsv`) append to the CSV when closing trades, ensuring complete parity across paper and live trading.
+- **Export CSV Button in History Tab (`GET /api/sniper/export/trades.csv`, `PythonSniperView.tsx`)**:
+  - Added an **Export CSV** button in the Python Sniper Bot Trade History tab with `Download` icon, allowing one-click export and download of the complete PnL ledger (`sniper_paper_pnl_YYYY-MM-DD.csv` or `sniper_live_pnl_YYYY-MM-DD.csv`).
+  - Implemented `/api/sniper/export/trades.csv` endpoint supporting authentication via `x-api-token` header or query token, with automatic fallback synthesis from existing trade history if the dedicated ledger is fresh.
+
+---
+
 ## v1.28.2 — Python Sniper Force-Delete / Rugpull Position Clear & Trade History Write-off (`sniperManager.ts`, `api.ts`, `PythonSniperView.tsx`)
 
 **Risk Warning: Trading can lose all of your money.**

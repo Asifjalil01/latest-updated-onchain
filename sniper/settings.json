@@ -32,5 +32,6 @@
   "log_rejects": true,
   "jupiter_api_key": "",
   "use_jupiter_price": true,
-  "python_binary_path": ""
+  "python_binary_path": "",
+  "rescan_delay_after_sell_sec": 0
 }

@@ -347,3 +347,192 @@ test('SniperManager live buy alerts explicitly on insufficient SOL and executes 
   }
 });
 
+test('SniperManager records pnl_history.csv and exports formatted CSV with outcome and SOL delta', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-pnl-test-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const { pnlCsv } = getSniperFilePaths('paper', tmpDir);
+
+    // 1. Append trade
+    mgr.appendPnlCsv('paper', {
+      time: '2026-11-19T10:00:00Z',
+      symbol: 'ANTS',
+      mint: 'ANTSMint1111111111111111111111111111111111111',
+      outcome: 'PROFIT',
+      entryPrice: 0.011,
+      exitPrice: 0.017,
+      costUsd: 5.0,
+      proceedsUsd: 7.7,
+      pnlUsd: 2.7,
+      pnlSol: 0.027,
+      pnlPct: 54.0,
+      reason: 'take_profit_50',
+      holdSeconds: 120,
+      dex: 'meteora',
+      source: 'gecko',
+      solPriceUsd: 100,
+      txBuy: 'sigBuy111',
+      txSell: 'sigSell222',
+      dexscreener: 'https://dexscreener.com/solana/ANTSMint1111111111111111111111111111111111111',
+    });
+
+    assert.equal(fs.existsSync(pnlCsv), true);
+    const content = fs.readFileSync(pnlCsv, 'utf-8');
+    assert.match(content, /^time,symbol,mint,outcome,entry_price,exit_price/);
+    assert.match(content, /ANTS,ANTSMint1111111111111111111111111111111111111,PROFIT/);
+    assert.match(content, /take_profit_50,120.0,meteora,gecko,100.0000/);
+
+    // 2. Export method returns the CSV content
+    const exported = mgr.exportPnlCsv('paper');
+    assert.match(exported, /PROFIT/);
+    assert.match(exported, /2.7000/);
+    assert.match(exported, /54.00/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('SniperManager calculates cooldown_remaining_sec from rescan_delay_after_sell_sec and last_sell_time', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-cooldown-test-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const { stateFile } = getSniperFilePaths('paper', tmpDir);
+
+    // Default setting: 60 seconds delay
+    mgr.updateSettings({ rescan_delay_after_sell_sec: 60 });
+
+    // Recent sell 20 seconds ago -> remaining should be ~40 seconds
+    const nowSec = Date.now() / 1000;
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({
+        positions: {},
+        last_sell_time: nowSec - 20,
+      }),
+      'utf-8'
+    );
+
+    const status1 = mgr.getStatus();
+    assert.ok(status1.cooldown_remaining_sec >= 38 && status1.cooldown_remaining_sec <= 41);
+    assert.equal(status1.scan_paused, true);
+    assert.equal(status1.rescan_delay_sec, 60);
+
+    // Sell 70 seconds ago -> delay expired
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({
+        positions: {},
+        last_sell_time: nowSec - 70,
+      }),
+      'utf-8'
+    );
+
+    const status2 = mgr.getStatus();
+    assert.equal(status2.cooldown_remaining_sec, 0);
+    assert.equal(status2.scan_paused, false);
+
+    // Setting disabled (0s delay)
+    mgr.updateSettings({ rescan_delay_after_sell_sec: 0 });
+    const status3 = mgr.getStatus();
+    assert.equal(status3.cooldown_remaining_sec, 0);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('SniperManager executeLiveBuy caps ExactIn swap cost at quote.inAmount so ancillary PumpSwap/WSOL rent does not inflate entry price', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-exactin-test-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const kp = await Keypair.generate();
+    const signer = new ServerSignerManager(path.join(tmpDir, 'ks.json'));
+    await signer.initFromEnv(JSON.stringify(Array.from(kp.secretKey)));
+    const mockTxBase64 = createBase64MockTx(kp);
+
+    const solPriceUsd = 72.22;
+    const tradeSizeUsd = 0.5;
+    // Mirror exact Cowboy Cat screenshot values: 0.00692329 SOL ($0.50) -> 31,936.708013 tokens
+    const exactQty = 31936.708013;
+    const exactRaw = '31936708013';
+    const quotedInLamports = Math.round((tradeSizeUsd / solPriceUsd) * 1e9); // 6,923,290 lamports
+
+    let tokenBalUi = 0;
+    let tokenRaw = '0';
+
+    const mockOrchestrator = {
+      signer,
+      rpcPool: {
+        getAgreedBalanceSol: async () => ({ agreed: true, balanceSol: 0.18, readings: [0.18, 0.18] }),
+        getAgreedTokenBalanceUi: async () => ({
+          agreed: true,
+          balanceUi: tokenBalUi,
+          rawAmount: tokenRaw,
+          decimals: 6,
+          readings: [tokenBalUi, tokenBalUi],
+        }),
+        inspectTokenOnChain: async () => ({ decimals: 6 }),
+      },
+      jupiter: {
+        getLiveSolPriceUsd: async () => solPriceUsd,
+        getLastQuoteError: () => null,
+        getQuote: async (params: any) => ({
+          inputMint: params.inputMint,
+          inAmount: String(quotedInLamports),
+          outputMint: params.outputMint,
+          outAmount: exactRaw,
+          slippageBps: params.slippageBps,
+          priceImpactPct: '0.001',
+          routePlan: [],
+        }),
+        buildSwapTransaction: async () => ({ swapTransaction: mockTxBase64 }),
+      },
+    } as unknown as BotOrchestrator;
+
+    const mockAdapter: LiveTxAdapter = {
+      sendSignedTransaction: async () => {
+        tokenBalUi = exactQty;
+        tokenRaw = exactRaw;
+        return '3gqzxB7LiveBuySig11111111111111111111111111';
+      },
+      pollConfirmation: async () => ({ status: 'confirmed' }),
+      reconcileParsedSwapSolDelta: async () => ({
+        found: true,
+        // Total wallet SOL outflow: 0.00692329 swap + 0.00203928 token ATA + 0.00297743 PumpSwap PDA/WSOL overhead + 0.00010000 fee
+        solDeltaLamports: -(quotedInLamports + 2_039_280 + 2_977_430 + 100_000),
+        feeLamports: 100_000,
+        createdAtaRentLamports: 2_039_280,
+        tokenDeltaUi: exactQty,
+      }),
+      findRecentSellSignature: async () => null,
+    };
+
+    mgr.attachOrchestrator(mockOrchestrator, mockAdapter);
+
+    const buyRes = await mgr.executeLiveBuy({
+      mint: 'AjshMJAXCowboyCat1111111111111111111111KkS6',
+      symbol: 'Cowboy Cat',
+      tradeSizeUsd,
+      solPriceUsd,
+    });
+
+    assert.equal(buyRes.ok, true);
+    // Entry cost & price must reflect the $0.50 (0.006923 SOL) swap, NOT 0.0099 SOL / $0.72!
+    assert.ok(
+      Math.abs((buyRes.costSol ?? 0) - quotedInLamports / 1e9) < 1e-8,
+      `Expected costSol ~0.006923, got ${buyRes.costSol}`
+    );
+    assert.ok(
+      Math.abs((buyRes.costUsd ?? 0) - 0.5) < 0.002,
+      `Expected costUsd ~$0.50, got ${buyRes.costUsd}`
+    );
+    assert.ok(
+      Math.abs((buyRes.entryPriceUsd ?? 0) - 0.000015656) < 0.00000005,
+      `Expected entryPriceUsd ~$0.000015656, got ${buyRes.entryPriceUsd}`
+    );
+    // Ancillary PumpSwap/WSOL PDA rent must be isolated in rentSol rather than corrupting entry price
+    assert.ok((buyRes.rentSol ?? 0) > 0.0049, `Expected rentSol to capture ATA+PDA overhead, got ${buyRes.rentSol}`);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+

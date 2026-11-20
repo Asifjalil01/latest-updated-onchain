@@ -16,6 +16,7 @@ import {
   Wallet,
   ShieldAlert,
   RefreshCw,
+  Download,
 } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import {
@@ -85,6 +86,7 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['max_hold_minutes', 'Max hold (minutes)', 'int'],
   ['max_age_minutes', 'Sniper window: max coin age (minutes)', 'float'],
   ['scan_interval_sec', 'Scan for new coins every (sec)', 'int'],
+  ['rescan_delay_after_sell_sec', 'Delay before rescan after sell (sec)', 'int'],
   ['monitor_interval_sec', 'Price check every (sec)', 'float'],
   ['min_liquidity_usd', 'Min liquidity $', 'float'],
   ['min_buys_m5', 'Min buys last 5 min', 'int'],
@@ -133,7 +135,7 @@ function fmtDate(isoStr: string): string {
 }
 
 export function PythonSniperView() {
-  const { apiFetch, pushToast, setActiveTab: setAppViewTab } = useBotStore();
+  const { apiFetch, apiToken, pushToast, setActiveTab: setAppViewTab } = useBotStore();
   const [mode, setMode] = useState<'paper' | 'live'>('paper');
   const [switchingMode, setSwitchingMode] = useState(false);
   const [running, setRunning] = useState(false);
@@ -155,6 +157,8 @@ export function PythonSniperView() {
     day_pnl: number;
     last_price_time?: number;
     scan_paused?: boolean;
+    last_sell_time?: number;
+    cooldown_remaining_sec?: number;
   }>({
     cash: 50.0,
     wallet_sol: null,
@@ -165,6 +169,8 @@ export function PythonSniperView() {
     day_pnl: 0.0,
     last_price_time: 0,
     scan_paused: false,
+    last_sell_time: 0,
+    cooldown_remaining_sec: 0,
   });
 
   // Separate committed server settings from draft user inputs to prevent snap-back while editing
@@ -178,6 +184,8 @@ export function PythonSniperView() {
   const [solPriceUsd, setSolPriceUsd] = useState<number | null>(null);
   const [priceAgeSec, setPriceAgeSec] = useState<number | null>(null);
   const [scanPaused, setScanPaused] = useState(false);
+  const [cooldownSec, setCooldownSec] = useState<number>(0);
+  const [exportingCsv, setExportingCsv] = useState(false);
   const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'logs' | 'settings'>('positions');
   const [historySearch, setHistorySearch] = useState('');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -212,6 +220,13 @@ export function PythonSniperView() {
         }
         setPriceAgeSec(typeof data.price_age_sec === 'number' ? data.price_age_sec : null);
         setScanPaused(Boolean(data.scan_paused ?? data.state?.scan_paused));
+        if (typeof data.cooldown_remaining_sec === 'number') {
+          setCooldownSec(data.cooldown_remaining_sec);
+        } else if (typeof data.state?.cooldown_remaining_sec === 'number') {
+          setCooldownSec(data.state.cooldown_remaining_sec);
+        } else {
+          setCooldownSec(0);
+        }
       }
     } catch {}
   };
@@ -406,6 +421,43 @@ export function PythonSniperView() {
     }
   };
 
+  const handleExportCsv = async () => {
+    try {
+      setExportingCsv(true);
+      const tokenParam = apiToken ? `&token=${encodeURIComponent(apiToken)}` : '';
+      const url = `/api/sniper/export/trades.csv?mode=${mode}${tokenParam}`;
+      const res = await fetch(url, {
+        headers: apiToken ? { 'x-api-token': apiToken } : {},
+      });
+      if (!res.ok) {
+        throw new Error(`Export failed with HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = downloadUrl;
+      const today = new Date().toISOString().slice(0, 10);
+      a.download = `sniper_${mode}_pnl_${today}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(downloadUrl);
+      pushToast({
+        kind: 'success',
+        title: 'PnL CSV exported successfully',
+        body: `Downloaded sniper_${mode}_pnl_${today}.csv`,
+      });
+    } catch (err) {
+      pushToast({
+        kind: 'error',
+        title: 'Export failed',
+        body: err instanceof Error ? err.message : 'Error exporting CSV',
+      });
+    } finally {
+      setExportingCsv(false);
+    }
+  };
+
   const positionsList = Object.entries(state.positions || {}).map(([mint, p]) => ({
     mint,
     ...p,
@@ -424,6 +476,7 @@ export function PythonSniperView() {
   const winRateText = closedCount > 0 ? `${((winsCount / closedCount) * 100).toFixed(0)}% (${winsCount}/${closedCount})` : 'no closed trades';
   const maxSlots = Math.max(1, Number(serverSettings.max_open_positions || draftSettings.max_open_positions || 3));
   const slotsFull = positionsList.length >= maxSlots || scanPaused;
+  const cooldownRemainingSec = Number(cooldownSec || state.cooldown_remaining_sec || 0);
 
   const isLiveMode = mode === 'live';
   const effectiveWalletSol = isLiveMode ? (liveWallet.balanceSol ?? state.wallet_sol ?? null) : null;
@@ -457,7 +510,11 @@ export function PythonSniperView() {
   let dotClass = 'bg-slate-400';
 
   if (running) {
-    if (slotsFull) {
+    if (cooldownRemainingSec > 0) {
+      statusText = `RUNNING · RESCAN DELAY (${cooldownRemainingSec}s) · SCAN PAUSED`;
+      statusBadgeClass = 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30';
+      dotClass = 'bg-amber-500 animate-pulse';
+    } else if (slotsFull) {
       const priceHint =
         priceAgeSec !== null && priceAgeSec <= 15
           ? `prices ${priceAgeSec.toFixed(1)}s ago`
@@ -718,7 +775,13 @@ export function PythonSniperView() {
               </span>
             </div>
             <div className="flex items-center gap-2">
-              {slotsFull && running && (
+              {cooldownRemainingSec > 0 && running && (
+                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30">
+                  <PauseCircle className="w-3 h-3" />
+                  <span>Rescan delay: {cooldownRemainingSec}s left</span>
+                </span>
+              )}
+              {slotsFull && running && cooldownRemainingSec <= 0 && (
                 <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30">
                   <PauseCircle className="w-3 h-3" />
                   <span>Scan auto-paused until a slot frees</span>
@@ -940,6 +1003,16 @@ export function PythonSniperView() {
                 onChange={(e) => setHistorySearch(e.target.value)}
                 className="px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs text-slate-900 dark:text-slate-100 font-mono w-48"
               />
+              <button
+                type="button"
+                onClick={() => void handleExportCsv()}
+                disabled={exportingCsv}
+                className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50 shadow-sm"
+                title="Export closed trades and PnL ledger to CSV"
+              >
+                <Download className="w-3.5 h-3.5 text-emerald-500" />
+                <span>{exportingCsv ? 'Exporting...' : 'Export CSV'}</span>
+              </button>
             </div>
           </div>
 
@@ -1263,6 +1336,12 @@ export function PythonSniperView() {
                   isUsdField && !isNaN(numericVal) && solPriceUsd
                     ? fmtSolAmount(usdToSol(numericVal, solPriceUsd))
                     : null;
+                const timeHelper =
+                  key === 'rescan_delay_after_sell_sec'
+                    ? !isNaN(numericVal) && numericVal > 0
+                      ? `≈ ${(numericVal / 60).toFixed(1)} min (${numericVal}s)`
+                      : '0s (immediate)'
+                    : null;
 
                 return (
                   <div key={key} className="space-y-1">
@@ -1273,6 +1352,11 @@ export function PythonSniperView() {
                       {solEquivalent && (
                         <span className="font-mono text-[11px] font-semibold text-teal-600 dark:text-teal-400 whitespace-nowrap">
                           ≈ {solEquivalent}
+                        </span>
+                      )}
+                      {timeHelper && (
+                        <span className="font-mono text-[11px] font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap">
+                          {timeHelper}
                         </span>
                       )}
                     </div>
