@@ -51,6 +51,7 @@ interface SniperPosition {
   peak_pct?: number;
   low_pct?: number;
   trailing_active?: boolean;
+  trailing_floor_pct?: number | null;
   dex?: string;
   source?: string;
   age_at_entry?: number;
@@ -182,7 +183,12 @@ export function PythonSniperView() {
   const [serverSettings, setServerSettings] = useState<Record<string, any>>({});
   const [draftSettings, setDraftSettings] = useState<Record<string, any>>({});
   const [isSettingsDirty, setIsSettingsDirty] = useState(false);
+  const isSettingsDirtyRef = useRef(false);
   const settingsLoadedRef = useRef(false);
+  const markSettingsDirty = (dirty: boolean) => {
+    isSettingsDirtyRef.current = dirty;
+    setIsSettingsDirty(dirty);
+  };
 
   const [trades, setTrades] = useState<EnrichedSniperTrade[]>([]);
   const [logs, setLogs] = useState<SniperLog[]>([]);
@@ -224,7 +230,7 @@ export function PythonSniperView() {
         if (!settingsLoadedRef.current) {
           setDraftSettings(fetchedSettings);
           settingsLoadedRef.current = true;
-        } else if (!isSettingsDirty) {
+        } else if (!isSettingsDirtyRef.current) {
           setDraftSettings(fetchedSettings);
         }
 
@@ -349,7 +355,7 @@ export function PythonSniperView() {
     try {
       const data = await apiFetch<any>('/api/sniper/reset', { method: 'POST' });
       if (data.ok) {
-        setIsSettingsDirty(false);
+        markSettingsDirty(false);
         pushToast({ kind: 'info', title: data.message || 'Account reset successfully' });
         void fetchStatus();
       }
@@ -385,7 +391,7 @@ export function PythonSniperView() {
       if (data.ok) {
         setServerSettings(payload);
         setDraftSettings(payload);
-        setIsSettingsDirty(false);
+        markSettingsDirty(false);
         pushToast({ kind: 'success', title: 'Python sniper settings saved' });
         void fetchStatus();
       }
@@ -943,7 +949,9 @@ export function PythonSniperView() {
                               className="inline-block mt-0.5 px-1.5 py-0.2 rounded bg-emerald-500/15 text-emerald-500 border border-emerald-500/30 text-[9px] font-bold uppercase tracking-wider"
                               title="Profit target reached — trailing stop is armed and tracking peak"
                             >
-                              Trail On
+                              {typeof p.trailing_floor_pct === 'number'
+                                ? `Trail ≥ +${p.trailing_floor_pct.toFixed(1)}%`
+                                : 'Trail On'}
                             </span>
                           )}
                         </td>
@@ -1376,7 +1384,7 @@ export function PythonSniperView() {
                   type="button"
                   onClick={() => {
                     setDraftSettings({ ...serverSettings });
-                    setIsSettingsDirty(false);
+                    markSettingsDirty(false);
                     pushToast({ kind: 'info', title: 'Edits discarded' });
                   }}
                   className="px-3 py-2 rounded-xl text-xs font-semibold border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition-colors"
@@ -1450,7 +1458,7 @@ export function PythonSniperView() {
                         value={val === true || val === 'true' ? 'true' : 'false'}
                         onChange={(e) => {
                           setDraftSettings({ ...draftSettings, [key]: e.target.value === 'true' });
-                          setIsSettingsDirty(true);
+                          markSettingsDirty(true);
                         }}
                         className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100"
                       >
@@ -1465,7 +1473,7 @@ export function PythonSniperView() {
                         value={val ?? ''}
                         onChange={(e) => {
                           setDraftSettings({ ...draftSettings, [key]: e.target.value });
-                          setIsSettingsDirty(true);
+                          markSettingsDirty(true);
                         }}
                         className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-teal-500"
                       />

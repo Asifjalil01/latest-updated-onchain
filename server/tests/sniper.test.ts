@@ -593,14 +593,17 @@ test('SniperManager clearLogs wipes scan logs, reports uptime_sec, and bridges P
 test('formatTrailingModeHint describes TP + Trailing, Trail-only, TP-only, and Disabled modes', () => {
   assert.equal(
     formatTrailingModeHint(50, 15),
-    'Arms at +50% · exits -15% from peak (profit only)'
+    'Arms at +50% · exits -15% from peak PnL (profit only)'
   );
-  assert.match(formatTrailingModeHint(0, 15), /^Arms at \+\d+% · profit-only trail \(-15%\)$/);
+  assert.equal(
+    formatTrailingModeHint(0, 15),
+    'Arms at +20% · profit-only trail (-15% peak PnL)'
+  );
   assert.equal(formatTrailingModeHint(50, 0), 'Fixed TP at +50% (trailing off)');
   assert.equal(formatTrailingModeHint(0, 0), 'Disabled');
 });
 
-test('Python sniper evaluate_exit_signal waits for TP before arming trailing stop and never sells at a loss', () => {
+test('Python sniper evaluate_exit_signal waits for TP before arming trailing stop, exits on peak PnL drop, and never sells at a loss', () => {
   const pyScript = [
     'import sys, types, json',
     'req = types.ModuleType("requests")',
@@ -612,20 +615,22 @@ test('Python sniper evaluate_exit_signal waits for TP before arming trailing sto
     'cases = {}',
     // 1. mihao screenshot regression: entry 0.00000833, peaked +12%, dropped to 0.00000781 (-6.24%) with TP=50, Trail=15 -> MUST HOLD (None, trailing_active=False)
     'cases["mihao_no_loss_sell"] = ev(0.00000833, 0.00000781, 0.00000833 * 1.12, 50, 15, 0.5, 12000)',
-    // 2. Reaches +50% (arm threshold) with TP=50, Trail=15 -> MUST NOT sell at +50%, trailing arms!
+    // 2. APCY screenshot regression: entry 0.00000737, peak +52.5%, returned to 0.00000986 (+33.78%) -> drop 18.72% >= 15% -> MUST SELL trailing_stop_15
+    'cases["apcy_peak52_5_to_33_78"] = ev(0.00000737, 0.00000986, 0.00000737 * 1.525, 50, 15, 4.0, 12000)',
+    // 3. Reaches +50% (arm threshold) with TP=50, Trail=15 -> MUST NOT sell at +50%, trailing arms!
     'cases["arms_at_tp50"] = ev(1.0, 1.50, 1.50, 50, 15, 1.0, 12000)',
-    // 3. Rides to +120% (2.20), pulls back 10% to 1.98 -> still holds
-    'cases["rides_above_tp"] = ev(1.0, 1.98, 2.20, 50, 15, 2.0, 12000)',
-    // 4. From +120% peak (2.20), drops exact 15% to 1.87 (+87% profit) -> MUST SELL trailing_stop_15
-    'cases["sells_15pct_from_peak"] = ev(1.0, 1.87, 2.20, 50, 15, 2.1, 12000)',
-    // 5. Armed at +50% then flash crash below entry (-5%) -> MUST NOT sell in a loss via trailing_stop
+    // 4. Rides to +120% (2.20), pulls back 10 PnL% to +110% (2.10) -> still holds (floor is +105%)
+    'cases["rides_above_tp"] = ev(1.0, 2.10, 2.20, 50, 15, 2.0, 12000)',
+    // 5. From +120% peak (2.20), drops exact 15 PnL% to +105% (2.05) -> MUST SELL trailing_stop_15
+    'cases["sells_15pct_from_peak"] = ev(1.0, 2.05, 2.20, 50, 15, 2.1, 12000)',
+    // 6. Armed at +50% then flash crash below entry (-5%) -> MUST NOT sell in a loss via trailing_stop
     'cases["flash_crash_no_loss_trail"] = ev(1.0, 0.95, 1.55, 50, 15, 2.5, 12000)',
-    // 6. Trail disabled (trail=0), TP=50 -> hits +50% -> immediate take_profit_50
+    // 7. Trail disabled (trail=0), TP=50 -> hits +50% -> immediate take_profit_50
     'cases["fixed_tp_when_trail_off"] = ev(1.0, 1.50, 1.50, 50, 0, 1.0, 12000)',
-    // 7. TP disabled (tp=0), Trail=15 -> peak +12% then drop 15% (-4.8% loss) -> MUST NOT sell
-    'cases["trail_only_blocks_loss"] = ev(1.0, 0.952, 1.12, 0, 15, 1.0, 12000)',
-    // 8. TP disabled (tp=0), Trail=15 -> peak +30% then drop 15% (+10.5% profit) -> MUST SELL trailing_stop_15
-    'cases["trail_only_sells_in_profit"] = ev(1.0, 1.30 * 0.85, 1.30, 0, 15, 1.0, 12000)',
+    // 8. TP disabled (tp=0), Trail=15 -> peak +12% then drop 15% (-3% loss) -> MUST NOT sell
+    'cases["trail_only_blocks_loss"] = ev(1.0, 0.97, 1.12, 0, 15, 1.0, 12000)',
+    // 9. TP disabled (tp=0), Trail=15 -> peak +30% then drop 15% (+15% profit) -> MUST SELL trailing_stop_15
+    'cases["trail_only_sells_in_profit"] = ev(1.0, 1.15, 1.30, 0, 15, 1.0, 12000)',
     'print(json.dumps(cases))',
   ].join('\n');
 
@@ -634,6 +639,9 @@ test('Python sniper evaluate_exit_signal waits for TP before arming trailing sto
 
   assert.equal(res.mihao_no_loss_sell[0], null);
   assert.equal(res.mihao_no_loss_sell[1], false);
+
+  assert.equal(res.apcy_peak52_5_to_33_78[0], 'trailing_stop_15');
+  assert.equal(res.apcy_peak52_5_to_33_78[1], true);
 
   assert.equal(res.arms_at_tp50[0], null);
   assert.equal(res.arms_at_tp50[1], true);

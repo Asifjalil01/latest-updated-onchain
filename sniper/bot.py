@@ -1004,7 +1004,7 @@ class TradingAccount:
           take_profit_pct acts as the arm threshold: wait until peak >= +tp% before
           activating trailing stop so runners are not sold early at +tp% or in a loss.
         - When take_profit_pct == 0 and trailing_stop_pct > 0, wait until peak reaches at
-          least enough profit that a trail% drop from peak remains profitable (+5% buffer).
+          least trail + 5% so the trailing floor (peak - trail) is already +5%+ in profit.
         """
         tp = float(tp or 0.0)
         trail = float(trail or 0.0)
@@ -1012,13 +1012,11 @@ class TradingAccount:
             return 0.0
         if tp > 0.0:
             return tp
-        frac_left = max(0.05, 1.0 - trail / 100.0)
-        breakeven_peak = (1.0 / frac_left - 1.0) * 100.0
-        return max(10.0, breakeven_peak + 5.0)
+        return max(10.0, trail + 5.0)
 
     @classmethod
     def evaluate_exit_signal(cls, entry, price, peak_price, tp, trail, held_minutes, max_hold_minutes):
-        """Return (reason_or_none, trailing_active, drop_from_peak_pct)."""
+        """Return (reason_or_none, trailing_active, drop_from_peak_pnl_pct)."""
         if not entry or entry <= 0 or not price or price <= 0:
             return None, False, 0.0
         tp = float(tp or 0.0)
@@ -1026,7 +1024,8 @@ class TradingAccount:
         peak = max(float(entry), float(peak_price or entry), float(price))
         change_pct = (price / entry - 1.0) * 100.0
         peak_chg_pct = (peak / entry - 1.0) * 100.0
-        drop_from_peak_pct = max(0.0, (1.0 - price / peak) * 100.0)
+        # Pullback from peak gain in percentage points (matches Spot Bot trailing floor: peak_pnl - trail)
+        drop_from_peak_pct = max(0.0, peak_chg_pct - change_pct)
 
         if trail > 0.0:
             arm_pct = cls.trailing_stop_arm_pct(tp, trail)
@@ -1080,8 +1079,9 @@ class TradingAccount:
             )
             was_active = bool(pos.get("trailing_active"))
             pos["trailing_active"] = trailing_active
+            pos["trailing_floor_pct"] = round(max(0.01, pos["peak_pct"] - trail), 2) if (trailing_active and trail > 0) else None
             if trailing_active and not was_active:
-                log(f"🎯 Trailing stop ARMED for {pos['symbol']}: peak +{pos['peak_pct']:.1f}% (trailing -{trail:g}% from peak, profit-protected)")
+                log(f"🎯 Trailing stop ARMED for {pos['symbol']}: peak +{pos['peak_pct']:.1f}% | exit floor +{pos['trailing_floor_pct']:.1f}% (-{trail:g}% from peak PnL)")
 
             if reason:
                 if _should_stop():

@@ -168,12 +168,11 @@ export function formatTrailingModeHint(takeProfitPct: number, trailingStopPct: n
   const tp = Number.isFinite(takeProfitPct) && takeProfitPct > 0 ? takeProfitPct : 0;
   const trail = Number.isFinite(trailingStopPct) && trailingStopPct > 0 ? trailingStopPct : 0;
   if (tp > 0 && trail > 0) {
-    return `Arms at +${tp}% · exits -${trail}% from peak (profit only)`;
+    return `Arms at +${tp}% · exits -${trail}% from peak PnL (profit only)`;
   }
   if (tp <= 0 && trail > 0) {
-    const fracLeft = Math.max(0.05, 1 - trail / 100);
-    const arm = Math.max(10, (1 / fracLeft - 1) * 100 + 5);
-    return `Arms at +${Math.ceil(arm)}% · profit-only trail (-${trail}%)`;
+    const arm = Math.max(10, Math.ceil(trail + 5));
+    return `Arms at +${arm}% · profit-only trail (-${trail}% peak PnL)`;
   }
   if (tp > 0 && trail <= 0) {
     return `Fixed TP at +${tp}% (trailing off)`;

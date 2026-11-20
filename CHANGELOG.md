@@ -2,6 +2,20 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.30.2 — Trailing Stop Pullback Measured from Peak PnL % + Live Floor Badge (`bot.py`, `PythonSniperView.tsx`, `sniperFormat.ts`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed
+- **Trailing Stop Exit Now Fires on `Peak PnL % - Trailing %` (`bot.py`)**:
+  - Fixed trailing drawdown calculation (`drop_from_peak_pct`) so it measures the drop directly in **percentage points from Peak PnL %** (`peak_chg_pct - change_pct >= trailing_stop_pct`), matching Solana Spot Bot's exit floor math (`peakGainPct - allowedDrop`).
+  - Previously, measuring `(1 - price / peak_price) * 100` meant a coin that peaked at `+52.5%` and dropped to `+33.78%` (`-18.72%` from peak PnL) only registered as `12.28%` and waited down until `+29.6%`. Now `52.5% - 15% = +37.5%` exit floor triggers `trailing_stop_15` cleanly as soon as PnL crosses below `+37.5%` (such as `+33.78%`).
+  - When `take_profit_pct = 0` and `trailing_stop_pct > 0`, the arm threshold is now `max(10, trailing_stop_pct + 5)%` so the initial trailing floor always starts at `+5%+` profit.
+- **Exact Trailing Floor Indicator (`PythonSniperView.tsx`, `sniperFormat.ts`)**:
+  - Updated the Open Positions `Trail` badge under `Peak / Low` to display the live exit floor (e.g. `Trail ≥ +37.5%`) once trailing stop arms.
+
+---
+
 ## v1.30.1 — Profit-Protected Trailing Stop & Take-Profit Activation (`bot.py`, `PythonSniperView.tsx`, `sniperFormat.ts`)
 
 **Risk Warning: Trading can lose all of your money.**
