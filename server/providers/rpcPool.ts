@@ -365,42 +365,92 @@ export class SolanaRpcPool {
     signature: string
   ): Promise<{ confirmed: boolean; err: string | null; agreements: number }> {
     const ordered = this.getOrderedConnections().slice(0, 3);
+    if (ordered.length === 0) {
+      return { confirmed: false, err: null, agreements: 0 };
+    }
+
     let confirmedCount = 0;
     let errorCount = 0;
+    let respondedCount = 0;
+    let completed = 0;
     let lastErr: string | null = null;
+    const quorum = Math.min(2, ordered.length);
 
-    await Promise.all(
-      ordered.map(async ({ ep, conn }) => {
-        try {
-          const statusResp = await Promise.race([
-            conn.getSignatureStatuses([signature], { searchTransactionHistory: true }),
-            new Promise<never>((_, rej) => setTimeout(() => rej(new Error('RPC timeout')), 4500)),
-          ]);
-          const st = statusResp.value[0];
-          if (st) {
-            if (st.err) {
-              errorCount += 1;
-              lastErr = JSON.stringify(st.err);
-            } else if (
-              st.confirmationStatus === 'confirmed' ||
-              st.confirmationStatus === 'finalized'
-            ) {
-              confirmedCount += 1;
-            }
-          }
-        } catch (err) {
-          this.recordEndpointError(ep.url, err instanceof Error ? err.message : String(err));
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (result: { confirmed: boolean; err: string | null; agreements: number }) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+
+      const checkFinal = () => {
+        if (confirmedCount >= quorum) {
+          finish({ confirmed: true, err: null, agreements: confirmedCount });
+          return;
         }
-      })
-    );
+        if (errorCount >= quorum) {
+          finish({
+            confirmed: false,
+            err: lastErr ?? 'On-chain transaction error',
+            agreements: errorCount,
+          });
+          return;
+        }
+        if (completed >= ordered.length) {
+          // If only 1 healthy RPC responded and confirmed with zero errors, accept it instead of stalling
+          if (confirmedCount >= 1 && errorCount === 0 && respondedCount === 1) {
+            finish({ confirmed: true, err: null, agreements: confirmedCount });
+            return;
+          }
+          if (errorCount >= 1 && confirmedCount === 0 && respondedCount === errorCount) {
+            finish({
+              confirmed: false,
+              err: lastErr ?? 'On-chain transaction error',
+              agreements: errorCount,
+            });
+            return;
+          }
+          finish({ confirmed: false, err: null, agreements: confirmedCount });
+        }
+      };
 
-    if (confirmedCount >= 2) {
-      return { confirmed: true, err: null, agreements: confirmedCount };
-    }
-    if (errorCount >= 2) {
-      return { confirmed: false, err: lastErr ?? 'On-chain transaction error', agreements: errorCount };
-    }
-    return { confirmed: false, err: null, agreements: confirmedCount };
+      for (const { ep, conn } of ordered) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const statusPromise = conn
+          .getSignatureStatuses([signature], { searchTransactionHistory: true })
+          .finally(() => {
+            if (timer !== undefined) clearTimeout(timer);
+          });
+        const timeoutPromise = new Promise<never>((_, rej) => {
+          timer = setTimeout(() => rej(new Error('RPC timeout')), 1800);
+        });
+
+        Promise.race([statusPromise, timeoutPromise])
+          .then((statusResp) => {
+            respondedCount += 1;
+            const st = statusResp?.value?.[0];
+            if (st) {
+              if (st.err) {
+                errorCount += 1;
+                lastErr = JSON.stringify(st.err);
+              } else if (
+                st.confirmationStatus === 'confirmed' ||
+                st.confirmationStatus === 'finalized'
+              ) {
+                confirmedCount += 1;
+              }
+            }
+          })
+          .catch((err) => {
+            this.recordEndpointError(ep.url, err instanceof Error ? err.message : String(err));
+          })
+          .finally(() => {
+            completed += 1;
+            checkFinal();
+          });
+      }
+    });
   }
 
   private async rpcJsonPost<T>(

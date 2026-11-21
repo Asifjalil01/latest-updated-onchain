@@ -2,6 +2,25 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.32.1 — Fast Live Buy Execution, Parallel Rug Screening, Streamlined Quick-Profit Settings UI & Young-Coin Rug Score Calibration (`rpcPool.ts`, `liveEngine.ts`, `sniperManager.ts`, `bot.py`, `settings.json`, `PythonSniperView.tsx`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Improved
+- **Fast Live Buy Execution (`sniperManager.ts`, `rpcPool.ts`, `liveEngine.ts`)**:
+  - Parallelized pre-buy checks and quote discovery inside `executeLiveBuy` (`getAgreedTokenBalanceUi`, `inspectTokenOnChain`, stale SOL balance check, and `jupiter.getQuote(..., bypassCache: true)`) in a single concurrent batch, with a `<10s` cached SOL balance fast-path when funded.
+  - Enabled `skipPreflight: true` on fast live snipe buy submissions (skipping redundant simulation RPC latency immediately after quoting) and moved post-buy SOL balance refresh into a non-blocking background update using immediate deterministic accounting.
+  - Rewrote `SolanaRpcPool.getAgreedSignatureConfirmation` to early-resolve as soon as quorum confirms or fails instead of stalling on a lagging 3rd RPC, lowered per-RPC status timeout from `4500ms` to `1800ms`, and added single healthy-responder confirmation fallback.
+  - Reduced `DefaultLiveTxAdapter.pollConfirmation` interval from `650ms` to `350ms` and `reconcileParsedSwapSolDelta` retry delay from `400ms` to `200ms`, cutting typical live buy execution from ~15s down to a few seconds.
+- **Parallel Rug Screening & Faster New-Launch Catch Rate (`bot.py`)**:
+  - Parallelized `hard_rug_check` using a 3-worker `ThreadPoolExecutor` so on-chain SPL/Token-2022 inspection, RugCheck `/report` fetch, and pre-buy Jupiter sell-route simulation execute concurrently (~1s vs 3–6s sequential) with non-blocking pool teardown on early rejection.
+  - Added `_pending_dex_retry` queue (`~2s` retry interval for up to `45s`) so ultra-fresh `pumpportal` launches not yet indexed on DexScreener (`not-on-dexscreener`) are re-checked within ~2 seconds instead of waiting `10s` (`SEEN_TTL_SEC`).
+- **Streamlined Quick-Profit Settings UI & Young-Coin Calibration (`PythonSniperView.tsx`, `settings.json`, `bot.py`, `sniperManager.ts`)**:
+  - Streamlined `PYTHON_SETTINGS_METADATA` in **Python Sniper Bot → Settings** to show the 20 essential quick-profit and anti-rug controls (`TP 35%`, `Trail 12%`, `SL 30%`, `LP-Drain 50%`, `Slippage 3%`), while cleanly commenting out optional/auto-managed fields in source for easy future re-enabling.
+  - Raised default `rugcheck_max_score` from `25` to `55` (and adjusted the UI weak-filter banner threshold to `> 60`) because brand-new `< 2m` Solana tokens baseline around `52/100` on RugCheck while Mint/Freeze Authority, Token-2022 extension, `>=80%` LP Lock/Burn, `<=35%` non-pool Top-10 holders, and Jupiter sell-route checks remain strictly enforced.
+
+---
+
 ## v1.32.0 — Trailing-Stop & Live Sell Reliability Fix, Fail-Closed Anti-Rug Protections, and Dev Server Startup Fix (`env.ts`, `jupiter.ts`, `liveEngine.ts`, `rpcPool.ts`, `sniperManager.ts`, `bot.py`, `settings.json`, `PythonSniperView.tsx`)
 
 **Risk Warning: Trading can lose all of your money.**

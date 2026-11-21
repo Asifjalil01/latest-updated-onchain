@@ -97,7 +97,7 @@ export class DefaultLiveTxAdapter implements LiveTxAdapter {
       const res = await this.rpcPool.getAgreedSignatureConfirmation(signature);
       if (res.confirmed) return { status: 'confirmed' };
       if (res.err) return { status: 'failed', err: res.err };
-      await new Promise((r) => setTimeout(r, 650));
+      await new Promise((r) => setTimeout(r, 350));
     }
     return { status: 'timeout' };
   }
@@ -192,7 +192,7 @@ export class DefaultLiveTxAdapter implements LiveTxAdapter {
         if (res.found || attempt === 1) {
           return res;
         }
-        await new Promise((r) => setTimeout(r, 400));
+        await new Promise((r) => setTimeout(r, 200));
       }
       return { found: false, solDeltaLamports: 0, feeLamports: 5000 };
     } catch {

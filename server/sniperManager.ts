@@ -594,15 +594,15 @@ export class SniperManager {
       trade_size_usd: 5.0,
       max_open_positions: 3,
       daily_loss_limit_usd: 10.0,
-      take_profit_pct: 50.0,
-      stop_loss_pct: 35.0,
-      trailing_stop_pct: 15.0,
+      take_profit_pct: 35.0,
+      stop_loss_pct: 30.0,
+      trailing_stop_pct: 12.0,
       recover_principal_enabled: false,
       recover_principal_sell_pct: 50.0,
       scale_out_sell_pct: 25.0,
       scale_out_step_gain_pct: 100.0,
       auto_rug_exit: true,
-      rug_liq_drop_pct: 60.0,
+      rug_liq_drop_pct: 50.0,
       max_hold_minutes: 120,
       max_age_minutes: 2.0,
       ultra_early_grace_sec: 0,
@@ -611,13 +611,13 @@ export class SniperManager {
       min_liquidity_usd: 3000.0,
       min_volume_m5_usd: 1500.0,
       min_buys_m5: 8,
-      min_buy_sell_ratio_m5: 1.2,
-      max_price_change_m5_pct: 300.0,
+      min_buy_sell_ratio_m5: 1.25,
+      max_price_change_m5_pct: 250.0,
       min_holders: 0,
       use_rugcheck: true,
       strict_rugcheck: true,
       require_lp_locked: true,
-      rugcheck_max_score: 25.0,
+      rugcheck_max_score: 55.0,
       max_top10_holder_pct: 35.0,
       rug_recheck_minutes: 15,
       use_gecko: true,
@@ -626,9 +626,9 @@ export class SniperManager {
       use_dex_profiles: true,
       use_pumpportal: true,
       use_promoted_feeds: false,
-      slippage_pct: 2.0,
+      slippage_pct: 3.0,
       fee_pct: 1.0,
-      log_rejects: true,
+      log_rejects: false,
       jupiter_api_key: '',
       python_binary_path: 'auto',
       rescan_delay_after_sell_sec: 0,
@@ -1095,14 +1095,55 @@ export class SniperManager {
     const solAmount = tradeSizeUsd / solPriceUsd;
     const minRequiredSol = solAmount + 0.001;
 
-    // 1. Check live wallet SOL balance
-    if (typeof rpcPool.getAgreedBalanceSol === 'function') {
-      const bal = await rpcPool.getAgreedBalanceSol(owner).catch(() => ({
+    const amountRaw = String(Math.max(10_000, Math.round(solAmount * LAMPORTS_PER_SOL)));
+    const slippageBps = Math.min(2500, Math.max(50, Math.round((params.slippagePct ?? 2.0) * 100)));
+
+    // 1-3. Run wallet SOL check (when cache is stale or tight), existing-balance check,
+    // on-chain mint inspection, AND Jupiter buy quote concurrently in one parallel batch.
+    const hasFreshSufficientBal =
+      this.liveWalletBalanceSol !== null &&
+      Date.now() - this.liveWalletUpdatedAt < 10_000 &&
+      this.liveWalletBalanceSol >= minRequiredSol + 0.002;
+
+    const solBalPromise =
+      !hasFreshSufficientBal && typeof rpcPool.getAgreedBalanceSol === 'function'
+        ? rpcPool.getAgreedBalanceSol(owner).catch(() => ({
+            agreed: false,
+            balanceSol: null,
+            readings: [] as number[],
+          }))
+        : Promise.resolve(null);
+
+    const [balRes, preBal, mintInfo, quote] = await Promise.all([
+      solBalPromise,
+      rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => ({
         agreed: false,
-        balanceSol: null,
+        balanceUi: null,
         readings: [],
-      }));
-      const knownBal = bal.agreed ? bal.balanceSol : bal.readings.length > 0 ? bal.readings[0] : null;
+        decimals: undefined,
+        rawAmount: undefined,
+      })),
+      typeof rpcPool.inspectTokenOnChain === 'function'
+        ? rpcPool.inspectTokenOnChain(params.mint).catch(() => null)
+        : Promise.resolve(null),
+      jupiter
+        .getQuote({
+          inputMint: WSOL_MINT,
+          outputMint: params.mint,
+          amountRaw,
+          slippageBps,
+          allowRelaxFallback: true,
+          bypassCache: true,
+        })
+        .catch(() => null),
+    ]);
+
+    if (balRes) {
+      const knownBal = balRes.agreed
+        ? balRes.balanceSol
+        : balRes.readings.length > 0
+          ? balRes.readings[0]
+          : null;
       if (knownBal !== null) {
         this.liveWalletBalanceSol = knownBal;
         this.liveWalletUpdatedAt = Date.now();
@@ -1119,14 +1160,6 @@ export class SniperManager {
       }
     }
 
-    // 2. Check existing on-chain balance + decimals
-    const [preBal, mintInfo] = await Promise.all([
-      rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => ({ agreed: false, balanceUi: null, readings: [], decimals: undefined, rawAmount: undefined })),
-      typeof rpcPool.inspectTokenOnChain === 'function'
-        ? rpcPool.inspectTokenOnChain(params.mint).catch(() => null)
-        : Promise.resolve(null),
-    ]);
-
     if (preBal.agreed && (preBal.balanceUi ?? 0) > 0) {
       return {
         ok: false,
@@ -1136,17 +1169,6 @@ export class SniperManager {
     }
 
     const decimals = mintInfo?.decimals ?? preBal.decimals ?? 6;
-    const amountRaw = String(Math.max(10_000, Math.round(solAmount * LAMPORTS_PER_SOL)));
-    const slippageBps = Math.min(2500, Math.max(50, Math.round((params.slippagePct ?? 2.0) * 100)));
-
-    // 3. Get Jupiter swap quote
-    const quote = await jupiter.getQuote({
-      inputMint: WSOL_MINT,
-      outputMint: params.mint,
-      amountRaw,
-      slippageBps,
-      allowRelaxFallback: true,
-    });
     if (!quote || Number(quote.outAmount) <= 0) {
       const detail = typeof jupiter.getLastQuoteError === 'function' ? jupiter.getLastQuoteError() : null;
       return {
@@ -1155,7 +1177,7 @@ export class SniperManager {
       };
     }
 
-    // 4. Build, sign, send, confirm
+    // 4. Build, sign, send (skipPreflight on fast snipe entry), confirm
     let swapTxResp;
     try {
       swapTxResp = await jupiter.buildSwapTransaction({
@@ -1177,7 +1199,7 @@ export class SniperManager {
 
     let sig: string;
     try {
-      sig = await this.txAdapter.sendSignedTransaction(rawSigned, 3);
+      sig = await this.txAdapter.sendSignedTransaction(rawSigned, 3, { skipPreflight: true });
     } catch (err) {
       return {
         ok: false,
@@ -1185,12 +1207,12 @@ export class SniperManager {
       };
     }
 
-    const conf = await this.txAdapter.pollConfirmation(sig, 25_000);
+    const conf = await this.txAdapter.pollConfirmation(sig, 20_000);
     if (conf.status === 'failed') {
       return { ok: false, error: conf.err || 'Buy transaction failed on-chain' };
     }
     if (conf.status === 'timeout') {
-      const late = await this.txAdapter.pollConfirmation(sig, 90_000);
+      const late = await this.txAdapter.pollConfirmation(sig, 45_000);
       if (late.status === 'failed') {
         return { ok: false, error: late.err || 'Buy transaction failed during confirmation' };
       }
@@ -1244,15 +1266,21 @@ export class SniperManager {
     const costUsd = realSolSpent * solPriceUsd;
     const entryPriceUsd = realQty > 0 ? costUsd / realQty : 0;
 
-    // Refresh wallet SOL balance
+    // Optimistically update wallet SOL balance immediately and refresh authoritative balance in background
+    if (this.liveWalletBalanceSol !== null) {
+      this.liveWalletBalanceSol = Math.max(0, this.liveWalletBalanceSol - realSolSpent - feeSol - rentSol);
+      this.liveWalletUpdatedAt = Date.now();
+    }
     if (typeof rpcPool.getAgreedBalanceSol === 'function') {
-      const newBal = await rpcPool.getAgreedBalanceSol(owner).catch(() => null);
-      if (newBal?.agreed && newBal.balanceSol !== null) {
-        this.liveWalletBalanceSol = newBal.balanceSol;
-        this.liveWalletUpdatedAt = Date.now();
-      } else if (this.liveWalletBalanceSol !== null) {
-        this.liveWalletBalanceSol = Math.max(0, this.liveWalletBalanceSol - realSolSpent - feeSol - rentSol);
-      }
+      void rpcPool
+        .getAgreedBalanceSol(owner)
+        .then((newBal) => {
+          if (newBal?.agreed && newBal.balanceSol !== null) {
+            this.liveWalletBalanceSol = newBal.balanceSol;
+            this.liveWalletUpdatedAt = Date.now();
+          }
+        })
+        .catch(() => undefined);
     }
 
     return {

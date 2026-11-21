@@ -7,6 +7,7 @@ Rug screen: on-chain mint/freeze authority (Solana RPC) + Jupiter audit + RugChe
 Entry: coins younger than max_age_minutes; coins younger than ultra_early_grace_sec
 skip the liquidity/buy-volume floors (true "first seconds" entries).
 """
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import io
 import json
@@ -32,13 +33,13 @@ CONFIG = {
     "mode": "paper",
     "start_balance_usd": 50.0, "trade_size_usd": 5.0, "max_open_positions": 3,
     "daily_loss_limit_usd": 10.0,
-    "take_profit_pct": 50.0, "stop_loss_pct": 35.0, "trailing_stop_pct": 15.0, "max_hold_minutes": 120,
+    "take_profit_pct": 35.0, "stop_loss_pct": 30.0, "trailing_stop_pct": 12.0, "max_hold_minutes": 120,
     "recover_principal_enabled": False,
     "recover_principal_sell_pct": 50.0,
     "scale_out_sell_pct": 25.0,
     "scale_out_step_gain_pct": 100.0,
     "auto_rug_exit": True,
-    "rug_liq_drop_pct": 60.0,
+    "rug_liq_drop_pct": 50.0,
     # sniper window: buy ONLY coins younger than this
     "max_age_minutes": 2.0,
     # coins younger than this skip liquidity/volume floors (0 = strict anti-rug from second 0)
@@ -47,19 +48,19 @@ CONFIG = {
     "scan_interval_sec": 1, "monitor_interval_sec": 1.0,
     # entry guards (applied after the grace window)
     "min_liquidity_usd": 3000.0, "min_volume_m5_usd": 1500.0,
-    "min_buys_m5": 8, "min_buy_sell_ratio_m5": 1.2,
-    "max_price_change_m5_pct": 300.0,
+    "min_buys_m5": 8, "min_buy_sell_ratio_m5": 1.25,
+    "max_price_change_m5_pct": 250.0,
     "min_holders": 0,
     # hard rug screen
     "use_rugcheck": True, "strict_rugcheck": True, "require_lp_locked": True,
-    "rugcheck_max_score": 25.0, "max_top10_holder_pct": 35.0, "rug_recheck_minutes": 15,
+    "rugcheck_max_score": 55.0, "max_top10_holder_pct": 35.0, "rug_recheck_minutes": 15,
     # candidate sources (any-DEX coverage)
     "use_gecko": True, "use_jupiter_recent": True, "use_dex_profiles": True,
     "use_pumpportal": True, "use_promoted_feeds": False,
     # misc
-    "slippage_pct": 2.0, "fee_pct": 1.0,
+    "slippage_pct": 3.0, "fee_pct": 1.0,
     "state_file": "state.json", "trades_csv": "trades.csv",
-    "log_rejects": True, "jupiter_api_key": "",
+    "log_rejects": False, "jupiter_api_key": "",
     # compatibility keys kept so old settings files still load
     "cooldown_minutes": 60, "min_volume_h1_usd": 0.0, "min_age_minutes": 0,
     "max_age_hours": 24, "min_buys_h1": 0, "min_buy_sell_ratio_h1": 0.0,
@@ -160,6 +161,7 @@ def maybe_reload_settings():
             with _seen_lock:
                 _seen.clear()
                 _too_old_mints.clear()
+                _pending_dex_retry.clear()
             return True
     except Exception:
         pass
@@ -325,6 +327,7 @@ _src_last, _src_stats = {}, {}
 _src_lock = threading.Lock()
 _seen, _seen_lock = {}, threading.Lock()
 _too_old_mints = {}
+_pending_dex_retry = {}  # mint -> [first_seen_ts, last_retry_ts]
 _src_of = {}
 _gecko_pairs = {}
 _gecko_backoff_until = 0.0
@@ -348,6 +351,8 @@ def _mark_seen(mints):
             for k in [k for k, v in _seen.items() if t - v > 600]: _seen.pop(k, None)
         if len(_too_old_mints) > 10000:
             for k in [k for k, v in _too_old_mints.items() if t - v > 1800]: _too_old_mints.pop(k, None)
+        if len(_pending_dex_retry) > 200:
+            for k in [k for k, v in _pending_dex_retry.items() if t - v[0] > 45.0]: _pending_dex_retry.pop(k, None)
 
 def _fresh_only(mints):
     t = time.time()
@@ -356,6 +361,35 @@ def _fresh_only(mints):
             m for m in mints
             if (t - _seen.get(m, 0) > SEEN_TTL_SEC) and (m not in _too_old_mints)
         ]
+
+def _get_due_pending_dex_mints(exclude_set, limit=30):
+    t = time.time()
+    due = []
+    with _seen_lock:
+        expired = [m for m, (first_ts, _) in _pending_dex_retry.items() if (t - first_ts > 45.0) or (m in _too_old_mints)]
+        for m in expired:
+            _pending_dex_retry.pop(m, None)
+        for m, (first_ts, last_try) in list(_pending_dex_retry.items()):
+            if m in exclude_set:
+                continue
+            if t - last_try >= 1.8:
+                _pending_dex_retry[m] = (first_ts, t)
+                due.append(m)
+                if len(due) >= limit:
+                    break
+    return due
+
+def _update_pending_dex_mints(fresh_mints, found_pairs):
+    t = time.time()
+    with _seen_lock:
+        for m in found_pairs:
+            _pending_dex_retry.pop(m, None)
+        for m in fresh_mints:
+            if m in found_pairs or m in _too_old_mints:
+                continue
+            if m not in _pending_dex_retry:
+                if len(_pending_dex_retry) < 120:
+                    _pending_dex_retry[m] = (t, t)
 
 def _src_gecko(cfg):
     global _gecko_backoff_until
@@ -496,6 +530,9 @@ def fetch_candidate_mints(cfg, force=False):
                 ordered_mints.append(m)
     fresh = _fresh_only(ordered_mints)
     _mark_seen(ordered_mints)
+    due_retries = _get_due_pending_dex_mints(set(fresh), limit=30)
+    if due_retries:
+        fresh = fresh + due_retries
     return fresh
 
 # ---------------------------------------------------------------- entry filters
@@ -670,174 +707,190 @@ def _check_sell_route(mint, decimals, price_usd, cfg):
     except Exception:
         return True, "jup_timeout"
 
+def _fetch_rugcheck_report(mint):
+    rep = get_json(f"{RUGC}/{mint}/report", timeout=6)
+    if not isinstance(rep, dict) or (rep.get("score") is None and not isinstance(rep.get("risks"), list)):
+        rep = get_json(f"{RUGC}/{mint}/report/summary", timeout=5)
+    return rep
+
 def hard_rug_check(mint, cfg, age_s, pair=None):
-    """Return (ok, reason). Fail-closed on-chain SPL/Token-2022 + RugCheck full report + holder concentration + sell-route test."""
+    """Return (ok, reason). Fail-closed parallel RPC SPL/Token-2022 + RugCheck report + holder concentration + sell-route test."""
     ttl = max(60, cfg.get("rug_recheck_minutes", 15) * 60)
     with _rug_lock:
         hit = _rug_cache.get(mint)
         if hit and time.time() - hit[0] < ttl: return hit[1]
 
     strict = bool(cfg.get("strict_rugcheck", True))
-    verdict = (True, "ok")
-    mint_info = _rpc_mint_account_info(mint)
-    decimals = mint_info.get("decimals", 6) if mint_info else 6
-    supply_ui = mint_info.get("supply_ui", 0.0) if mint_info else 0.0
-    jup_verified = False
+    use_rc = bool(cfg.get("use_rugcheck", True))
+    px_usd = _f(pair.get("priceUsd")) if pair is not None else None
 
-    if mint_info is not None:
-        if mint_info.get("mint_auth"):
-            verdict = (False, "mint authority NOT revoked (on-chain: dev can mint supply)")
-        elif mint_info.get("freeze_auth"):
-            verdict = (False, "freeze authority enabled (on-chain: dev can freeze sells)")
-        elif mint_info.get("disallowed_extensions"):
-            exts = ", ".join(mint_info["disallowed_extensions"])
-            verdict = (False, f"disallowed Token-2022 extensions: {exts}")
-    else:
-        hdrs = {"x-api-key": cfg["jupiter_api_key"]} if cfg.get("jupiter_api_key") else None
-        jt = get_json(f"{JUP}/search", params={"query": mint}, headers=hdrs)
-        if isinstance(jt, dict): jt = jt.get("tokens") or jt.get("data") or []
-        if isinstance(jt, list) and jt:
-            tok = next((t for t in jt if isinstance(t, dict) and t.get("id") == mint), None)
-            if tok is None and isinstance(jt[0], dict): tok = jt[0]
-            if isinstance(tok, dict):
-                jup_verified = True
-                if tok.get("mintAuthority"): verdict = (False, "mint authority NOT revoked")
-                elif tok.get("freezeAuthority"): verdict = (False, "freeze authority enabled")
-        if verdict[0] and strict and not jup_verified:
-            verdict = (False, "on-chain RPC inspection unavailable (fail closed)")
+    pool = ThreadPoolExecutor(max_workers=3)
+    rpc_fut = pool.submit(_rpc_mint_account_info, mint)
+    rc_fut = pool.submit(_fetch_rugcheck_report, mint) if use_rc else None
+    sell_fut = pool.submit(_check_sell_route, mint, 6, px_usd, cfg) if (px_usd and px_usd > 0) else None
 
-    young = age_s < 180
-    dex_id = str((pair or {}).get("dexId") or "").lower()
-    is_bonding_curve = dex_id == "pumpfun"
-    pair_addr = str((pair or {}).get("pairAddress") or "")
-    pair_liq = _f(((pair or {}).get("liquidity") or {}).get("usd")) or 0.0
-    min_liq_cfg = float(cfg.get("min_liquidity_usd", 3000) or 0)
+    try:
+        verdict = (True, "ok")
+        mint_info = rpc_fut.result()
+        decimals = mint_info.get("decimals", 6) if mint_info else 6
+        supply_ui = mint_info.get("supply_ui", 0.0) if mint_info else 0.0
+        jup_verified = False
 
-    if verdict[0] and cfg.get("use_rugcheck", True):
-        rep = get_json(f"{RUGC}/{mint}/report", timeout=8)
-        if not isinstance(rep, dict) or (rep.get("score") is None and not isinstance(rep.get("risks"), list)):
-            rep = get_json(f"{RUGC}/{mint}/report/summary", timeout=6)
-
-        if not isinstance(rep, dict) or (not isinstance(rep.get("risks"), list) and rep.get("score") is None):
-            if strict:
-                verdict = (False, "no rugcheck report yet (fail closed)")
+        if mint_info is not None:
+            if mint_info.get("mint_auth"):
+                verdict = (False, "mint authority NOT revoked (on-chain: dev can mint supply)")
+            elif mint_info.get("freeze_auth"):
+                verdict = (False, "freeze authority enabled (on-chain: dev can freeze sells)")
+            elif mint_info.get("disallowed_extensions"):
+                exts = ", ".join(mint_info["disallowed_extensions"])
+                verdict = (False, f"disallowed Token-2022 extensions: {exts}")
         else:
-            if rep.get("rugged") is True:
-                verdict = (False, "token flagged as RUGGED on RugCheck")
+            hdrs = {"x-api-key": cfg["jupiter_api_key"]} if cfg.get("jupiter_api_key") else None
+            jt = get_json(f"{JUP}/search", params={"query": mint}, headers=hdrs)
+            if isinstance(jt, dict): jt = jt.get("tokens") or jt.get("data") or []
+            if isinstance(jt, list) and jt:
+                tok = next((t for t in jt if isinstance(t, dict) and t.get("id") == mint), None)
+                if tok is None and isinstance(jt[0], dict): tok = jt[0]
+                if isinstance(tok, dict):
+                    jup_verified = True
+                    if tok.get("mintAuthority"): verdict = (False, "mint authority NOT revoked")
+                    elif tok.get("freezeAuthority"): verdict = (False, "freeze authority enabled")
+            if verdict[0] and strict and not jup_verified:
+                verdict = (False, "on-chain RPC inspection unavailable (fail closed)")
 
-            if verdict[0]:
-                if rep.get("mintAuthority"):
-                    verdict = (False, "RugCheck reports active mint authority")
-                elif rep.get("freezeAuthority"):
-                    verdict = (False, "RugCheck reports active freeze authority")
+        young = age_s < 180
+        dex_id = str((pair or {}).get("dexId") or "").lower()
+        is_bonding_curve = dex_id == "pumpfun"
+        pair_addr = str((pair or {}).get("pairAddress") or "")
+        pair_liq = _f(((pair or {}).get("liquidity") or {}).get("usd")) or 0.0
+        min_liq_cfg = float(cfg.get("min_liquidity_usd", 3000) or 0)
 
-            # Enforce RugCheck risk score at EVERY age (never skip young tokens)
-            if verdict[0]:
-                sn = _f(rep.get("score_normalised"))
-                if sn is None and _f(rep.get("score")) is not None:
-                    raw_s = _f(rep.get("score")) or 0.0
-                    sn = min(100.0, raw_s / 100.0) if raw_s > 100.0 else raw_s
-                if sn is not None:
-                    if sn > 100: sn /= 1000.0
-                    max_rc_score = float(cfg.get("rugcheck_max_score", 25) or 25)
-                    if sn >= max_rc_score:
-                        verdict = (False, f"rugcheck risk score {sn:.0f}/100 >= {max_rc_score:.0f}")
+        if verdict[0] and rc_fut is not None:
+            rep = rc_fut.result()
 
-            # Enforce LP lock/burn check on AMM pools (non-bonding-curve) when require_lp_locked is active
-            known_pools = set()
-            if pair_addr:
-                known_pools.add(pair_addr)
-            for addr, kinfo in (rep.get("knownAccounts") or {}).items():
-                if isinstance(kinfo, dict):
-                    ktype = str(kinfo.get("type") or "").upper()
-                    if ktype in ("AMM", "LOCKER", "POOL", "CLOB"):
-                        known_pools.add(addr)
+            if not isinstance(rep, dict) or (not isinstance(rep.get("risks"), list) and rep.get("score") is None):
+                if strict:
+                    verdict = (False, "no rugcheck report yet (fail closed)")
+            else:
+                if rep.get("rugged") is True:
+                    verdict = (False, "token flagged as RUGGED on RugCheck")
 
-            if verdict[0] and cfg.get("require_lp_locked", True) and not is_bonding_curve:
-                markets = rep.get("markets")
-                if isinstance(markets, list) and markets:
-                    max_lp_pct = 0.0
-                    for m in markets:
-                        if not isinstance(m, dict): continue
-                        if m.get("pubkey"):
-                            known_pools.add(str(m.get("pubkey")))
-                        lp = m.get("lp") or {}
-                        locked_pct = _f(lp.get("lpLockedPct")) or 0.0
-                        burned_pct = 100.0 if lp.get("lpBurned") else 0.0
-                        max_lp_pct = max(max_lp_pct, locked_pct, burned_pct)
-                    if max_lp_pct < 80.0:
-                        verdict = (False, f"LP burned/locked {max_lp_pct:.0f}% < 80% minimum (rug risk)")
+                if verdict[0]:
+                    if rep.get("mintAuthority"):
+                        verdict = (False, "RugCheck reports active mint authority")
+                    elif rep.get("freezeAuthority"):
+                        verdict = (False, "RugCheck reports active freeze authority")
 
-            max_top10 = float(cfg.get("max_top10_holder_pct", 35) or 35)
-            max_single = min(25.0, max(10.0, max_top10 * 0.65))
-            top10_pct = None
-            single_max_pct = None
+                # Enforce RugCheck risk score at EVERY age (never skip young tokens)
+                if verdict[0]:
+                    sn = _f(rep.get("score_normalised"))
+                    if sn is None and _f(rep.get("score")) is not None:
+                        raw_s = _f(rep.get("score")) or 0.0
+                        sn = min(100.0, raw_s / 100.0) if raw_s > 100.0 else raw_s
+                    if sn is not None:
+                        if sn > 100: sn /= 1000.0
+                        max_rc_score = float(cfg.get("rugcheck_max_score", 55) or 55)
+                        if sn >= max_rc_score:
+                            verdict = (False, f"rugcheck risk score {sn:.0f}/100 >= {max_rc_score:.0f}")
 
-            # Compute true non-pool top holder % from full RugCheck report first, else RPC
-            top_holders = rep.get("topHolders")
-            if isinstance(top_holders, list) and top_holders:
-                non_pool_pcts = []
-                for h in top_holders[:20]:
-                    if not isinstance(h, dict): continue
-                    addr = str(h.get("address") or "")
-                    owner = str(h.get("owner") or "")
-                    if addr in known_pools or owner in known_pools or addr in KNOWN_POOL_OR_BURN_OWNERS or owner in KNOWN_POOL_OR_BURN_OWNERS:
-                        continue
-                    pct = _f(h.get("pct"))
-                    if pct is not None:
-                        non_pool_pcts.append(pct)
-                top10_pct = sum(non_pool_pcts[:10])
-                single_max_pct = max(non_pool_pcts) if non_pool_pcts else 0.0
+                # Enforce LP lock/burn check on AMM pools (non-bonding-curve) when require_lp_locked is active
+                known_pools = set()
+                if pair_addr:
+                    known_pools.add(pair_addr)
+                for addr, kinfo in (rep.get("knownAccounts") or {}).items():
+                    if isinstance(kinfo, dict):
+                        ktype = str(kinfo.get("type") or "").upper()
+                        if ktype in ("AMM", "LOCKER", "POOL", "CLOB"):
+                            known_pools.add(addr)
 
-            if top10_pct is None and supply_ui > 0:
-                top10_pct, single_max_pct = _rpc_top_holders(mint, supply_ui, known_pools)
+                if verdict[0] and cfg.get("require_lp_locked", True) and not is_bonding_curve:
+                    markets = rep.get("markets")
+                    if isinstance(markets, list) and markets:
+                        max_lp_pct = 0.0
+                        for m in markets:
+                            if not isinstance(m, dict): continue
+                            if m.get("pubkey"):
+                                known_pools.add(str(m.get("pubkey")))
+                            lp = m.get("lp") or {}
+                            locked_pct = _f(lp.get("lpLockedPct")) or 0.0
+                            burned_pct = 100.0 if lp.get("lpBurned") else 0.0
+                            max_lp_pct = max(max_lp_pct, locked_pct, burned_pct)
+                        if max_lp_pct < 80.0:
+                            verdict = (False, f"LP burned/locked {max_lp_pct:.0f}% < 80% minimum (rug risk)")
 
-            risks = rep.get("risks") if isinstance(rep.get("risks"), list) else []
-            if verdict[0]:
-                for risk in risks:
-                    if not isinstance(risk, dict): continue
-                    level = str(risk.get("level") or "").lower()
-                    name = str(risk.get("name") or ""); low = name.lower()
-                    desc = str(risk.get("description") or "")
-                    if "holder" in low:
-                        m = re.search(r"([\d.]+)\s*%", desc + " " + name)
-                        if m and float(m.group(1)) > max_top10:
-                            verdict = (False, f"{name} ({m.group(1)}% > {max_top10:.0f}% limit)")
+                max_top10 = float(cfg.get("max_top10_holder_pct", 35) or 35)
+                max_single = min(25.0, max(10.0, max_top10 * 0.65))
+                top10_pct = None
+                single_max_pct = None
+
+                # Compute true non-pool top holder % from full RugCheck report first, else RPC
+                top_holders = rep.get("topHolders")
+                if isinstance(top_holders, list) and top_holders:
+                    non_pool_pcts = []
+                    for h in top_holders[:20]:
+                        if not isinstance(h, dict): continue
+                        addr = str(h.get("address") or "")
+                        owner = str(h.get("owner") or "")
+                        if addr in known_pools or owner in known_pools or addr in KNOWN_POOL_OR_BURN_OWNERS or owner in KNOWN_POOL_OR_BURN_OWNERS:
+                            continue
+                        pct = _f(h.get("pct"))
+                        if pct is not None:
+                            non_pool_pcts.append(pct)
+                    top10_pct = sum(non_pool_pcts[:10])
+                    single_max_pct = max(non_pool_pcts) if non_pool_pcts else 0.0
+
+                if top10_pct is None and supply_ui > 0:
+                    top10_pct, single_max_pct = _rpc_top_holders(mint, supply_ui, known_pools)
+
+                risks = rep.get("risks") if isinstance(rep.get("risks"), list) else []
+                if verdict[0]:
+                    for risk in risks:
+                        if not isinstance(risk, dict): continue
+                        level = str(risk.get("level") or "").lower()
+                        name = str(risk.get("name") or ""); low = name.lower()
+                        desc = str(risk.get("description") or "")
+                        if "holder" in low:
+                            m = re.search(r"([\d.]+)\s*%", desc + " " + name)
+                            if m and float(m.group(1)) > max_top10:
+                                verdict = (False, f"{name} ({m.group(1)}% > {max_top10:.0f}% limit)")
+                                break
+                        if "unlocked" in low and ("lp" in low or "liquidity" in low) and cfg.get("require_lp_locked", True):
+                            verdict = (False, f"LP risk: {name}")
                             break
-                    if "unlocked" in low and ("lp" in low or "liquidity" in low) and cfg.get("require_lp_locked", True):
-                        verdict = (False, f"LP risk: {name}")
+                        if level not in ("danger", "critical"):
+                            if strict and any(k in low for k in ("transfer fee", "permanent delegate", "honeypot", "insider", "copycat", "freeze", "mint")):
+                                verdict = (False, f"rugcheck risk: {name}")
+                                break
+                            continue
+                        # Exempt only generic 'Low Liquidity' / 'Low amount of LP Providers' when pair liquidity already beat min_liquidity_usd
+                        is_generic_liq_warn = ("low liquidity" in low or "low amount of lp providers" in low) and "unlocked" not in low
+                        if young and is_generic_liq_warn and pair_liq >= min_liq_cfg:
+                            continue
+                        if not strict and not any(k in low for k in ("mint", "freeze", "authorit", "holder", "transfer fee", "delegate", "unlocked")):
+                            continue
+                        verdict = (False, f"rugcheck danger: {name or 'unknown risk'}")
                         break
-                    if level not in ("danger", "critical"):
-                        if strict and any(k in low for k in ("transfer fee", "permanent delegate", "honeypot", "insider", "copycat", "freeze", "mint")):
-                            verdict = (False, f"rugcheck risk: {name}")
-                            break
-                        continue
-                    # Exempt only generic 'Low Liquidity' / 'Low amount of LP Providers' when pair liquidity already beat min_liquidity_usd
-                    is_generic_liq_warn = ("low liquidity" in low or "low amount of lp providers" in low) and "unlocked" not in low
-                    if young and is_generic_liq_warn and pair_liq >= min_liq_cfg:
-                        continue
-                    if not strict and not any(k in low for k in ("mint", "freeze", "authorit", "holder", "transfer fee", "delegate", "unlocked")):
-                        continue
-                    verdict = (False, f"rugcheck danger: {name or 'unknown risk'}")
-                    break
 
-            if verdict[0]:
-                if top10_pct is None:
-                    if strict:
-                        verdict = (False, "top holder concentration unavailable (fail closed)")
-                else:
-                    if top10_pct > max_top10:
-                        verdict = (False, f"top-10 non-pool holders own {top10_pct:.1f}% > {max_top10:.0f}% limit")
-                    elif single_max_pct is not None and single_max_pct > max_single:
-                        verdict = (False, f"single holder owns {single_max_pct:.1f}% > {max_single:.0f}% limit")
+                if verdict[0]:
+                    if top10_pct is None:
+                        if strict:
+                            verdict = (False, "top holder concentration unavailable (fail closed)")
+                    else:
+                        if top10_pct > max_top10:
+                            verdict = (False, f"top-10 non-pool holders own {top10_pct:.1f}% > {max_top10:.0f}% limit")
+                        elif single_max_pct is not None and single_max_pct > max_single:
+                            verdict = (False, f"single holder owns {single_max_pct:.1f}% > {max_single:.0f}% limit")
 
-    # Pre-buy Jupiter sell-route check to filter honeypots and dead exit pools
-    if verdict[0] and pair is not None:
-        px_usd = _f(pair.get("priceUsd"))
-        if px_usd and px_usd > 0:
-            route_ok, route_reason = _check_sell_route(mint, decimals, px_usd, cfg)
+        # Pre-buy Jupiter sell-route check (reuses parallel pre-flight future when decimals == 6)
+        if verdict[0] and px_usd and px_usd > 0:
+            if sell_fut is not None and decimals == 6:
+                route_ok, route_reason = sell_fut.result()
+            else:
+                route_ok, route_reason = _check_sell_route(mint, decimals, px_usd, cfg)
             if not route_ok:
                 verdict = (False, route_reason)
+    finally:
+        pool.shutdown(wait=False)
 
     with _rug_lock:
         if len(_rug_cache) > 5000: _rug_cache.clear()
@@ -1661,6 +1714,7 @@ def scan_and_buy(acct, cfg):
             gp = _gecko_pairs[mint]
             liq = _f((gp.get("liquidity") or {}).get("usd")) or 0.0
             pairs[mint] = (liq, gp)
+    _update_pending_dex_mints(fresh, pairs)
     with _stats_lock: _stats["no_pair"] += max(0, len(fresh) - len(pairs))
 
     for mint, (_liq, pair) in pairs.items():

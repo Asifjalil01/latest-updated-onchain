@@ -1244,6 +1244,195 @@ test('v1.32.0: executeLiveSell uses bypassCache, retries simulation failure with
   }
 });
 
+test('v1.32.1: getAgreedSignatureConfirmation early-resolves without waiting for lagging 3rd RPC & accepts single healthy confirmation', async () => {
+  const { SolanaRpcPool } = await import('../providers/rpcPool.ts');
+  const pool = new SolanaRpcPool([
+    'https://rpc1.example.invalid',
+    'https://rpc2.example.invalid',
+    'https://rpc3.example.invalid',
+  ]);
+  const connMap = (pool as any).connections as Map<string, any>;
+  const urls = pool.getOrderedConnections().slice(0, 3).map((x) => x.ep.url);
+
+  // Case 1: 2 RPCs confirm immediately while 3rd hangs for 800ms -> resolves well under 300ms
+  let slowTimer: ReturnType<typeof setTimeout> | undefined;
+  connMap.set(urls[0], {
+    getSignatureStatuses: async () => ({ value: [{ err: null, confirmationStatus: 'confirmed' }] }),
+  });
+  connMap.set(urls[1], {
+    getSignatureStatuses: async () => ({ value: [{ err: null, confirmationStatus: 'finalized' }] }),
+  });
+  connMap.set(urls[2], {
+    getSignatureStatuses: () =>
+      new Promise((resolve) => {
+        slowTimer = setTimeout(() => resolve({ value: [null] }), 800);
+      }),
+  });
+
+  const t0 = Date.now();
+  const fastRes = await pool.getAgreedSignatureConfirmation('sigFastEarlyResolve111');
+  const elapsedMs = Date.now() - t0;
+  if (slowTimer !== undefined) clearTimeout(slowTimer);
+  assert.equal(fastRes.confirmed, true);
+  assert.equal(fastRes.err, null);
+  assert.equal(fastRes.agreements, 2);
+  assert.ok(elapsedMs < 300, `Expected early resolution < 300ms, took ${elapsedMs}ms`);
+
+  // Case 2: 1 RPC confirms cleanly while other 2 reject -> accepts single healthy confirmation
+  connMap.set(urls[0], {
+    getSignatureStatuses: async () => ({ value: [{ err: null, confirmationStatus: 'confirmed' }] }),
+  });
+  connMap.set(urls[1], {
+    getSignatureStatuses: async () => {
+      throw new Error('429 rate limited');
+    },
+  });
+  connMap.set(urls[2], {
+    getSignatureStatuses: async () => {
+      throw new Error('503 busy');
+    },
+  });
+  const singleRes = await pool.getAgreedSignatureConfirmation('sigSingleHealthy111');
+  assert.equal(singleRes.confirmed, true);
+  assert.equal(singleRes.agreements, 1);
+});
+
+test('v1.32.1: executeLiveBuy runs quote & token checks in parallel, uses skipPreflight, and skips post-buy balance wait', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-fast-buy-v1321-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const kp = await Keypair.generate();
+    const signer = new ServerSignerManager(path.join(tmpDir, 'ks.json'));
+    await signer.initFromEnv(JSON.stringify(Array.from(kp.secretKey)));
+    const mockTxBase64 = createBase64MockTx(kp);
+
+    let balanceCalls = 0;
+    let quoteStartedWhileInspectPending = false;
+    let inspectPending = false;
+    let buySkipPreflight: boolean | undefined;
+
+    const mockOrchestrator = {
+      signer,
+      rpcPool: {
+        getAgreedBalanceSol: async () => {
+          balanceCalls++;
+          if (balanceCalls >= 2) {
+            await new Promise((r) => setTimeout(r, 800));
+          }
+          return { agreed: true, balanceSol: 0.5, readings: [0.5, 0.5] };
+        },
+        getAgreedTokenBalanceUi: async () => ({
+          agreed: true,
+          balanceUi: 0,
+          rawAmount: '0',
+          decimals: 6,
+          readings: [0, 0],
+        }),
+        inspectTokenOnChain: async () => {
+          inspectPending = true;
+          await new Promise((r) => setTimeout(r, 50));
+          inspectPending = false;
+          return { decimals: 6 };
+        },
+      },
+      jupiter: {
+        getLiveSolPriceUsd: async () => 100,
+        getLastQuoteError: () => null,
+        getQuote: async (params: any) => {
+          if (inspectPending) quoteStartedWhileInspectPending = true;
+          return {
+            inputMint: params.inputMint,
+            inAmount: params.amountRaw,
+            outputMint: params.outputMint,
+            outAmount: '250000000',
+            slippageBps: params.slippageBps,
+            priceImpactPct: '0.001',
+            routePlan: [],
+          };
+        },
+        buildSwapTransaction: async () => ({ swapTransaction: mockTxBase64 }),
+      },
+    } as unknown as BotOrchestrator;
+
+    const mockAdapter: LiveTxAdapter = {
+      sendSignedTransaction: async (_tx, _maxRetries, options) => {
+        buySkipPreflight = options?.skipPreflight;
+        return 'sigFastBuy111';
+      },
+      pollConfirmation: async () => ({ status: 'confirmed' }),
+      reconcileParsedSwapSolDelta: async () => ({
+        found: true,
+        solDeltaLamports: -52_049_280,
+        feeLamports: 10_000,
+        createdAtaRentLamports: 2_039_280,
+        tokenDeltaUi: 250,
+      }),
+      findRecentSellSignature: async () => null,
+    };
+
+    mgr.attachOrchestrator(mockOrchestrator, mockAdapter);
+    const t0 = Date.now();
+    const res = await mgr.executeLiveBuy({
+      mint: 'MintFastBuy11111111111111111111111111111',
+      symbol: 'FAST',
+      tradeSizeUsd: 5.0,
+      solPriceUsd: 100,
+    });
+    const elapsedMs = Date.now() - t0;
+
+    assert.equal(res.ok, true);
+    assert.equal(quoteStartedWhileInspectPending, true);
+    assert.equal(buySkipPreflight, true);
+    assert.ok(elapsedMs < 400, `Expected non-blocking post-buy balance refresh (<400ms), took ${elapsedMs}ms`);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('v1.32.1: bot.py parallel hard_rug_check allows clean <2m score 52 under default 55 limit & _pending_dex_retry re-queues unindexed mints in ~2s', () => {
+  const pyScript = [
+    'import sys, types, json, time',
+    'req = types.ModuleType("requests")',
+    'class DummySess:',
+    '    def get(self, *a, **k): raise RuntimeError("no net")',
+    '    def post(self, *a, **k): raise RuntimeError("no net")',
+    'req.Session = lambda: DummySess()',
+    'sys.modules["requests"] = req',
+    'sys.path.insert(0, "sniper")',
+    'import bot',
+    'out = {"default_rc": bot.CONFIG["rugcheck_max_score"]}',
+    'cfg = dict(bot.CONFIG)',
+    'def slow_rpc(m): time.sleep(0.15); return {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": []}',
+    'def slow_rc(url, **k): time.sleep(0.15); return {"score_normalised": 52, "risks": [], "markets": [{"pubkey": "Pool1", "lp": {"lpLockedPct": 100, "lpBurned": True}}], "topHolders": [{"address": "Pool1", "owner": "Pool1", "pct": 70.0}, {"address": "W1", "owner": "W1", "pct": 8.0}]} if "rugcheck" in url else None',
+    'def slow_sell(*a, **k): time.sleep(0.15); return (True, "ok")',
+    'bot._rpc_mint_account_info = slow_rpc',
+    'bot.get_json = slow_rc',
+    'bot._check_sell_route = slow_sell',
+    't0 = time.time()',
+    'ok_52, reason_52 = bot.hard_rug_check("MintYoungScore52", cfg, age_s=40, pair={"dexId": "pumpswap", "pairAddress": "Pool1", "priceUsd": "0.0001", "liquidity": {"usd": 5000}})',
+    'out["elapsed_ms"] = round((time.time() - t0) * 1000)',
+    'out["score_52_res"] = [ok_52, reason_52]',
+    'bot._pending_dex_retry.clear()',
+    'bot._update_pending_dex_mints(["MintNewLaunch111"], {})',
+    'out["retry_immediate"] = bot._get_due_pending_dex_mints(set())',
+    'bot._pending_dex_retry["MintNewLaunch111"] = (time.time() - 2.0, time.time() - 2.0)',
+    'out["retry_after_2s"] = bot._get_due_pending_dex_mints(set())',
+    'bot._update_pending_dex_mints(["MintNewLaunch111"], {"MintNewLaunch111": (5000, {})})',
+    'out["retry_after_found"] = list(bot._pending_dex_retry.keys())',
+    'print(json.dumps(out))',
+  ].join('\n');
+
+  const raw = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+  const out = JSON.parse(raw.trim().split('\n').pop() || '{}');
+
+  assert.equal(out.default_rc, 55);
+  assert.equal(out.score_52_res[0], true);
+  assert.ok(out.elapsed_ms < 320, `Expected parallel hard_rug_check (<320ms vs 450ms sequential), took ${out.elapsed_ms}ms`);
+  assert.deepEqual(out.retry_immediate, []);
+  assert.deepEqual(out.retry_after_2s, ['MintNewLaunch111']);
+  assert.deepEqual(out.retry_after_found, []);
+});
+
 
 
 
