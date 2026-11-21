@@ -62,6 +62,8 @@ interface SniperPosition {
   source?: string;
   age_at_entry?: number;
   last_updated?: number;
+  last_sell_error?: string;
+  last_sell_error_at?: number;
 }
 
 interface SniperLiveWallet {
@@ -89,12 +91,13 @@ const USD_SETTING_KEYS = new Set([
 ]);
 
 const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' | 'string']> = [
-  ['start_balance_usd', 'Start balance $ (used on reset)', 'float'],
+  ['start_balance_usd', 'Start balance $ (paper reset only)', 'float'],
   ['trade_size_usd', 'Trade size $', 'float'],
   ['max_open_positions', 'Max open positions', 'int'],
   ['daily_loss_limit_usd', 'Daily loss limit $', 'float'],
   ['take_profit_pct', 'Take profit % (0 = off)', 'float'],
   ['trailing_stop_pct', 'Trailing stop % from peak (0 = off)', 'float'],
+  ['stop_loss_pct', 'Stop loss % (0 = off)', 'float'],
   ['recover_principal_enabled', 'Recover investment at TP (sell % + trailing ladder)', 'bool'],
   ['recover_principal_sell_pct', 'Step 1: Sell % at TP to recover money (default 50)', 'float'],
   ['scale_out_sell_pct', 'Step 2: Sell % of remaining on extra pumps (0 = off)', 'float'],
@@ -110,21 +113,24 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['min_buy_sell_ratio_m5', 'Min buy/sell ratio (5 min)', 'float'],
   ['max_price_change_m5_pct', 'Skip if pumped +X% in 5 min', 'float'],
   ['min_volume_m5_usd', 'Min 5-min volume $ (0 = off)', 'float'],
-  ['min_holders', 'Min buys in last 1h (0 = off)', 'int'],
+  ['min_holders', 'Min buys in last 1h (0 = off, optional)', 'int'],
   ['use_rugcheck', 'Hard RugCheck (score + risks)', 'bool'],
-  ['strict_rugcheck', 'Strict: reject ANY danger risk', 'bool'],
+  ['strict_rugcheck', 'Strict: reject ANY danger & missing reports', 'bool'],
+  ['require_lp_locked', 'Require LP burned/locked >= 80% (AMM pools)', 'bool'],
   ['rugcheck_max_score', 'Max RugCheck risk score (0-100)', 'float'],
-  ['max_top10_holder_pct', 'Max top-10 holders %', 'float'],
-  ['rug_recheck_minutes', 'Recheck rug score every (min)', 'int'],
+  ['max_top10_holder_pct', 'Max top-10 non-pool holders %', 'float'],
+  ['rug_recheck_minutes', 'Recheck rug score every (min, optional)', 'int'],
+  ['auto_rug_exit', 'Auto emergency sell on LP drain (rug exit)', 'bool'],
+  ['rug_liq_drop_pct', 'LP drain emergency sell trigger % (e.g. 60)', 'float'],
   ['use_gecko', 'Source: GeckoTerminal new pools (all DEXes)', 'bool'],
   ['use_jupiter_recent', 'Source: Jupiter recent tokens', 'bool'],
   ['use_jupiter_price', 'Use Jupiter live prices', 'bool'],
   ['use_dex_profiles', 'Source: DexScreener token profiles', 'bool'],
   ['use_pumpportal', 'Source: PumpPortal new launches', 'bool'],
-  ['use_promoted_feeds', 'Source: DexScreener boosted (promoted)', 'bool'],
-  ['slippage_pct', 'Simulated slippage %', 'float'],
-  ['fee_pct', 'Simulated fee %', 'float'],
-  ['log_rejects', 'Log filtered-out coins (debug)', 'bool'],
+  ['use_promoted_feeds', 'Source: DexScreener boosted (not recommended)', 'bool'],
+  ['slippage_pct', 'Slippage % (used in paper & live sells)', 'float'],
+  ['fee_pct', 'Simulated fee % (paper only)', 'float'],
+  ['log_rejects', 'Log filtered-out coins (debug, optional)', 'bool'],
   ['jupiter_api_key', 'Jupiter API Key (optional)', 'string'],
   ['python_binary_path', 'Python executable / path (auto, py, python, or full path to python.exe)', 'string'],
 ];
@@ -945,6 +951,14 @@ export function PythonSniperView() {
                           <span className="text-[10px] font-mono text-slate-500 uppercase block leading-tight">
                             {dexLabel}
                           </span>
+                          {p.last_sell_error && (
+                            <span
+                              className="mt-1 inline-block px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-500 border border-rose-500/30 text-[10px] font-mono max-w-[220px] truncate"
+                              title={p.last_sell_error}
+                            >
+                              Sell retry: {p.last_sell_error}
+                            </span>
+                          )}
                         </td>
 
                         {/* PnL % */}
@@ -1443,7 +1457,39 @@ export function PythonSniperView() {
                 Configure your trade sizing ($ / SOL), slippage, rug screen, age windows, Python executable path, and candidate sources.
               </p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setDraftSettings({
+                    ...draftSettings,
+                    stop_loss_pct: 35,
+                    trailing_stop_pct: 15,
+                    auto_rug_exit: true,
+                    rug_liq_drop_pct: 60,
+                    ultra_early_grace_sec: 0,
+                    min_liquidity_usd: 3000,
+                    min_volume_m5_usd: 1500,
+                    min_buys_m5: 8,
+                    min_buy_sell_ratio_m5: 1.2,
+                    use_rugcheck: true,
+                    strict_rugcheck: true,
+                    require_lp_locked: true,
+                    rugcheck_max_score: 25,
+                    max_top10_holder_pct: 35,
+                    use_promoted_feeds: false,
+                  });
+                  markSettingsDirty(true);
+                  pushToast({
+                    kind: 'info',
+                    title: 'Safe Anti-Rug defaults loaded',
+                    body: 'Review settings and click Apply and Save Python Settings.',
+                  });
+                }}
+                className="px-3 py-2 rounded-xl text-xs font-semibold border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 transition-colors"
+              >
+                Apply Safe Anti-Rug Preset
+              </button>
               {isSettingsDirty && (
                 <button
                   type="button"
@@ -1475,6 +1521,26 @@ export function PythonSniperView() {
               )}
             </div>
           </div>
+
+          {(Number(draftSettings.min_liquidity_usd ?? 0) < 1500 ||
+            Number(draftSettings.ultra_early_grace_sec ?? 0) > 0 ||
+            draftSettings.use_rugcheck === false ||
+            draftSettings.strict_rugcheck === false ||
+            draftSettings.require_lp_locked === false ||
+            Number(draftSettings.max_top10_holder_pct ?? 100) > 45 ||
+            Number(draftSettings.rugcheck_max_score ?? 100) > 40) && (
+            <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-800 dark:text-amber-300 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+                <div>
+                  <p className="font-bold">Weak Anti-Rug Filter Settings Detected</p>
+                  <p className="text-[11px] opacity-90">
+                    Low liquidity (&lt;$1,500), non-zero ultra-early bypass, unlocked LP allowance, or high Top-10% (&gt;45%) increases rugpull risk on brand-new coins. Click <strong>Apply Safe Anti-Rug Preset</strong> to harden protection.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
 
           <form onSubmit={handleSaveSettings} className="space-y-6">
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 text-xs">

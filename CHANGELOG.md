@@ -2,6 +2,30 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.32.0 — Trailing-Stop & Live Sell Reliability Fix, Fail-Closed Anti-Rug Protections, and Dev Server Startup Fix (`env.ts`, `jupiter.ts`, `liveEngine.ts`, `rpcPool.ts`, `sniperManager.ts`, `bot.py`, `settings.json`, `PythonSniperView.tsx`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed
+- **Dev Server CLI Flag Parsing (`server/config/env.ts`)**:
+  - Updated `loadAppEnv()` to honor `--port` and `--host` CLI arguments ahead of `PORT`/`HOST` environment variables so `tsx server.ts --port 3000 --host 0.0.0.0` always binds reliably on port `3000`.
+- **Trailing Stop Not Selling After Hitting TP (`afk` +73.1% → +25.36% Regression) & Live Sell Execution (`bot.py`, `sniperManager.ts`, `jupiter.ts`, `liveEngine.ts`, `rpcPool.ts`)**:
+  - Fixed a state-machine gap in `evaluate_exit_signal` when `recover_principal_enabled=True`: if a coin spiked above `take_profit_pct` (e.g. `+73.1%`) and retraced below TP before recovery closed out (e.g. `+25.36%`) while `trailing_stop_pct > 0`, `trailing_stop` was never evaluated because `principal_recovered` was still `False`. Trailing stop now triggers whenever peak reached TP and PnL pulls back `>= trailing_stop_pct` while still in profit.
+  - Prevented `trailing_active` from displaying as `True` when `trailing_stop_pct` is `0`.
+  - Wired `stop_loss_pct` (default `35%`) into `evaluate_exit_signal` so losing entries exit before hitting `-100%` write-offs.
+  - Hardened `executeLiveSell`: passes `bypassCache: true` to `jupiter.getQuote` so urgent sell retries never reuse stale `1200ms` cached routes, falls back to `inspectTokenOnChain` decimals and single-RPC balance readings when <2 RPCs respond (`getAgreedTokenBalanceUi`), caps per-tier `pollConfirmation` (`14s`/`20s`) within a `95s` Python bridge timeout (previously `55s` timed out mid-retry), uses `skipPreflight: true` on urgent/retry tiers with automatic simulation-failure retry, and reconciles already-landed transactions on confirmation timeout via `findRecentSellSignature` + zero-balance check.
+  - Surfaced live sell errors (`last_sell_error`) directly on Open Positions in `PythonSniperView.tsx`.
+
+### Added & Improved
+- **Hardened Fail-Closed Anti-Rug Filters & Emergency LP-Drain Exit (`bot.py`, `sniperManager.ts`, `settings.json`, `PythonSniperView.tsx`)**:
+  - Updated default `settings.json` & `saveDefaultSettings()` anti-rug floors: `min_liquidity_usd: 3000`, `min_volume_m5_usd: 1500`, `min_buys_m5: 8`, `min_buy_sell_ratio_m5: 1.2`, `ultra_early_grace_sec: 0` (eliminated blind 10s bypass), `rugcheck_max_score: 25`, `max_top10_holder_pct: 35`, `require_lp_locked: true`, `stop_loss_pct: 35`, `auto_rug_exit: true`, `rug_liq_drop_pct: 60`.
+  - Upgraded `passes_filters` to reject honeypot buy-only patterns (`>= 12 buys / 0 sells` after `30s`) and inflated `MCap / Liquidity > 150x` pools.
+  - Upgraded `hard_rug_check`: rejects Token-2022 disallowed extensions (`TransferFeeConfig`, `PermanentDelegate`, `TransferHook`, `ConfidentialTransferMint`, `MintCloseAuthority`, `DefaultAccountState`, `NonTransferable`), fetches full RugCheck `/report` to check `rugged` flags and enforce `rugcheck_max_score` + fail-closed missing report checks at **all** token ages (`< 180s` no longer bypasses score checks), verifies `>= 80%` LP burn/lock on non-bonding-curve AMMs when `require_lp_locked` is enabled, computes non-pool Top-10 & Single-Max holder percentages via RugCheck/RPC, and runs a pre-buy Jupiter reverse sell-route check (`_check_sell_route`) to block unroutable honeypots.
+  - Added real-time liquidity polling in `monitor()` (`entry_liquidity_usd`) + `auto_rug_exit` in `evaluate_exit_signal` to trigger an immediate emergency `rug_liquidity_drop` sell when pool liquidity plunges `>= rug_liq_drop_pct%` (default `60%`).
+  - Exposed `stop_loss_pct`, `require_lp_locked`, `auto_rug_exit`, and `rug_liq_drop_pct` in **Python Sniper Bot → Settings**, added a weak-filter warning banner, labeled optional/paper-only fields, and added a 1-click **Apply Safe Anti-Rug Preset** button.
+
+---
+
 ## v1.31.0 — Force-Delete Resurrection Fix, Principal Recovery & Scale-Out Ladder, and Tighter New-Coin Rug Filters (`bot.py`, `sniperManager.ts`, `api.ts`, `PythonSniperView.tsx`, `sniperFormat.ts`)
 
 **Risk Warning: Trading can lose all of your money.**

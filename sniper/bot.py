@@ -32,25 +32,27 @@ CONFIG = {
     "mode": "paper",
     "start_balance_usd": 50.0, "trade_size_usd": 5.0, "max_open_positions": 3,
     "daily_loss_limit_usd": 10.0,
-    "take_profit_pct": 50.0, "trailing_stop_pct": 0.0, "max_hold_minutes": 120,
+    "take_profit_pct": 50.0, "stop_loss_pct": 35.0, "trailing_stop_pct": 15.0, "max_hold_minutes": 120,
     "recover_principal_enabled": False,
     "recover_principal_sell_pct": 50.0,
     "scale_out_sell_pct": 25.0,
     "scale_out_step_gain_pct": 100.0,
+    "auto_rug_exit": True,
+    "rug_liq_drop_pct": 60.0,
     # sniper window: buy ONLY coins younger than this
     "max_age_minutes": 2.0,
-    # coins younger than this skip the liquidity / buy-volume floors (first-seconds entries)
-    "ultra_early_grace_sec": 10,
+    # coins younger than this skip liquidity/volume floors (0 = strict anti-rug from second 0)
+    "ultra_early_grace_sec": 0,
     # scan speed
     "scan_interval_sec": 1, "monitor_interval_sec": 1.0,
     # entry guards (applied after the grace window)
-    "min_liquidity_usd": 300.0, "min_volume_m5_usd": 0.0,
-    "min_buys_m5": 2, "min_buy_sell_ratio_m5": 1.0,
+    "min_liquidity_usd": 3000.0, "min_volume_m5_usd": 1500.0,
+    "min_buys_m5": 8, "min_buy_sell_ratio_m5": 1.2,
     "max_price_change_m5_pct": 300.0,
     "min_holders": 0,
     # hard rug screen
-    "use_rugcheck": True, "strict_rugcheck": True, "rugcheck_max_score": 50.0,
-    "max_top10_holder_pct": 75.0, "rug_recheck_minutes": 15,
+    "use_rugcheck": True, "strict_rugcheck": True, "require_lp_locked": True,
+    "rugcheck_max_score": 25.0, "max_top10_holder_pct": 35.0, "rug_recheck_minutes": 15,
     # candidate sources (any-DEX coverage)
     "use_gecko": True, "use_jupiter_recent": True, "use_dex_profiles": True,
     "use_pumpportal": True, "use_promoted_feeds": False,
@@ -171,12 +173,36 @@ GECKO = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
 JUP = "https://api.jup.ag/tokens/v2"
 JUP_PRICE = "https://api.jup.ag/price/v3"
 JUP_PRICE_LITE = "https://lite-api.jup.ag/price/v3"
+JUP_QUOTE = "https://api.jup.ag/swap/v1/quote"
+JUP_QUOTE_LITE = "https://lite-api.jup.ag/swap/v1/quote"
 RUGC = "https://api.rugcheck.xyz/v1/tokens"
 PUMPP = "https://api.pumpportal.fun/api/data"
 RPC_URLS = [
-    "https://api.mainnet-beta.solana.com",
     "https://solana-rpc.publicnode.com",
+    "https://api.zan.top/solana-mainnet",
+    "https://api.mainnet-beta.solana.com",
 ]
+KNOWN_POOL_OR_BURN_OWNERS = {
+    "11111111111111111111111111111111",
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+    "GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL",
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+    "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",
+    "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC",
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+    "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg",
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+}
+DISALLOWED_TOKEN2022_EXTENSIONS = {
+    "transferFeeConfig",
+    "nonTransferable",
+    "permanentDelegate",
+    "transferHook",
+}
 HEADERS = {"User-Agent": "solana-launch-sniper/2.0", "Accept": "application/json"}
 _session = requests.Session()
 
@@ -488,15 +514,24 @@ def passes_filters(pair, cfg, now_ms=None):
     ratio = cfg.get("min_buy_sell_ratio_m5", 1.0)
     if ratio > 0 and buys < sells * ratio:
         return False, "selling pressure", f"{buys}b/{sells}s in last 5m"
+    if age_s >= 30 and buys >= 12 and sells == 0:
+        return False, "honeypot pattern", f"{buys} buys / 0 sells in 5m"
+
     m5c = _f((pair.get("priceChange") or {}).get("m5"))
     if m5c is not None and m5c > cfg.get("max_price_change_m5_pct", 300):
         return False, "already pumped", f"+{m5c:.0f}% in 5m"
 
-    if age_s > cfg.get("ultra_early_grace_sec", 10):
-        liq = _f((pair.get("liquidity") or {}).get("usd")) or 0.0
-        if liq < cfg.get("min_liquidity_usd", 300):
-            return False, "low liquidity", f"${liq:.0f} < ${cfg.get('min_liquidity_usd', 0):.0f}"
-        if buys < cfg.get("min_buys_m5", 2):
+    liq = _f((pair.get("liquidity") or {}).get("usd")) or 0.0
+    fdv = _f(pair.get("fdv")) or _f(pair.get("marketCap")) or 0.0
+    if liq > 0 and fdv > 0 and fdv > liq * 150.0:
+        return False, "inflated mcap/liq", f"MCap ${fdv:.0f} vs LP ${liq:.0f}"
+
+    grace_sec = max(0, float(cfg.get("ultra_early_grace_sec", 0) or 0))
+    if age_s > grace_sec:
+        min_liq = float(cfg.get("min_liquidity_usd", 3000) or 0)
+        if liq < min_liq:
+            return False, "low liquidity", f"${liq:.0f} < ${min_liq:.0f}"
+        if buys < cfg.get("min_buys_m5", 8):
             return False, "few buys", f"{buys} buys in last 5m"
         if cfg.get("min_volume_m5_usd", 0) > 0:
             mv5 = _f((pair.get("volume") or {}).get("m5")) or 0.0
@@ -509,8 +544,8 @@ def passes_filters(pair, cfg, now_ms=None):
 # ---------------------------------------------------------------- hard rug screen
 _rug_cache, _rug_lock = {}, threading.Lock()
 
-def _rpc_mint_authorities(mint):
-    """Direct on-chain check of the SPL mint account. Returns (rpc_ok, mint_auth, freeze_auth)."""
+def _rpc_mint_account_info(mint):
+    """Direct on-chain check of SPL/Token-2022 mint. Returns dict or None if RPC failed."""
     body = {"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [mint, {"encoding": "jsonParsed"}]}
     for url in RPC_URLS:
         try:
@@ -520,23 +555,143 @@ def _rpc_mint_authorities(mint):
             parsed = ((value.get("data") or {}).get("parsed") or {})
             if parsed.get("type") == "mint":
                 inf = parsed.get("info") or {}
-                return True, inf.get("mintAuthority"), inf.get("freezeAuthority")
+                decimals = int(inf.get("decimals") if inf.get("decimals") is not None else 6)
+                raw_supply = float(inf.get("supply") or 0)
+                supply_ui = raw_supply / (10 ** decimals) if decimals >= 0 else raw_supply
+                disallowed = []
+                for ext in (inf.get("extensions") or []):
+                    ext_name = str((ext or {}).get("extension") or "")
+                    if ext_name in DISALLOWED_TOKEN2022_EXTENSIONS:
+                        disallowed.append(ext_name)
+                return {
+                    "mint_auth": inf.get("mintAuthority"),
+                    "freeze_auth": inf.get("freezeAuthority"),
+                    "decimals": decimals,
+                    "supply_ui": supply_ui,
+                    "disallowed_extensions": disallowed,
+                }
         except Exception:
             continue
-    return False, None, None
+    return None
 
-def hard_rug_check(mint, cfg, age_s):
-    """Return (ok, reason). On-chain authority check + Jupiter audit + RugCheck. Cached."""
+def _rpc_mint_authorities(mint):
+    """Direct on-chain check of the SPL mint account. Returns (rpc_ok, mint_auth, freeze_auth)."""
+    info = _rpc_mint_account_info(mint)
+    if info is None:
+        return False, None, None
+    return True, info.get("mint_auth"), info.get("freeze_auth")
+
+def _rpc_top_holders(mint, supply_ui, exclude_addrs=None):
+    """Best-effort RPC largest holder calculation excluding known pool/burn addresses."""
+    if not supply_ui or supply_ui <= 0:
+        return None, None
+    excl = set(KNOWN_POOL_OR_BURN_OWNERS)
+    if exclude_addrs:
+        excl.update(exclude_addrs)
+    for url in RPC_URLS:
+        try:
+            r = _session.post(
+                url,
+                json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint, {"commitment": "confirmed"}]},
+                timeout=5,
+                headers={**HEADERS, "Content-Type": "application/json"},
+            )
+            if r.status_code != 200:
+                continue
+            vals = ((r.json().get("result") or {}).get("value") or [])[:15]
+            if not vals:
+                continue
+            addrs = [v.get("address") for v in vals if v.get("address")]
+            owners_by_idx = {}
+            if addrs:
+                mr = _session.post(
+                    url,
+                    json={"jsonrpc": "2.0", "id": 2, "method": "getMultipleAccounts", "params": [addrs, {"encoding": "jsonParsed", "commitment": "confirmed"}]},
+                    timeout=5,
+                    headers={**HEADERS, "Content-Type": "application/json"},
+                )
+                if mr.status_code == 200:
+                    mvals = ((mr.json().get("result") or {}).get("value") or [])
+                    for idx, mv in enumerate(mvals):
+                        owner = (((((mv or {}).get("data") or {}).get("parsed") or {}).get("info") or {}).get("owner") or "")
+                        owners_by_idx[idx] = owner
+            non_pool = []
+            for idx, v in enumerate(vals):
+                addr = v.get("address") or ""
+                owner = owners_by_idx.get(idx, "")
+                if addr in excl or owner in excl or "11111111111111111" in owner:
+                    continue
+                ui = _f(v.get("uiAmount")) or 0.0
+                pct = (ui / supply_ui) * 100.0
+                non_pool.append(pct)
+            top10_pct = sum(non_pool[:10])
+            single_max = max(non_pool) if non_pool else 0.0
+            return top10_pct, single_max
+        except Exception:
+            continue
+    return None, None
+
+def _check_sell_route(mint, decimals, price_usd, cfg):
+    """Verify Jupiter can quote an exit swap mint -> WSOL with sane price impact (catches honeypots)."""
+    if not mint or not price_usd or price_usd <= 0:
+        return True, "skip"
+    trade_usd = max(0.5, float(cfg.get("trade_size_usd", 5.0) or 5.0))
+    qty_ui = trade_usd / float(price_usd)
+    dec = max(0, int(decimals if decimals is not None else 6))
+    raw_units = max(1, int(qty_ui * (10 ** dec)))
+    has_key = bool(cfg.get("jupiter_api_key"))
+    url = JUP_QUOTE if has_key else JUP_QUOTE_LITE
+    hdrs = {"x-api-key": cfg["jupiter_api_key"]} if has_key else None
+    try:
+        r = _session.get(
+            url,
+            params={
+                "inputMint": mint,
+                "outputMint": WSOL_MINT,
+                "amount": str(raw_units),
+                "slippageBps": "1500",
+                "swapMode": "ExactIn",
+            },
+            headers={**HEADERS, **(hdrs or {})},
+            timeout=5,
+        )
+        if r.status_code == 400:
+            return False, "no sell route back to SOL (honeypot / unroutable)"
+        if r.status_code != 200:
+            return True, "jup_unavailable"
+        q = r.json()
+        out_amt = _f(q.get("outAmount")) or 0.0
+        if out_amt <= 0:
+            return False, "zero sell output on Jupiter (honeypot)"
+        impact = abs(_f(q.get("priceImpactPct")) or 0.0) * 100.0
+        if impact > 15.0:
+            return False, f"sell price impact too high ({impact:.1f}% > 15%)"
+        return True, "ok"
+    except Exception:
+        return True, "jup_timeout"
+
+def hard_rug_check(mint, cfg, age_s, pair=None):
+    """Return (ok, reason). Fail-closed on-chain SPL/Token-2022 + RugCheck full report + holder concentration + sell-route test."""
     ttl = max(60, cfg.get("rug_recheck_minutes", 15) * 60)
     with _rug_lock:
         hit = _rug_cache.get(mint)
         if hit and time.time() - hit[0] < ttl: return hit[1]
 
+    strict = bool(cfg.get("strict_rugcheck", True))
     verdict = (True, "ok")
-    rpc_ok, ma, fa = _rpc_mint_authorities(mint)
-    if rpc_ok:
-        if ma: verdict = (False, "mint authority NOT revoked (on-chain: dev can mint supply)")
-        elif fa: verdict = (False, "freeze authority enabled (on-chain: dev can freeze sells)")
+    mint_info = _rpc_mint_account_info(mint)
+    decimals = mint_info.get("decimals", 6) if mint_info else 6
+    supply_ui = mint_info.get("supply_ui", 0.0) if mint_info else 0.0
+    jup_verified = False
+
+    if mint_info is not None:
+        if mint_info.get("mint_auth"):
+            verdict = (False, "mint authority NOT revoked (on-chain: dev can mint supply)")
+        elif mint_info.get("freeze_auth"):
+            verdict = (False, "freeze authority enabled (on-chain: dev can freeze sells)")
+        elif mint_info.get("disallowed_extensions"):
+            exts = ", ".join(mint_info["disallowed_extensions"])
+            verdict = (False, f"disallowed Token-2022 extensions: {exts}")
     else:
         hdrs = {"x-api-key": cfg["jupiter_api_key"]} if cfg.get("jupiter_api_key") else None
         jt = get_json(f"{JUP}/search", params={"query": mint}, headers=hdrs)
@@ -545,47 +700,144 @@ def hard_rug_check(mint, cfg, age_s):
             tok = next((t for t in jt if isinstance(t, dict) and t.get("id") == mint), None)
             if tok is None and isinstance(jt[0], dict): tok = jt[0]
             if isinstance(tok, dict):
+                jup_verified = True
                 if tok.get("mintAuthority"): verdict = (False, "mint authority NOT revoked")
                 elif tok.get("freezeAuthority"): verdict = (False, "freeze authority enabled")
+        if verdict[0] and strict and not jup_verified:
+            verdict = (False, "on-chain RPC inspection unavailable (fail closed)")
 
-    young = age_s < 180   # seconds-old pools always look 'low liquidity' to RugCheck
+    young = age_s < 180
+    dex_id = str((pair or {}).get("dexId") or "").lower()
+    is_bonding_curve = dex_id == "pumpfun"
+    pair_addr = str((pair or {}).get("pairAddress") or "")
+    pair_liq = _f(((pair or {}).get("liquidity") or {}).get("usd")) or 0.0
+    min_liq_cfg = float(cfg.get("min_liquidity_usd", 3000) or 0)
+
     if verdict[0] and cfg.get("use_rugcheck", True):
-        rep = get_json(f"{RUGC}/{mint}/report/summary", timeout=8)
-        risks = rep.get("risks") if isinstance(rep, dict) else None
-        if isinstance(risks, list):
-            if not young:
+        rep = get_json(f"{RUGC}/{mint}/report", timeout=8)
+        if not isinstance(rep, dict) or (rep.get("score") is None and not isinstance(rep.get("risks"), list)):
+            rep = get_json(f"{RUGC}/{mint}/report/summary", timeout=6)
+
+        if not isinstance(rep, dict) or (not isinstance(rep.get("risks"), list) and rep.get("score") is None):
+            if strict:
+                verdict = (False, "no rugcheck report yet (fail closed)")
+        else:
+            if rep.get("rugged") is True:
+                verdict = (False, "token flagged as RUGGED on RugCheck")
+
+            if verdict[0]:
+                if rep.get("mintAuthority"):
+                    verdict = (False, "RugCheck reports active mint authority")
+                elif rep.get("freezeAuthority"):
+                    verdict = (False, "RugCheck reports active freeze authority")
+
+            # Enforce RugCheck risk score at EVERY age (never skip young tokens)
+            if verdict[0]:
                 sn = _f(rep.get("score_normalised"))
+                if sn is None and _f(rep.get("score")) is not None:
+                    raw_s = _f(rep.get("score")) or 0.0
+                    sn = min(100.0, raw_s / 100.0) if raw_s > 100.0 else raw_s
                 if sn is not None:
                     if sn > 100: sn /= 1000.0
-                    if sn >= cfg.get("rugcheck_max_score", 50):
-                        verdict = (False, f"rugcheck risk score {sn:.0f}/100")
+                    max_rc_score = float(cfg.get("rugcheck_max_score", 25) or 25)
+                    if sn >= max_rc_score:
+                        verdict = (False, f"rugcheck risk score {sn:.0f}/100 >= {max_rc_score:.0f}")
+
+            # Enforce LP lock/burn check on AMM pools (non-bonding-curve) when require_lp_locked is active
+            known_pools = set()
+            if pair_addr:
+                known_pools.add(pair_addr)
+            for addr, kinfo in (rep.get("knownAccounts") or {}).items():
+                if isinstance(kinfo, dict):
+                    ktype = str(kinfo.get("type") or "").upper()
+                    if ktype in ("AMM", "LOCKER", "POOL", "CLOB"):
+                        known_pools.add(addr)
+
+            if verdict[0] and cfg.get("require_lp_locked", True) and not is_bonding_curve:
+                markets = rep.get("markets")
+                if isinstance(markets, list) and markets:
+                    max_lp_pct = 0.0
+                    for m in markets:
+                        if not isinstance(m, dict): continue
+                        if m.get("pubkey"):
+                            known_pools.add(str(m.get("pubkey")))
+                        lp = m.get("lp") or {}
+                        locked_pct = _f(lp.get("lpLockedPct")) or 0.0
+                        burned_pct = 100.0 if lp.get("lpBurned") else 0.0
+                        max_lp_pct = max(max_lp_pct, locked_pct, burned_pct)
+                    if max_lp_pct < 80.0:
+                        verdict = (False, f"LP burned/locked {max_lp_pct:.0f}% < 80% minimum (rug risk)")
+
+            max_top10 = float(cfg.get("max_top10_holder_pct", 35) or 35)
+            max_single = min(25.0, max(10.0, max_top10 * 0.65))
+            top10_pct = None
+            single_max_pct = None
+
+            # Compute true non-pool top holder % from full RugCheck report first, else RPC
+            top_holders = rep.get("topHolders")
+            if isinstance(top_holders, list) and top_holders:
+                non_pool_pcts = []
+                for h in top_holders[:20]:
+                    if not isinstance(h, dict): continue
+                    addr = str(h.get("address") or "")
+                    owner = str(h.get("owner") or "")
+                    if addr in known_pools or owner in known_pools or addr in KNOWN_POOL_OR_BURN_OWNERS or owner in KNOWN_POOL_OR_BURN_OWNERS:
+                        continue
+                    pct = _f(h.get("pct"))
+                    if pct is not None:
+                        non_pool_pcts.append(pct)
+                top10_pct = sum(non_pool_pcts[:10])
+                single_max_pct = max(non_pool_pcts) if non_pool_pcts else 0.0
+
+            if top10_pct is None and supply_ui > 0:
+                top10_pct, single_max_pct = _rpc_top_holders(mint, supply_ui, known_pools)
+
+            risks = rep.get("risks") if isinstance(rep.get("risks"), list) else []
             if verdict[0]:
-                strict = cfg.get("strict_rugcheck", True)
-                max_top10 = float(cfg.get("max_top10_holder_pct", 75) or 75)
                 for risk in risks:
+                    if not isinstance(risk, dict): continue
                     level = str(risk.get("level") or "").lower()
                     name = str(risk.get("name") or ""); low = name.lower()
                     desc = str(risk.get("description") or "")
-                    # Always reject high top-10 / single-holder concentration even on brand-new (<3m) coins
                     if "holder" in low:
                         m = re.search(r"([\d.]+)\s*%", desc + " " + name)
                         if m and float(m.group(1)) > max_top10:
                             verdict = (False, f"{name} ({m.group(1)}% > {max_top10:.0f}% limit)")
                             break
-                    if level != "danger":
-                        # Still block critical Token-2022 / rug hooks regardless of level/age
-                        if ("transfer fee" in low or "permanent delegate" in low) and strict:
+                    if "unlocked" in low and ("lp" in low or "liquidity" in low) and cfg.get("require_lp_locked", True):
+                        verdict = (False, f"LP risk: {name}")
+                        break
+                    if level not in ("danger", "critical"):
+                        if strict and any(k in low for k in ("transfer fee", "permanent delegate", "honeypot", "insider", "copycat", "freeze", "mint")):
                             verdict = (False, f"rugcheck risk: {name}")
                             break
                         continue
-                    if young and (("liquidity" in low) or ("lp" in low)) and "unlocked" not in low:
+                    # Exempt only generic 'Low Liquidity' / 'Low amount of LP Providers' when pair liquidity already beat min_liquidity_usd
+                    is_generic_liq_warn = ("low liquidity" in low or "low amount of lp providers" in low) and "unlocked" not in low
+                    if young and is_generic_liq_warn and pair_liq >= min_liq_cfg:
                         continue
-                    if not strict and not (("mint" in low) or ("freeze" in low) or ("authorit" in low) or ("holder" in low) or ("transfer fee" in low) or ("delegate" in low)):
+                    if not strict and not any(k in low for k in ("mint", "freeze", "authorit", "holder", "transfer fee", "delegate", "unlocked")):
                         continue
                     verdict = (False, f"rugcheck danger: {name or 'unknown risk'}")
                     break
-        elif not young:
-            verdict = (False, "no rugcheck report (coin not brand new)")
+
+            if verdict[0]:
+                if top10_pct is None:
+                    if strict:
+                        verdict = (False, "top holder concentration unavailable (fail closed)")
+                else:
+                    if top10_pct > max_top10:
+                        verdict = (False, f"top-10 non-pool holders own {top10_pct:.1f}% > {max_top10:.0f}% limit")
+                    elif single_max_pct is not None and single_max_pct > max_single:
+                        verdict = (False, f"single holder owns {single_max_pct:.1f}% > {max_single:.0f}% limit")
+
+    # Pre-buy Jupiter sell-route check to filter honeypots and dead exit pools
+    if verdict[0] and pair is not None:
+        px_usd = _f(pair.get("priceUsd"))
+        if px_usd and px_usd > 0:
+            route_ok, route_reason = _check_sell_route(mint, decimals, px_usd, cfg)
+            if not route_ok:
+                verdict = (False, route_reason)
 
     with _rug_lock:
         if len(_rug_cache) > 5000: _rug_cache.clear()
@@ -887,6 +1139,8 @@ class TradingAccount:
             "dex": meta.get("dex", "?"),
             "source": meta.get("source", "?"),
             "age_at_entry": round(meta.get("age_s", 0), 1),
+            "entry_liquidity_usd": meta.get("liquidity_usd"),
+            "current_liquidity_usd": meta.get("liquidity_usd"),
             **extra_pos,
         }
         self.state["blacklist"].append(mint)
@@ -960,10 +1214,12 @@ class TradingAccount:
                 "solPriceUsd": sol_px,
                 "reason": reason,
                 "sellFraction": req_frac if is_partial else 1.0,
-            }, timeout=55)
+            }, timeout=95)
             if not isinstance(res, dict) or not res.get("ok"):
                 err = (res or {}).get("error") or "No live sell route available"
                 pos["last_sell_attempt"] = time.time()
+                pos["last_sell_error"] = str(err)[:220]
+                pos["last_sell_error_at"] = time.time()
                 self.save()
                 log(f"✗ LIVE SELL FAILED {pos['symbol']} [{reason}]: {err} (keeping position open)")
                 return False
@@ -998,6 +1254,8 @@ class TradingAccount:
                 pos["recovered_usd"] = round(float(pos.get("recovered_usd") or 0.0) + proceeds, 4)
                 pos["realized_pnl_usd"] = round(float(pos.get("realized_pnl_usd") or 0.0) + pnl, 4)
                 pos["last_sell_attempt"] = time.time()
+                pos.pop("last_sell_error", None)
+                pos.pop("last_sell_error_at", None)
             else:
                 is_partial = False
                 self.state["positions"].pop(mint, None)
@@ -1143,24 +1401,40 @@ class TradingAccount:
         scale_out_sell_pct=25.0,
         scale_out_step_gain_pct=100.0,
         next_scale_out_pct=None,
+        stop_loss_pct=0.0,
+        auto_rug_exit=False,
+        entry_liquidity_usd=None,
+        current_liquidity_usd=None,
+        rug_liq_drop_pct=60.0,
     ):
         """Return (reason_or_none, trailing_active, drop_from_peak_pnl_pct)."""
         if not entry or entry <= 0 or not price or price <= 0:
             return None, False, 0.0
         tp = float(tp or 0.0)
         trail = float(trail or 0.0)
+        sl = max(0.0, float(stop_loss_pct or 0.0))
         peak = max(float(entry), float(peak_price or entry), float(price))
         change_pct = round((price / entry - 1.0) * 100.0, 6)
         peak_chg_pct = round((peak / entry - 1.0) * 100.0, 6)
         drop_from_peak_pct = max(0.0, round(peak_chg_pct - change_pct, 6))
 
+        # 1. Emergency auto-rug exit if pool liquidity drains sharply below entry floor
+        if auto_rug_exit and entry_liquidity_usd is not None and entry_liquidity_usd >= 500.0 and current_liquidity_usd is not None:
+            liq_drop_limit = max(20.0, min(95.0, float(rug_liq_drop_pct or 60.0)))
+            liq_drop_pct = (1.0 - float(current_liquidity_usd) / float(entry_liquidity_usd)) * 100.0
+            if float(current_liquidity_usd) < 250.0 or liq_drop_pct >= liq_drop_limit:
+                return "rug_liquidity_drop", False, drop_from_peak_pct
+
+        # 2. Take profit / Principal recovery / Profit-only trailing stop
         if recover_principal_enabled:
             if not principal_recovered:
-                # Wait for Take Profit / Principal Recovery target before selling initial % or arming trail
-                trailing_active = tp > 0.0 and peak_chg_pct >= tp
+                trailing_active = tp > 0.0 and trail > 0.0 and peak_chg_pct >= tp
                 if tp > 0.0 and change_pct >= tp:
                     pct_int = int(round(max(5.0, min(95.0, float(recover_sell_pct or 50.0)))))
-                    return f"principal_recovery_{pct_int}pct", True, drop_from_peak_pct
+                    return f"principal_recovery_{pct_int}pct", (trail > 0.0), drop_from_peak_pct
+                # If TP spike armed trailing stop before partial sell could fill and price pulled back >= trail, still exit in profit!
+                if trailing_active and change_pct > 0.0 and drop_from_peak_pct >= trail:
+                    return f"trailing_stop_{trail:g}", True, drop_from_peak_pct
             else:
                 # Principal is safely recovered — remaining bag rides with trailing stop + optional scale-out ladder
                 trailing_active = trail > 0.0
@@ -1180,6 +1454,10 @@ class TradingAccount:
             if tp > 0.0 and change_pct >= tp:
                 return f"take_profit_{tp:g}", False, drop_from_peak_pct
 
+        # 3. Stop loss (protects against slow rugs / post-entry dumps)
+        if sl > 0.0 and change_pct <= -sl:
+            return f"stop_loss_{sl:g}", trailing_active, drop_from_peak_pct
+
         max_hold = float(max_hold_minutes or 0.0)
         if max_hold > 0.0 and held_minutes >= max_hold:
             return "max_hold", trailing_active, drop_from_peak_pct
@@ -1187,23 +1465,29 @@ class TradingAccount:
         return None, trailing_active, drop_from_peak_pct
 
     @locked
-    def check_exits(self, prices):
+    def check_exits(self, prices, liquidities=None):
         if _should_stop():
             return 0
         self._drain_delete_queue()
+        liquidities = liquidities or {}
         exits = 0
         tp = float(self.cfg.get("take_profit_pct", 50) or 0.0)
+        sl = float(self.cfg.get("stop_loss_pct", 0) or 0.0)
         trail = float(self.cfg.get("trailing_stop_pct", 0) or 0.0)
         max_hold = float(self.cfg.get("max_hold_minutes", 120) or 0.0)
         recover_enabled = bool(self.cfg.get("recover_principal_enabled", False))
         recover_sell_pct = float(self.cfg.get("recover_principal_sell_pct", 50.0) or 50.0)
         scale_sell_pct = float(self.cfg.get("scale_out_sell_pct", 25.0) or 25.0)
         scale_step = float(self.cfg.get("scale_out_step_gain_pct", 100.0) or 0.0)
+        auto_rug = bool(self.cfg.get("auto_rug_exit", True))
+        rug_drop = float(self.cfg.get("rug_liq_drop_pct", 60.0) or 60.0)
         now_ts = time.time()
         self.state["last_price_time"] = now_ts
         for mint, pos in list(self.state["positions"].items()):
             if _should_stop():
                 break
+            if mint in liquidities and liquidities[mint] is not None:
+                pos["current_liquidity_usd"] = liquidities[mint]
             price = prices.get(mint)
             if price is None or price <= 0:
                 continue
@@ -1235,6 +1519,11 @@ class TradingAccount:
                 scale_out_sell_pct=scale_sell_pct,
                 scale_out_step_gain_pct=scale_step,
                 next_scale_out_pct=pos.get("next_scale_out_pct"),
+                stop_loss_pct=sl,
+                auto_rug_exit=auto_rug,
+                entry_liquidity_usd=pos.get("entry_liquidity_usd"),
+                current_liquidity_usd=pos.get("current_liquidity_usd"),
+                rug_liq_drop_pct=rug_drop,
             )
             was_active = bool(pos.get("trailing_active"))
             pos["trailing_active"] = trailing_active
@@ -1249,7 +1538,7 @@ class TradingAccount:
                 is_recovery = reason_str.startswith("principal_recovery")
                 is_scale_out = reason_str.startswith("scale_out")
                 if not reason_str.startswith("take_profit") and not is_recovery and not is_scale_out and self.mode == "live":
-                    cooldown = 2.0 if reason_str.startswith("trailing_stop") else 5.0
+                    cooldown = 2.0 if (reason_str.startswith("trailing_stop") or reason_str == "rug_liquidity_drop") else 4.0
                     if now_ts - float(pos.get("last_sell_attempt") or 0.0) < cooldown:
                         continue
                 sell_frac = (
@@ -1394,7 +1683,7 @@ def scan_and_buy(acct, cfg):
         if _should_stop():
             return
         age_s = max(0.0, (now_ms - int(pair.get("pairCreatedAt") or 0)) / 1000.0)
-        rok, rwhy = hard_rug_check(mint, cfg, age_s)
+        rok, rwhy = hard_rug_check(mint, cfg, age_s, pair=pair)
         if not rok:
             with _stats_lock: _stats["rug"] += 1
             log(f"✗ RUG REJECT {symbol}: {rwhy}")
@@ -1404,7 +1693,8 @@ def scan_and_buy(acct, cfg):
             return
         price = _f(pair.get("priceUsd"))
         if price is None: continue
-        meta = {"dex": pair.get("dexId") or "?", "source": _src_of.get(mint, "?"), "age_s": age_s}
+        liq_usd = _f((pair.get("liquidity") or {}).get("usd"))
+        meta = {"dex": pair.get("dexId") or "?", "source": _src_of.get(mint, "?"), "age_s": age_s, "liquidity_usd": liq_usd}
         if acct.buy(mint, symbol, price, pair.get("url"), meta):
             with _stats_lock: _stats["bought"] += 1
             if acct.is_slots_full()[0]:
@@ -1458,6 +1748,8 @@ def _process_sell_queue(acct, prices):
     except Exception:
         pass
 
+_last_liq_poll = [0.0]
+
 def monitor(acct):
     if _should_stop():
         return {}
@@ -1489,31 +1781,37 @@ def monitor(acct):
 
     mints = list(pos.keys())
     prices = _jupiter_prices(mints, acct.cfg)
+    liquidities = {}
     missing = [mint for mint in mints if mint not in prices]
-    for i in range(0, len(missing), 30):
+    need_liq_check = bool(acct.cfg.get("auto_rug_exit", True)) and (time.time() - _last_liq_poll[0] >= 3.0)
+    ds_targets = mints if need_liq_check else missing
+    if need_liq_check and ds_targets:
+        _last_liq_poll[0] = time.time()
+    for i in range(0, len(ds_targets), 30):
         if _should_stop():
             return prices
-        chunk = missing[i:i + 30]
+        chunk = ds_targets[i:i + 30]
         data = get_json(f"{DEX}/tokens/v1/solana/{','.join(chunk)}", timeout=4)
         if isinstance(data, list):
             best_by_mint = {}
             for p in data:
                 if not isinstance(p, dict): continue
                 mint = (p.get("baseToken") or {}).get("address")
-                if mint in pos and mint not in prices:
+                if mint in pos:
                     price = _f(p.get("priceUsd"))
                     liq = _f((p.get("liquidity") or {}).get("usd")) or 0.0
-                    if price is not None and price > 0:
-                        cur = best_by_mint.get(mint)
-                        if cur is None or liq > cur[0]:
-                            best_by_mint[mint] = (liq, price)
-            for mint, (_liq, price) in best_by_mint.items():
-                prices[mint] = price
+                    cur = best_by_mint.get(mint)
+                    if cur is None or liq > cur[0]:
+                        best_by_mint[mint] = (liq, price)
+            for mint, (liq, price) in best_by_mint.items():
+                liquidities[mint] = liq
+                if mint not in prices and price is not None and price > 0:
+                    prices[mint] = price
 
     if _should_stop():
         return prices
     _process_sell_queue(acct, prices)
-    acct.check_exits(prices)
+    acct.check_exits(prices, liquidities=liquidities)
     return prices
 
 def probe(cfg):

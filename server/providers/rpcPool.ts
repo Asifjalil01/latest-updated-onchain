@@ -323,7 +323,14 @@ export class SolanaRpcPool {
     );
 
     if (readings.length < 2) {
-      return { agreed: false, balanceUi: null, readings };
+      const single = rawDetails[0];
+      return {
+        agreed: false,
+        balanceUi: single ? single.ui : null,
+        readings,
+        decimals: single?.decimals,
+        rawAmount: single && single.rawBigInt > 0n ? single.rawBigInt.toString() : undefined,
+      };
     }
 
     for (let i = 0; i < rawDetails.length; i++) {
@@ -344,7 +351,14 @@ export class SolanaRpcPool {
       }
     }
 
-    return { agreed: false, balanceUi: null, readings };
+    const fallback = rawDetails[0];
+    return {
+      agreed: false,
+      balanceUi: fallback ? fallback.ui : null,
+      readings,
+      decimals: fallback?.decimals,
+      rawAmount: fallback && fallback.rawBigInt > 0n ? fallback.rawBigInt.toString() : undefined,
+    };
   }
 
   async getAgreedSignatureConfirmation(

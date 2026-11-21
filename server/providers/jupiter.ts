@@ -263,6 +263,7 @@ export class JupiterProvider {
     restrictIntermediateTokens?: boolean;
     onlyDirectRoutes?: boolean;
     allowRelaxFallback?: boolean;
+    bypassCache?: boolean;
   }): Promise<JupiterQuoteResponse | null> {
     const attempts: Array<{ restrictIntermediate: boolean; onlyDirect: boolean }> = [
       {
@@ -291,11 +292,14 @@ export class JupiterProvider {
       }
 
       try {
+        const cacheTtlMs = params.bypassCache ? 0 : 1200;
         const quote = await this.swapHttp.fetchJson<JupiterQuoteResponse>(
           `${this.baseUrl}/swap/v1/quote?${qs.toString()}`,
           { headers: this.getHeaders() },
-          `quote_${params.inputMint}_${params.outputMint}_${params.amountRaw}_${params.slippageBps}_${attempt.restrictIntermediate ? 'strict' : 'relaxed'}`,
-          1200
+          params.bypassCache
+            ? ''
+            : `quote_${params.inputMint}_${params.outputMint}_${params.amountRaw}_${params.slippageBps}_${attempt.restrictIntermediate ? 'strict' : 'relaxed'}`,
+          cacheTtlMs
         );
         if (quote && quote.outAmount && Number(quote.outAmount) > 0 && Array.isArray(quote.routePlan)) {
           this.lastQuoteError = null;

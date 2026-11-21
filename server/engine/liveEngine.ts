@@ -44,7 +44,8 @@ export interface ExecutionProgressEvent {
 export interface LiveTxAdapter {
   sendSignedTransaction: (
     rawTx: Uint8Array,
-    maxRetries: number
+    maxRetries: number,
+    options?: { skipPreflight?: boolean }
   ) => Promise<string>;
   pollConfirmation: (
     signature: string,
@@ -71,10 +72,15 @@ export interface LiveTxAdapter {
 export class DefaultLiveTxAdapter implements LiveTxAdapter {
   constructor(private readonly rpcPool: SolanaRpcPool) {}
 
-  async sendSignedTransaction(rawTx: Uint8Array, maxRetries: number): Promise<string> {
+  async sendSignedTransaction(
+    rawTx: Uint8Array,
+    maxRetries: number,
+    options?: { skipPreflight?: boolean }
+  ): Promise<string> {
+    const skipPreflight = Boolean(options?.skipPreflight);
     return this.rpcPool.withFailover(async (conn) => {
       const sig = await conn.sendRawTransaction(rawTx, {
-        skipPreflight: false,
+        skipPreflight,
         maxRetries: BigInt(maxRetries),
         preflightCommitment: 'confirmed',
       });

@@ -58,8 +58,19 @@ export function loadAppEnv(): AppEnvConfig {
     isFirstRunTokenGenerated = true;
   }
 
-  const host = process.env.HOST || '127.0.0.1';
-  const portRaw = Number(process.env.PORT || 3000);
+  const argvHostIdx = process.argv.indexOf('--host');
+  const cliHost =
+    argvHostIdx >= 0 && process.argv[argvHostIdx + 1] && !process.argv[argvHostIdx + 1].startsWith('--')
+      ? process.argv[argvHostIdx + 1]
+      : undefined;
+  const argvPortIdx = process.argv.indexOf('--port');
+  const cliPortRaw =
+    argvPortIdx >= 0 && process.argv[argvPortIdx + 1] && !process.argv[argvPortIdx + 1].startsWith('--')
+      ? Number(process.argv[argvPortIdx + 1])
+      : NaN;
+
+  const host = cliHost || process.env.HOST || '127.0.0.1';
+  const portRaw = Number.isFinite(cliPortRaw) && cliPortRaw > 0 ? cliPortRaw : Number(process.env.PORT || 3000);
   const port = Number.isFinite(portRaw) && portRaw > 0 ? portRaw : 3000;
 
   const dbPath = path.resolve(cwd, process.env.DB_PATH || './data/solana_spot_bot.db');

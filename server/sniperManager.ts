@@ -595,29 +595,30 @@ export class SniperManager {
       max_open_positions: 3,
       daily_loss_limit_usd: 10.0,
       take_profit_pct: 50.0,
-      stop_loss_pct: 0.0,
-      trailing_stop_pct: 0.0,
+      stop_loss_pct: 35.0,
+      trailing_stop_pct: 15.0,
       recover_principal_enabled: false,
       recover_principal_sell_pct: 50.0,
       scale_out_sell_pct: 25.0,
       scale_out_step_gain_pct: 100.0,
       auto_rug_exit: true,
-      rug_liq_drop_pct: 75.0,
+      rug_liq_drop_pct: 60.0,
       max_hold_minutes: 120,
       max_age_minutes: 2.0,
-      ultra_early_grace_sec: 10,
+      ultra_early_grace_sec: 0,
       scan_interval_sec: 1,
       monitor_interval_sec: 1.0,
-      min_liquidity_usd: 300.0,
-      min_volume_m5_usd: 0.0,
-      min_buys_m5: 2,
-      min_buy_sell_ratio_m5: 1.0,
+      min_liquidity_usd: 3000.0,
+      min_volume_m5_usd: 1500.0,
+      min_buys_m5: 8,
+      min_buy_sell_ratio_m5: 1.2,
       max_price_change_m5_pct: 300.0,
       min_holders: 0,
       use_rugcheck: true,
       strict_rugcheck: true,
-      rugcheck_max_score: 50.0,
-      max_top10_holder_pct: 75.0,
+      require_lp_locked: true,
+      rugcheck_max_score: 25.0,
+      max_top10_holder_pct: 35.0,
       rug_recheck_minutes: 15,
       use_gecko: true,
       use_jupiter_recent: true,
@@ -1336,8 +1337,11 @@ export class SniperManager {
       decimals: undefined,
       rawAmount: undefined,
     }));
-    const hasReliableBal = bal.agreed || (Array.isArray(bal.readings) && bal.readings.length > 0 && bal.balanceUi !== null);
-    if (hasReliableBal && bal.balanceUi !== null && bal.balanceUi > 0) {
+    const hasUsableBal =
+      bal.balanceUi !== null &&
+      bal.balanceUi > 0 &&
+      (bal.agreed || (Array.isArray(bal.readings) && bal.readings.length > 0));
+    if (hasUsableBal && bal.balanceUi !== null) {
       if (typeof bal.decimals === 'number' && bal.decimals >= 0) {
         effectiveDecimals = bal.decimals;
       }
@@ -1347,12 +1351,17 @@ export class SniperManager {
       if (bal.rawAmount && /^\d+$/.test(bal.rawAmount) && BigInt(bal.rawAmount) > 0n) {
         exactTotalRaw = bal.rawAmount;
       }
+    } else if ((params.decimals === undefined || params.decimals === null) && typeof rpcPool.inspectTokenOnChain === 'function') {
+      const mintInfo = await rpcPool.inspectTokenOnChain(params.mint).catch(() => null);
+      if (mintInfo && typeof mintInfo.decimals === 'number' && mintInfo.decimals >= 0) {
+        effectiveDecimals = mintInfo.decimals;
+      }
     }
 
     const totalRawBig =
       exactTotalRaw !== null
         ? BigInt(exactTotalRaw)
-        : BigInt(Math.max(1, Math.floor(totalHeldQty * 10 ** effectiveDecimals)));
+        : BigInt(Math.max(1, Math.floor(Math.max(0, totalHeldQty) * 10 ** effectiveDecimals)));
 
     const requestedFraction =
       params.sellFraction !== undefined &&
@@ -1379,11 +1388,17 @@ export class SniperManager {
     const amountRaw = rawToSellBig.toString();
 
     const baseSlippageBps = Math.min(2500, Math.max(100, Math.round((params.slippagePct ?? 2.0) * 100)));
+    const reasonStr = String(params.reason || '');
+    const isUrgentExit =
+      reasonStr.startsWith('trailing_stop') ||
+      reasonStr.startsWith('stop_loss') ||
+      reasonStr === 'rug_liquidity_drop' ||
+      reasonStr === 'manual_exit';
     const slippageTiers = Array.from(
       new Set([
         baseSlippageBps,
-        Math.max(baseSlippageBps, 800),
-        Math.max(baseSlippageBps, 2000),
+        Math.max(baseSlippageBps, 1000),
+        Math.max(baseSlippageBps, 2500),
         5000,
       ])
     ).sort((a, b) => a - b);
@@ -1393,10 +1408,10 @@ export class SniperManager {
     let lastError = 'Sell failed';
     let hadAnyRoute = false;
 
-    // 2. Progressive slippage escalation across quote + build + sign + send so tight slippage never blocks TP/rug exits
+    // 2. Progressive slippage escalation across quote + build + sign + send so tight slippage/preflight never blocks TP/trailing/rug exits
     for (let idx = 0; idx < slippageTiers.length; idx += 1) {
       const slipBps = slippageTiers[idx];
-      const relax = idx > 0 || params.reason === 'rug_liquidity_drop' || params.reason === 'manual_exit';
+      const relax = idx > 0 || isUrgentExit;
       const q = await jupiter.getQuote({
         inputMint: params.mint,
         outputMint: WSOL_MINT,
@@ -1404,6 +1419,7 @@ export class SniperManager {
         slippageBps: slipBps,
         restrictIntermediateTokens: !relax,
         allowRelaxFallback: true,
+        bypassCache: true,
       });
 
       if (!q || Number(q.outAmount) <= 0) {
@@ -1432,31 +1448,57 @@ export class SniperManager {
       await signer.signVersionedTransaction(versionedTx);
       const rawSigned = versionedTx.serialize();
 
-      let sentSig: string;
+      let sentSig: string | null = null;
+      const preferSkipPreflight = idx > 0 || isUrgentExit;
       try {
-        sentSig = await this.txAdapter.sendSignedTransaction(rawSigned, 3);
+        sentSig = await this.txAdapter.sendSignedTransaction(rawSigned, 3, {
+          skipPreflight: preferSkipPreflight,
+        });
       } catch (err) {
-        lastError = `Live sell submission failed (${(slipBps / 100).toFixed(1)}% slip): ${err instanceof Error ? err.message : String(err)}`;
-        continue;
+        // Retry once with skipPreflight=true if preflight simulation failed due to volatile pool state
+        if (!preferSkipPreflight) {
+          try {
+            sentSig = await this.txAdapter.sendSignedTransaction(rawSigned, 3, {
+              skipPreflight: true,
+            });
+          } catch (retryErr) {
+            lastError = `Live sell submission failed (${(slipBps / 100).toFixed(1)}% slip): ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`;
+            continue;
+          }
+        } else {
+          lastError = `Live sell submission failed (${(slipBps / 100).toFixed(1)}% slip): ${err instanceof Error ? err.message : String(err)}`;
+          continue;
+        }
       }
 
-      const conf = await this.txAdapter.pollConfirmation(sentSig, 25_000);
+      const confirmWindowMs = idx === slippageTiers.length - 1 ? 20_000 : 14_000;
+      const conf = await this.txAdapter.pollConfirmation(sentSig, confirmWindowMs);
       if (conf.status === 'failed') {
         lastError = conf.err || `Sell failed on-chain at ${(slipBps / 100).toFixed(1)}% slippage`;
         continue;
       }
       if (conf.status === 'timeout') {
-        const late = await this.txAdapter.pollConfirmation(sentSig, 90_000);
-        if (late.status === 'failed') {
-          lastError = late.err || 'Sell confirmation failed on-chain';
-          continue;
+        // Check whether the tx actually landed on-chain despite slow confirmation RPC polling
+        const recentSig = await this.txAdapter.findRecentSellSignature(owner, params.mint).catch(() => null);
+        if (recentSig) {
+          sig = recentSig;
+          break;
         }
-        if (late.status === 'timeout') {
+        const postBalCheck = !isPartial
+          ? await rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => null)
+          : null;
+        if (postBalCheck && (postBalCheck.agreed || (postBalCheck.readings?.length ?? 0) > 0) && (postBalCheck.balanceUi ?? 0) <= 0.000001) {
+          sig = sentSig;
+          break;
+        }
+        lastError = `Sell confirmation timed out (tx ${sentSig}) at ${(slipBps / 100).toFixed(1)}% slippage`;
+        if (idx === slippageTiers.length - 1) {
           return {
             ok: false,
             error: `Sell confirmation timed out (tx ${sentSig}); keeping position open until verified.`,
           };
         }
+        continue;
       }
 
       sig = sentSig;

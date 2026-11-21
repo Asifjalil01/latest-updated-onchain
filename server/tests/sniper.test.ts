@@ -1030,6 +1030,7 @@ test('Python bot principal recovery + scale-out ladder + trailing stop + young-c
       'acct.check_exits({"MintLadder1": entry * 3.04})',
       'remaining_count = len(acct.state["positions"])',
       // 5. Young coin (age_s=15) with 85% top-10 concentration (> max_top10_holder_pct 60%) MUST BE REJECTED
+      'bot._rpc_mint_account_info = lambda m: {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": []}',
       'bot._rpc_mint_authorities = lambda m: (True, None, None)',
       'bot.get_json = lambda url, params=None, headers=None, timeout=8: {"score_normalised": 10, "risks": [{"level": "warn", "name": "Top 10 holders high ownership", "description": "Top 10 holders hold 85% of supply"}]} if "rugcheck" in url else None',
       'rug_ok, rug_reason = bot.hard_rug_check("MintConcentrated1", cfg, age_s=15)',
@@ -1068,6 +1069,181 @@ test('Python bot principal recovery + scale-out ladder + trailing stop + young-c
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('v1.32.0: afk +73.1% -> +25.36% trailing stop fires even with recover_principal_enabled, plus stop-loss, LP-drain rug exit & fail-closed anti-rug filters', () => {
+  const pyScript = [
+    'import sys, types, json, time',
+    'req = types.ModuleType("requests")',
+    'class DummySess:',
+    '    def get(self, *a, **k): raise RuntimeError("no net")',
+    '    def post(self, *a, **k): raise RuntimeError("no net")',
+    'req.Session = lambda: DummySess()',
+    'sys.modules["requests"] = req',
+    'sys.path.insert(0, "sniper")',
+    'import bot',
+    'ev = bot.TradingAccount.evaluate_exit_signal',
+    'out = {}',
+    // 1. Exact afk screenshot regression: TP=50, Trail=15, Peak=+73.1%, Now=+25.36% with recover_principal_enabled=True & principal_recovered=False
+    'out["afk_trail_fix"] = ev(1.0, 1.2536, 1.731, 50, 15, 4.0, 12000, recover_principal_enabled=True, principal_recovered=False)',
+    // 2. When trail=0 and principal_recovered=True, trailing_active must be False
+    'out["trail_zero_inactive"] = ev(1.0, 1.50, 1.50, 50, 0, 1.0, 12000, recover_principal_enabled=True, principal_recovered=True)',
+    // 3. Stop loss 35% fires at -36%
+    'out["stop_loss_fires"] = ev(1.0, 0.64, 1.02, 50, 15, 2.0, 12000, stop_loss_pct=35)',
+    // 4. Emergency LP drain auto-rug exit triggers when liquidity plunges >= 60%
+    'out["lp_drain_fires"] = ev(1.0, 0.90, 1.05, 50, 15, 1.0, 12000, stop_loss_pct=35, auto_rug_exit=True, rug_liq_drop_pct=60, entry_liquidity_usd=5000, current_liquidity_usd=1500)',
+    // 5. passes_filters: honeypot pattern (12 buys / 0 sells after 30s) & no grace bypass at grace=0
+    'now_ms = int(time.time() * 1000)',
+    'honeypot_pair = {"pairCreatedAt": now_ms - 45000, "priceUsd": "0.001", "liquidity": {"usd": 5000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 14, "sells": 0}}}',
+    'out["honeypot_filter"] = bot.passes_filters(honeypot_pair, dict(bot.CONFIG), now_ms)',
+    'low_liq_young = {"pairCreatedAt": now_ms - 5000, "priceUsd": "0.001", "liquidity": {"usd": 400}, "volume": {"m5": 2000}, "txns": {"m5": {"buys": 10, "sells": 2}}}',
+    'out["no_grace_bypass"] = bot.passes_filters(low_liq_young, dict(bot.CONFIG), now_ms)',
+    // 6. hard_rug_check: Token-2022 disallowed extension rejection
+    'cfg = dict(bot.CONFIG)',
+    'bot._check_sell_route = lambda *a, **k: (True, "ok")',
+    'bot._rpc_mint_account_info = lambda m: {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": ["PermanentDelegate"]}',
+    'out["t22_reject"] = bot.hard_rug_check("MintT22Bad", cfg, age_s=20)',
+    // 7. hard_rug_check: Fail closed on missing RugCheck report even at <180s
+    'bot._rpc_mint_account_info = lambda m: {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": []}',
+    'bot.get_json = lambda *a, **k: None',
+    'out["missing_report_young"] = bot.hard_rug_check("MintNoReport", cfg, age_s=20)',
+    // 8. hard_rug_check: Reject unlocked LP on AMM pool (not bonding curve)
+    'bot.get_json = lambda url, **k: {"score_normalised": 5, "risks": [], "markets": [{"pubkey": "Pool1", "lp": {"lpLockedPct": 0, "lpBurned": False}}], "topHolders": [{"address": "Pool1", "owner": "Pool1", "pct": 70.0}, {"address": "W1", "owner": "W1", "pct": 5.0}]} if "rugcheck" in url else None',
+    'out["unlocked_lp_reject"] = bot.hard_rug_check("MintUnlockedLP", cfg, age_s=25, pair={"dexId": "raydium", "pairAddress": "Pool1", "liquidity": {"usd": 5000}})',
+    // 9. hard_rug_check: Reject non-pool Top-10 concentration > 35%
+    'bot.get_json = lambda url, **k: {"score_normalised": 5, "risks": [], "markets": [{"pubkey": "Pool1", "lp": {"lpLockedPct": 100, "lpBurned": True}}], "topHolders": [{"address": "Pool1", "owner": "Pool1", "pct": 50.0}, {"address": "W1", "owner": "W1", "pct": 25.0}, {"address": "W2", "owner": "W2", "pct": 18.0}]} if "rugcheck" in url else None',
+    'out["non_pool_top10_reject"] = bot.hard_rug_check("MintWhaleTop10", cfg, age_s=25, pair={"dexId": "raydium", "pairAddress": "Pool1", "liquidity": {"usd": 5000}})',
+    'print(json.dumps(out))',
+  ].join('\n');
+
+  const raw = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+  const out = JSON.parse(raw.trim().split('\n').pop() || '{}');
+
+  assert.equal(out.afk_trail_fix[0], 'trailing_stop_15');
+  assert.equal(out.afk_trail_fix[1], true);
+
+  assert.equal(out.trail_zero_inactive[0], null);
+  assert.equal(out.trail_zero_inactive[1], false);
+
+  assert.equal(out.stop_loss_fires[0], 'stop_loss_35');
+  assert.equal(out.lp_drain_fires[0], 'rug_liquidity_drop');
+
+  assert.equal(out.honeypot_filter[0], false);
+  assert.equal(out.honeypot_filter[1], 'honeypot pattern');
+
+  assert.equal(out.no_grace_bypass[0], false);
+  assert.equal(out.no_grace_bypass[1], 'low liquidity');
+
+  assert.equal(out.t22_reject[0], false);
+  assert.match(out.t22_reject[1], /PermanentDelegate/i);
+
+  assert.equal(out.missing_report_young[0], false);
+  assert.match(out.missing_report_young[1], /fail closed/i);
+
+  assert.equal(out.unlocked_lp_reject[0], false);
+  assert.match(out.unlocked_lp_reject[1], /LP burned\/locked/i);
+
+  assert.equal(out.non_pool_top10_reject[0], false);
+  assert.match(out.non_pool_top10_reject[1], /top-10 non-pool holders/i);
+});
+
+test('v1.32.0: executeLiveSell uses bypassCache, retries simulation failure with skipPreflight, and recovers on confirmation timeout', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-live-sell-v132-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const kp = await Keypair.generate();
+    const signer = new ServerSignerManager(path.join(tmpDir, 'ks.json'));
+    await signer.initFromEnv(JSON.stringify(Array.from(kp.secretKey)));
+    const mockTxBase64 = createBase64MockTx(kp);
+
+    const bypassCacheSeen: boolean[] = [];
+    const skipPreflightCalls: Array<boolean | undefined> = [];
+    let attemptCount = 0;
+
+    const mockOrchestrator = {
+      signer,
+      rpcPool: {
+        getAgreedBalanceSol: async () => ({ agreed: true, balanceSol: 0.5, readings: [0.5, 0.5] }),
+        getAgreedTokenBalanceUi: async () => ({
+          agreed: false,
+          balanceUi: 100,
+          rawAmount: '100000000',
+          decimals: 6,
+          readings: [100],
+        }),
+        inspectTokenOnChain: async () => ({ decimals: 6 }),
+      },
+      jupiter: {
+        getLiveSolPriceUsd: async () => 100,
+        getLastQuoteError: () => null,
+        getQuote: async (params: any) => {
+          bypassCacheSeen.push(Boolean(params.bypassCache));
+          return {
+            inputMint: params.inputMint,
+            inAmount: params.amountRaw,
+            outputMint: params.outputMint,
+            outAmount: '7500000',
+            slippageBps: params.slippageBps,
+            priceImpactPct: '0.002',
+            routePlan: [],
+          };
+        },
+        buildSwapTransaction: async () => ({ swapTransaction: mockTxBase64 }),
+      },
+    } as unknown as BotOrchestrator;
+
+    const mockAdapter: LiveTxAdapter = {
+      sendSignedTransaction: async (_tx, _maxRetries, options) => {
+        attemptCount++;
+        skipPreflightCalls.push(options?.skipPreflight);
+        if (attemptCount === 1) {
+          throw new Error('Simulation failed: custom program error: 0x1771');
+        }
+        return 'sigSkipPreflightRecovered111';
+      },
+      pollConfirmation: async () => ({ status: 'timeout' }),
+      reconcileParsedSwapSolDelta: async () => ({
+        found: true,
+        solDeltaLamports: 7_500_000,
+        feeLamports: 10_000,
+      }),
+      findRecentSellSignature: async () => 'sigSkipPreflightRecovered111',
+    };
+
+    mgr.attachOrchestrator(mockOrchestrator, mockAdapter);
+
+    // Non-urgent exit starts with skipPreflight=false and falls back to skipPreflight=true after simulation error
+    const resTp = await mgr.executeLiveSell({
+      mint: 'MintAfkSell1111111111111111111111111111111',
+      symbol: 'AFK',
+      qty: 100,
+      costUsd: 0.5,
+      solPriceUsd: 100,
+      reason: 'take_profit_50',
+    });
+
+    assert.equal(resTp.ok, true);
+    assert.equal(resTp.txSig, 'sigSkipPreflightRecovered111');
+    assert.ok(bypassCacheSeen.length >= 1 && bypassCacheSeen.every(Boolean));
+    assert.equal(skipPreflightCalls[0], false);
+    assert.equal(skipPreflightCalls[1], true);
+
+    // Urgent trailing_stop exit skips preflight immediately on first attempt
+    skipPreflightCalls.length = 0;
+    const resTrail = await mgr.executeLiveSell({
+      mint: 'MintAfkSell1111111111111111111111111111111',
+      symbol: 'AFK',
+      qty: 100,
+      costUsd: 0.5,
+      solPriceUsd: 100,
+      reason: 'trailing_stop_15',
+    });
+    assert.equal(resTrail.ok, true);
+    assert.equal(skipPreflightCalls[0], true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 
 
