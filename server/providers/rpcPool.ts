@@ -485,7 +485,11 @@ export class SolanaRpcPool {
             if (st) {
               if (st.err) {
                 errorCount += 1;
-                lastErr = JSON.stringify(st.err);
+                const rawErr = JSON.stringify(st.err);
+                lastErr =
+                  /"Custom":\s*(?:6001|6004|1771)|0x1771|Slippage/i.test(rawErr)
+                    ? `On-chain slippage exceeded (${rawErr})`
+                    : rawErr;
               } else if (
                 st.confirmationStatus === 'confirmed' ||
                 st.confirmationStatus === 'finalized'

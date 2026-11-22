@@ -9,6 +9,8 @@ export interface ProviderOptions {
   cacheTtlMs?: number;
   circuitFailureThreshold?: number;
   circuitCooldownMs?: number;
+  base429BackoffMs?: number;
+  max429BackoffMs?: number;
 }
 
 interface CacheEntry<T> {
@@ -27,12 +29,14 @@ const domainRateStates = new Map<string, DomainRateState>();
 export class HttpProvider {
   public readonly sourceName: string;
   private readonly domain: string;
-  private readonly minIntervalMs: number;
+  private minIntervalMs: number;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly cacheTtlMs: number;
   private readonly circuitFailureThreshold: number;
   private readonly circuitCooldownMs: number;
+  private readonly base429BackoffMs: number;
+  private readonly max429BackoffMs: number;
 
   private cache = new Map<string, CacheEntry<unknown>>();
   private consecutiveFailures = 0;
@@ -54,6 +58,12 @@ export class HttpProvider {
     this.cacheTtlMs = options.cacheTtlMs ?? 15_000;
     this.circuitFailureThreshold = options.circuitFailureThreshold ?? 5;
     this.circuitCooldownMs = options.circuitCooldownMs ?? 60_000;
+    this.base429BackoffMs = options.base429BackoffMs ?? 15_000;
+    this.max429BackoffMs = options.max429BackoffMs ?? 180_000;
+  }
+
+  setMinIntervalMs(ms: number): void {
+    this.minIntervalMs = Math.max(0, ms);
   }
 
   private getDomainState(): DomainRateState {
@@ -144,8 +154,11 @@ export class HttpProvider {
           const retryAfterHeader = response.headers.get('retry-after');
           const retryAfterSec = retryAfterHeader ? Number(retryAfterHeader) : NaN;
           const backoffMs = Number.isFinite(retryAfterSec)
-            ? Math.max(5_000, retryAfterSec * 1000)
-            : Math.min(180_000, 15_000 * 2 ** Math.min(domainState.consecutive429s - 1, 3));
+            ? Math.min(this.max429BackoffMs, Math.max(1_500, retryAfterSec * 1000))
+            : Math.min(
+                this.max429BackoffMs,
+                this.base429BackoffMs * 2 ** Math.min(domainState.consecutive429s - 1, 3)
+              );
           domainState.rateLimitedUntilMs = Date.now() + backoffMs;
           lastErr = new Error(`HTTP 429 from ${this.domain}`);
           throw lastErr;
@@ -206,14 +219,17 @@ export class HttpProvider {
     const isClient4xx =
       typeof finalStatus === 'number' && finalStatus >= 400 && finalStatus < 500 && finalStatus !== 429;
     const errMsg = lastErr ? lastErr.message : 'Unknown provider failure';
+    const isRateLimitErr = errMsg.includes('HTTP 429') || errMsg.includes('Rate limited backoff');
     this.lastError = errMsg;
     if (!isClient4xx) {
       this.errorCount += 1;
-      this.consecutiveFailures += 1;
       this.recentErrors = [{ message: errMsg, atMs: Date.now() }, ...this.recentErrors].slice(0, 10);
-      if (this.consecutiveFailures >= this.circuitFailureThreshold) {
-        this.circuitState = 'OPEN';
-        this.circuitOpenedAtMs = Date.now();
+      if (!isRateLimitErr) {
+        this.consecutiveFailures += 1;
+        if (this.consecutiveFailures >= this.circuitFailureThreshold) {
+          this.circuitState = 'OPEN';
+          this.circuitOpenedAtMs = Date.now();
+        }
       }
     }
     throw lastErr ?? new Error(`Provider failure: ${this.sourceName}`);

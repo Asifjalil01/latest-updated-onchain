@@ -1834,4 +1834,225 @@ test('v1.34.0: website/launchpad checkboxes normalize in SniperManager and stric
   assert.equal(out.dex_ignores_synth, false);
 });
 
+test('v1.34.1: Jupiter 429 fails over cleanly without circuit-open, PumpPortal trade-local rescues buys/sells, and slippage retry recovers failed buy', async () => {
+  const { JupiterProvider } = await import('../providers/jupiter.ts');
+  const kp = await Keypair.generate();
+  const mockTxBytes = Buffer.from(createBase64MockTx(kp), 'base64');
+
+  const prevFetch = globalThis.fetch;
+  const calledUrls: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    calledUrls.push(url);
+    if (url.startsWith('https://lite-api.jup.ag/swap/v1/quote')) {
+      return new Response('Too many requests', { status: 429 });
+    }
+    if (url.startsWith('https://api.jup.ag/swap/v1/quote')) {
+      return new Response(
+        JSON.stringify({
+          inputMint: 'So11111111111111111111111111111111111111112',
+          inAmount: '10000000',
+          outputMint: 'MintFallback1111111111111111111111111111111',
+          outAmount: '500000000',
+          slippageBps: 300,
+          priceImpactPct: '0.01',
+          routePlan: [{ percent: 100, swapInfo: { label: 'PumpSwap' } }],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    if (url === 'https://pumpportal.fun/api/trade-local') {
+      return new Response(mockTxBytes, {
+        status: 200,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      });
+    }
+    return new Response('Not found', { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    const jup = new JupiterProvider();
+    // 1. lite-api.jup.ag 429 fails over cleanly to api.jup.ag without firing a duplicate relaxed request or tripping circuit breaker
+    const q = await jup.getQuote({
+      inputMint: 'So11111111111111111111111111111111111111112',
+      outputMint: 'MintFallback1111111111111111111111111111111',
+      amountRaw: '10000000',
+      slippageBps: 300,
+    });
+    assert.ok(q && q.outAmount === '500000000');
+    const liteCalls = calledUrls.filter((u) => u.startsWith('https://lite-api.jup.ag/swap/v1/quote'));
+    assert.equal(liteCalls.length, 1, 'Must break immediately after 429 without sending duplicate relaxed quote');
+    const swapHealth = jup.getHealth().find((h) => h.source === 'jupiter_swap');
+    assert.equal(swapHealth?.circuitState, 'CLOSED');
+
+    // 2. buildPumpPortalSwapTransaction parses raw binary VersionedTransaction payload
+    const ppTx = await jup.buildPumpPortalSwapTransaction({
+      userPublicKey: kp.publicKey.toBase58(),
+      action: 'buy',
+      mint: 'MintFallback1111111111111111111111111111111',
+      amount: 0.01,
+      denominatedInSol: true,
+      slippagePct: 8,
+      priorityFeeSol: 0.0002,
+    });
+    assert.ok(ppTx instanceof Uint8Array && ppTx.length > 32);
+  } finally {
+    globalThis.fetch = prevFetch;
+  }
+
+  // 3. SniperManager.executeLiveBuy falls back to PumpPortal when Jupiter has no route / 429 AND retries once on on-chain slippage revert
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1341-'));
+  try {
+    const manager = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const mockTxB64 = createBase64MockTx(kp);
+    let pollAttempt = 0;
+    let ppFallbacks = 0;
+    const buySlippages: number[] = [];
+    const heldBalance: Record<string, number> = {};
+    let activeMint = '';
+
+    const mockOrchestrator = {
+      signer: {
+        isUnlocked: () => true,
+        getPublicKey: () => kp.publicKey.toBase58(),
+        signVersionedTransaction: async () => undefined,
+      },
+      rpcPool: {
+        getAgreedBalanceSol: async () => ({ agreed: true, balanceSol: 0.5, readings: [0.5, 0.5] }),
+        getAgreedTokenBalanceUi: async (_owner: string, mint: string) => {
+          activeMint = mint;
+          const bal = heldBalance[mint] ?? 0;
+          return {
+            agreed: true,
+            balanceUi: bal,
+            readings: [bal, bal],
+            decimals: 6,
+            rawAmount: bal > 0 ? String(bal * 1_000_000) : '0',
+          };
+        },
+        inspectTokenOnChain: async () => ({ decimals: 6 }),
+      },
+      jupiter: {
+        getLiveSolPriceUsd: async () => 70,
+        getLastQuoteError: () => 'Rate limited backoff active for lite-api.jup.ag',
+        getQuote: async (params: any) => {
+          buySlippages.push(params.slippageBps);
+          if (params.outputMint.includes('PPFallback') || params.inputMint.includes('PPFallback')) return null;
+          return {
+            inputMint: params.inputMint,
+            inAmount: params.amountRaw,
+            outputMint: params.outputMint,
+            outAmount: '25000000000',
+            slippageBps: params.slippageBps,
+            priceImpactPct: '0.01',
+            routePlan: [],
+          };
+        },
+        buildSwapTransaction: async () => ({ swapTransaction: mockTxB64 }),
+        buildPumpPortalSwapTransaction: async () => {
+          ppFallbacks += 1;
+          return new Uint8Array(mockTxBytes);
+        },
+      },
+    };
+    const mockAdapter: LiveTxAdapter = {
+      sendSignedTransaction: async () => 'sigMock111',
+      pollConfirmation: async () => {
+        pollAttempt += 1;
+        // First buy attempt reverts with on-chain slippage 6001; retry succeeds cleanly
+        if (pollAttempt === 1) {
+          return { status: 'failed', err: 'On-chain slippage exceeded ({"InstructionError":[3,{"Custom":6001}]})' };
+        }
+        if (activeMint) {
+          heldBalance[activeMint] = activeMint.includes('Retry') ? 25000 : 12000;
+        }
+        return { status: 'confirmed' };
+      },
+      reconcileParsedSwapSolDelta: async () => ({
+        found: true,
+        solDeltaLamports: -7_142_857,
+        feeLamports: 5000,
+        tokenDeltaUi: 25000,
+      }),
+      findRecentSellSignature: async () => null,
+    };
+    manager.attachOrchestrator(mockOrchestrator as unknown as BotOrchestrator, mockAdapter);
+
+    // Tight 3% slippage fails on attempt 1 (6001) and automatically retries once at bumped slippage -> succeeds!
+    const retryRes = await manager.executeLiveBuy({
+      mint: 'MintRetryBuy1111111111111111111111111111111',
+      symbol: 'RETRY',
+      tradeSizeUsd: 0.5,
+      slippagePct: 3,
+      solPriceUsd: 70,
+    });
+    assert.equal(retryRes.ok, true);
+    assert.deepEqual(buySlippages, [300, 1000]);
+
+    // When Jupiter returns null (429 / no route), PumpPortal trade-local automatically buys instead of failing!
+    const ppBuyRes = await manager.executeLiveBuy({
+      mint: 'MintPPFallback11111111111111111111111111111',
+      symbol: 'PPBUY',
+      tradeSizeUsd: 0.5,
+      slippagePct: 3,
+      solPriceUsd: 70,
+    });
+    assert.equal(ppBuyRes.ok, true);
+    assert.equal(ppFallbacks, 1);
+
+    // When Jupiter returns null on sell, PumpPortal trade-local automatically sells!
+    const ppSellRes = await manager.executeLiveSell({
+      mint: 'MintPPFallback11111111111111111111111111111',
+      symbol: 'PPBUY',
+      qty: 12000,
+      rawAmount: '12000000000',
+      decimals: 6,
+      costUsd: 0.5,
+      costSol: 0.0071,
+      slippagePct: 3,
+      solPriceUsd: 70,
+      reason: 'take_profit_35',
+    });
+    assert.equal(ppSellRes.ok, true);
+    assert.equal(ppFallbacks, 2);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // 4. bot.py skips redundant Jupiter sell-route probes when pair already has sells >= 2
+  const pyScript = [
+    'import sys, types, json, time',
+    'req = types.ModuleType("requests")',
+    'class DummySess:',
+    '    def get(self, *a, **k): raise RuntimeError("no net")',
+    '    def post(self, *a, **k): raise RuntimeError("no net")',
+    'req.Session = lambda: DummySess()',
+    'sys.modules["requests"] = req',
+    'sys.path.insert(0, "sniper")',
+    'import bot',
+    'probe_calls = [0]',
+    'def spy_probe(*a, **k):',
+    '    probe_calls[0] += 1',
+    '    return (True, "ok")',
+    'bot._check_sell_route = spy_probe',
+    'bot._rpc_mint_account_info = lambda m, c=None: {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": []}',
+    'bot.get_json = lambda u, **k: {"score_normalised": 10, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
+    'cfg = dict(bot.CONFIG)',
+    'pair_active = {"dexId": "meteora", "priceUsd": "0.0001", "liquidity": {"usd": 8000}, "txns": {"m5": {"buys": 12, "sells": 4}}}',
+    'ok1, _ = bot.hard_rug_check("MintActiveSells11111111111111111111111111", cfg, age_s=25, pair=pair_active)',
+    'calls_after_active = probe_calls[0]',
+    'pair_zero_sells = {"dexId": "meteora", "priceUsd": "0.0001", "liquidity": {"usd": 8000}, "txns": {"m5": {"buys": 12, "sells": 0}}}',
+    'ok2, _ = bot.hard_rug_check("MintZeroSells1111111111111111111111111111", cfg, age_s=25, pair=pair_zero_sells)',
+    'calls_after_zero = probe_calls[0]',
+    'print(json.dumps({"ok1": ok1, "calls_after_active": calls_after_active, "ok2": ok2, "calls_after_zero": calls_after_zero}))',
+  ].join('\n');
+  const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+  const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+  assert.equal(pyOut.ok1, true);
+  assert.equal(pyOut.calls_after_active, 0, 'Active pair with >=2 sells should not burn Jupiter /quote quota');
+  assert.equal(pyOut.ok2, true);
+  assert.equal(pyOut.calls_after_zero, 1, 'Zero-sell honeypot suspect still checks Jupiter sell route');
+});
+
+
 

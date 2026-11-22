@@ -44,6 +44,7 @@ export interface JupiterSwapResponse {
 export class JupiterProvider {
   private readonly priceHttp: HttpProvider;
   private readonly swapHttp: HttpProvider;
+  private readonly fallbackSwapHttp: HttpProvider;
   private readonly tokensHttp: HttpProvider;
   private apiKey?: string;
   private baseUrl: string;
@@ -55,24 +56,41 @@ export class JupiterProvider {
     this.priceHttp = new HttpProvider({
       sourceName: 'jupiter_price',
       domain,
-      minIntervalMs: 250,
+      minIntervalMs: 350,
       timeoutMs: 6000,
       maxRetries: 0,
-      cacheTtlMs: 850,
+      cacheTtlMs: 1200,
+      base429BackoffMs: 2500,
+      max429BackoffMs: 12_000,
     });
     this.swapHttp = new HttpProvider({
       sourceName: 'jupiter_swap',
       domain,
-      minIntervalMs: 250,
+      minIntervalMs: this.apiKey ? 200 : 750,
       timeoutMs: 9000,
+      maxRetries: 0,
       cacheTtlMs: 1500,
+      base429BackoffMs: 2500,
+      max429BackoffMs: 10_000,
+    });
+    this.fallbackSwapHttp = new HttpProvider({
+      sourceName: 'jupiter_swap_fallback',
+      domain: 'api.jup.ag',
+      minIntervalMs: 900,
+      timeoutMs: 9000,
+      maxRetries: 0,
+      cacheTtlMs: 1500,
+      base429BackoffMs: 3000,
+      max429BackoffMs: 12_000,
     });
     this.tokensHttp = new HttpProvider({
       sourceName: 'jupiter_tokens',
       domain,
-      minIntervalMs: 400,
+      minIntervalMs: 500,
       timeoutMs: 8000,
       cacheTtlMs: 30_000,
+      base429BackoffMs: 5000,
+      max429BackoffMs: 30_000,
     });
   }
 
@@ -82,6 +100,7 @@ export class JupiterProvider {
     this.apiKey = clean;
     const domain = this.apiKey ? 'api.jup.ag' : 'lite-api.jup.ag';
     this.baseUrl = `https://${domain}`;
+    this.swapHttp.setMinIntervalMs(this.apiKey ? 200 : 750);
   }
 
   private getHeaders(): Record<string, string> {
@@ -283,40 +302,61 @@ export class JupiterProvider {
       attempts.push({ restrictIntermediate: false, onlyDirect: false });
     }
 
-    let lastErr: string | null = null;
-    for (const attempt of attempts) {
-      const qs = new URLSearchParams({
-        inputMint: params.inputMint,
-        outputMint: params.outputMint,
-        amount: params.amountRaw,
-        slippageBps: String(params.slippageBps),
-        swapMode: 'ExactIn',
-      });
-      if (!attempt.restrictIntermediate) {
-        qs.set('restrictIntermediateTokens', 'false');
-      }
-      if (attempt.onlyDirect) {
-        qs.set('onlyDirectRoutes', 'true');
-      }
+    const hosts: Array<{ url: string; client: HttpProvider }> = [
+      { url: this.baseUrl, client: this.swapHttp },
+    ];
+    if (!this.apiKey && this.baseUrl === 'https://lite-api.jup.ag') {
+      hosts.push({ url: 'https://api.jup.ag', client: this.fallbackSwapHttp });
+    }
 
-      try {
-        const cacheTtlMs = params.bypassCache ? 0 : 1200;
-        const quote = await this.swapHttp.fetchJson<JupiterQuoteResponse>(
-          `${this.baseUrl}/swap/v1/quote?${qs.toString()}`,
-          { headers: this.getHeaders() },
-          params.bypassCache
-            ? ''
-            : `quote_${params.inputMint}_${params.outputMint}_${params.amountRaw}_${params.slippageBps}_${attempt.restrictIntermediate ? 'strict' : 'relaxed'}`,
-          cacheTtlMs
-        );
-        if (quote && quote.outAmount && Number(quote.outAmount) > 0 && Array.isArray(quote.routePlan)) {
-          this.lastQuoteError = null;
-          this.swapHttp.recordItems(1);
-          return quote;
+    let lastErr: string | null = null;
+    for (const host of hosts) {
+      if (host.client.isRateLimited()) {
+        lastErr = `Rate limited backoff active for ${host.url.replace('https://', '')}`;
+        continue;
+      }
+      for (const attempt of attempts) {
+        const qs = new URLSearchParams({
+          inputMint: params.inputMint,
+          outputMint: params.outputMint,
+          amount: params.amountRaw,
+          slippageBps: String(params.slippageBps),
+          swapMode: 'ExactIn',
+        });
+        if (!attempt.restrictIntermediate) {
+          qs.set('restrictIntermediateTokens', 'false');
         }
-        lastErr = 'Empty routePlan or zero outAmount';
-      } catch (err) {
-        lastErr = err instanceof Error ? err.message : String(err);
+        if (attempt.onlyDirect) {
+          qs.set('onlyDirectRoutes', 'true');
+        }
+
+        try {
+          const cacheTtlMs = params.bypassCache ? 0 : 1200;
+          const quote = await host.client.fetchJson<JupiterQuoteResponse>(
+            `${host.url}/swap/v1/quote?${qs.toString()}`,
+            { headers: this.getHeaders() },
+            params.bypassCache
+              ? ''
+              : `quote_${params.inputMint}_${params.outputMint}_${params.amountRaw}_${params.slippageBps}_${attempt.restrictIntermediate ? 'strict' : 'relaxed'}`,
+            cacheTtlMs
+          );
+          if (quote && quote.outAmount && Number(quote.outAmount) > 0 && Array.isArray(quote.routePlan)) {
+            this.lastQuoteError = null;
+            host.client.recordItems(1);
+            return quote;
+          }
+          lastErr = 'Empty routePlan or zero outAmount';
+        } catch (err) {
+          lastErr = err instanceof Error ? err.message : String(err);
+          // Never fire a second relaxed request into an active 429 or circuit limit on the same host
+          if (/429|Rate limited|Circuit breaker/i.test(lastErr)) {
+            break;
+          }
+        }
+      }
+      // Only move to secondary host when the primary failed due to 429/rate-limit/network, not when token truly has no route (HTTP 400)
+      if (lastErr && !/429|Rate limited|Circuit breaker|timeout|fetch failed/i.test(lastErr)) {
+        break;
       }
     }
 
@@ -353,26 +393,106 @@ export class JupiterProvider {
       prioritizationFeeLamports = { autoMultiplier: 2 };
     }
 
-    return this.swapHttp.fetchJson<JupiterSwapResponse>(
-      `${this.baseUrl}/swap/v1/swap`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...this.getHeaders(),
-        },
-        body: JSON.stringify({
-          quoteResponse: params.quoteResponse,
-          userPublicKey: params.userPublicKey,
-          wrapAndUnwrapSol: true,
-          dynamicComputeUnitLimit: true,
-          ...(params.dynamicSlippage ? { dynamicSlippage: true } : {}),
-          prioritizationFeeLamports,
-        }),
+    const bodyPayload = JSON.stringify({
+      quoteResponse: params.quoteResponse,
+      userPublicKey: params.userPublicKey,
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      ...(params.dynamicSlippage ? { dynamicSlippage: true } : {}),
+      prioritizationFeeLamports,
+    });
+
+    const hosts: Array<{ url: string; client: HttpProvider }> = [
+      { url: this.baseUrl, client: this.swapHttp },
+    ];
+    if (!this.apiKey && this.baseUrl === 'https://lite-api.jup.ag') {
+      hosts.push({ url: 'https://api.jup.ag', client: this.fallbackSwapHttp });
+    }
+
+    let lastErr: unknown;
+    for (let i = 0; i < hosts.length; i++) {
+      const host = hosts[i];
+      if (host.client.isRateLimited() && i < hosts.length - 1) {
+        continue;
+      }
+      try {
+        return await host.client.fetchJson<JupiterSwapResponse>(
+          `${host.url}/swap/v1/swap`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...this.getHeaders(),
+            },
+            body: bodyPayload,
+          },
+          '',
+          0
+        );
+      } catch (err) {
+        lastErr = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (i < hosts.length - 1 && /429|Rate limited|timeout|fetch failed/i.test(msg)) {
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error('Jupiter swap build failed');
+  }
+
+  /**
+   * Direct PumpPortal unsigned local swap transaction fallback (pool='auto' covers Pump.fun,
+   * PumpSwap, LaunchLab, Raydium, Raydium-CPMM, and Bonk when Jupiter is rate-limited or unindexed).
+   */
+  async buildPumpPortalSwapTransaction(params: {
+    userPublicKey: string;
+    action: 'buy' | 'sell';
+    mint: string;
+    amount: number | string;
+    denominatedInSol: boolean;
+    slippagePct: number;
+    priorityFeeSol: number;
+    pool?: string;
+  }): Promise<Uint8Array> {
+    const res = await fetch('https://pumpportal.fun/api/trade-local', {
+      method: 'POST',
+      signal: AbortSignal.timeout(8000),
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/octet-stream, application/json',
       },
-      '',
-      0
-    );
+      body: JSON.stringify({
+        publicKey: params.userPublicKey,
+        action: params.action,
+        mint: params.mint,
+        amount: params.amount,
+        denominatedInSol: params.denominatedInSol ? 'true' : 'false',
+        slippage: Math.max(1, Math.min(50, Math.round(params.slippagePct))),
+        priorityFee: Math.max(0.00001, Number(params.priorityFeeSol.toFixed(6))),
+        pool: params.pool || 'auto',
+      }),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw new Error(`PumpPortal trade-local HTTP ${res.status}${detail ? `: ${detail.slice(0, 120)}` : ''}`);
+    }
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('application/json')) {
+      const json = (await res.json()) as { transaction?: string; error?: string };
+      if (json?.transaction) {
+        return new Uint8Array(Buffer.from(json.transaction, 'base64'));
+      }
+      throw new Error(json?.error || 'PumpPortal trade-local returned empty transaction');
+    }
+
+    const buf = new Uint8Array(await res.arrayBuffer());
+    if (buf.length < 32) {
+      throw new Error('PumpPortal trade-local returned invalid transaction payload');
+    }
+    return buf;
   }
 
   /**
@@ -385,9 +505,10 @@ export class JupiterProvider {
   ): Promise<Record<string, number>> {
     const out: Record<string, number> = {};
     if (!solPriceUsd || solPriceUsd <= 0 || positions.length === 0) return out;
+    if (this.swapHttp.isRateLimited()) return out;
 
     await Promise.all(
-      positions.slice(0, 10).map(async (p) => {
+      positions.slice(0, 4).map(async (p) => {
         const mint = (p.mint || '').trim();
         const qty = Number(p.qty || 0);
         if (!mint || qty <= 0) return;
@@ -401,7 +522,7 @@ export class JupiterProvider {
           outputMint: WSOL_MINT,
           amountRaw: rawAmount,
           slippageBps: 500,
-          allowRelaxFallback: true,
+          allowRelaxFallback: false,
           bypassCache: true,
         }).catch(() => null);
         if (quote && Number(quote.outAmount) > 0) {

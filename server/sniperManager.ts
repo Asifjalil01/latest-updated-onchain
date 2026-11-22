@@ -1304,65 +1304,143 @@ export class SniperManager {
     }
 
     const decimals = mintInfo?.decimals ?? preBal.decimals ?? 6;
-    if (!quote || Number(quote.outAmount) <= 0) {
-      const detail = typeof jupiter.getLastQuoteError === 'function' ? jupiter.getLastQuoteError() : null;
-      return {
-        ok: false,
-        error: `No Jupiter buy route available (${detail || 'route not found'})`,
-      };
-    }
-
-    // 4. Build, sign, send (skipPreflight on fast snipe entry), confirm
     const savedSettings = this.readSettings();
     const execFees = this.resolveSwapExecutionFees(savedSettings, false);
-    let swapTxResp;
-    try {
-      swapTxResp = await jupiter.buildSwapTransaction({
-        quoteResponse: quote,
-        userPublicKey: owner,
-        priorityFeeLamports: execFees.priorityFeeLamports,
-        priorityLevel: execFees.priorityLevel,
-        maxPriorityFeeLamports: execFees.maxPriorityFeeLamports,
-        ...(execFees.jitoTipLamports > 0 ? { jitoTipLamports: execFees.jitoTipLamports } : {}),
-      });
-    } catch (err) {
-      return {
-        ok: false,
-        error: `Jupiter buy build failed: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
+    const priorityFeeSolFallback =
+      typeof execFees.priorityFeeLamports === 'number'
+        ? execFees.priorityFeeLamports / LAMPORTS_PER_SOL
+        : execFees.jitoTipLamports > 0
+          ? execFees.jitoTipLamports / LAMPORTS_PER_SOL
+          : 0.0002;
 
-    const txBytes = Buffer.from(swapTxResp.swapTransaction, 'base64');
-    const versionedTx = VersionedTransaction.deserialize(txBytes);
-    await signer.signVersionedTransaction(versionedTx);
-    const rawSigned = versionedTx.serialize();
-    this.broadcastToJitoBestEffort(rawSigned, execFees.jitoTipLamports);
+    const buildAndSignBuy = async (
+      initialQuote: any,
+      attemptSlippageBps: number
+    ): Promise<{
+      ok: boolean;
+      rawSigned?: Uint8Array;
+      quoteUsed?: any;
+      error?: string;
+    }> => {
+      let q = initialQuote;
+      let jupErr: string | null = null;
 
-    let sig: string;
-    try {
-      sig = await this.txAdapter.sendSignedTransaction(rawSigned, 3, { skipPreflight: true });
-    } catch (err) {
-      return {
-        ok: false,
-        error: `Live buy submission failed: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-
-    const conf = await this.txAdapter.pollConfirmation(sig, 20_000);
-    if (conf.status === 'failed') {
-      return { ok: false, error: conf.err || 'Buy transaction failed on-chain' };
-    }
-    if (conf.status === 'timeout') {
-      const late = await this.txAdapter.pollConfirmation(sig, 45_000);
-      if (late.status === 'failed') {
-        return { ok: false, error: late.err || 'Buy transaction failed during confirmation' };
-      }
-      if (late.status === 'timeout') {
-        const postCheck = await rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => ({ agreed: false, balanceUi: null }));
-        if (!postCheck.agreed || (postCheck.balanceUi ?? 0) <= 0) {
-          return { ok: false, error: `Buy confirmation timed out (tx ${sig}); verify on Solscan.` };
+      if (!q || Number(q.outAmount) <= 0) {
+        const detail = typeof jupiter.getLastQuoteError === 'function' ? jupiter.getLastQuoteError() : null;
+        jupErr = `No Jupiter buy route available (${detail || 'route not found'})`;
+      } else {
+        try {
+          const swapTxResp = await jupiter.buildSwapTransaction({
+            quoteResponse: q,
+            userPublicKey: owner,
+            priorityFeeLamports: execFees.priorityFeeLamports,
+            priorityLevel: execFees.priorityLevel,
+            maxPriorityFeeLamports: execFees.maxPriorityFeeLamports,
+            ...(execFees.jitoTipLamports > 0 ? { jitoTipLamports: execFees.jitoTipLamports } : {}),
+            dynamicSlippage: true,
+          });
+          const txBytes = Buffer.from(swapTxResp.swapTransaction, 'base64');
+          const versionedTx = VersionedTransaction.deserialize(txBytes);
+          await signer.signVersionedTransaction(versionedTx);
+          return { ok: true, rawSigned: versionedTx.serialize(), quoteUsed: q };
+        } catch (err) {
+          jupErr = `Jupiter buy build failed: ${err instanceof Error ? err.message : String(err)}`;
         }
       }
+
+      // Automatic fallback to PumpPortal trade-local (pool='auto') when Jupiter hits 429 / backoff / no-route
+      if (typeof jupiter.buildPumpPortalSwapTransaction === 'function') {
+        try {
+          const ppRaw = await jupiter.buildPumpPortalSwapTransaction({
+            userPublicKey: owner,
+            action: 'buy',
+            mint: params.mint,
+            amount: solAmount,
+            denominatedInSol: true,
+            slippagePct: Math.max(attemptSlippageBps / 100, 8),
+            priorityFeeSol: priorityFeeSolFallback,
+            pool: 'auto',
+          });
+          const versionedTx = VersionedTransaction.deserialize(ppRaw);
+          await signer.signVersionedTransaction(versionedTx);
+          return { ok: true, rawSigned: versionedTx.serialize(), quoteUsed: null };
+        } catch {
+          // Preserve clearer Jupiter primary error if PumpPortal fallback does not cover this pool
+        }
+      }
+
+      return { ok: false, error: jupErr || 'No Jupiter buy route available' };
+    };
+
+    let sig: string | null = null;
+    let activeQuote: any = quote;
+    const maxAttempts = slippageBps < 1000 ? 2 : 1;
+
+    for (let attemptIdx = 0; attemptIdx < maxAttempts; attemptIdx += 1) {
+      const attemptSlipBps =
+        attemptIdx === 0 ? slippageBps : Math.min(1500, Math.max(slippageBps * 2, 1000));
+      const attemptQuote =
+        attemptIdx === 0
+          ? quote
+          : await jupiter
+              .getQuote({
+                inputMint: WSOL_MINT,
+                outputMint: params.mint,
+                amountRaw,
+                slippageBps: attemptSlipBps,
+                allowRelaxFallback: true,
+                bypassCache: true,
+              })
+              .catch(() => null);
+
+      const built = await buildAndSignBuy(attemptQuote, attemptSlipBps);
+      if (!built.ok || !built.rawSigned) {
+        return { ok: false, error: built.error || 'Live buy failed' };
+      }
+      activeQuote = built.quoteUsed;
+      this.broadcastToJitoBestEffort(built.rawSigned, execFees.jitoTipLamports);
+
+      let sentSig: string;
+      try {
+        sentSig = await this.txAdapter.sendSignedTransaction(built.rawSigned, 3, { skipPreflight: true });
+      } catch (err) {
+        return {
+          ok: false,
+          error: `Live buy submission failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+
+      const conf = await this.txAdapter.pollConfirmation(sentSig, 20_000);
+      if (conf.status === 'failed') {
+        const errText = conf.err || 'Buy transaction failed on-chain';
+        const canRetrySlippage =
+          attemptIdx + 1 < maxAttempts &&
+          /slippage|6001|6004|1771|On-chain transaction error|InstructionError/i.test(errText);
+        if (canRetrySlippage) {
+          continue;
+        }
+        return { ok: false, error: errText };
+      }
+      if (conf.status === 'timeout') {
+        const late = await this.txAdapter.pollConfirmation(sentSig, 45_000);
+        if (late.status === 'failed') {
+          return { ok: false, error: late.err || 'Buy transaction failed during confirmation' };
+        }
+        if (late.status === 'timeout') {
+          const postCheck = await rpcPool
+            .getAgreedTokenBalanceUi(owner, params.mint)
+            .catch(() => ({ agreed: false, balanceUi: null }));
+          if (!postCheck.agreed || (postCheck.balanceUi ?? 0) <= 0) {
+            return { ok: false, error: `Buy confirmation timed out (tx ${sentSig}); verify on Solscan.` };
+          }
+        }
+      }
+      sig = sentSig;
+      break;
+    }
+
+    if (!sig) {
+      return { ok: false, error: 'Buy transaction failed on-chain' };
     }
 
     // 5. Reconcile exact on-chain quantities & SOL spent
@@ -1371,7 +1449,7 @@ export class SniperManager {
       this.txAdapter.reconcileParsedSwapSolDelta(sig, owner, params.mint),
     ]);
 
-    const quotedQty = Number(quote.outAmount) / 10 ** decimals;
+    const quotedQty = activeQuote ? Number(activeQuote.outAmount) / 10 ** decimals : 0;
     const realDecimals = typeof balCheck.decimals === 'number' ? balCheck.decimals : decimals;
     const realQty =
       balCheck.agreed && (balCheck.balanceUi ?? 0) > 0
@@ -1382,9 +1460,14 @@ export class SniperManager {
     const realRawAmount =
       balCheck.rawAmount && /^\d+$/.test(balCheck.rawAmount)
         ? balCheck.rawAmount
-        : String(quote.outAmount);
+        : activeQuote?.outAmount
+          ? String(activeQuote.outAmount)
+          : '0';
 
-    const quotedSolIn = Number(quote.inAmount) > 0 ? Number(quote.inAmount) / LAMPORTS_PER_SOL : solAmount;
+    const quotedSolIn =
+      activeQuote && Number(activeQuote.inAmount) > 0
+        ? Number(activeQuote.inAmount) / LAMPORTS_PER_SOL
+        : solAmount;
     let realSolSpent = quotedSolIn;
     let feeSol = 0.0001;
     let rentSol = 0;
@@ -1594,6 +1677,9 @@ export class SniperManager {
       if (!q || Number(q.outAmount) <= 0) {
         const detail = typeof jupiter.getLastQuoteError === 'function' ? jupiter.getLastQuoteError() : null;
         lastError = `No sell route available${detail ? ` (${detail})` : ''}`;
+        if (detail && /429|Rate limited|Circuit breaker/i.test(detail)) {
+          break;
+        }
         continue;
       }
       hadAnyRoute = true;
@@ -1613,7 +1699,11 @@ export class SniperManager {
           dynamicSlippage: true,
         });
       } catch (err) {
-        lastError = `Jupiter sell build failed: ${err instanceof Error ? err.message : String(err)}`;
+        const msg = err instanceof Error ? err.message : String(err);
+        lastError = `Jupiter sell build failed: ${msg}`;
+        if (/429|Rate limited|Circuit breaker/i.test(msg)) {
+          break;
+        }
         continue;
       }
 
@@ -1680,7 +1770,49 @@ export class SniperManager {
       break;
     }
 
-    if (!sig || !quote) {
+    // Emergency PumpPortal trade-local sell fallback when Jupiter is rate-limited or has no route
+    if (!sig && typeof jupiter.buildPumpPortalSwapTransaction === 'function') {
+      try {
+        const savedSettings = this.readSettings();
+        const sellExecFees = this.resolveSwapExecutionFees(savedSettings, true);
+        const ppFeeSol =
+          typeof sellExecFees.priorityFeeLamports === 'number'
+            ? sellExecFees.priorityFeeLamports / LAMPORTS_PER_SOL
+            : 0.0003;
+        const ppRaw = await jupiter.buildPumpPortalSwapTransaction({
+          userPublicKey: owner,
+          action: 'sell',
+          mint: params.mint,
+          amount: isPartial ? soldQty : '100%',
+          denominatedInSol: false,
+          slippagePct: Math.max(params.slippagePct ?? 3, isUrgentExit ? 25 : 15),
+          priorityFeeSol: ppFeeSol,
+          pool: 'auto',
+        });
+        const versionedTx = VersionedTransaction.deserialize(ppRaw);
+        await signer.signVersionedTransaction(versionedTx);
+        const rawSigned = versionedTx.serialize();
+        this.broadcastToJitoBestEffort(rawSigned, sellExecFees.jitoTipLamports);
+        const ppSig = await this.txAdapter.sendSignedTransaction(rawSigned, 3, { skipPreflight: true });
+        const ppConf = await this.txAdapter.pollConfirmation(ppSig, 20_000);
+        if (ppConf.status === 'confirmed') {
+          sig = ppSig;
+          hadAnyRoute = true;
+        } else if (ppConf.status === 'timeout') {
+          const postBalCheck = !isPartial
+            ? await rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => null)
+            : null;
+          if (postBalCheck && (postBalCheck.agreed || (postBalCheck.readings?.length ?? 0) > 0) && (postBalCheck.balanceUi ?? 0) <= 0.000001) {
+            sig = ppSig;
+            hadAnyRoute = true;
+          }
+        }
+      } catch {
+        // Keep primary Jupiter error details
+      }
+    }
+
+    if (!sig) {
       return {
         ok: false,
         noRoute: !hadAnyRoute,
@@ -1690,7 +1822,7 @@ export class SniperManager {
 
     // 3. Reconcile exact SOL proceeds & remaining balance (when partial sell)
     const txDelta = await this.txAdapter.reconcileParsedSwapSolDelta(sig, owner, params.mint);
-    const quotedSolOut = Number(quote.outAmount) / LAMPORTS_PER_SOL;
+    const quotedSolOut = quote ? Number(quote.outAmount) / LAMPORTS_PER_SOL : 0;
     let solOut = quotedSolOut;
     let feeSol = 0.0001;
     let reclaimedRentSol = 0;

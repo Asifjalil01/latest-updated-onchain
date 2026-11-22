@@ -2,6 +2,22 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.34.1 — Fix Jupiter 429 Rate Limits, Missing Buy/Sell Routes (`PumpPortal` Auto-Fallback) & On-Chain Slippage Retries (`base.ts`, `jupiter.ts`, `sniperManager.ts`, `rpcPool.ts`, `bot.py`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed & Improved
+- **Eliminated `HTTP 429` & `Rate limited backoff active for lite-api.jup.ag` Failures (`base.ts`, `jupiter.ts`, `bot.py`)**:
+  - Added short `2.5s–10s` swap-rate-limit cooldown bounds (replacing the old `15s–180s` global blackout on `lite-api.jup.ag`) and prevented HTTP 429 responses from tripping the 60s circuit breaker.
+  - Added keyless pacing (`750ms` interval) on `lite-api.jup.ag`, stopped `getQuote()` from firing a second relaxed retry into an active 429, and added automatic failover to `api.jup.ag` when `lite-api.jup.ag` is throttled.
+  - Stopped `bot.py` from wasting shared IP Jupiter quota: `hard_rug_check` skips redundant Jupiter sell-route probes when live swap telemetry already shows active sells (`sells >= 2`), enforces shared 429 cooldowns (`_jup_quote_backoff_until`), throttles calm background reverse-quote polling (`4s` when far from TP/SL vs `1.2s` near targets), and spaces consecutive failed live buys by `0.9s`.
+- **Automatic PumpPortal `trade-local` (`pool='auto'`) Buy & Sell Fallback (`jupiter.ts`, `sniperManager.ts`)**:
+  - When Jupiter has no route yet (fresh Pump.fun / PumpSwap / LaunchLab / Raydium / Bonk launches) or returns `429` / rate-limit backoff, `executeLiveBuy` and `executeLiveSell` automatically build the swap via `https://pumpportal.fun/api/trade-local` (`pool: 'auto'`), sign it locally with your wallet, and broadcast it on-chain.
+- **Fixed `On-chain transaction error` Slippage Reverts (`sniperManager.ts`, `rpcPool.ts`)**:
+  - Enabled `dynamicSlippage: true` on live Jupiter buy swaps, added a single-shot automatic slippage retry (`8%–15%`) if a tight-slippage (`3%`) fast-launch buy reverts on-chain, and decoded custom Solana slippage error codes (`6001` / `6004` / `0x1771`) clearly in logs.
+
+---
+
 ## v1.34.0 — Target Websites & Launchpads Checkboxes (`pump.fun`, `axiom.trade`, `pumpswap`, `letsbonk.fun`, `raydium`, `meteora`, `moonshot`, `bags.fm`, `believe.app`, `gmgn.ai`, `photon`, `bullx.io` & more) (`bot.py`, `settings.json`, `sniperManager.ts`, `PythonSniperView.tsx`)
 
 **Risk Warning: Trading can lose all of your money.**

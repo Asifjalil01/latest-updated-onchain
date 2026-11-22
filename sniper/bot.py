@@ -833,15 +833,32 @@ def _rpc_top_holders(mint, supply_ui, exclude_addrs=None, cfg=None):
             continue
     return None, None
 
+_jup_quote_lock = threading.Lock()
+_jup_quote_backoff_until = 0.0
+_last_jup_quote_ts = 0.0
+_sell_route_cache = {}
+
 def _check_sell_route(mint, decimals, price_usd, cfg):
     """Verify Jupiter can quote an exit swap mint -> WSOL with sane price impact (catches honeypots)."""
+    global _jup_quote_backoff_until, _last_jup_quote_ts
     if not mint or not price_usd or price_usd <= 0:
         return True, "skip"
+    now_ts = time.time()
+    has_key = bool(cfg.get("jupiter_api_key"))
+    with _jup_quote_lock:
+        cached = _sell_route_cache.get(mint)
+        if cached and now_ts - cached[0] < 90.0:
+            return cached[1]
+        if now_ts < _jup_quote_backoff_until:
+            return True, "jup_backoff_skip"
+        if not has_key and now_ts - _last_jup_quote_ts < 1.5:
+            return True, "jup_paced_skip"
+        _last_jup_quote_ts = now_ts
+
     trade_usd = max(0.5, float(cfg.get("trade_size_usd", 5.0) or 5.0))
     qty_ui = trade_usd / float(price_usd)
     dec = max(0, int(decimals if decimals is not None else 6))
     raw_units = max(1, int(qty_ui * (10 ** dec)))
-    has_key = bool(cfg.get("jupiter_api_key"))
     url = JUP_QUOTE if has_key else JUP_QUOTE_LITE
     hdrs = {"x-api-key": cfg["jupiter_api_key"]} if has_key else None
     try:
@@ -857,18 +874,36 @@ def _check_sell_route(mint, decimals, price_usd, cfg):
             headers={**HEADERS, **(hdrs or {})},
             timeout=5,
         )
+        if r.status_code == 429:
+            with _jup_quote_lock:
+                _jup_quote_backoff_until = time.time() + 12.0
+            return True, "jup_429"
         if r.status_code == 400:
-            return False, "no sell route back to SOL (honeypot / unroutable)"
+            res = (False, "no sell route back to SOL (honeypot / unroutable)")
+            with _jup_quote_lock:
+                if len(_sell_route_cache) > 1000: _sell_route_cache.clear()
+                _sell_route_cache[mint] = (time.time(), res)
+            return res
         if r.status_code != 200:
             return True, "jup_unavailable"
         q = r.json()
         out_amt = _f(q.get("outAmount")) or 0.0
         if out_amt <= 0:
-            return False, "zero sell output on Jupiter (honeypot)"
+            res = (False, "zero sell output on Jupiter (honeypot)")
+            with _jup_quote_lock:
+                _sell_route_cache[mint] = (time.time(), res)
+            return res
         impact = abs(_f(q.get("priceImpactPct")) or 0.0) * 100.0
         if impact > 15.0:
-            return False, f"sell price impact too high ({impact:.1f}% > 15%)"
-        return True, "ok"
+            res = (False, f"sell price impact too high ({impact:.1f}% > 15%)")
+            with _jup_quote_lock:
+                _sell_route_cache[mint] = (time.time(), res)
+            return res
+        res = (True, "ok")
+        with _jup_quote_lock:
+            if len(_sell_route_cache) > 1000: _sell_route_cache.clear()
+            _sell_route_cache[mint] = (time.time(), res)
+        return res
     except Exception:
         return True, "jup_timeout"
 
@@ -888,6 +923,13 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
     strict = bool(cfg.get("strict_rugcheck", True))
     use_rc = bool(cfg.get("use_rugcheck", True))
     px_usd = _f(pair.get("priceUsd")) if pair is not None else None
+    tx_m5 = (pair.get("txns") or {}).get("m5") if isinstance(pair, dict) else None
+    pp_info = pair.get("_pumpportal") if isinstance(pair, dict) else None
+    observed_sells = max(
+        int((tx_m5 or {}).get("sells") or 0),
+        int((pp_info or {}).get("sells_60s") or 0),
+    )
+    need_sell_probe = bool(px_usd and px_usd > 0 and observed_sells < 2)
 
     pool = ThreadPoolExecutor(max_workers=3)
     try:
@@ -896,7 +938,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
         _rpc_params = 1
     rpc_fut = pool.submit(_rpc_mint_account_info, mint, cfg) if _rpc_params >= 2 else pool.submit(_rpc_mint_account_info, mint)
     rc_fut = pool.submit(_fetch_rugcheck_report, mint) if use_rc else None
-    sell_fut = pool.submit(_check_sell_route, mint, 6, px_usd, cfg) if (px_usd and px_usd > 0) else None
+    sell_fut = pool.submit(_check_sell_route, mint, 6, px_usd, cfg) if need_sell_probe else None
 
     try:
         verdict = (True, "ok")
@@ -1101,8 +1143,8 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                         elif single_max_pct is not None and single_max_pct > max_single:
                             verdict = (False, f"single holder owns {single_max_pct:.1f}% > {max_single:.0f}% limit")
 
-        # Pre-buy Jupiter sell-route check (reuses parallel pre-flight future when decimals == 6)
-        if verdict[0] and px_usd and px_usd > 0:
+        # Pre-buy Jupiter sell-route check (runs only when fewer than 2 sells observed; reuses parallel future)
+        if verdict[0] and need_sell_probe:
             if sell_fut is not None and decimals == 6:
                 route_ok, route_reason = sell_fut.result()
             else:
@@ -2071,11 +2113,36 @@ def scan_and_buy(acct, cfg):
             with _stats_lock: _stats["bought"] += 1
             if acct.is_slots_full()[0]:
                 break
+        elif acct.mode == "live" and not _should_stop():
+            # Brief spacing after a failed live buy prevents back-to-back Jupiter 429 collisions on the next ranked candidate
+            time.sleep(0.9)
+
+_last_rev_quote_ts = [0.0]
 
 def _reverse_quote_prices(pos_dict, cfg, sol_px):
-    """Fetch true executable exit prices (mint -> WSOL quote) for open positions."""
+    """Fetch true executable exit prices (mint -> WSOL quote) without overloading Jupiter keyless limits."""
     if not cfg.get("use_real_swap_quotes", True) or not pos_dict:
         return {}
+    now_ts = time.time()
+    tp = float(cfg.get("take_profit_pct") or 0.0)
+    sl = float(cfg.get("stop_loss_pct") or 0.0)
+    near_exit = False
+    for _m, p in pos_dict.items():
+        pnl = float(p.get("pnl_pct") or 0.0)
+        if p.get("trailing_active"):
+            near_exit = True
+            break
+        if tp > 0 and pnl >= tp * 0.7:
+            near_exit = True
+            break
+        if sl > 0 and pnl <= -sl * 0.7:
+            near_exit = True
+            break
+    min_interval = 1.2 if near_exit else 4.0
+    if now_ts - _last_rev_quote_ts[0] < min_interval:
+        return {}
+    _last_rev_quote_ts[0] = now_ts
+
     if _bridge_base_url():
         payload_pos = [
             {
@@ -2084,7 +2151,7 @@ def _reverse_quote_prices(pos_dict, cfg, sol_px):
                 "decimals": int(p.get("decimals") if p.get("decimals") is not None else 6),
                 "rawAmount": p.get("raw_amount"),
             }
-            for mint, p in list(pos_dict.items())[:10]
+            for mint, p in list(pos_dict.items())[:4]
             if float(p.get("qty") or 0.0) > 0
         ]
         if payload_pos:
