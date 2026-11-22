@@ -589,6 +589,20 @@ def _extract_pair_websites(pair):
 
 def matches_enabled_platforms(pair, mint="", source="", cfg=None):
     """Check whether pair/mint/source matches user-checked websites in enabled_platforms ([] = all allowed)."""
+    if bool((cfg or {}).get("axiom_pulse_migrated_only_enabled", False)):
+        mint_str = str(mint or (pair.get("baseToken") or {}).get("address") or "").strip()
+        mint_low = mint_str.lower()
+        dex_raw = str((pair or {}).get("dexId") or "").strip().lower()
+        dex_norm = dex_raw.replace("-", "").replace("_", "").replace(" ", "")
+        liq_pre = _f(((pair or {}).get("liquidity") or {}).get("usd")) or 0.0
+        is_pumpswap = dex_norm in ("pumpswap", "pumpfunamm")
+        is_raydium = "raydium" in dex_norm or "launchlab" in dex_norm
+        is_meteora = "meteora" in dex_norm or "dlmm" in dex_norm
+        is_migrated = (is_pumpswap or is_raydium or is_meteora) or (dex_norm not in ("pumpfun", "pump") and not mint_low.endswith("pump") and liq_pre >= 2000.0)
+        if not is_migrated:
+            return False, "axiom pulse migrated only", f"dex={dex_raw or '?'} not migrated AMM pool"
+        return True, "axiom_pulse_migrated"
+
     selected_raw = (cfg or {}).get("enabled_platforms") if isinstance(cfg, dict) else None
     if not isinstance(selected_raw, list) or not selected_raw:
         return True, "all"

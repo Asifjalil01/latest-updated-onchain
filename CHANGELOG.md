@@ -2,6 +2,18 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.36.0 — Axiom.trade Pulse Migrated Coins Exclusive Filter (`PythonSniperView.tsx`, `bot.py`, `settings.json`, `sniperManager.ts`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added
+- **Axiom.trade Pulse: Migrated Coins Only (Exclusive Mode) (`PythonSniperView.tsx`, `bot.py`, `settings.json`)**:
+  - Added a new exclusive toggle under **Python Sniper Bot → Settings → Speed & Anti-Rug Protections**: `axiom_pulse_migrated_only_enabled`.
+  - When checked, the bot **forgets and bypasses all other platform and website filters**, restricting scanning and trading **strictly to migrated coins from Axiom.trade Pulse** (graduated AMM pools such as Pumpswap, Raydium, and Meteora, or verified AMM pools with liquidity `>= $2,000`, filtering out unmigrated bonding curves).
+  - When unchecked, the bot uses your standard target website filter selections.
+
+---
+
 ## v1.35.0 — Speed & Anti-Rug Protections Checkbox Suite, Fast 1–3s Live Buy Pipeline, Raydium Fallback & Linked Settings Guide (`PythonSniperView.tsx`, `bot.py`, `sniperManager.ts`, `jupiter.ts`, `settings.json`, `api.ts`)
 
 **Risk Warning: Trading can lose all of your money.**

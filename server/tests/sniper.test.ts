@@ -2335,6 +2335,24 @@ test('v1.35.0: Speed & Anti-Rug checkboxes (checked applies rule, unchecked igno
   assert.equal(pyOut.ok_lp_off, true);
 });
 
+test('v1.36.0: axiom_pulse_migrated_only_enabled blocks unmigrated pumpfun bonding curve coins and passes migrated pumpswap/raydium coins', async () => {
+  const pyScript = [
+    'import sys, types, json',
+    'sys.path.insert(0, "sniper")',
+    'import bot',
+    'cfg = {**bot.CONFIG, "axiom_pulse_migrated_only_enabled": True}',
+    'unmigrated_pair = {"baseToken": {"address": "UnmigratedPump111111111111111111111pumps"}, "dexId": "pumpfun"}',
+    'migrated_pair = {"baseToken": {"address": "MigratedSwap1111111111111111111111111111"}, "dexId": "pumpswap"}',
+    'ok_unmigrated, reason_unmigrated = bot.matches_enabled_platforms(unmigrated_pair, cfg=cfg)',
+    'ok_migrated, reason_migrated = bot.matches_enabled_platforms(migrated_pair, cfg=cfg)',
+    'print(json.dumps({"ok_unmigrated": ok_unmigrated, "reason_unmigrated": reason_unmigrated, "ok_migrated": ok_migrated, "reason_migrated": reason_migrated}))',
+  ].join('\n');
+  const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+  const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+  assert.equal(pyOut.ok_unmigrated, false);
+  assert.equal(pyOut.ok_migrated, true);
+});
+
 
 
 

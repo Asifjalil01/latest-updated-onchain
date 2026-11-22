@@ -57,5 +57,6 @@
   "anti_rug_sell_sim_enabled": false,
   "anti_rug_copycat_cooldown_enabled": true,
   "python_binary_path": "auto",
-  "rescan_delay_after_sell_sec": 0
+  "rescan_delay_after_sell_sec": 0,
+  "axiom_pulse_migrated_only_enabled": false
 }

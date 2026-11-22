@@ -300,6 +300,15 @@ const SNIPER_PROTECTION_MODULES: SniperProtectionModuleOption[] = [
       'Checked: Forces an urgent market sell after 2 consecutive confirmed >= 50% liquidity drops on AMM pools without a healthy Jupiter exit quote (Pump.fun curves are skipped). Unchecked: Exits strictly via Take Profit, Trailing Stop, or Stop Loss.',
     linkedTo: 'Stop loss % · Trailing stop % · Slippage % · Exit monitor: real Jupiter reverse swap quotes',
   },
+  {
+    key: 'axiom_pulse_migrated_only_enabled',
+    group: 'speed',
+    label: 'Axiom.trade Pulse: Migrated Coins Only (Exclusive Mode)',
+    defaultValue: false,
+    description:
+      'Checked: Forgets and bypasses all other website filters, scanning and trading ONLY migrated coins from Axiom.trade Pulse (graduated AMM pools like Pumpswap, Raydium, and Meteora). Unchecked: Uses your standard website filter settings.',
+    linkedTo: 'Target Websites / Launchpads Filter',
+  },
 ];
 
 function fmtHeld(minutes: number): string {
