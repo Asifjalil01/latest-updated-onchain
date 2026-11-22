@@ -2,6 +2,28 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.35.0 — Speed & Anti-Rug Protections Checkbox Suite, Fast 1–3s Live Buy Pipeline, Raydium Fallback & Linked Settings Guide (`PythonSniperView.tsx`, `bot.py`, `sniperManager.ts`, `jupiter.ts`, `settings.json`, `api.ts`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Dedicated "Speed & Anti-Rug Protections" Checkbox Section (`PythonSniperView.tsx`, `settings.json`)**:
+  - Added a separate configuration section under **Python Sniper Bot → Settings** containing 10 individual opt-in/opt-out checkboxes split into **Buy & Execution Speed Modules** and **Anti-Rug & Capital Safety Modules**, complete with **Enable All (10)**, **Recommended Defaults**, and **Uncheck All** shortcuts.
+  - Every option displays a plain-English explanation of what it does when **checked vs. unchecked**, plus an explicit **Linked to:** line showing every related setting it interacts with or overrides.
+- **Buy & Execution Speed Modules (`bot.py`, `sniperManager.ts`, `jupiter.ts`, `api.ts`)**:
+  - **Fast Live Buy Pipeline (`fast_live_buy_enabled`)**: Releases `TradingAccount.lock` during live HTTP swap requests, reuses token `decimals` verified during `hard_rug_check` (skipping redundant `inspectTokenOnChain` RPC calls), and caps post-buy RPC balance polling at `750ms` (with detached background `live_state.json` reconciliation) so live buys finish in ~1–3s instead of 8–12s.
+  - **Parallel Top-3 Rug Pre-Screening (`parallel_rug_screen_enabled`)**: Screens the top 3 ranked launches concurrently via `ThreadPoolExecutor` so clean coins reach swap execution earlier.
+  - **Jupiter 429 Quota Guard (`jupiter_quota_guard_enabled`)**: Pauses background exit reverse-quote polling (`_reverse_quote_prices` / `getReverseExitPrices`) during active live swaps, for `10s` afterward, and while running keyless with open scan slots to avoid Jupiter `HTTP 429` collisions during buys.
+  - **Direct PumpPortal & Raydium Instant Swap Fallback (`direct_dex_fallback_enabled`)**: Added direct Raydium Trade API swap execution (`buildRaydiumSwapTransaction`) alongside PumpPortal `trade-local` (`pool='auto'`) fallback when Jupiter returns `429` or has no route on a brand-new pool or urgent exit.
+- **Anti-Rug & Capital Safety Modules (`bot.py`, `settings.json`)**:
+  - **Tight Anti-Rug Score & Whale Cap (`anti_rug_tight_score_enabled`)**: Hardens `hard_rug_check` thresholds to RugCheck score `< 45`, Top-10 non-pool holders `<= 30%`, and single private wallet `<= 12%`.
+  - **Real Pool Depth & MCap/LP Ratio Guard (`anti_rug_pool_depth_check_enabled`)**: Enforces an effective `$2,500` minimum pool depth floor and rejects inflated wash-trade launches with `MCap > 80× Liquidity` (instead of `150×`).
+  - **Always Simulate Exit Swap & Tight 10% Impact Cap (`anti_rug_sell_sim_enabled`)**: Forces a live Jupiter `mint -> WSOL` sell simulation before every entry (even when sells already appear on the chart) and lowers the maximum exit price-impact threshold from `15%` to `10%`.
+  - **Copycat Ticker Cooldown (`anti_rug_copycat_cooldown_enabled`)**: Places a rug-rejected coin's ticker symbol on a 10-minute cooldown (bypassed only if liquidity reaches `$15,000+`).
+  - **Require Burned/Locked LP `>= 80%` (`require_lp_locked`)** & **Auto Emergency Sell on LP Drain (`auto_rug_exit`)**: Restored as explicit checkboxes in the safety section, with unlocked Meteora DLMM/DAMM pools now properly audited when `require_lp_locked` is checked while Pump.fun curves and PumpSwap stay allowed.
+
+---
+
 ## v1.34.1 — Fix Jupiter 429 Rate Limits, Missing Buy/Sell Routes (`PumpPortal` Auto-Fallback) & On-Chain Slippage Retries (`base.ts`, `jupiter.ts`, `sniperManager.ts`, `rpcPool.ts`, `bot.py`)
 
 **Risk Warning: Trading can lose all of your money.**

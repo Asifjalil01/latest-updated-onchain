@@ -65,6 +65,14 @@ CONFIG = {
     "slippage_pct": 3.0, "fee_pct": 1.0,
     "priority_fee_tier": "fast", "jito_tip_sol": 0.0,
     "custom_rpc_url": "",
+    "fast_live_buy_enabled": True,
+    "parallel_rug_screen_enabled": True,
+    "jupiter_quota_guard_enabled": True,
+    "direct_dex_fallback_enabled": True,
+    "anti_rug_tight_score_enabled": False,
+    "anti_rug_pool_depth_check_enabled": True,
+    "anti_rug_sell_sim_enabled": False,
+    "anti_rug_copycat_cooldown_enabled": True,
     "state_file": "state.json", "trades_csv": "trades.csv",
     "log_rejects": False, "jupiter_api_key": "",
     # compatibility keys kept so old settings files still load
@@ -650,6 +658,35 @@ def matches_enabled_platforms(pair, mint="", source="", cfg=None):
             return True, plat
     return False, f"dex={dex_raw or '?'} src={src_low or '?'} not in [{','.join(selected)}]"
 
+_rejected_symbol_cooldown = {}
+_symbol_cd_lock = threading.Lock()
+
+def _note_symbol_cooldown(symbol, cfg=None):
+    sym = str(symbol or "").strip().upper()
+    if not sym or sym in ("?", "UNKNOWN"):
+        return
+    if cfg is not None and not bool(cfg.get("anti_rug_copycat_cooldown_enabled", True)):
+        return
+    with _symbol_cd_lock:
+        if len(_rejected_symbol_cooldown) > 500:
+            now_ts = time.time()
+            for k in [k for k, v in _rejected_symbol_cooldown.items() if v <= now_ts]:
+                _rejected_symbol_cooldown.pop(k, None)
+        _rejected_symbol_cooldown[sym] = time.time() + 600.0
+
+def _is_symbol_on_cooldown(symbol, liq, cfg):
+    if not bool((cfg or {}).get("anti_rug_copycat_cooldown_enabled", True)):
+        return False
+    sym = str(symbol or "").strip().upper()
+    if not sym or sym in ("?", "UNKNOWN"):
+        return False
+    with _symbol_cd_lock:
+        exp = _rejected_symbol_cooldown.get(sym, 0.0)
+    if exp > time.time():
+        # Only allow same-symbol entry during 10-min cooldown if liquidity is strongly established ($15k+)
+        return (liq or 0.0) < 15000.0
+    return False
+
 def passes_filters(pair, cfg, now_ms=None, source=None):
     """Returns (ok, short_reason_code, detail)."""
     mint_addr = (pair.get("baseToken") or {}).get("address") or ""
@@ -657,6 +694,10 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
     ok_plat, plat_detail = matches_enabled_platforms(pair, mint_addr, src_hint, cfg)
     if not ok_plat:
         return False, "wrong website", plat_detail
+    liq_pre = _f((pair.get("liquidity") or {}).get("usd")) or 0.0
+    sym_pre = (pair.get("baseToken") or {}).get("symbol") or ""
+    if _is_symbol_on_cooldown(sym_pre, liq_pre, cfg):
+        return False, "copycat cooldown", f"{sym_pre} cooled down 10m after rug reject"
     now_ms = now_ms or int(time.time() * 1000)
     created = int(pair.get("pairCreatedAt") or 0)
     if created <= 0: return False, "missing data", "no pairCreatedAt"
@@ -689,16 +730,19 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
     if m5c is not None and m5c > cfg.get("max_price_change_m5_pct", 300):
         return False, "already pumped", f"+{m5c:.0f}% in 5m"
 
-    liq = _f((pair.get("liquidity") or {}).get("usd")) or 0.0
+    liq = liq_pre
     fdv = _f(pair.get("fdv")) or _f(pair.get("marketCap")) or 0.0
-    if liq > 0 and fdv > 0 and fdv > liq * 150.0:
+    pool_depth_on = bool(cfg.get("anti_rug_pool_depth_check_enabled", True))
+    max_fdv_mult = 80.0 if pool_depth_on else 150.0
+    if liq > 0 and fdv > 0 and fdv > liq * max_fdv_mult:
         return False, "inflated mcap/liq", f"MCap ${fdv:.0f} vs LP ${liq:.0f}"
 
     grace_sec = max(0, float(cfg.get("ultra_early_grace_sec", 0) or 0))
     if age_s > grace_sec:
         min_liq = float(cfg.get("min_liquidity_usd", 5000) or 0)
-        if liq < min_liq:
-            return False, "low liquidity", f"${liq:.0f} < ${min_liq:.0f}"
+        eff_min_liq = max(min_liq, 2500.0) if (pool_depth_on and min_liq > 0) else min_liq
+        if liq < eff_min_liq:
+            return False, "low liquidity", f"${liq:.0f} < ${eff_min_liq:.0f}"
         if buys < cfg.get("min_buys_m5", 8):
             return False, "few buys", f"{buys} buys in last 5m"
         if cfg.get("min_volume_m5_usd", 0) > 0:
@@ -837,16 +881,19 @@ _jup_quote_lock = threading.Lock()
 _jup_quote_backoff_until = 0.0
 _last_jup_quote_ts = 0.0
 _sell_route_cache = {}
+_last_mint_decimals = {}
 
-def _check_sell_route(mint, decimals, price_usd, cfg):
+def _check_sell_route(mint, decimals, price_usd, cfg, max_impact_pct=15.0):
     """Verify Jupiter can quote an exit swap mint -> WSOL with sane price impact (catches honeypots)."""
     global _jup_quote_backoff_until, _last_jup_quote_ts
     if not mint or not price_usd or price_usd <= 0:
         return True, "skip"
     now_ts = time.time()
     has_key = bool(cfg.get("jupiter_api_key"))
+    impact_cap = float(max_impact_pct or 15.0)
+    cache_key = f"{mint}:{impact_cap:g}"
     with _jup_quote_lock:
-        cached = _sell_route_cache.get(mint)
+        cached = _sell_route_cache.get(cache_key)
         if cached and now_ts - cached[0] < 90.0:
             return cached[1]
         if now_ts < _jup_quote_backoff_until:
@@ -882,7 +929,7 @@ def _check_sell_route(mint, decimals, price_usd, cfg):
             res = (False, "no sell route back to SOL (honeypot / unroutable)")
             with _jup_quote_lock:
                 if len(_sell_route_cache) > 1000: _sell_route_cache.clear()
-                _sell_route_cache[mint] = (time.time(), res)
+                _sell_route_cache[cache_key] = (time.time(), res)
             return res
         if r.status_code != 200:
             return True, "jup_unavailable"
@@ -891,18 +938,18 @@ def _check_sell_route(mint, decimals, price_usd, cfg):
         if out_amt <= 0:
             res = (False, "zero sell output on Jupiter (honeypot)")
             with _jup_quote_lock:
-                _sell_route_cache[mint] = (time.time(), res)
+                _sell_route_cache[cache_key] = (time.time(), res)
             return res
         impact = abs(_f(q.get("priceImpactPct")) or 0.0) * 100.0
-        if impact > 15.0:
-            res = (False, f"sell price impact too high ({impact:.1f}% > 15%)")
+        if impact > impact_cap:
+            res = (False, f"sell price impact too high ({impact:.1f}% > {impact_cap:g}%)")
             with _jup_quote_lock:
-                _sell_route_cache[mint] = (time.time(), res)
+                _sell_route_cache[cache_key] = (time.time(), res)
             return res
         res = (True, "ok")
         with _jup_quote_lock:
             if len(_sell_route_cache) > 1000: _sell_route_cache.clear()
-            _sell_route_cache[mint] = (time.time(), res)
+            _sell_route_cache[cache_key] = (time.time(), res)
         return res
     except Exception:
         return True, "jup_timeout"
@@ -915,9 +962,14 @@ def _fetch_rugcheck_report(mint):
 
 def hard_rug_check(mint, cfg, age_s, pair=None):
     """Return (ok, reason). Fail-closed parallel RPC SPL/Token-2022 + RugCheck report + holder concentration + sell-route test."""
+    tight_score_on = bool(cfg.get("anti_rug_tight_score_enabled", False))
+    pool_depth_on = bool(cfg.get("anti_rug_pool_depth_check_enabled", True))
+    sell_sim_on = bool(cfg.get("anti_rug_sell_sim_enabled", False))
+    lp_req_on = bool(cfg.get("require_lp_locked", False))
+    cache_key = f"{mint}:{int(tight_score_on)}:{int(pool_depth_on)}:{int(sell_sim_on)}:{int(lp_req_on)}"
     ttl = max(60, cfg.get("rug_recheck_minutes", 15) * 60)
     with _rug_lock:
-        hit = _rug_cache.get(mint)
+        hit = _rug_cache.get(cache_key)
         if hit and time.time() - hit[0] < ttl: return hit[1]
 
     strict = bool(cfg.get("strict_rugcheck", True))
@@ -929,7 +981,8 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
         int((tx_m5 or {}).get("sells") or 0),
         int((pp_info or {}).get("sells_60s") or 0),
     )
-    need_sell_probe = bool(px_usd and px_usd > 0 and observed_sells < 2)
+    need_sell_probe = bool(px_usd and px_usd > 0 and (sell_sim_on or observed_sells < 2))
+    sell_impact_cap = 10.0 if sell_sim_on else 15.0
 
     pool = ThreadPoolExecutor(max_workers=3)
     try:
@@ -938,12 +991,27 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
         _rpc_params = 1
     rpc_fut = pool.submit(_rpc_mint_account_info, mint, cfg) if _rpc_params >= 2 else pool.submit(_rpc_mint_account_info, mint)
     rc_fut = pool.submit(_fetch_rugcheck_report, mint) if use_rc else None
-    sell_fut = pool.submit(_check_sell_route, mint, 6, px_usd, cfg) if need_sell_probe else None
+    if need_sell_probe:
+        try:
+            _sell_params = len(inspect.signature(_check_sell_route).parameters)
+        except Exception:
+            _sell_params = 4
+        sell_fut = (
+            pool.submit(_check_sell_route, mint, 6, px_usd, cfg, sell_impact_cap)
+            if _sell_params >= 5
+            else pool.submit(_check_sell_route, mint, 6, px_usd, cfg)
+        )
+    else:
+        sell_fut = None
 
     try:
         verdict = (True, "ok")
         mint_info = rpc_fut.result()
         decimals = mint_info.get("decimals", 6) if mint_info else 6
+        if mint:
+            _last_mint_decimals[mint] = decimals
+            if len(_last_mint_decimals) > 2000:
+                _last_mint_decimals.clear()
         supply_ui = mint_info.get("supply_ui", 0.0) if mint_info else 0.0
         jup_verified = False
 
@@ -973,8 +1041,14 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
         dex_id = str((pair or {}).get("dexId") or "").lower()
         is_bonding_curve = dex_id == "pumpfun"
         pair_addr = str((pair or {}).get("pairAddress") or "")
-        pair_liq = _f(((pair or {}).get("liquidity") or {}).get("usd")) or 0.0
+        raw_pair_liq = ((pair or {}).get("liquidity") or {}).get("usd") if isinstance(pair, dict) else None
+        pair_liq = _f(raw_pair_liq) or 0.0
         min_liq_cfg = float(cfg.get("min_liquidity_usd", 3000) or 0)
+        grace_sec = max(0.0, float(cfg.get("ultra_early_grace_sec", 0) or 0))
+
+        if verdict[0] and pool_depth_on and isinstance(pair, dict) and raw_pair_liq is not None and age_s > grace_sec:
+            if pair_liq < 2500.0:
+                verdict = (False, f"pool depth too shallow (${pair_liq:.0f} < $2,500)")
 
         if verdict[0] and rc_fut is not None:
             rep = rc_fut.result()
@@ -1006,6 +1080,8 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                     if sn is not None:
                         if sn > 100: sn /= 1000.0
                         max_rc_score = float(cfg.get("rugcheck_max_score", 55) or 55)
+                        if tight_score_on:
+                            max_rc_score = min(max_rc_score, 45.0)
                         if sn >= max_rc_score:
                             verdict = (False, f"rugcheck risk score {sn:.0f}/100 >= {max_rc_score:.0f}")
 
@@ -1051,7 +1127,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
 
                 markets = rep.get("markets")
                 has_canonical_pool = is_bonding_curve or any(
-                    k in dex_id for k in ("pumpswap", "pump", "meteora", "orca", "whirlpool", "launchlab", "moonshot")
+                    k in dex_id for k in ("pumpswap", "pump", "launchlab", "moonshot")
                 )
                 if isinstance(markets, list) and markets:
                     for m in markets:
@@ -1059,11 +1135,10 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                         if m.get("pubkey"):
                             known_pools.add(str(m.get("pubkey")))
                         mtype = str(m.get("marketType") or "").lower()
-                        if any(k in mtype for k in ("pump", "meteora", "dlmm", "damm", "orca", "whirlpool", "cpmm", "clmm", "launchlab")):
+                        if any(k in mtype for k in ("pump", "launchlab", "moonshot")):
                             has_canonical_pool = True
 
-                require_lp_lock = bool(cfg.get("require_lp_locked", False))
-                if verdict[0] and require_lp_lock and not has_canonical_pool:
+                if verdict[0] and lp_req_on and not has_canonical_pool:
                     if isinstance(markets, list) and markets:
                         max_lp_pct = 0.0
                         for m in markets:
@@ -1076,7 +1151,11 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                             verdict = (False, f"LP burned/locked {max_lp_pct:.0f}% < 80% minimum (rug risk)")
 
                 max_top10 = float(cfg.get("max_top10_holder_pct", 35) or 35)
+                if tight_score_on:
+                    max_top10 = min(max_top10, 30.0)
                 max_single = min(25.0, max(10.0, max_top10 * 0.65))
+                if tight_score_on:
+                    max_single = min(12.0, max_single)
                 top10_pct = None
                 single_max_pct = None
 
@@ -1112,7 +1191,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                                 verdict = (False, f"{name} ({m.group(1)}% > {max_top10:.0f}% limit)")
                                 break
                         if "unlocked" in low and ("lp" in low or "liquidity" in low):
-                            if require_lp_lock and not has_canonical_pool:
+                            if lp_req_on and not has_canonical_pool:
                                 verdict = (False, f"LP risk: {name}")
                                 break
                             continue
@@ -1143,12 +1222,20 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                         elif single_max_pct is not None and single_max_pct > max_single:
                             verdict = (False, f"single holder owns {single_max_pct:.1f}% > {max_single:.0f}% limit")
 
-        # Pre-buy Jupiter sell-route check (runs only when fewer than 2 sells observed; reuses parallel future)
+        # Pre-buy Jupiter sell-route check (reuses parallel future)
         if verdict[0] and need_sell_probe:
             if sell_fut is not None and decimals == 6:
                 route_ok, route_reason = sell_fut.result()
             else:
-                route_ok, route_reason = _check_sell_route(mint, decimals, px_usd, cfg)
+                try:
+                    _sell_params = len(inspect.signature(_check_sell_route).parameters)
+                except Exception:
+                    _sell_params = 4
+                route_ok, route_reason = (
+                    _check_sell_route(mint, decimals, px_usd, cfg, sell_impact_cap)
+                    if _sell_params >= 5
+                    else _check_sell_route(mint, decimals, px_usd, cfg)
+                )
             if not route_ok:
                 verdict = (False, route_reason)
     finally:
@@ -1156,7 +1243,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
 
     with _rug_lock:
         if len(_rug_cache) > 5000: _rug_cache.clear()
-        _rug_cache[mint] = (time.time(), verdict)
+        _rug_cache[cache_key] = (time.time(), verdict)
     return verdict
 
 # ---------------------------------------------------------------- account (paper & live)
@@ -1206,6 +1293,8 @@ class TradingAccount:
         }
         self._last_wallet_sync = 0.0
         self._last_insufficient_log = 0.0
+        self._in_flight_buys = 0
+        self._last_live_swap_ts = 0.0
         self.load()
 
     def load(self):
@@ -1277,7 +1366,8 @@ class TradingAccount:
 
     def is_slots_full(self):
         max_pos = max(1, int(self.cfg.get("max_open_positions", 3)))
-        return len(self.state["positions"]) >= max_pos, len(self.state["positions"]), max_pos
+        used = len(self.state["positions"]) + int(getattr(self, "_in_flight_buys", 0))
+        return used >= max_pos, used, max_pos
 
     def sync_live_wallet(self, force=False):
         if self.mode != "live":
@@ -1349,328 +1439,371 @@ class TradingAccount:
         if len(bl) > 5000: del bl[:len(bl) - 5000]
         self.save()
 
-    @locked
     def buy(self, mint, symbol, price, url=None, meta=None):
         if _should_stop():
             return False
         meta = meta or {}
         c = self.cfg
         url = url or f"https://dexscreener.com/solana/{mint}"
-        ok, why = self.can_open()
-        if not ok or mint in self.state["positions"]:
-            return False
-        size = c["trade_size_usd"]
-        sol_px = self.state.get("sol_price_usd")
-        tx_buy = ""
-        cost_sol = (size / sol_px) if sol_px and sol_px > 0 else 0.0
-        extra_pos = {}
+        fast_lock = self.mode == "live" and bool(c.get("fast_live_buy_enabled", True))
+        with self.lock:
+            ok, _why = self.can_open()
+            if not ok or mint in self.state["positions"] or self.is_slots_full()[0]:
+                return False
+            size = c["trade_size_usd"]
+            sol_px = self.state.get("sol_price_usd")
+            tx_buy = ""
+            cost_sol = (size / sol_px) if sol_px and sol_px > 0 else 0.0
+            extra_pos = {}
+            if fast_lock:
+                self._in_flight_buys += 1
 
         if self.mode == "live":
-            log(f"⚡ LIVE BUY REQUEST {symbol} (${size:.2f}) via Jupiter...")
-            res = bridge_post("/api/sniper/live-buy", {
-                "mint": mint,
+            try:
+                log(f"⚡ LIVE BUY REQUEST {symbol} (${size:.2f}) via Jupiter...")
+                buy_payload = {
+                    "mint": mint,
+                    "symbol": symbol,
+                    "tradeSizeUsd": size,
+                    "slippagePct": c.get("slippage_pct", 2.0),
+                    "solPriceUsd": sol_px,
+                    "dex": meta.get("dex", "?"),
+                    "source": meta.get("source", "?"),
+                    "age_s": meta.get("age_s", 0),
+                    "url": url,
+                }
+                if fast_lock and meta.get("decimals") is not None:
+                    buy_payload["decimals"] = meta.get("decimals")
+                if fast_lock:
+                    res = bridge_post("/api/sniper/live-buy", buy_payload, timeout=55)
+                else:
+                    with self.lock:
+                        res = bridge_post("/api/sniper/live-buy", buy_payload, timeout=55)
+                self._last_live_swap_ts = time.time()
+                if _should_stop():
+                    if not isinstance(res, dict) or not res.get("ok"):
+                        return False
+                if not isinstance(res, dict) or not res.get("ok"):
+                    err = (res or {}).get("error") or "Live swap failed"
+                    with self.lock:
+                        if (res or {}).get("insufficientFunds"):
+                            if time.time() - self._last_insufficient_log > 10:
+                                self._last_insufficient_log = time.time()
+                                log(f"⚠ {err}")
+                            bal_sol = _f((res or {}).get("walletBalanceSol"))
+                            if bal_sol is not None:
+                                self.state["wallet_sol"] = bal_sol
+                                if sol_px:
+                                    self.state["cash"] = round(bal_sol * sol_px, 4)
+                                self.save()
+                        else:
+                            log(f"✗ LIVE BUY FAILED {symbol}: {err}")
+                            if (res or {}).get("blacklist"):
+                                self.note_rejected(mint)
+                    return False
+
+                qty = float(res.get("qty") or 0.0)
+                fill = float(res.get("entryPriceUsd") or price)
+                size = float(res.get("costUsd") or size)
+                cost_sol = float(res.get("costSol") or cost_sol)
+                tx_buy = str(res.get("txSig") or "")
+                extra_pos = {
+                    "raw_amount": str(res.get("rawAmount") or ""),
+                    "decimals": int(res.get("decimals") if res.get("decimals") is not None else 6),
+                    "cost_sol": cost_sol,
+                    "fee_sol": float(res.get("feeSol") or 0.0),
+                    "rent_sol": float(res.get("rentSol") or 0.0),
+                    "tx_buy": tx_buy,
+                    "last_sell_attempt": 0.0,
+                }
+            finally:
+                if fast_lock:
+                    with self.lock:
+                        self._in_flight_buys = max(0, self._in_flight_buys - 1)
+        else:
+            with self.lock:
+                fill = price * (1 + c["slippage_pct"] / 100)
+                qty = (size * (1 - c["fee_pct"] / 100)) / fill
+
+        with self.lock:
+            if self.mode == "live":
+                if _f(res.get("solPriceUsd")):
+                    sol_px = _f(res.get("solPriceUsd"))
+                    self.state["sol_price_usd"] = sol_px
+                if _f(res.get("walletBalanceSol")) is not None:
+                    bal_sol = float(res["walletBalanceSol"])
+                    self.state["wallet_sol"] = bal_sol
+                    if sol_px:
+                        self.state["cash"] = round(bal_sol * sol_px, 4)
+                else:
+                    self.state["cash"] = max(0.0, float(self.state.get("cash") or 0.0) - size)
+            else:
+                self.state["cash"] -= size
+
+            self.state["positions"][mint] = {
                 "symbol": symbol,
-                "tradeSizeUsd": size,
-                "slippagePct": c.get("slippage_pct", 2.0),
-                "solPriceUsd": sol_px,
+                "qty": qty,
+                "entry_price": fill,
+                "current_price": fill,
+                "cost": size,
+                "original_cost": size,
+                "opened": time.time(),
+                "last_updated": time.time(),
+                "url": url,
+                "peak_price": fill,
+                "low_price": fill,
+                "pnl_pct": 0.0,
+                "pnl_usd": 0.0,
+                "peak_pct": 0.0,
+                "low_pct": 0.0,
+                "trailing_active": False,
+                "trailing_floor_pct": None,
+                "principal_recovered": False,
+                "recovered_usd": 0.0,
+                "realized_pnl_usd": 0.0,
+                "next_scale_out_pct": None,
+                "scale_out_count": 0,
                 "dex": meta.get("dex", "?"),
                 "source": meta.get("source", "?"),
-                "age_s": meta.get("age_s", 0),
-                "url": url,
-            }, timeout=55)
-            if _should_stop():
-                if not isinstance(res, dict) or not res.get("ok"):
-                    return False
-            if not isinstance(res, dict) or not res.get("ok"):
-                err = (res or {}).get("error") or "Live swap failed"
-                if (res or {}).get("insufficientFunds"):
-                    if time.time() - self._last_insufficient_log > 10:
-                        self._last_insufficient_log = time.time()
-                        log(f"⚠ {err}")
-                    bal_sol = _f((res or {}).get("walletBalanceSol"))
-                    if bal_sol is not None:
-                        self.state["wallet_sol"] = bal_sol
-                        if sol_px:
-                            self.state["cash"] = round(bal_sol * sol_px, 4)
-                        self.save()
-                else:
-                    log(f"✗ LIVE BUY FAILED {symbol}: {err}")
-                    if (res or {}).get("blacklist"):
-                        self.note_rejected(mint)
-                return False
-
-            qty = float(res.get("qty") or 0.0)
-            fill = float(res.get("entryPriceUsd") or price)
-            size = float(res.get("costUsd") or size)
-            cost_sol = float(res.get("costSol") or cost_sol)
-            tx_buy = str(res.get("txSig") or "")
-            if _f(res.get("solPriceUsd")):
-                sol_px = _f(res.get("solPriceUsd"))
-                self.state["sol_price_usd"] = sol_px
-            if _f(res.get("walletBalanceSol")) is not None:
-                bal_sol = float(res["walletBalanceSol"])
-                self.state["wallet_sol"] = bal_sol
-                if sol_px:
-                    self.state["cash"] = round(bal_sol * sol_px, 4)
-            else:
-                self.state["cash"] = max(0.0, float(self.state.get("cash") or 0.0) - size)
-            extra_pos = {
-                "raw_amount": str(res.get("rawAmount") or ""),
-                "decimals": int(res.get("decimals") if res.get("decimals") is not None else 6),
-                "cost_sol": cost_sol,
-                "fee_sol": float(res.get("feeSol") or 0.0),
-                "rent_sol": float(res.get("rentSol") or 0.0),
-                "tx_buy": tx_buy,
-                "last_sell_attempt": 0.0,
+                "age_at_entry": round(meta.get("age_s", 0), 1),
+                "entry_liquidity_usd": meta.get("liquidity_usd"),
+                "current_liquidity_usd": meta.get("liquidity_usd"),
+                "entry_liq_source": meta.get("liq_source", "dexscreener"),
+                "liq_drop_streak": 0,
+                **extra_pos,
             }
-        else:
-            fill = price * (1 + c["slippage_pct"] / 100)
-            qty = (size * (1 - c["fee_pct"] / 100)) / fill
-            self.state["cash"] -= size
-
-        self.state["positions"][mint] = {
-            "symbol": symbol,
-            "qty": qty,
-            "entry_price": fill,
-            "current_price": fill,
-            "cost": size,
-            "original_cost": size,
-            "opened": time.time(),
-            "last_updated": time.time(),
-            "url": url,
-            "peak_price": fill,
-            "low_price": fill,
-            "pnl_pct": 0.0,
-            "pnl_usd": 0.0,
-            "peak_pct": 0.0,
-            "low_pct": 0.0,
-            "trailing_active": False,
-            "trailing_floor_pct": None,
-            "principal_recovered": False,
-            "recovered_usd": 0.0,
-            "realized_pnl_usd": 0.0,
-            "next_scale_out_pct": None,
-            "scale_out_count": 0,
-            "dex": meta.get("dex", "?"),
-            "source": meta.get("source", "?"),
-            "age_at_entry": round(meta.get("age_s", 0), 1),
-            "entry_liquidity_usd": meta.get("liquidity_usd"),
-            "current_liquidity_usd": meta.get("liquidity_usd"),
-            "entry_liq_source": meta.get("liq_source", "dexscreener"),
-            "liq_drop_streak": 0,
-            **extra_pos,
-        }
-        self.state["blacklist"].append(mint)
-        self._log_trade([
-            now().isoformat(),
-            "BUY",
-            symbol,
-            mint,
-            fmt_price(fill),
-            round(size, 4),
-            "",
-            "",
-            "sniper_entry",
-            url,
-            meta.get("age_s", 0),
-            meta.get("dex", "?"),
-            meta.get("source", "?"),
-            fmt_price(fill),
-            round(sol_px, 4) if sol_px else "",
-            tx_buy,
-        ])
-        sol_hint = f" ({cost_sol:.4f} SOL)" if cost_sol else (f" ({size / sol_px:.4f} SOL)" if sol_px else "")
-        mode_tag = "LIVE BUY" if self.mode == "live" else "SNIPER BUY"
-        tx_hint = f" tx={tx_buy[:8]}..." if tx_buy else ""
-        log(f"✓ {mode_tag} {symbol} [{meta.get('dex', '?')}/{meta.get('source', '?')}] age {meta.get('age_s', 0):.0f}s @ ${fmt_price(fill)}{sol_hint}{tx_hint}")
-        full, cnt, max_pos = self.is_slots_full()
-        if full and not self.state.get("scan_paused"):
-            self.state["scan_paused"] = True
-            log(f"⏸ Slots full ({cnt}/{max_pos}) — stopped scanning for new coins until a slot frees up.")
-        self.save()
+            self.state["blacklist"].append(mint)
+            self._log_trade([
+                now().isoformat(),
+                "BUY",
+                symbol,
+                mint,
+                fmt_price(fill),
+                round(size, 4),
+                "",
+                "",
+                "sniper_entry",
+                url,
+                meta.get("age_s", 0),
+                meta.get("dex", "?"),
+                meta.get("source", "?"),
+                fmt_price(fill),
+                round(sol_px, 4) if sol_px else "",
+                tx_buy,
+            ])
+            sol_hint = f" ({cost_sol:.4f} SOL)" if cost_sol else (f" ({size / sol_px:.4f} SOL)" if sol_px else "")
+            mode_tag = "LIVE BUY" if self.mode == "live" else "SNIPER BUY"
+            tx_hint = f" tx={tx_buy[:8]}..." if tx_buy else ""
+            log(f"✓ {mode_tag} {symbol} [{meta.get('dex', '?')}/{meta.get('source', '?')}] age {meta.get('age_s', 0):.0f}s @ ${fmt_price(fill)}{sol_hint}{tx_hint}")
+            full, cnt, max_pos = self.is_slots_full()
+            if full and not self.state.get("scan_paused"):
+                self.state["scan_paused"] = True
+                log(f"⏸ Slots full ({cnt}/{max_pos}) — stopped scanning for new coins until a slot frees up.")
+            self.save()
         return True
 
-    @locked
     def sell(self, mint, price, reason, sell_fraction=1.0):
         if _should_stop():
             return False
         c = self.cfg
-        pos = self.state["positions"].get(mint)
-        if not pos:
-            return False
+        fast_lock = self.mode == "live" and bool(c.get("fast_live_buy_enabled", True))
+        with self.lock:
+            pos = self.state["positions"].get(mint)
+            if not pos:
+                return False
+            sol_px = self.state.get("sol_price_usd")
+            tx_sell = ""
+            req_frac = float(sell_fraction if sell_fraction is not None else 1.0)
+            is_partial = 0.01 < req_frac < 0.999
+            req_frac = min(1.0, max(0.05, req_frac)) if is_partial else 1.0
 
-        sol_px = self.state.get("sol_price_usd")
-        tx_sell = ""
-        req_frac = float(sell_fraction if sell_fraction is not None else 1.0)
-        is_partial = 0.01 < req_frac < 0.999
-        req_frac = min(1.0, max(0.05, req_frac)) if is_partial else 1.0
+            prev_qty = float(pos.get("qty") or 0.0)
+            prev_cost = float(pos.get("cost") or 0.0)
+            prev_cost_sol = float(pos.get("cost_sol") or 0.0)
+            pos_symbol = pos["symbol"]
+            pos_raw_amount = pos.get("raw_amount")
+            pos_decimals = pos.get("decimals")
 
-        prev_qty = float(pos.get("qty") or 0.0)
-        prev_cost = float(pos.get("cost") or 0.0)
-        prev_cost_sol = float(pos.get("cost_sol") or 0.0)
-
-        # Avoid leaving microscopic unswappable dust on partial sells
-        if is_partial:
-            est_rem_usd = (prev_qty * (1.0 - req_frac)) * float(price or 0.0) * (1.0 - float(c.get("fee_pct", 1.0)) / 100.0)
-            if est_rem_usd < 0.15:
-                req_frac = 1.0
-                is_partial = False
+            # Avoid leaving microscopic unswappable dust on partial sells
+            if is_partial:
+                est_rem_usd = (prev_qty * (1.0 - req_frac)) * float(price or 0.0) * (1.0 - float(c.get("fee_pct", 1.0)) / 100.0)
+                if est_rem_usd < 0.15:
+                    req_frac = 1.0
+                    is_partial = False
 
         if self.mode == "live":
             frac_label = f" ({req_frac * 100:.0f}%)" if is_partial else ""
-            log(f"⚡ LIVE SELL {pos['symbol']}{frac_label} [{reason}] via Jupiter...")
-            res = bridge_post("/api/sniper/live-sell", {
+            log(f"⚡ LIVE SELL {pos_symbol}{frac_label} [{reason}] via Jupiter...")
+            sell_payload = {
                 "mint": mint,
-                "symbol": pos["symbol"],
+                "symbol": pos_symbol,
                 "qty": prev_qty,
-                "rawAmount": pos.get("raw_amount"),
-                "decimals": pos.get("decimals"),
+                "rawAmount": pos_raw_amount,
+                "decimals": pos_decimals,
                 "costUsd": prev_cost,
                 "costSol": prev_cost_sol,
                 "slippagePct": c.get("slippage_pct", 2.0),
                 "solPriceUsd": sol_px,
                 "reason": reason,
                 "sellFraction": req_frac if is_partial else 1.0,
-            }, timeout=95)
+            }
+            if fast_lock:
+                res = bridge_post("/api/sniper/live-sell", sell_payload, timeout=95)
+            else:
+                with self.lock:
+                    res = bridge_post("/api/sniper/live-sell", sell_payload, timeout=95)
+            self._last_live_swap_ts = time.time()
             if not isinstance(res, dict) or not res.get("ok"):
                 err = (res or {}).get("error") or "No live sell route available"
-                pos["last_sell_attempt"] = time.time()
-                pos["last_sell_error"] = str(err)[:220]
-                pos["last_sell_error_at"] = time.time()
-                self.save()
-                log(f"✗ LIVE SELL FAILED {pos['symbol']} [{reason}]: {err} (keeping position open)")
+                with self.lock:
+                    cur = self.state["positions"].get(mint)
+                    if cur:
+                        cur["last_sell_attempt"] = time.time()
+                        cur["last_sell_error"] = str(err)[:220]
+                        cur["last_sell_error_at"] = time.time()
+                        self.save()
+                log(f"✗ LIVE SELL FAILED {pos_symbol} [{reason}]: {err} (keeping position open)")
                 return False
 
-            fill = float(res.get("exitPriceUsd") or price)
-            proceeds = float(res.get("proceedsUsd") or 0.0)
-            sold_frac = float(res.get("soldFraction") or req_frac)
-            actual_partial = bool(res.get("isPartial")) and float(res.get("remainingQty") or 0.0) > 0.0
-            allocated_cost = prev_cost * sold_frac if actual_partial else prev_cost
-            pnl = float(res.get("pnlUsd") if res.get("pnlUsd") is not None else (proceeds - allocated_cost))
-            pnl_pct = float(res.get("pnlPct") if res.get("pnlPct") is not None else (pnl / allocated_cost * 100 if allocated_cost else 0.0))
-            tx_sell = str(res.get("txSig") or "")
-            if _f(res.get("solPriceUsd")):
-                sol_px = _f(res.get("solPriceUsd"))
-                self.state["sol_price_usd"] = sol_px
-            if _f(res.get("walletBalanceSol")) is not None:
-                bal_sol = float(res["walletBalanceSol"])
-                self.state["wallet_sol"] = bal_sol
-                if sol_px:
-                    self.state["cash"] = round(bal_sol * sol_px, 4)
-            else:
-                self.state["cash"] = float(self.state.get("cash") or 0.0) + proceeds
+            with self.lock:
+                pos = self.state["positions"].get(mint)
+                if not pos:
+                    return True
+                fill = float(res.get("exitPriceUsd") or price)
+                proceeds = float(res.get("proceedsUsd") or 0.0)
+                sold_frac = float(res.get("soldFraction") or req_frac)
+                actual_partial = bool(res.get("isPartial")) and float(res.get("remainingQty") or 0.0) > 0.0
+                allocated_cost = prev_cost * sold_frac if actual_partial else prev_cost
+                pnl = float(res.get("pnlUsd") if res.get("pnlUsd") is not None else (proceeds - allocated_cost))
+                pnl_pct = float(res.get("pnlPct") if res.get("pnlPct") is not None else (pnl / allocated_cost * 100 if allocated_cost else 0.0))
+                tx_sell = str(res.get("txSig") or "")
+                if _f(res.get("solPriceUsd")):
+                    sol_px = _f(res.get("solPriceUsd"))
+                    self.state["sol_price_usd"] = sol_px
+                if _f(res.get("walletBalanceSol")) is not None:
+                    bal_sol = float(res["walletBalanceSol"])
+                    self.state["wallet_sol"] = bal_sol
+                    if sol_px:
+                        self.state["cash"] = round(bal_sol * sol_px, 4)
+                else:
+                    self.state["cash"] = float(self.state.get("cash") or 0.0) + proceeds
 
-            if actual_partial:
-                is_partial = True
-                pos["qty"] = float(res.get("remainingQty") or 0.0)
-                if res.get("remainingRawAmount"):
-                    pos["raw_amount"] = str(res.get("remainingRawAmount"))
-                pos["cost"] = round(max(0.0, prev_cost - allocated_cost), 6)
-                if prev_cost_sol > 0:
-                    pos["cost_sol"] = max(0.0, prev_cost_sol * (1.0 - sold_frac))
-                pos["recovered_usd"] = round(float(pos.get("recovered_usd") or 0.0) + proceeds, 4)
-                pos["realized_pnl_usd"] = round(float(pos.get("realized_pnl_usd") or 0.0) + pnl, 4)
-                pos["last_sell_attempt"] = time.time()
-                pos.pop("last_sell_error", None)
-                pos.pop("last_sell_error_at", None)
-            else:
-                is_partial = False
-                self.state["positions"].pop(mint, None)
+                if actual_partial:
+                    is_partial = True
+                    pos["qty"] = float(res.get("remainingQty") or 0.0)
+                    if res.get("remainingRawAmount"):
+                        pos["raw_amount"] = str(res.get("remainingRawAmount"))
+                    pos["cost"] = round(max(0.0, prev_cost - allocated_cost), 6)
+                    if prev_cost_sol > 0:
+                        pos["cost_sol"] = max(0.0, prev_cost_sol * (1.0 - sold_frac))
+                    pos["recovered_usd"] = round(float(pos.get("recovered_usd") or 0.0) + proceeds, 4)
+                    pos["realized_pnl_usd"] = round(float(pos.get("realized_pnl_usd") or 0.0) + pnl, 4)
+                    pos["last_sell_attempt"] = time.time()
+                    pos.pop("last_sell_error", None)
+                    pos.pop("last_sell_error_at", None)
+                else:
+                    is_partial = False
+                    self.state["positions"].pop(mint, None)
         else:
-            fill = price * (1 - c["slippage_pct"] / 100)
+            with self.lock:
+                pos = self.state["positions"].get(mint)
+                if not pos:
+                    return False
+                fill = price * (1 - c["slippage_pct"] / 100)
+                if is_partial:
+                    sold_qty = prev_qty * req_frac
+                    rem_qty = max(0.0, prev_qty - sold_qty)
+                    allocated_cost = prev_cost * req_frac
+                    proceeds = sold_qty * fill * (1 - c["fee_pct"] / 100)
+                    pnl = proceeds - allocated_cost
+                    pnl_pct = (pnl / allocated_cost * 100) if allocated_cost > 0 else 0.0
+                    self.state["cash"] += proceeds
+                    pos["qty"] = rem_qty
+                    pos["cost"] = round(max(0.0, prev_cost - allocated_cost), 6)
+                    pos["recovered_usd"] = round(float(pos.get("recovered_usd") or 0.0) + proceeds, 4)
+                    pos["realized_pnl_usd"] = round(float(pos.get("realized_pnl_usd") or 0.0) + pnl, 4)
+                else:
+                    allocated_cost = prev_cost
+                    self.state["positions"].pop(mint, None)
+                    proceeds = prev_qty * fill * (1 - c["fee_pct"] / 100)
+                    pnl = proceeds - allocated_cost
+                    pnl_pct = (pnl / allocated_cost * 100) if allocated_cost > 0 else 0.0
+                    self.state["cash"] += proceeds
+
+        with self.lock:
+            self._roll_day()
+            self.state["day_pnl"] += pnl
+            self.state["total_pnl"] += pnl
+            if not is_partial:
+                self.state["closed"] += 1
+                cumulative_pnl = float(pos.get("realized_pnl_usd") or 0.0) + pnl
+                if cumulative_pnl > 0:
+                    self.state["wins"] += 1
+
+            self._log_trade([
+                now().isoformat(),
+                "SELL",
+                pos["symbol"],
+                mint,
+                fmt_price(fill),
+                round(proceeds, 4),
+                round(pnl, 4),
+                round(pnl_pct, 2),
+                reason,
+                pos.get("url", ""),
+                pos.get("age_at_entry", 0),
+                pos.get("dex", "?"),
+                pos.get("source", "?"),
+                fmt_price(pos["entry_price"]),
+                round(sol_px, 4) if sol_px else "",
+                tx_sell,
+            ])
+            now_ts = time.time()
+            outcome = "PROFIT" if pnl >= 0 else "LOSS"
+            hold_sec = round(now_ts - pos.get("opened", now_ts), 1)
+            pnl_sol = round(pnl / sol_px, 6) if sol_px and sol_px > 0 else 0.0
+            self._log_pnl([
+                now().isoformat(),
+                pos["symbol"],
+                mint,
+                outcome,
+                fmt_price(pos["entry_price"]),
+                fmt_price(fill),
+                round(allocated_cost, 4),
+                round(proceeds, 4),
+                round(pnl, 4),
+                pnl_sol,
+                round(pnl_pct, 2),
+                reason,
+                hold_sec,
+                pos.get("dex", "?"),
+                pos.get("source", "?"),
+                round(sol_px, 4) if sol_px else "",
+                pos.get("tx_buy", ""),
+                tx_sell,
+                pos.get("url", f"https://dexscreener.com/solana/{mint}")
+            ])
+            sol_hint = f" ({pnl / sol_px:+.4f} SOL)" if sol_px else ""
+            tx_hint = f" tx={tx_sell[:8]}..." if tx_sell else ""
             if is_partial:
-                sold_qty = prev_qty * req_frac
-                rem_qty = max(0.0, prev_qty - sold_qty)
-                allocated_cost = prev_cost * req_frac
-                proceeds = sold_qty * fill * (1 - c["fee_pct"] / 100)
-                pnl = proceeds - allocated_cost
-                pnl_pct = (pnl / allocated_cost * 100) if allocated_cost > 0 else 0.0
-                self.state["cash"] += proceeds
-                pos["qty"] = rem_qty
-                pos["cost"] = round(max(0.0, prev_cost - allocated_cost), 6)
-                pos["recovered_usd"] = round(float(pos.get("recovered_usd") or 0.0) + proceeds, 4)
-                pos["realized_pnl_usd"] = round(float(pos.get("realized_pnl_usd") or 0.0) + pnl, 4)
+                mode_tag = "LIVE PARTIAL SELL" if self.mode == "live" else "PARTIAL SELL"
+                log(f"💰 {mode_tag} {pos['symbol']} ({req_frac * 100:.0f}%) entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} proceeds ${proceeds:.2f} pnl ${pnl:+.2f}{sol_hint} [{reason}]{tx_hint}")
             else:
-                allocated_cost = prev_cost
-                self.state["positions"].pop(mint, None)
-                proceeds = prev_qty * fill * (1 - c["fee_pct"] / 100)
-                pnl = proceeds - allocated_cost
-                pnl_pct = (pnl / allocated_cost * 100) if allocated_cost > 0 else 0.0
-                self.state["cash"] += proceeds
-
-        self._roll_day()
-        self.state["day_pnl"] += pnl
-        self.state["total_pnl"] += pnl
-        if not is_partial:
-            self.state["closed"] += 1
-            cumulative_pnl = float(pos.get("realized_pnl_usd") or 0.0) + pnl
-            if cumulative_pnl > 0:
-                self.state["wins"] += 1
-
-        self._log_trade([
-            now().isoformat(),
-            "SELL",
-            pos["symbol"],
-            mint,
-            fmt_price(fill),
-            round(proceeds, 4),
-            round(pnl, 4),
-            round(pnl_pct, 2),
-            reason,
-            pos.get("url", ""),
-            pos.get("age_at_entry", 0),
-            pos.get("dex", "?"),
-            pos.get("source", "?"),
-            fmt_price(pos["entry_price"]),
-            round(sol_px, 4) if sol_px else "",
-            tx_sell,
-        ])
-        now_ts = time.time()
-        outcome = "PROFIT" if pnl >= 0 else "LOSS"
-        hold_sec = round(now_ts - pos.get("opened", now_ts), 1)
-        pnl_sol = round(pnl / sol_px, 6) if sol_px and sol_px > 0 else 0.0
-        self._log_pnl([
-            now().isoformat(),
-            pos["symbol"],
-            mint,
-            outcome,
-            fmt_price(pos["entry_price"]),
-            fmt_price(fill),
-            round(allocated_cost, 4),
-            round(proceeds, 4),
-            round(pnl, 4),
-            pnl_sol,
-            round(pnl_pct, 2),
-            reason,
-            hold_sec,
-            pos.get("dex", "?"),
-            pos.get("source", "?"),
-            round(sol_px, 4) if sol_px else "",
-            pos.get("tx_buy", ""),
-            tx_sell,
-            pos.get("url", f"https://dexscreener.com/solana/{mint}")
-        ])
-        sol_hint = f" ({pnl / sol_px:+.4f} SOL)" if sol_px else ""
-        tx_hint = f" tx={tx_sell[:8]}..." if tx_sell else ""
-        if is_partial:
-            mode_tag = "LIVE PARTIAL SELL" if self.mode == "live" else "PARTIAL SELL"
-            log(f"💰 {mode_tag} {pos['symbol']} ({req_frac * 100:.0f}%) entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} proceeds ${proceeds:.2f} pnl ${pnl:+.2f}{sol_hint} [{reason}]{tx_hint}")
-        else:
-            self.state["last_sell_time"] = now_ts
-            mode_tag = "LIVE SELL" if self.mode == "live" else "SELL"
-            log(f"✗ {mode_tag} {pos['symbol']} entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} pnl ${pnl:.2f}{sol_hint} ({pnl_pct:.1f}%) [{reason}]{tx_hint}")
-            rescan_delay = max(0, int(self.cfg.get("rescan_delay_after_sell_sec", 0)))
-            full, cnt, max_pos = self.is_slots_full()
-            if rescan_delay > 0:
-                self.state["cooldown_remaining_sec"] = rescan_delay
-                log(f"⏳ Rescan delay active: will wait {rescan_delay}s before searching for new coins.")
-            else:
-                self.state["cooldown_remaining_sec"] = 0
-                if not full and self.state.get("scan_paused"):
-                    self.state["scan_paused"] = False
-                    log(f"▶ Slot freed ({cnt}/{max_pos}) — resuming scan for new coins.")
-                    _scan_wake.set()
-        self.save()
+                self.state["last_sell_time"] = now_ts
+                mode_tag = "LIVE SELL" if self.mode == "live" else "SELL"
+                log(f"✗ {mode_tag} {pos['symbol']} entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} pnl ${pnl:.2f}{sol_hint} ({pnl_pct:.1f}%) [{reason}]{tx_hint}")
+                rescan_delay = max(0, int(self.cfg.get("rescan_delay_after_sell_sec", 0)))
+                full, cnt, max_pos = self.is_slots_full()
+                if rescan_delay > 0:
+                    self.state["cooldown_remaining_sec"] = rescan_delay
+                    log(f"⏳ Rescan delay active: will wait {rescan_delay}s before searching for new coins.")
+                else:
+                    self.state["cooldown_remaining_sec"] = 0
+                    if not full and self.state.get("scan_paused"):
+                        self.state["scan_paused"] = False
+                        log(f"▶ Slot freed ({cnt}/{max_pos}) — resuming scan for new coins.")
+                        _scan_wake.set()
+            self.save()
         return True
 
     @staticmethod
@@ -2082,7 +2215,34 @@ def scan_and_buy(acct, cfg):
         top_score = score_candidate(ranked[0][1], cfg, now_ms)
         log(f"⚡ Ranked {len(ranked)} passing launches (top: {top_sym} score={top_score:.1f})")
 
-    # 2. Run parallel hard_rug_check and enter in highest-momentum order until slots fill
+    # 2. Run parallel or sequential hard_rug_check and enter in highest-momentum order until slots fill
+    pre_screened = {}
+    if bool(cfg.get("parallel_rug_screen_enabled", True)) and len(ranked) > 1:
+        top_batch = ranked[:3]
+        scr_pool = ThreadPoolExecutor(max_workers=len(top_batch))
+        try:
+            futs = [
+                (
+                    m,
+                    (p.get("baseToken") or {}).get("symbol") or "?",
+                    scr_pool.submit(
+                        hard_rug_check,
+                        m,
+                        cfg,
+                        max(0.0, (now_ms - int(p.get("pairCreatedAt") or 0)) / 1000.0),
+                        pair=p,
+                    ),
+                )
+                for m, p in top_batch
+            ]
+            for m, _sym, f in futs:
+                try:
+                    pre_screened[m] = f.result()
+                except Exception:
+                    pass
+        finally:
+            scr_pool.shutdown(wait=False)
+
     for mint, pair in ranked:
         if _should_stop():
             return
@@ -2091,11 +2251,15 @@ def scan_and_buy(acct, cfg):
         if not acct.can_open()[0]: break
         symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
         age_s = max(0.0, (now_ms - int(pair.get("pairCreatedAt") or 0)) / 1000.0)
-        rok, rwhy = hard_rug_check(mint, cfg, age_s, pair=pair)
+        if mint in pre_screened:
+            rok, rwhy = pre_screened[mint]
+        else:
+            rok, rwhy = hard_rug_check(mint, cfg, age_s, pair=pair)
         if not rok:
             with _stats_lock: _stats["rug"] += 1
             log(f"✗ RUG REJECT {symbol}: {rwhy}")
             acct.note_rejected(mint)
+            _note_symbol_cooldown(symbol, cfg)
             continue
         if _should_stop():
             return
@@ -2108,6 +2272,7 @@ def scan_and_buy(acct, cfg):
             "age_s": age_s,
             "liquidity_usd": liq_usd,
             "liq_source": "pumpportal" if pair.get("_synthetic") else "dexscreener",
+            "decimals": _last_mint_decimals.get(mint),
         }
         if acct.buy(mint, symbol, price, pair.get("url"), meta):
             with _stats_lock: _stats["bought"] += 1
@@ -2115,14 +2280,19 @@ def scan_and_buy(acct, cfg):
                 break
         elif acct.mode == "live" and not _should_stop():
             # Brief spacing after a failed live buy prevents back-to-back Jupiter 429 collisions on the next ranked candidate
-            time.sleep(0.9)
+            time.sleep(0.5 if bool(cfg.get("fast_live_buy_enabled", True)) else 0.9)
 
 _last_rev_quote_ts = [0.0]
 
-def _reverse_quote_prices(pos_dict, cfg, sol_px):
+def _reverse_quote_prices(pos_dict, cfg, sol_px, acct=None):
     """Fetch true executable exit prices (mint -> WSOL quote) without overloading Jupiter keyless limits."""
     if not cfg.get("use_real_swap_quotes", True) or not pos_dict:
         return {}
+    if bool(cfg.get("jupiter_quota_guard_enabled", True)) and acct is not None and acct.mode == "live":
+        if time.time() - float(getattr(acct, "_last_live_swap_ts", 0.0) or 0.0) < 10.0:
+            return {}
+        if not cfg.get("jupiter_api_key") and not acct.is_slots_full()[0]:
+            return {}
     now_ts = time.time()
     tp = float(cfg.get("take_profit_pct") or 0.0)
     sl = float(cfg.get("stop_loss_pct") or 0.0)
@@ -2208,11 +2378,9 @@ def _process_sell_queue(acct, prices):
                 return
             with acct.lock:
                 pos = acct.state["positions"].get(mint)
-                if not pos:
-                    continue
-                px = prices.get(mint) or pos.get("current_price") or pos.get("entry_price")
-                if px:
-                    acct.sell(mint, px, "manual_exit")
+                px = (prices.get(mint) or pos.get("current_price") or pos.get("entry_price")) if pos else None
+            if pos and px:
+                acct.sell(mint, px, "manual_exit")
     except Exception:
         pass
 
@@ -2249,7 +2417,7 @@ def monitor(acct):
 
     mints = list(pos.keys())
     prices = _jupiter_prices(mints, acct.cfg)
-    rev_prices = _reverse_quote_prices(pos, acct.cfg, sol_px)
+    rev_prices = _reverse_quote_prices(pos, acct.cfg, sol_px, acct=acct)
     if rev_prices:
         prices.update(rev_prices)
     liquidities = {}

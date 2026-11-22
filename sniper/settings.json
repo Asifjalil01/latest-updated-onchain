@@ -48,6 +48,14 @@
   "jupiter_api_key": "",
   "use_jupiter_price": true,
   "use_real_swap_quotes": true,
+  "fast_live_buy_enabled": true,
+  "parallel_rug_screen_enabled": true,
+  "jupiter_quota_guard_enabled": true,
+  "direct_dex_fallback_enabled": true,
+  "anti_rug_tight_score_enabled": false,
+  "anti_rug_pool_depth_check_enabled": true,
+  "anti_rug_sell_sim_enabled": false,
+  "anti_rug_copycat_cooldown_enabled": true,
   "python_binary_path": "auto",
   "rescan_delay_after_sell_sec": 0
 }

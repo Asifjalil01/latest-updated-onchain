@@ -20,6 +20,8 @@ import {
   Trash2,
   Clock,
   Globe,
+  Zap,
+  ShieldCheck,
 } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import {
@@ -196,6 +198,108 @@ const SNIPER_WEBSITE_OPTIONS: Array<{ id: string; name: string; domain: string; 
   { id: 'bullx', name: 'BullX', domain: 'bullx.io', note: 'BullX Pump Vision pools' },
   { id: 'dexscreener', name: 'DexScreener', domain: 'dexscreener.com', note: 'DexScreener indexed / profile feeds' },
   { id: 'geckoterminal', name: 'GeckoTerminal', domain: 'geckoterminal.com', note: 'GeckoTerminal new pools feed' },
+];
+
+interface SniperProtectionModuleOption {
+  key: string;
+  group: 'speed' | 'safety';
+  label: string;
+  defaultValue: boolean;
+  description: string;
+  linkedTo: string;
+}
+
+const SNIPER_PROTECTION_MODULES: SniperProtectionModuleOption[] = [
+  {
+    key: 'fast_live_buy_enabled',
+    group: 'speed',
+    label: 'Fast Live Buy Pipeline (Skip Redundant Checks & Lock Hold)',
+    defaultValue: true,
+    description:
+      'Checked: Releases the internal bot lock during HTTP swap requests, reuses token decimals already verified in Hard RugCheck, and caps post-buy balance RPC polling at 750ms (~1–3s buys). Unchecked: Runs slower locked sequential swaps and waits for full RPC polling.',
+    linkedTo: 'Priority fee speed tier · Optional Jito tip · Private RPC URL',
+  },
+  {
+    key: 'parallel_rug_screen_enabled',
+    group: 'speed',
+    label: 'Parallel Top-3 Rug Pre-Screening',
+    defaultValue: true,
+    description:
+      'Checked: Screens the top 3 ranked launch candidates concurrently across worker threads so passing coins reach buy execution faster. Unchecked: Checks each candidate one by one in sequence.',
+    linkedTo: 'Hard RugCheck (score + risks) · Max RugCheck risk score · Max top-10 non-pool holders %',
+  },
+  {
+    key: 'jupiter_quota_guard_enabled',
+    group: 'speed',
+    label: 'Jupiter 429 Quota Guard (Pause Background Exit Quotes)',
+    defaultValue: true,
+    description:
+      'Checked: Automatically pauses background exit reverse-quote polling during active live swaps, for 10s afterward, and while running keyless with open scan slots so buys avoid Jupiter HTTP 429 throttling. Unchecked: Polls reverse quotes continuously.',
+    linkedTo: 'Exit monitor: real Jupiter reverse swap quotes · Always Simulate Exit Swap',
+  },
+  {
+    key: 'direct_dex_fallback_enabled',
+    group: 'speed',
+    label: 'Direct PumpPortal & Raydium Instant Swap Fallback',
+    defaultValue: true,
+    description:
+      'Checked: When Jupiter returns HTTP 429 or has no route on a brand-new coin or urgent exit, immediately builds and signs the swap via PumpPortal trade-local (pool=auto) or Raydium Trade API. Unchecked: Uses Jupiter swap routes only.',
+    linkedTo: 'Slippage % · Priority fee speed tier',
+  },
+  {
+    key: 'anti_rug_tight_score_enabled',
+    group: 'safety',
+    label: 'Tight Anti-Rug Score & Whale Cap (<= 45 Score / <= 30% Top-10)',
+    defaultValue: false,
+    description:
+      'Checked: Enforces stricter limits than defaults — rejects RugCheck risk score >= 45 (vs 55), Top-10 non-pool holders > 30% (vs 35%), and single private wallet > 12%. Unchecked: Follows the numeric RugCheck & Top-10 thresholds set above.',
+    linkedTo: 'Max RugCheck risk score (0-100) · Max top-10 non-pool holders % · Hard RugCheck',
+  },
+  {
+    key: 'anti_rug_pool_depth_check_enabled',
+    group: 'safety',
+    label: 'Real Pool Depth & MCap/LP Ratio Guard ($2,500 Floor & 80x Cap)',
+    defaultValue: true,
+    description:
+      'Checked: Requires at least $2,500 effective liquidity (when Min liquidity > 0) and blocks artificially inflated MCap > 80x Liquidity wash-trade traps. Unchecked: Uses your Min liquidity $ directly with a looser 150x MCap/LP cap.',
+    linkedTo: 'Min liquidity $ · Min 5-min volume $',
+  },
+  {
+    key: 'anti_rug_sell_sim_enabled',
+    group: 'safety',
+    label: 'Always Simulate Exit Swap & Tight 10% Impact Cap',
+    defaultValue: false,
+    description:
+      'Checked: Runs a live Jupiter token->SOL sell simulation before every buy (even when active sells already appear on chart) and rejects if exit price impact exceeds 10% (vs 15%). Unchecked: Only simulates when sells < 2 (saves Jupiter quota).',
+    linkedTo: 'Jupiter 429 Quota Guard · Hard RugCheck · Slippage %',
+  },
+  {
+    key: 'anti_rug_copycat_cooldown_enabled',
+    group: 'safety',
+    label: 'Copycat Ticker Cooldown (10 Min After Rug Reject)',
+    defaultValue: true,
+    description:
+      'Checked: Puts a rejected token ticker on a 10-minute cooldown to avoid clone-spam rug launches (tokens with >= $15k liquidity bypass). Unchecked: Evaluates every new launch fresh regardless of ticker.',
+    linkedTo: 'Hard RugCheck · Target Websites / Launchpads Filter',
+  },
+  {
+    key: 'require_lp_locked',
+    group: 'safety',
+    label: 'Require Burned/Locked LP >= 80% (AMM & Meteora Pools)',
+    defaultValue: false,
+    description:
+      'Checked: Rejects standard AMM and unlocked Meteora DLMM/DAMM pools unless >= 80% of LP is burned/locked (canonical Pump.fun curves & PumpSwap stay allowed). Unchecked: Allows unlocked AMM/Meteora LPs.',
+    linkedTo: 'Hard RugCheck · Target Websites / Launchpads Filter',
+  },
+  {
+    key: 'auto_rug_exit',
+    group: 'safety',
+    label: 'Auto Emergency Sell on LP Drain (AMM Pools Only)',
+    defaultValue: false,
+    description:
+      'Checked: Forces an urgent market sell after 2 consecutive confirmed >= 50% liquidity drops on AMM pools without a healthy Jupiter exit quote (Pump.fun curves are skipped). Unchecked: Exits strictly via Take Profit, Trailing Stop, or Stop Loss.',
+    linkedTo: 'Stop loss % · Trailing stop % · Slippage % · Exit monitor: real Jupiter reverse swap quotes',
+  },
 ];
 
 function fmtHeld(minutes: number): string {
@@ -463,8 +567,10 @@ export function PythonSniperView() {
           payload[key] = String(raw ?? '');
         }
       }
-      if (!('auto_rug_exit' in payload)) payload.auto_rug_exit = false;
-      if (!('require_lp_locked' in payload)) payload.require_lp_locked = false;
+      for (const mod of SNIPER_PROTECTION_MODULES) {
+        const raw = draftSettings[mod.key];
+        payload[mod.key] = raw === undefined ? mod.defaultValue : raw === true || raw === 'true';
+      }
       payload.enabled_platforms = Array.isArray(draftSettings.enabled_platforms)
         ? Array.from(
             new Set(
@@ -1562,6 +1668,14 @@ export function PythonSniperView() {
                     priority_fee_tier: 'fast',
                     recover_principal_enabled: false,
                     use_promoted_feeds: false,
+                    fast_live_buy_enabled: true,
+                    parallel_rug_screen_enabled: true,
+                    jupiter_quota_guard_enabled: true,
+                    direct_dex_fallback_enabled: true,
+                    anti_rug_tight_score_enabled: false,
+                    anti_rug_pool_depth_check_enabled: true,
+                    anti_rug_sell_sim_enabled: false,
+                    anti_rug_copycat_cooldown_enabled: true,
                     enabled_platforms: Array.isArray(draftSettings.enabled_platforms)
                       ? draftSettings.enabled_platforms
                       : [],
@@ -1880,6 +1994,202 @@ export function PythonSniperView() {
                             </label>
                           );
                         })}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Separate Section: Speed & Anti-Rug Protections (Checkboxes) */}
+                {(() => {
+                  const isModEnabled = (mod: SniperProtectionModuleOption) => {
+                    const raw = draftSettings[mod.key];
+                    return raw === undefined ? mod.defaultValue : raw === true || raw === 'true';
+                  };
+                  const enabledCount = SNIPER_PROTECTION_MODULES.filter(isModEnabled).length;
+                  const toggleModule = (key: string, nextVal: boolean) => {
+                    setDraftSettings({ ...draftSettings, [key]: nextVal });
+                    markSettingsDirty(true);
+                  };
+                  const applyProtectionPreset = (mode: 'all' | 'recommended' | 'none') => {
+                    const patch: Record<string, boolean> = {};
+                    for (const mod of SNIPER_PROTECTION_MODULES) {
+                      if (mode === 'all') patch[mod.key] = true;
+                      else if (mode === 'none') patch[mod.key] = false;
+                      else patch[mod.key] = mod.defaultValue;
+                    }
+                    setDraftSettings({ ...draftSettings, ...patch });
+                    markSettingsDirty(true);
+                  };
+                  const speedModules = SNIPER_PROTECTION_MODULES.filter((m) => m.group === 'speed');
+                  const safetyModules = SNIPER_PROTECTION_MODULES.filter((m) => m.group === 'safety');
+
+                  return (
+                    <div
+                      data-testid="sniper-protection-modules"
+                      className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 p-4 space-y-4"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-2">
+                            <ShieldCheck className="w-4 h-4 text-teal-600 dark:text-teal-400" />
+                            <h3 className="text-xs font-bold text-slate-800 dark:text-slate-100">
+                              Speed &amp; Anti-Rug Protections
+                            </h3>
+                            <span
+                              data-testid="sniper-protection-status"
+                              className={`px-2 py-0.5 rounded-md font-mono text-[10px] font-bold border ${
+                                enabledCount === 0
+                                  ? 'bg-slate-500/10 text-slate-600 dark:text-slate-400 border-slate-500/30'
+                                  : 'bg-teal-500/10 text-teal-700 dark:text-teal-300 border-teal-500/30'
+                              }`}
+                            >
+                              {enabledCount} / {SNIPER_PROTECTION_MODULES.length} Active
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                            Check any option to enable it; uncheck to make the bot ignore and skip that rule. Linked settings appear below each option.
+                          </p>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => applyProtectionPreset('all')}
+                            className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                              enabledCount === SNIPER_PROTECTION_MODULES.length
+                                ? 'bg-teal-600 text-white border-teal-600'
+                                : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            Enable All ({SNIPER_PROTECTION_MODULES.length})
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => applyProtectionPreset('recommended')}
+                            className="px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"
+                          >
+                            Recommended Defaults
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => applyProtectionPreset('none')}
+                            className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                              enabledCount === 0
+                                ? 'bg-rose-600 text-white border-rose-600'
+                                : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            Uncheck All
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Speed Subsection */}
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-sky-700 dark:text-sky-400">
+                          <Zap className="w-3.5 h-3.5" />
+                          <span>Buy &amp; Execution Speed Modules</span>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                          {speedModules.map((mod) => {
+                            const checked = isModEnabled(mod);
+                            return (
+                              <label
+                                key={mod.key}
+                                htmlFor={`py-prot-${mod.key}`}
+                                className={`flex items-start gap-2.5 p-3 rounded-xl border text-left transition-colors cursor-pointer select-none ${
+                                  checked
+                                    ? 'border-teal-500/60 bg-teal-500/10 dark:bg-teal-500/15'
+                                    : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] hover:border-slate-300 dark:hover:border-slate-700'
+                                }`}
+                              >
+                                <input
+                                  id={`py-prot-${mod.key}`}
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={(e) => toggleModule(mod.key, e.target.checked)}
+                                  className="mt-0.5 h-4 w-4 rounded border-slate-300 dark:border-slate-700 text-teal-600 focus:ring-teal-500 cursor-pointer shrink-0"
+                                />
+                                <div className="min-w-0 flex-1 space-y-1">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-xs font-semibold text-slate-800 dark:text-slate-100">
+                                      {mod.label}
+                                    </span>
+                                    <span
+                                      className={`font-mono text-[10px] px-1.5 py-0.5 rounded font-bold shrink-0 ${
+                                        checked
+                                          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                          : 'bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400'
+                                      }`}
+                                    >
+                                      {checked ? 'ACTIVE' : 'OFF'}
+                                    </span>
+                                  </div>
+                                  <p className="text-[11px] leading-snug text-slate-600 dark:text-slate-300">
+                                    {mod.description}
+                                  </p>
+                                  <p className="text-[10px] font-mono text-teal-700 dark:text-teal-400">
+                                    Linked to: {mod.linkedTo}
+                                  </p>
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Safety Subsection */}
+                      <div className="space-y-2 pt-1">
+                        <div className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-amber-700 dark:text-amber-400">
+                          <ShieldCheck className="w-3.5 h-3.5" />
+                          <span>Anti-Rug &amp; Capital Safety Modules</span>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                          {safetyModules.map((mod) => {
+                            const checked = isModEnabled(mod);
+                            return (
+                              <label
+                                key={mod.key}
+                                htmlFor={`py-prot-${mod.key}`}
+                                className={`flex items-start gap-2.5 p-3 rounded-xl border text-left transition-colors cursor-pointer select-none ${
+                                  checked
+                                    ? 'border-teal-500/60 bg-teal-500/10 dark:bg-teal-500/15'
+                                    : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] hover:border-slate-300 dark:hover:border-slate-700'
+                                }`}
+                              >
+                                <input
+                                  id={`py-prot-${mod.key}`}
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={(e) => toggleModule(mod.key, e.target.checked)}
+                                  className="mt-0.5 h-4 w-4 rounded border-slate-300 dark:border-slate-700 text-teal-600 focus:ring-teal-500 cursor-pointer shrink-0"
+                                />
+                                <div className="min-w-0 flex-1 space-y-1">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-xs font-semibold text-slate-800 dark:text-slate-100">
+                                      {mod.label}
+                                    </span>
+                                    <span
+                                      className={`font-mono text-[10px] px-1.5 py-0.5 rounded font-bold shrink-0 ${
+                                        checked
+                                          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                          : 'bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400'
+                                      }`}
+                                    >
+                                      {checked ? 'ACTIVE' : 'OFF'}
+                                    </span>
+                                  </div>
+                                  <p className="text-[11px] leading-snug text-slate-600 dark:text-slate-300">
+                                    {mod.description}
+                                  </p>
+                                  <p className="text-[10px] font-mono text-teal-700 dark:text-teal-400">
+                                    Linked to: {mod.linkedTo}
+                                  </p>
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
                   );

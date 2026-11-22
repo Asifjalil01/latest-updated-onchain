@@ -778,6 +778,11 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       tradeSizeUsd,
       slippagePct: req.body?.slippagePct !== undefined ? Number(req.body.slippagePct) : undefined,
       solPriceUsd: req.body?.solPriceUsd !== undefined ? Number(req.body.solPriceUsd) : undefined,
+      decimals:
+        req.body?.decimals !== undefined && req.body?.decimals !== null && Number.isFinite(Number(req.body.decimals))
+          ? Number(req.body.decimals)
+          : undefined,
+      dex: typeof req.body?.dex === 'string' ? req.body.dex : undefined,
     });
     res.json(result);
   });

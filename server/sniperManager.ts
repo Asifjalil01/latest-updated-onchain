@@ -241,6 +241,8 @@ export class SniperManager {
   private liveWalletBalanceSol: number | null = null;
   private liveWalletUpdatedAt = 0;
   private refreshingLiveWallet = false;
+  private liveSwapActiveCount = 0;
+  private lastLiveSwapAtMs = 0;
 
   constructor(options?: { baseDir?: string; startTimers?: boolean }) {
     this.baseDir = options?.baseDir || SNIPER_DIR;
@@ -645,6 +647,14 @@ export class SniperManager {
       custom_rpc_url: '',
       log_rejects: false,
       jupiter_api_key: '',
+      fast_live_buy_enabled: true,
+      parallel_rug_screen_enabled: true,
+      jupiter_quota_guard_enabled: true,
+      direct_dex_fallback_enabled: true,
+      anti_rug_tight_score_enabled: false,
+      anti_rug_pool_depth_check_enabled: true,
+      anti_rug_sell_sim_enabled: false,
+      anti_rug_copycat_cooldown_enabled: true,
       python_binary_path: 'auto',
       rescan_delay_after_sell_sec: 0,
     };
@@ -1017,7 +1027,14 @@ export class SniperManager {
   public async getReverseExitPrices(
     positions: Array<{ mint: string; qty: number; decimals?: number; rawAmount?: string | null }>,
     solPriceOverride?: number | null
-  ): Promise<{ ok: boolean; prices: Record<string, number>; solPriceUsd: number | null }> {
+  ): Promise<{ ok: boolean; prices: Record<string, number>; solPriceUsd: number | null; pausedForQuota?: boolean }> {
+    const settings = this.readSettings();
+    if (
+      settings.jupiter_quota_guard_enabled !== false &&
+      (this.liveSwapActiveCount > 0 || (this.lastLiveSwapAtMs > 0 && Date.now() - this.lastLiveSwapAtMs < 10_000))
+    ) {
+      return { ok: true, prices: {}, solPriceUsd: this.solPriceUsd, pausedForQuota: true };
+    }
     const jupiter = this.orchestrator?.jupiter as any;
     if (!jupiter || typeof jupiter.getReverseExitPricesUsd !== 'function') {
       return { ok: false, prices: {}, solPriceUsd: this.solPriceUsd };
@@ -1185,6 +1202,8 @@ export class SniperManager {
     tradeSizeUsd: number;
     slippagePct?: number;
     solPriceUsd?: number | null;
+    decimals?: number | null;
+    dex?: string;
   }): Promise<{
     ok: boolean;
     error?: string;
@@ -1212,6 +1231,9 @@ export class SniperManager {
       return { ok: false, error: 'Live wallet signer is locked. Unlock your wallet in Wallets & Signer first.' };
     }
 
+    this.liveSwapActiveCount += 1;
+    try {
+
     let solPriceUsd =
       params.solPriceUsd && Number.isFinite(params.solPriceUsd) && params.solPriceUsd > 0
         ? params.solPriceUsd
@@ -1233,8 +1255,17 @@ export class SniperManager {
     const amountRaw = String(Math.max(10_000, Math.round(solAmount * LAMPORTS_PER_SOL)));
     const slippageBps = Math.min(2500, Math.max(50, Math.round((params.slippagePct ?? 2.0) * 100)));
 
+    const savedSettings = this.readSettings();
+    const fastBuyEnabled = savedSettings.fast_live_buy_enabled !== false;
+    const directDexFallbackEnabled = savedSettings.direct_dex_fallback_enabled !== false;
+    const preDecimals =
+      typeof params.decimals === 'number' && Number.isFinite(params.decimals) && params.decimals >= 0 && params.decimals <= 18
+        ? params.decimals
+        : null;
+
     // 1-3. Run wallet SOL check (when cache is stale or tight), existing-balance check,
-    // on-chain mint inspection, AND Jupiter buy quote concurrently in one parallel batch.
+    // on-chain mint inspection (skipped when fast_live_buy_enabled has pre-verified decimals from Python),
+    // AND Jupiter buy quote concurrently in one parallel batch.
     const hasFreshSufficientBal =
       this.liveWalletBalanceSol !== null &&
       Date.now() - this.liveWalletUpdatedAt < 10_000 &&
@@ -1249,6 +1280,13 @@ export class SniperManager {
           }))
         : Promise.resolve(null);
 
+    const inspectPromise =
+      fastBuyEnabled && preDecimals !== null
+        ? Promise.resolve({ decimals: preDecimals })
+        : typeof rpcPool.inspectTokenOnChain === 'function'
+          ? rpcPool.inspectTokenOnChain(params.mint).catch(() => null)
+          : Promise.resolve(null);
+
     const [balRes, preBal, mintInfo, quote] = await Promise.all([
       solBalPromise,
       rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => ({
@@ -1258,9 +1296,7 @@ export class SniperManager {
         decimals: undefined,
         rawAmount: undefined,
       })),
-      typeof rpcPool.inspectTokenOnChain === 'function'
-        ? rpcPool.inspectTokenOnChain(params.mint).catch(() => null)
-        : Promise.resolve(null),
+      inspectPromise,
       jupiter
         .getQuote({
           inputMint: WSOL_MINT,
@@ -1303,8 +1339,7 @@ export class SniperManager {
       };
     }
 
-    const decimals = mintInfo?.decimals ?? preBal.decimals ?? 6;
-    const savedSettings = this.readSettings();
+    const decimals = mintInfo?.decimals ?? preBal.decimals ?? preDecimals ?? 6;
     const execFees = this.resolveSwapExecutionFees(savedSettings, false);
     const priorityFeeSolFallback =
       typeof execFees.priorityFeeLamports === 'number'
@@ -1348,24 +1383,48 @@ export class SniperManager {
         }
       }
 
-      // Automatic fallback to PumpPortal trade-local (pool='auto') when Jupiter hits 429 / backoff / no-route
-      if (typeof jupiter.buildPumpPortalSwapTransaction === 'function') {
-        try {
-          const ppRaw = await jupiter.buildPumpPortalSwapTransaction({
-            userPublicKey: owner,
-            action: 'buy',
-            mint: params.mint,
-            amount: solAmount,
-            denominatedInSol: true,
-            slippagePct: Math.max(attemptSlippageBps / 100, 8),
-            priorityFeeSol: priorityFeeSolFallback,
-            pool: 'auto',
-          });
-          const versionedTx = VersionedTransaction.deserialize(ppRaw);
-          await signer.signVersionedTransaction(versionedTx);
-          return { ok: true, rawSigned: versionedTx.serialize(), quoteUsed: null };
-        } catch {
-          // Preserve clearer Jupiter primary error if PumpPortal fallback does not cover this pool
+      // Automatic fallback to PumpPortal trade-local (pool='auto') and Raydium Trade API when enabled
+      if (directDexFallbackEnabled) {
+        const fallbackTimeout = fastBuyEnabled ? 3500 : 8000;
+        const dexLow = String(params.dex || '').toLowerCase();
+        if (typeof jupiter.buildPumpPortalSwapTransaction === 'function' && !dexLow.includes('orca')) {
+          try {
+            const ppRaw = await jupiter.buildPumpPortalSwapTransaction({
+              userPublicKey: owner,
+              action: 'buy',
+              mint: params.mint,
+              amount: solAmount,
+              denominatedInSol: true,
+              slippagePct: Math.max(attemptSlippageBps / 100, 8),
+              priorityFeeSol: priorityFeeSolFallback,
+              pool: 'auto',
+              timeoutMs: fallbackTimeout,
+            });
+            const versionedTx = VersionedTransaction.deserialize(ppRaw);
+            await signer.signVersionedTransaction(versionedTx);
+            return { ok: true, rawSigned: versionedTx.serialize(), quoteUsed: null };
+          } catch {
+            // Try direct Raydium swap API next
+          }
+        }
+        if (typeof (jupiter as any).buildRaydiumSwapTransaction === 'function') {
+          try {
+            const rayRaw = await (jupiter as any).buildRaydiumSwapTransaction({
+              userPublicKey: owner,
+              inputMint: WSOL_MINT,
+              outputMint: params.mint,
+              amountRaw,
+              slippageBps: Math.max(attemptSlippageBps, 800),
+              wrapSol: true,
+              unwrapSol: false,
+              timeoutMs: fallbackTimeout,
+            });
+            const versionedTx = VersionedTransaction.deserialize(rayRaw);
+            await signer.signVersionedTransaction(versionedTx);
+            return { ok: true, rawSigned: versionedTx.serialize(), quoteUsed: null };
+          } catch {
+            // Preserve clearer Jupiter primary error if Raydium does not route this pool
+          }
         }
       }
 
@@ -1443,11 +1502,69 @@ export class SniperManager {
       return { ok: false, error: 'Buy transaction failed on-chain' };
     }
 
-    // 5. Reconcile exact on-chain quantities & SOL spent
-    const [balCheck, txDelta] = await Promise.all([
-      rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => ({ agreed: false, balanceUi: null, decimals: undefined, rawAmount: undefined })),
+    // 5. Reconcile exact on-chain quantities & SOL spent (capped at 750ms when fast_live_buy_enabled is active)
+    const reconcilePromise = Promise.all([
+      rpcPool
+        .getAgreedTokenBalanceUi(owner, params.mint)
+        .catch(() => ({ agreed: false, balanceUi: null as number | null, decimals: undefined as number | undefined, rawAmount: undefined as string | undefined })),
       this.txAdapter.reconcileParsedSwapSolDelta(sig, owner, params.mint),
     ]);
+
+    let balCheck: { agreed: boolean; balanceUi: number | null; decimals?: number; rawAmount?: string } = {
+      agreed: false,
+      balanceUi: null,
+      decimals: undefined,
+      rawAmount: undefined,
+    };
+    let txDelta: {
+      found: boolean;
+      solDeltaLamports: number;
+      feeLamports: number;
+      createdAtaRentLamports?: number;
+      closedAtaRentLamports?: number;
+      tokenDeltaUi?: number;
+    } = { found: false, solDeltaLamports: 0, feeLamports: 100_000 };
+
+    if (fastBuyEnabled) {
+      let timerId: ReturnType<typeof setTimeout> | undefined;
+      const fastRaced = await Promise.race([
+        reconcilePromise.then((res) => ({ timedOut: false as const, res })),
+        new Promise<{ timedOut: true }>((resolve) => {
+          timerId = setTimeout(() => resolve({ timedOut: true }), 750);
+        }),
+      ]);
+      if (timerId !== undefined) clearTimeout(timerId);
+      if (fastRaced.timedOut) {
+        // Return immediately using quoted fill and finish exact balance + rent reconciliation in background
+        void reconcilePromise
+          .then(([bgBal, bgDelta]) => {
+            try {
+              const { stateFile } = getSniperFilePaths('live', this.baseDir);
+              if (fs.existsSync(stateFile)) {
+                const st = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+                const p = st?.positions?.[params.mint];
+                if (p) {
+                  const bgQty =
+                    bgBal.agreed && (bgBal.balanceUi ?? 0) > 0
+                      ? bgBal.balanceUi!
+                      : bgDelta.tokenDeltaUi && bgDelta.tokenDeltaUi > 0
+                        ? bgDelta.tokenDeltaUi
+                        : p.qty;
+                  if (bgQty > 0) p.qty = bgQty;
+                  if (bgBal.rawAmount && /^\d+$/.test(bgBal.rawAmount)) p.raw_amount = bgBal.rawAmount;
+                  if (typeof bgBal.decimals === 'number') p.decimals = bgBal.decimals;
+                  this.writeStateAtomic(stateFile, st);
+                }
+              }
+            } catch {}
+          })
+          .catch(() => undefined);
+      } else {
+        [balCheck, txDelta] = fastRaced.res;
+      }
+    } else {
+      [balCheck, txDelta] = await reconcilePromise;
+    }
 
     const quotedQty = activeQuote ? Number(activeQuote.outAmount) / 10 ** decimals : 0;
     const realDecimals = typeof balCheck.decimals === 'number' ? balCheck.decimals : decimals;
@@ -1521,6 +1638,10 @@ export class SniperManager {
       solPriceUsd,
       walletBalanceSol: this.liveWalletBalanceSol,
     };
+    } finally {
+      this.liveSwapActiveCount = Math.max(0, this.liveSwapActiveCount - 1);
+      this.lastLiveSwapAtMs = Date.now();
+    }
   }
 
   public async executeLiveSell(params: {
@@ -1565,6 +1686,9 @@ export class SniperManager {
     if (!signer.isUnlocked() || !owner) {
       return { ok: false, error: 'Live wallet signer is locked. Unlock your wallet in Wallets & Signer first.' };
     }
+
+    this.liveSwapActiveCount += 1;
+    try {
 
     let solPriceUsd =
       params.solPriceUsd && Number.isFinite(params.solPriceUsd) && params.solPriceUsd > 0
@@ -1770,45 +1894,74 @@ export class SniperManager {
       break;
     }
 
-    // Emergency PumpPortal trade-local sell fallback when Jupiter is rate-limited or has no route
-    if (!sig && typeof jupiter.buildPumpPortalSwapTransaction === 'function') {
-      try {
-        const savedSettings = this.readSettings();
-        const sellExecFees = this.resolveSwapExecutionFees(savedSettings, true);
-        const ppFeeSol =
-          typeof sellExecFees.priorityFeeLamports === 'number'
-            ? sellExecFees.priorityFeeLamports / LAMPORTS_PER_SOL
-            : 0.0003;
-        const ppRaw = await jupiter.buildPumpPortalSwapTransaction({
-          userPublicKey: owner,
-          action: 'sell',
-          mint: params.mint,
-          amount: isPartial ? soldQty : '100%',
-          denominatedInSol: false,
-          slippagePct: Math.max(params.slippagePct ?? 3, isUrgentExit ? 25 : 15),
-          priorityFeeSol: ppFeeSol,
-          pool: 'auto',
-        });
-        const versionedTx = VersionedTransaction.deserialize(ppRaw);
+    // Emergency PumpPortal + Raydium Trade API sell fallback when Jupiter is rate-limited or has no route
+    const savedSellSettings = this.readSettings();
+    if (!sig && savedSellSettings.direct_dex_fallback_enabled !== false) {
+      const sellExecFees = this.resolveSwapExecutionFees(savedSellSettings, true);
+      const ppFeeSol =
+        typeof sellExecFees.priorityFeeLamports === 'number'
+          ? sellExecFees.priorityFeeLamports / LAMPORTS_PER_SOL
+          : 0.0003;
+      const fallbackSlipPct = Math.max(params.slippagePct ?? 3, isUrgentExit ? 25 : 15);
+      const tryDirectBytes = async (rawUnsigned: Uint8Array): Promise<boolean> => {
+        const versionedTx = VersionedTransaction.deserialize(rawUnsigned);
         await signer.signVersionedTransaction(versionedTx);
         const rawSigned = versionedTx.serialize();
         this.broadcastToJitoBestEffort(rawSigned, sellExecFees.jitoTipLamports);
-        const ppSig = await this.txAdapter.sendSignedTransaction(rawSigned, 3, { skipPreflight: true });
-        const ppConf = await this.txAdapter.pollConfirmation(ppSig, 20_000);
-        if (ppConf.status === 'confirmed') {
-          sig = ppSig;
+        const fbSig = await this.txAdapter!.sendSignedTransaction(rawSigned, 3, { skipPreflight: true });
+        const fbConf = await this.txAdapter!.pollConfirmation(fbSig, 20_000);
+        if (fbConf.status === 'confirmed') {
+          sig = fbSig;
           hadAnyRoute = true;
-        } else if (ppConf.status === 'timeout') {
+          return true;
+        }
+        if (fbConf.status === 'timeout') {
           const postBalCheck = !isPartial
             ? await rpcPool.getAgreedTokenBalanceUi(owner, params.mint).catch(() => null)
             : null;
           if (postBalCheck && (postBalCheck.agreed || (postBalCheck.readings?.length ?? 0) > 0) && (postBalCheck.balanceUi ?? 0) <= 0.000001) {
-            sig = ppSig;
+            sig = fbSig;
             hadAnyRoute = true;
+            return true;
           }
         }
-      } catch {
-        // Keep primary Jupiter error details
+        return false;
+      };
+
+      if (typeof jupiter.buildPumpPortalSwapTransaction === 'function') {
+        try {
+          const ppRaw = await jupiter.buildPumpPortalSwapTransaction({
+            userPublicKey: owner,
+            action: 'sell',
+            mint: params.mint,
+            amount: isPartial ? soldQty : '100%',
+            denominatedInSol: false,
+            slippagePct: fallbackSlipPct,
+            priorityFeeSol: ppFeeSol,
+            pool: 'auto',
+            timeoutMs: savedSellSettings.fast_live_buy_enabled !== false ? 4000 : 8000,
+          });
+          await tryDirectBytes(ppRaw);
+        } catch {
+          // Try Raydium emergency sell next
+        }
+      }
+      if (!sig && typeof (jupiter as any).buildRaydiumSwapTransaction === 'function') {
+        try {
+          const rayRaw = await (jupiter as any).buildRaydiumSwapTransaction({
+            userPublicKey: owner,
+            inputMint: params.mint,
+            outputMint: WSOL_MINT,
+            amountRaw,
+            slippageBps: Math.min(5000, Math.round(fallbackSlipPct * 100)),
+            wrapSol: false,
+            unwrapSol: true,
+            timeoutMs: savedSellSettings.fast_live_buy_enabled !== false ? 4000 : 8000,
+          });
+          await tryDirectBytes(rayRaw);
+        } catch {
+          // Keep primary Jupiter error details
+        }
       }
     }
 
@@ -1894,6 +2047,10 @@ export class SniperManager {
       remainingQty,
       remainingRawAmount,
     };
+    } finally {
+      this.liveSwapActiveCount = Math.max(0, this.liveSwapActiveCount - 1);
+      this.lastLiveSwapAtMs = Date.now();
+    }
   }
 
   public async sellPosition(mint: string) {

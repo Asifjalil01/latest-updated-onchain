@@ -454,10 +454,12 @@ export class JupiterProvider {
     slippagePct: number;
     priorityFeeSol: number;
     pool?: string;
+    timeoutMs?: number;
   }): Promise<Uint8Array> {
+    const timeoutMs = Math.max(1500, Math.min(10_000, params.timeoutMs ?? 4500));
     const res = await fetch('https://pumpportal.fun/api/trade-local', {
       method: 'POST',
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(timeoutMs),
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/octet-stream, application/json',
@@ -493,6 +495,77 @@ export class JupiterProvider {
       throw new Error('PumpPortal trade-local returned invalid transaction payload');
     }
     return buf;
+  }
+
+  /**
+   * Direct Raydium Trade API fallback (transaction-v1.raydium.io) for Raydium / LaunchLab pools
+   * when Jupiter is rate-limited or unindexed.
+   */
+  async buildRaydiumSwapTransaction(params: {
+    userPublicKey: string;
+    inputMint: string;
+    outputMint: string;
+    amountRaw: string;
+    slippageBps: number;
+    computeUnitPriceMicroLamports?: number;
+    wrapSol?: boolean;
+    unwrapSol?: boolean;
+    timeoutMs?: number;
+  }): Promise<Uint8Array> {
+    const timeoutMs = Math.max(1500, Math.min(10_000, params.timeoutMs ?? 4000));
+    const computeQs = new URLSearchParams({
+      inputMint: params.inputMint,
+      outputMint: params.outputMint,
+      amount: params.amountRaw,
+      slippageBps: String(Math.max(50, Math.min(5000, Math.round(params.slippageBps)))),
+      txVersion: 'V0',
+    });
+
+    const quoteRes = await fetch(
+      `https://transaction-v1.raydium.io/compute/swap-base-in?${computeQs.toString()}`,
+      {
+        signal: AbortSignal.timeout(timeoutMs),
+        headers: { Accept: 'application/json' },
+      }
+    );
+    if (!quoteRes.ok) {
+      throw new Error(`Raydium compute HTTP ${quoteRes.status}`);
+    }
+    const swapResponse = (await quoteRes.json()) as { success?: boolean; msg?: string };
+    if (!swapResponse || swapResponse.success === false) {
+      throw new Error(swapResponse?.msg || 'Raydium compute returned no route');
+    }
+
+    const txRes = await fetch('https://transaction-v1.raydium.io/transaction/swap-base-in', {
+      method: 'POST',
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        computeUnitPriceMicroLamports: String(Math.max(10_000, Math.round(params.computeUnitPriceMicroLamports ?? 100_000))),
+        swapResponse,
+        txVersion: 'V0',
+        wallet: params.userPublicKey,
+        wrapSol: params.wrapSol ?? params.inputMint === WSOL_MINT,
+        unwrapSol: params.unwrapSol ?? params.outputMint === WSOL_MINT,
+      }),
+    });
+    if (!txRes.ok) {
+      throw new Error(`Raydium tx build HTTP ${txRes.status}`);
+    }
+    const txJson = (await txRes.json()) as {
+      success?: boolean;
+      msg?: string;
+      data?: Array<{ transaction?: string }>;
+    };
+    const b64 = txJson?.data?.[0]?.transaction;
+    if (!b64 || txJson?.success === false) {
+      throw new Error(txJson?.msg || 'Raydium tx build returned empty transaction');
+    }
+    const bytes = new Uint8Array(Buffer.from(b64, 'base64'));
+    if (bytes.length < 32) {
+      throw new Error('Raydium tx build returned invalid transaction payload');
+    }
+    return bytes;
   }
 
   /**

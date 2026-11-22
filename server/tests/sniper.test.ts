@@ -2054,5 +2054,287 @@ test('v1.34.1: Jupiter 429 fails over cleanly without circuit-open, PumpPortal t
   assert.equal(pyOut.calls_after_zero, 1, 'Zero-sell honeypot suspect still checks Jupiter sell route');
 });
 
+test('v1.35.0: Speed & Anti-Rug checkboxes (checked applies rule, unchecked ignores rule) across SniperManager, JupiterProvider & bot.py', async () => {
+  const { JupiterProvider } = await import('../providers/jupiter.ts');
+  const kp = await Keypair.generate();
+  const mockTxB64 = createBase64MockTx(kp);
+  const mockTxBytes = Buffer.from(mockTxB64, 'base64');
+
+  // 1. Raydium Trade API direct fallback test
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.startsWith('https://transaction-v1.raydium.io/compute/swap-base-in')) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: { swapType: 'BaseIn', inputMint: 'So111', outputMint: 'MintRay', outputAmount: '100000' },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    if (url === 'https://transaction-v1.raydium.io/transaction/swap-base-in') {
+      return new Response(
+        JSON.stringify({ success: true, data: [{ transaction: mockTxB64 }] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    return new Response('Not found', { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    const jup = new JupiterProvider();
+    const rayTx = await jup.buildRaydiumSwapTransaction({
+      userPublicKey: kp.publicKey.toBase58(),
+      inputMint: 'So11111111111111111111111111111111111111112',
+      outputMint: 'MintRay111111111111111111111111111111111111',
+      amountRaw: '7100000',
+      slippageBps: 800,
+    });
+    assert.ok(rayTx instanceof Uint8Array && rayTx.length > 32);
+  } finally {
+    globalThis.fetch = prevFetch;
+  }
+
+  // 2. SniperManager speed/fallback/quota flags (checked vs unchecked)
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1350-'));
+  try {
+    const manager = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    let inspectCalls = 0;
+    let raydiumCalls = 0;
+    let ppCalls = 0;
+    let revQuoteCalls = 0;
+    const heldByMint = new Map<string, number>();
+    let currentMint = '';
+
+    const mockOrchestrator = {
+      signer: {
+        isUnlocked: () => true,
+        getPublicKey: () => kp.publicKey.toBase58(),
+        signVersionedTransaction: async () => undefined,
+      },
+      rpcPool: {
+        getAgreedBalanceSol: async () => ({ agreed: true, balanceSol: 0.5, readings: [0.5, 0.5] }),
+        getAgreedTokenBalanceUi: async (_owner: string, mint: string) => {
+          currentMint = mint;
+          const bal = heldByMint.get(mint) ?? 0;
+          return {
+            agreed: true,
+            balanceUi: bal,
+            readings: [bal, bal],
+            decimals: 6,
+            rawAmount: bal > 0 ? String(bal * 1_000_000) : '0',
+          };
+        },
+        inspectTokenOnChain: async () => {
+          inspectCalls += 1;
+          return { decimals: 6 };
+        },
+      },
+      jupiter: {
+        getLiveSolPriceUsd: async () => 70,
+        getLastQuoteError: () => 'No routes found',
+        getQuote: async (params: any) => {
+          currentMint = params.outputMint;
+          if (params.outputMint.includes('RayOnly')) return null;
+          return {
+            inputMint: params.inputMint,
+            inAmount: params.amountRaw,
+            outputMint: params.outputMint,
+            outAmount: '5000000000',
+            slippageBps: params.slippageBps,
+            priceImpactPct: '0.01',
+            routePlan: [],
+          };
+        },
+        buildSwapTransaction: async () => ({ swapTransaction: mockTxB64 }),
+        buildPumpPortalSwapTransaction: async () => {
+          ppCalls += 1;
+          return null;
+        },
+        buildRaydiumSwapTransaction: async () => {
+          raydiumCalls += 1;
+          return new Uint8Array(mockTxBytes);
+        },
+        getReverseExitPricesUsd: async () => {
+          revQuoteCalls += 1;
+          return { MintRev: 0.001 };
+        },
+      },
+    };
+    const mockAdapter: LiveTxAdapter = {
+      sendSignedTransaction: async () => 'sigV1350',
+      pollConfirmation: async () => {
+        if (currentMint) heldByMint.set(currentMint, 5000);
+        return { status: 'confirmed' };
+      },
+      reconcileParsedSwapSolDelta: async () => ({
+        found: true,
+        solDeltaLamports: -7_142_857,
+        feeLamports: 5000,
+        tokenDeltaUi: 5000,
+      }),
+      findRecentSellSignature: async () => null,
+    };
+    manager.attachOrchestrator(mockOrchestrator as unknown as BotOrchestrator, mockAdapter);
+
+    // Settings persistence of all 10 checkboxes
+    const saved = manager.updateSettings({
+      fast_live_buy_enabled: true,
+      parallel_rug_screen_enabled: true,
+      jupiter_quota_guard_enabled: true,
+      direct_dex_fallback_enabled: true,
+      anti_rug_tight_score_enabled: true,
+      anti_rug_pool_depth_check_enabled: true,
+      anti_rug_sell_sim_enabled: true,
+      anti_rug_copycat_cooldown_enabled: true,
+      require_lp_locked: true,
+      auto_rug_exit: true,
+    });
+    assert.equal(saved.ok, true);
+    assert.equal(saved.settings?.anti_rug_tight_score_enabled, true);
+
+    // fast_live_buy_enabled=true skips inspectTokenOnChain when decimals provided
+    const fastBuy = await manager.executeLiveBuy({
+      mint: 'MintFast11111111111111111111111111111111111',
+      symbol: 'FAST',
+      tradeSizeUsd: 0.5,
+      slippagePct: 3,
+      solPriceUsd: 70,
+      decimals: 6,
+    });
+    assert.equal(fastBuy.ok, true);
+    assert.equal(inspectCalls, 0);
+
+    // jupiter_quota_guard_enabled=true pauses reverse quotes right after a live swap
+    const pausedRev = await manager.getReverseExitPrices([{ mint: 'MintRev', qty: 100 }], 70);
+    assert.equal(pausedRev.pausedForQuota, true);
+    assert.equal(revQuoteCalls, 0);
+
+    // direct_dex_fallback_enabled=true invokes Raydium when Jupiter & PumpPortal return null
+    const rayFallbackBuy = await manager.executeLiveBuy({
+      mint: 'MintRayOnly11111111111111111111111111111111',
+      symbol: 'RAYFB',
+      tradeSizeUsd: 0.5,
+      slippagePct: 3,
+      solPriceUsd: 70,
+      decimals: 6,
+    });
+    assert.equal(rayFallbackBuy.ok, true);
+    assert.equal(ppCalls, 1);
+    assert.equal(raydiumCalls, 1);
+
+    // Now uncheck fast_live_buy_enabled, jupiter_quota_guard_enabled, direct_dex_fallback_enabled
+    manager.updateSettings({
+      fast_live_buy_enabled: false,
+      jupiter_quota_guard_enabled: false,
+      direct_dex_fallback_enabled: false,
+    });
+
+    const slowBuy = await manager.executeLiveBuy({
+      mint: 'MintSlow11111111111111111111111111111111111',
+      symbol: 'SLOW',
+      tradeSizeUsd: 0.5,
+      slippagePct: 3,
+      solPriceUsd: 70,
+      decimals: 6,
+    });
+    assert.equal(slowBuy.ok, true);
+    assert.equal(inspectCalls, 1, 'Unchecking fast_live_buy_enabled should run full inspectTokenOnChain');
+
+    // Unchecked jupiter_quota_guard_enabled runs reverse quote immediately after swap
+    const unguardedRev = await manager.getReverseExitPrices([{ mint: 'MintRev', qty: 100 }], 70);
+    assert.equal(unguardedRev.pausedForQuota, undefined);
+    assert.equal(revQuoteCalls, 1);
+
+    // Unchecked direct_dex_fallback_enabled fails instead of calling PumpPortal/Raydium
+    const noFallbackBuy = await manager.executeLiveBuy({
+      mint: 'MintRayOnly11111111111111111111111111111111',
+      symbol: 'NOFB',
+      tradeSizeUsd: 0.5,
+      slippagePct: 3,
+      solPriceUsd: 70,
+      decimals: 6,
+    });
+    assert.equal(noFallbackBuy.ok, false);
+    assert.equal(ppCalls, 1, 'Should not invoke PumpPortal when direct_dex_fallback_enabled is unchecked');
+    assert.equal(raydiumCalls, 1, 'Should not invoke Raydium when direct_dex_fallback_enabled is unchecked');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // 3. Python bot.py unit verification for all anti-rug & filter checkboxes (true vs false)
+  const pyScript = [
+    'import sys, types, json, time',
+    'req = types.ModuleType("requests")',
+    'class DummySess:',
+    '    def get(self, *a, **k): raise RuntimeError("no net")',
+    '    def post(self, *a, **k): raise RuntimeError("no net")',
+    'req.Session = lambda: DummySess()',
+    'sys.modules["requests"] = req',
+    'sys.path.insert(0, "sniper")',
+    'import bot',
+    'bot._rpc_mint_account_info = lambda m, c=None: {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": []}',
+    'def fake_rc(url, **k):',
+    '    if "rugcheck" not in url: return None',
+    '    if "TightScore" in url:',
+    '        return {"score_normalised": 48, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 16.0}, {"address": "W2", "owner": "W2", "pct": 16.0}]}',
+    '    if "MeteoraUnlocked" in url:',
+    '        return {"score_normalised": 10, "risks": [], "markets": [{"pubkey": "PoolM", "marketType": "meteora", "lp": {"lpLockedPct": 0}}], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]}',
+    '    return {"score_normalised": 10, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]}',
+    'bot.get_json = fake_rc',
+    'probe_impacts = []',
+    'def spy_sell_route(mint, decimals, px, cfg, max_impact_pct=15.0):',
+    '    probe_impacts.append(max_impact_pct)',
+    '    return (True, "ok")',
+    'bot._check_sell_route = spy_sell_route',
+    'now_ms = int(time.time() * 1000)',
+    // A. anti_rug_tight_score_enabled
+    'cfg_tight = {**bot.CONFIG, "anti_rug_tight_score_enabled": True}',
+    'ok_tight, why_tight = bot.hard_rug_check("TightScore111111111111111111111111111111111", cfg_tight, age_s=25, pair={"dexId": "pumpswap", "priceUsd": "0.001", "liquidity": {"usd": 8000}, "txns": {"m5": {"buys": 10, "sells": 3}}})',
+    'cfg_loose = {**bot.CONFIG, "anti_rug_tight_score_enabled": False}',
+    'ok_loose, _ = bot.hard_rug_check("TightScore111111111111111111111111111111111", cfg_loose, age_s=25, pair={"dexId": "pumpswap", "priceUsd": "0.001", "liquidity": {"usd": 8000}, "txns": {"m5": {"buys": 10, "sells": 3}}})',
+    // B. anti_rug_pool_depth_check_enabled
+    'shallow_pair = {"baseToken": {"address": "MintShallow11", "symbol": "SHL"}, "dexId": "pumpswap", "pairCreatedAt": now_ms - 25000, "priceUsd": "0.001", "liquidity": {"usd": 2000}, "fdv": 10000, "volume": {"m5": 5000}, "txns": {"m5": {"buys": 10, "sells": 2}}}',
+    'cfg_depth_on = {**bot.CONFIG, "min_liquidity_usd": 1500, "anti_rug_pool_depth_check_enabled": True}',
+    'cfg_depth_off = {**bot.CONFIG, "min_liquidity_usd": 1500, "anti_rug_pool_depth_check_enabled": False}',
+    'ok_depth_on, code_depth_on, _ = bot.passes_filters(shallow_pair, cfg_depth_on, now_ms)',
+    'ok_depth_off, _, _ = bot.passes_filters(shallow_pair, cfg_depth_off, now_ms)',
+    // C. anti_rug_sell_sim_enabled
+    'pair_active = {"dexId": "pumpswap", "priceUsd": "0.001", "liquidity": {"usd": 8000}, "txns": {"m5": {"buys": 12, "sells": 4}}}',
+    'bot.hard_rug_check("SellSimMint1111111111111111111111111111111111", {**bot.CONFIG, "anti_rug_sell_sim_enabled": False}, age_s=25, pair=pair_active)',
+    'impacts_when_off = list(probe_impacts)',
+    'bot.hard_rug_check("SellSimMint1111111111111111111111111111111111", {**bot.CONFIG, "anti_rug_sell_sim_enabled": True}, age_s=25, pair=pair_active)',
+    'impacts_when_on = list(probe_impacts)',
+    // D. anti_rug_copycat_cooldown_enabled
+    'clone_pair = {"baseToken": {"address": "MintClone11", "symbol": "SCAMCLONE"}, "dexId": "pumpswap", "pairCreatedAt": now_ms - 25000, "priceUsd": "0.001", "liquidity": {"usd": 6000}, "fdv": 20000, "volume": {"m5": 5000}, "txns": {"m5": {"buys": 10, "sells": 2}}}',
+    'bot._note_symbol_cooldown("SCAMCLONE", {**bot.CONFIG, "anti_rug_copycat_cooldown_enabled": True})',
+    'ok_cd_on, code_cd_on, _ = bot.passes_filters(clone_pair, {**bot.CONFIG, "anti_rug_copycat_cooldown_enabled": True}, now_ms)',
+    'ok_cd_off, _, _ = bot.passes_filters(clone_pair, {**bot.CONFIG, "anti_rug_copycat_cooldown_enabled": False}, now_ms)',
+    // E. require_lp_locked blocks 0% Meteora unlocked LP when checked, allows when unchecked
+    'met_pair = {"dexId": "meteora", "priceUsd": "0.001", "liquidity": {"usd": 8000}, "txns": {"m5": {"buys": 10, "sells": 3}}}',
+    'ok_lp_on, why_lp_on = bot.hard_rug_check("MeteoraUnlocked111111111111111111111111111111", {**bot.CONFIG, "require_lp_locked": True}, age_s=25, pair=met_pair)',
+    'ok_lp_off, _ = bot.hard_rug_check("MeteoraUnlocked111111111111111111111111111111", {**bot.CONFIG, "require_lp_locked": False}, age_s=25, pair=met_pair)',
+    'print(json.dumps({"ok_tight": ok_tight, "why_tight": why_tight, "ok_loose": ok_loose, "ok_depth_on": ok_depth_on, "code_depth_on": code_depth_on, "ok_depth_off": ok_depth_off, "impacts_when_off": impacts_when_off, "impacts_when_on": impacts_when_on, "ok_cd_on": ok_cd_on, "code_cd_on": code_cd_on, "ok_cd_off": ok_cd_off, "ok_lp_on": ok_lp_on, "why_lp_on": why_lp_on, "ok_lp_off": ok_lp_off}))',
+  ].join('\n');
+  const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+  const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+  assert.equal(pyOut.ok_tight, false);
+  assert.match(pyOut.why_tight, /rugcheck risk score 48\/100 >= 45/i);
+  assert.equal(pyOut.ok_loose, true);
+  assert.equal(pyOut.ok_depth_on, false);
+  assert.equal(pyOut.code_depth_on, 'low liquidity');
+  assert.equal(pyOut.ok_depth_off, true);
+  assert.deepEqual(pyOut.impacts_when_off, []);
+  assert.deepEqual(pyOut.impacts_when_on, [10]);
+  assert.equal(pyOut.ok_cd_on, false);
+  assert.equal(pyOut.code_cd_on, 'copycat cooldown');
+  assert.equal(pyOut.ok_cd_off, true);
+  assert.equal(pyOut.ok_lp_on, false);
+  assert.match(pyOut.why_lp_on, /LP burned\/locked/i);
+  assert.equal(pyOut.ok_lp_off, true);
+});
+
+
 
 
