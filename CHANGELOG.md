@@ -2,6 +2,20 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.33.1 — Prevent False `rug_liquidity_drop` Loss Sells on Dips, Pump.fun Curves & Missing DexScreener Liquidity (`bot.py`, `PythonSniperView.tsx`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed
+- **Prevented False `rug_liquidity_drop` Exits During Normal Early Dips (`sniper/bot.py`)**:
+  - Fixed `monitor()` coercing missing/`None` DexScreener `liquidity.usd` fields into `0.0` (common on newly-indexed or bonding-curve pairs), which previously triggered an immediate 100% LP-drain false alarm seconds after entry even when Stop Loss and Trailing Stop were disabled (`0`).
+  - Excluded `pumpfun` bonding-curve tokens from `rug_liquidity_drop` because bonding-curve SOL is program-locked and cannot be LP-pulled, and added automatic entry liquidity baseline recalibration when transitioning from a synthetic PumpPortal curve quote (or `pumpfun` migration) to a DEX pool (`pumpswap`, `raydium`, etc.).
+  - Added 2-poll LP-drain confirmation (`liq_drop_streak >= 2`) and live Jupiter reverse-quote protection inside `check_exits()`: mild dips (`> -35%`) with an active Jupiter exit quote no longer falsely trigger `rug_liquidity_drop`, while genuine AMM LP collapses (`>= 2` consecutive confirmed drain polls or `<= -50%` crash with no reverse quote) still trigger emergency exits.
+- **Settings Clarity (`PythonSniperView.tsx`)**:
+  - Added an inline helper hint under **Auto emergency sell on LP drain (rug exit)** explaining that it skips Pump.fun curves, requires 2 confirmed LP-drain polls, and can be set to `False (Disabled)` to ride all dips strictly to TP/SL/Trail.
+
+---
+
 ## v1.33.0 — Sub-20s Direct PumpPortal Curve Entry, Private RPC + Jito/Priority Execution, Anti-Bundle Rug Screening & Momentum Ranking (`pumpportal.ts`, `rpcPool.ts`, `jupiter.ts`, `sniperManager.ts`, `api.ts`, `bot.py`, `settings.json`, `PythonSniperView.tsx`)
 
 **Risk Warning: Trading can lose all of your money.**

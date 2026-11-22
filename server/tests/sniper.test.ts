@@ -1672,7 +1672,67 @@ test('v1.33.0: bot.py blocks bundled insider RugCheck reports, creator holds/dum
   assert.deepEqual(out.bought_mints, ['MintStrongBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB']);
 });
 
+test('v1.33.1: prevents false rug_liquidity_drop sells on Pump.fun curves, missing DexScreener liquidity, PumpPortal recalibration & mild dips when SL/Trail are 0', () => {
+  const pyScript = [
+    'import sys, types, json, time, tempfile, shutil',
+    'req = types.ModuleType("requests")',
+    'class DummySess:',
+    '    def get(self, *a, **k): raise RuntimeError("no net")',
+    '    def post(self, *a, **k): raise RuntimeError("no net")',
+    'req.Session = lambda: DummySess()',
+    'sys.modules["requests"] = req',
+    'sys.path.insert(0, "sniper")',
+    'import bot',
+    'out = {}',
+    'tmp_dir = tempfile.mkdtemp()',
+    'orig_base = bot._base_dir',
+    'bot._base_dir = lambda: tmp_dir',
+    'try:',
+    '    cfg = dict(bot.CONFIG, take_profit_pct=45.0, stop_loss_pct=0.0, trailing_stop_pct=0.0, auto_rug_exit=True, rug_liq_drop_pct=50.0, slippage_pct=0.0, fee_pct=0.0, use_jupiter_price=False, use_real_swap_quotes=False)',
+    '    acct = bot.TradingAccount(cfg, mode="paper")',
+    '    # 1. Pump.fun bonding curve coin (whallet regression): must NEVER exit via rug_liquidity_drop on -16% dip or 0/missing liq',
+    '    acct.buy("MintPump1", "WHAL", 0.00000430, meta={"dex": "pumpfun", "liquidity_usd": 4200.0, "liq_source": "pumpportal"})',
+    '    acct.check_exits({"MintPump1": 0.00000364}, liquidities={"MintPump1": 0.0})',
+    '    acct.check_exits({"MintPump1": 0.00000364}, liquidities={"MintPump1": 100.0})',
+    '    out["pumpfun_kept_open"] = "MintPump1" in acct.state["positions"]',
+    '    # Price recovers to 0.000005757 (+33.9%) -> stays open waiting for fixed TP +45%, then sells at TP',
+    '    acct.check_exits({"MintPump1": 0.000005757}, liquidities={"MintPump1": 4500.0})',
+    '    out["still_open_at_5757"] = "MintPump1" in acct.state["positions"]',
+    '    acct.check_exits({"MintPump1": 0.00000630}, liquidities={"MintPump1": 4800.0})',
+    '    out["closed_at_tp"] = "MintPump1" not in acct.state["positions"]',
+    '    # 2. AMM coin entered via PumpPortal synthetic liquidity -> first DexScreener poll recalibrates baseline cleanly; mild -16% dip with healthy quote never triggers',
+    '    acct.buy("MintAmm1", "AMM1", 0.0000100, meta={"dex": "pumpswap", "liquidity_usd": 4200.0, "liq_source": "pumpportal"})',
+    '    acct.check_exits({"MintAmm1": 0.0000084}, liquidities={"MintAmm1": 1800.0}, healthy_rev_quotes={"MintAmm1"})',
+    '    acct.check_exits({"MintAmm1": 0.0000084}, liquidities={"MintAmm1": 400.0}, healthy_rev_quotes={"MintAmm1"})',
+    '    out["mild_dip_with_quote_kept"] = "MintAmm1" in acct.state["positions"]',
+    '    # 3. AMM coin single-poll liquidity drop glitch does not exit immediately, but 2 consecutive confirmed AMM drops without healthy quote DO exit',
+    '    acct.check_exits({"MintAmm1": 0.0000060}, liquidities={"MintAmm1": 300.0}, healthy_rev_quotes=set())',
+    '    out["single_poll_kept"] = "MintAmm1" in acct.state["positions"]',
+    '    acct.check_exits({"MintAmm1": 0.0000060}, liquidities={"MintAmm1": 300.0}, healthy_rev_quotes=set())',
+    '    out["two_poll_amm_rug_exited"] = "MintAmm1" not in acct.state["positions"]',
+    '    # 4. monitor() must NOT coerce missing DexScreener liquidity.usd (None) into 0.0',
+    '    acct.buy("MintMon1", "MON1", 0.0000100, meta={"dex": "pumpswap", "liquidity_usd": 5000.0, "liq_source": "dexscreener"})',
+    '    bot._last_liq_poll[0] = 0.0',
+    '    bot.get_sol_price_usd = lambda c: (70.0, time.time())',
+    '    bot.get_json = lambda url, **k: [{"baseToken": {"address": "MintMon1"}, "dexId": "pumpswap", "priceUsd": "0.0000085"}] if "dexscreener" in url else None',
+    '    bot.monitor(acct)',
+    '    out["mon_kept_missing_liq"] = "MintMon1" in acct.state["positions"]',
+    '    out["mon_liq_preserved"] = acct.state["positions"]["MintMon1"]["current_liquidity_usd"]',
+    'finally:',
+    '    bot._base_dir = orig_base',
+    '    shutil.rmtree(tmp_dir, ignore_errors=True)',
+    'print(json.dumps(out))',
+  ].join('\n');
 
+  const raw = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+  const out = JSON.parse(raw.trim().split('\n').pop() || '{}');
 
-
-
+  assert.equal(out.pumpfun_kept_open, true);
+  assert.equal(out.still_open_at_5757, true);
+  assert.equal(out.closed_at_tp, true);
+  assert.equal(out.mild_dip_with_quote_kept, true);
+  assert.equal(out.single_poll_kept, true);
+  assert.equal(out.two_poll_amm_rug_exited, true);
+  assert.equal(out.mon_kept_missing_liq, true);
+  assert.equal(out.mon_liq_preserved, 5000.0);
+});

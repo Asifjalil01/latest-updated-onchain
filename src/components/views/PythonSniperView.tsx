@@ -1593,6 +1593,12 @@ export function PythonSniperView() {
                         !isNaN(numericVal) ? numericVal : 0
                       )
                     : null;
+                const rugHelper =
+                  key === 'auto_rug_exit'
+                    ? val === true || val === 'true'
+                      ? 'Skips Pump.fun curves · needs 2 confirmed LP-drain polls (set False to hold all dips)'
+                      : 'LP-drain emergency sell off — only TP/SL/Trail exits apply'
+                    : null;
 
                     const hasTpRecoveryError =
                       key === 'take_profit_pct' && recoverPrincipalOn && !draftValidation.valid;
@@ -1662,6 +1668,11 @@ export function PythonSniperView() {
                         {trailHelper && (
                           <p className="font-mono text-[11px] font-medium text-teal-600 dark:text-teal-400">
                             {trailHelper}
+                          </p>
+                        )}
+                        {rugHelper && (
+                          <p className="font-mono text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                            {rugHelper}
                           </p>
                         )}
                         {hasTpRecoveryError && draftValidation.error && (

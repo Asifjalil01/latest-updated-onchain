@@ -1307,6 +1307,8 @@ class TradingAccount:
             "age_at_entry": round(meta.get("age_s", 0), 1),
             "entry_liquidity_usd": meta.get("liquidity_usd"),
             "current_liquidity_usd": meta.get("liquidity_usd"),
+            "entry_liq_source": meta.get("liq_source", "dexscreener"),
+            "liq_drop_streak": 0,
             **extra_pos,
         }
         self.state["blacklist"].append(mint)
@@ -1572,6 +1574,8 @@ class TradingAccount:
         entry_liquidity_usd=None,
         current_liquidity_usd=None,
         rug_liq_drop_pct=60.0,
+        dex="",
+        liq_drop_confirmed=True,
     ):
         """Return (reason_or_none, trailing_active, drop_from_peak_pnl_pct)."""
         if not entry or entry <= 0 or not price or price <= 0:
@@ -1584,8 +1588,17 @@ class TradingAccount:
         peak_chg_pct = round((peak / entry - 1.0) * 100.0, 6)
         drop_from_peak_pct = max(0.0, round(peak_chg_pct - change_pct, 6))
 
-        # 1. Emergency auto-rug exit if pool liquidity drains sharply below entry floor
-        if auto_rug_exit and entry_liquidity_usd is not None and entry_liquidity_usd >= 500.0 and current_liquidity_usd is not None:
+        # 1. Emergency auto-rug exit if AMM pool liquidity drains sharply below entry floor
+        # Pump.fun bonding curves cannot have LP withdrawn; never false-trigger rug_liquidity_drop on bonding curves.
+        is_bonding_curve = str(dex or "").strip().lower() == "pumpfun"
+        if (
+            auto_rug_exit
+            and not is_bonding_curve
+            and liq_drop_confirmed
+            and entry_liquidity_usd is not None
+            and entry_liquidity_usd >= 500.0
+            and current_liquidity_usd is not None
+        ):
             liq_drop_limit = max(20.0, min(95.0, float(rug_liq_drop_pct or 60.0)))
             liq_drop_pct = (1.0 - float(current_liquidity_usd) / float(entry_liquidity_usd)) * 100.0
             if float(current_liquidity_usd) < 250.0 or liq_drop_pct >= liq_drop_limit:
@@ -1631,11 +1644,13 @@ class TradingAccount:
         return None, trailing_active, drop_from_peak_pct
 
     @locked
-    def check_exits(self, prices, liquidities=None):
+    def check_exits(self, prices, liquidities=None, healthy_rev_quotes=None, dex_updates=None):
         if _should_stop():
             return 0
         self._drain_delete_queue()
         liquidities = liquidities or {}
+        healthy_rev_quotes = healthy_rev_quotes or set()
+        dex_updates = dex_updates or {}
         exits = 0
         tp = float(self.cfg.get("take_profit_pct", 50) or 0.0)
         sl = float(self.cfg.get("stop_loss_pct", 0) or 0.0)
@@ -1652,8 +1667,25 @@ class TradingAccount:
         for mint, pos in list(self.state["positions"].items()):
             if _should_stop():
                 break
+            prev_dex = str(pos.get("dex") or "").strip().lower()
+            new_dex = str(dex_updates.get(mint) or "").strip().lower()
+            if new_dex and new_dex != "?" and new_dex != prev_dex:
+                pos["dex"] = new_dex
+                # If bonding curve migrated to AMM, wait to recalibrate baseline from AMM liquidity
+                if prev_dex == "pumpfun" and new_dex != "pumpfun":
+                    pos["entry_liq_source"] = "pumpportal"
+                    pos["liq_drop_streak"] = 0
+            pos_dex = str(pos.get("dex") or "").strip().lower()
+
             if mint in liquidities and liquidities[mint] is not None:
-                pos["current_liquidity_usd"] = liquidities[mint]
+                liq_val = float(liquidities[mint])
+                if not (pos_dex == "pumpfun" and liq_val <= 0):
+                    if pos.get("entry_liq_source") == "pumpportal" and liq_val > 0 and pos_dex != "pumpfun":
+                        pos["entry_liquidity_usd"] = liq_val
+                        pos["entry_liq_source"] = "dexscreener"
+                        pos["liq_drop_streak"] = 0
+                    pos["current_liquidity_usd"] = liq_val
+
             price = prices.get(mint)
             if price is None or price <= 0:
                 continue
@@ -1669,6 +1701,27 @@ class TradingAccount:
             pos["pnl_usd"] = round(proceeds - pos["cost"], 4)
             pos["peak_pct"] = round((pos["peak_price"] / entry - 1) * 100, 2)
             pos["low_pct"] = round((pos["low_price"] / entry - 1) * 100, 2)
+
+            entry_liq = pos.get("entry_liquidity_usd")
+            cur_liq = pos.get("current_liquidity_usd")
+            liq_drop_confirmed = False
+            if auto_rug and pos_dex != "pumpfun" and entry_liq is not None and entry_liq >= 500.0 and cur_liq is not None:
+                liq_drop_limit = max(20.0, min(95.0, float(rug_drop or 60.0)))
+                liq_drop_pct_now = (1.0 - float(cur_liq) / float(entry_liq)) * 100.0
+                looks_drained = float(cur_liq) < 250.0 or liq_drop_pct_now >= liq_drop_limit
+                if looks_drained:
+                    has_healthy_quote = mint in healthy_rev_quotes
+                    # Never panic-sell on a mild dip when a live Jupiter reverse exit quote is still active
+                    if has_healthy_quote and change > -35.0:
+                        pos["liq_drop_streak"] = 0
+                    else:
+                        pos["liq_drop_streak"] = int(pos.get("liq_drop_streak") or 0) + 1
+                        if pos["liq_drop_streak"] >= 2 or (change <= -50.0 and not has_healthy_quote):
+                            liq_drop_confirmed = True
+                else:
+                    pos["liq_drop_streak"] = 0
+            else:
+                pos["liq_drop_streak"] = 0
 
             held_min = max(0.0, (now_ts - pos["opened"]) / 60.0)
             reason, trailing_active, _drop_pct = self.evaluate_exit_signal(
@@ -1687,9 +1740,11 @@ class TradingAccount:
                 next_scale_out_pct=pos.get("next_scale_out_pct"),
                 stop_loss_pct=sl,
                 auto_rug_exit=auto_rug,
-                entry_liquidity_usd=pos.get("entry_liquidity_usd"),
-                current_liquidity_usd=pos.get("current_liquidity_usd"),
+                entry_liquidity_usd=entry_liq,
+                current_liquidity_usd=cur_liq,
                 rug_liq_drop_pct=rug_drop,
+                dex=pos_dex,
+                liq_drop_confirmed=liq_drop_confirmed,
             )
             was_active = bool(pos.get("trailing_active"))
             pos["trailing_active"] = trailing_active
@@ -1898,7 +1953,13 @@ def scan_and_buy(acct, cfg):
         price = _f(pair.get("priceUsd"))
         if price is None or price <= 0: continue
         liq_usd = _f((pair.get("liquidity") or {}).get("usd"))
-        meta = {"dex": pair.get("dexId") or "?", "source": _src_of.get(mint, "?"), "age_s": age_s, "liquidity_usd": liq_usd}
+        meta = {
+            "dex": pair.get("dexId") or "?",
+            "source": _src_of.get(mint, "?"),
+            "age_s": age_s,
+            "liquidity_usd": liq_usd,
+            "liq_source": "pumpportal" if pair.get("_synthetic") else "dexscreener",
+        }
         if acct.buy(mint, symbol, price, pair.get("url"), meta):
             with _stats_lock: _stats["bought"] += 1
             if acct.is_slots_full()[0]:
@@ -2018,6 +2079,7 @@ def monitor(acct):
     if rev_prices:
         prices.update(rev_prices)
     liquidities = {}
+    dex_updates = {}
     missing = [mint for mint in mints if mint not in prices]
     need_liq_check = bool(acct.cfg.get("auto_rug_exit", True)) and (time.time() - _last_liq_poll[0] >= 3.0)
     ds_targets = mints if need_liq_check else missing
@@ -2035,19 +2097,30 @@ def monitor(acct):
                 mint = (p.get("baseToken") or {}).get("address")
                 if mint in pos:
                     price = _f(p.get("priceUsd"))
-                    liq = _f((p.get("liquidity") or {}).get("usd")) or 0.0
+                    raw_liq = _f((p.get("liquidity") or {}).get("usd"))
+                    dex_id = str(p.get("dexId") or "").strip().lower()
+                    liq_valid = raw_liq if (raw_liq is not None and (raw_liq > 0 or dex_id != "pumpfun")) else None
+                    score_liq = liq_valid if liq_valid is not None else -1.0
                     cur = best_by_mint.get(mint)
-                    if cur is None or liq > cur[0]:
-                        best_by_mint[mint] = (liq, price)
-            for mint, (liq, price) in best_by_mint.items():
-                liquidities[mint] = liq
+                    if cur is None or score_liq > cur[0]:
+                        best_by_mint[mint] = (score_liq, liq_valid, price, dex_id)
+            for mint, (_score_liq, liq_valid, price, dex_id) in best_by_mint.items():
+                if dex_id:
+                    dex_updates[mint] = dex_id
+                if liq_valid is not None:
+                    liquidities[mint] = liq_valid
                 if mint not in prices and price is not None and price > 0:
                     prices[mint] = price
 
     if _should_stop():
         return prices
     _process_sell_queue(acct, prices)
-    acct.check_exits(prices, liquidities=liquidities)
+    acct.check_exits(
+        prices,
+        liquidities=liquidities,
+        healthy_rev_quotes=set(rev_prices.keys()),
+        dex_updates=dex_updates,
+    )
     return prices
 
 def probe(cfg):
