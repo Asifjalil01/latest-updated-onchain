@@ -19,6 +19,7 @@ import {
   Download,
   Trash2,
   Clock,
+  Globe,
 } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import {
@@ -176,6 +177,26 @@ const PYTHON_SETTING_NOTES: Record<string, string> = {
   jito_tip_sol: 'Optional Jito validator tip in SOL on live swaps for faster block landing (0 = disabled).',
   custom_rpc_url: 'Optional private Helius/QuickNode RPC placed first ahead of free public RPCs.',
 };
+
+const SNIPER_WEBSITE_OPTIONS: Array<{ id: string; name: string; domain: string; note: string }> = [
+  { id: 'pumpfun', name: 'Pump.fun', domain: 'pump.fun', note: 'Bonding-curve & *pump launches' },
+  { id: 'pumpswap', name: 'PumpSwap', domain: 'swap.pump.fun', note: 'Graduated Pump.fun AMM pools' },
+  { id: 'axiom', name: 'Axiom Trade', domain: 'axiom.trade', note: 'Axiom Pulse / Trenches launchpads' },
+  { id: 'letsbonk', name: 'LetsBonk.fun', domain: 'letsbonk.fun', note: 'Bonk launchpad & *bonk mints' },
+  { id: 'raydium', name: 'Raydium / LaunchLab', domain: 'raydium.io', note: 'Raydium CPMM, CLMM & LaunchLab' },
+  { id: 'meteora', name: 'Meteora', domain: 'meteora.ag', note: 'Meteora DLMM & DAMM v2 pools' },
+  { id: 'moonshot', name: 'Moonshot', domain: 'moonshot.cc', note: 'Moonshot launchpad & *moon mints' },
+  { id: 'bags', name: 'Bags', domain: 'bags.fm', note: 'Bags.fm creator fee launches' },
+  { id: 'believe', name: 'Believe', domain: 'believe.app', note: 'Believe / LaunchCoin launches' },
+  { id: 'boop', name: 'Boop', domain: 'boop.fun', note: 'Boop.fun meme launches' },
+  { id: 'orca', name: 'Orca', domain: 'orca.so', note: 'Orca Whirlpool DEX pools' },
+  { id: 'jupiter', name: 'Jupiter', domain: 'jup.ag', note: 'Jupiter Studio / recent feed' },
+  { id: 'gmgn', name: 'GMGN', domain: 'gmgn.ai', note: 'GMGN sniper & trench pools' },
+  { id: 'photon', name: 'Photon', domain: 'photon-sol.tinyastro.io', note: 'Photon Solana meme pools' },
+  { id: 'bullx', name: 'BullX', domain: 'bullx.io', note: 'BullX Pump Vision pools' },
+  { id: 'dexscreener', name: 'DexScreener', domain: 'dexscreener.com', note: 'DexScreener indexed / profile feeds' },
+  { id: 'geckoterminal', name: 'GeckoTerminal', domain: 'geckoterminal.com', note: 'GeckoTerminal new pools feed' },
+];
 
 function fmtHeld(minutes: number): string {
   if (minutes < 1) {
@@ -444,6 +465,15 @@ export function PythonSniperView() {
       }
       if (!('auto_rug_exit' in payload)) payload.auto_rug_exit = false;
       if (!('require_lp_locked' in payload)) payload.require_lp_locked = false;
+      payload.enabled_platforms = Array.isArray(draftSettings.enabled_platforms)
+        ? Array.from(
+            new Set(
+              draftSettings.enabled_platforms
+                .map((v: unknown) => String(v).trim().toLowerCase())
+                .filter(Boolean)
+            )
+          )
+        : [];
 
       const clientCheck = validatePythonSniperSettings({ ...payload, mode }, solPriceUsd);
       if (!clientCheck.valid) {
@@ -1532,6 +1562,9 @@ export function PythonSniperView() {
                     priority_fee_tier: 'fast',
                     recover_principal_enabled: false,
                     use_promoted_feeds: false,
+                    enabled_platforms: Array.isArray(draftSettings.enabled_platforms)
+                      ? draftSettings.enabled_platforms
+                      : [],
                   });
                   markSettingsDirty(true);
                   pushToast({
@@ -1727,6 +1760,130 @@ export function PythonSniperView() {
                     );
                   })}
                 </div>
+
+                {(() => {
+                  const selectedWebsites: string[] = Array.isArray(draftSettings.enabled_platforms)
+                    ? draftSettings.enabled_platforms.map((x: unknown) => String(x).trim().toLowerCase()).filter(Boolean)
+                    : [];
+                  const toggleWebsite = (siteId: string) => {
+                    const next = selectedWebsites.includes(siteId)
+                      ? selectedWebsites.filter((id) => id !== siteId)
+                      : [...selectedWebsites, siteId];
+                    setDraftSettings({ ...draftSettings, enabled_platforms: next });
+                    markSettingsDirty(true);
+                  };
+                  const setWebsites = (next: string[]) => {
+                    setDraftSettings({ ...draftSettings, enabled_platforms: next });
+                    markSettingsDirty(true);
+                  };
+
+                  return (
+                    <div
+                      data-testid="sniper-website-filter"
+                      className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 p-4 space-y-3"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-2">
+                            <Globe className="w-4 h-4 text-teal-600 dark:text-teal-400" />
+                            <h3 className="text-xs font-bold text-slate-800 dark:text-slate-100">
+                              Target Websites / Launchpads Filter
+                            </h3>
+                            <span
+                              data-testid="sniper-website-status"
+                              className={`px-2 py-0.5 rounded-md font-mono text-[10px] font-bold border ${
+                                selectedWebsites.length === 0
+                                  ? 'bg-teal-500/10 text-teal-700 dark:text-teal-300 border-teal-500/30'
+                                  : 'bg-amber-500/10 text-amber-700 dark:text-amber-300 border-amber-500/30'
+                              }`}
+                            >
+                              {selectedWebsites.length === 0
+                                ? 'All Websites Active'
+                                : `${selectedWebsites.length} Selected Only`}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                            Leave all unchecked to search every website, or check specific websites to scan &amp; buy ONLY coins from those platforms.
+                          </p>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setWebsites([])}
+                            className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                              selectedWebsites.length === 0
+                                ? 'bg-teal-600 text-white border-teal-600'
+                                : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            All Websites (Any)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setWebsites(['pumpfun'])}
+                            className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                              selectedWebsites.length === 1 && selectedWebsites[0] === 'pumpfun'
+                                ? 'bg-teal-600 text-white border-teal-600'
+                                : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            Pump.fun Only
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setWebsites(['axiom'])}
+                            className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                              selectedWebsites.length === 1 && selectedWebsites[0] === 'axiom'
+                                ? 'bg-teal-600 text-white border-teal-600'
+                                : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            Axiom / Trenches
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5">
+                        {SNIPER_WEBSITE_OPTIONS.map((site) => {
+                          const checked = selectedWebsites.includes(site.id);
+                          return (
+                            <label
+                              key={site.id}
+                              htmlFor={`py-site-${site.id}`}
+                              className={`flex items-start gap-2.5 p-2.5 rounded-xl border text-left transition-colors cursor-pointer select-none ${
+                                checked
+                                  ? 'border-teal-500/60 bg-teal-500/10 dark:bg-teal-500/15'
+                                  : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] hover:border-slate-300 dark:hover:border-slate-700'
+                              }`}
+                            >
+                              <input
+                                id={`py-site-${site.id}`}
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => toggleWebsite(site.id)}
+                                className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 dark:border-slate-700 text-teal-600 focus:ring-teal-500 cursor-pointer shrink-0"
+                              />
+                              <div className="min-w-0 flex-1 space-y-0.5">
+                                <div className="flex items-center justify-between gap-1.5">
+                                  <span className="text-xs font-semibold text-slate-800 dark:text-slate-100 truncate">
+                                    {site.name}
+                                  </span>
+                                  <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 shrink-0">
+                                    {site.domain}
+                                  </span>
+                                </div>
+                                <p className="text-[11px] leading-snug text-slate-500 dark:text-slate-400">
+                                  {site.note}
+                                </p>
+                              </div>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {recoverPrincipalOn && (
                   <div

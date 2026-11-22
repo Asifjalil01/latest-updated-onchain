@@ -57,9 +57,10 @@ CONFIG = {
     "use_rugcheck": True, "strict_rugcheck": True, "require_lp_locked": False,
     "block_insider_bundles": True, "block_creator_dump": True, "max_dev_hold_pct": 5.0,
     "rugcheck_max_score": 55.0, "max_top10_holder_pct": 35.0, "rug_recheck_minutes": 15,
-    # candidate sources (any-DEX coverage)
+    # candidate sources & website filters (empty = all websites)
     "use_gecko": True, "use_jupiter_recent": True, "use_dex_profiles": True,
     "use_pumpportal": True, "use_promoted_feeds": False,
+    "enabled_platforms": [],
     # execution & speed
     "slippage_pct": 3.0, "fee_pct": 1.0,
     "priority_fee_tier": "fast", "jito_tip_sol": 0.0,
@@ -560,9 +561,102 @@ def fetch_candidate_mints(cfg, force=False):
         fresh = fresh + due_retries
     return fresh
 
-# ---------------------------------------------------------------- entry filters & momentum ranking
-def passes_filters(pair, cfg, now_ms=None):
+# ---------------------------------------------------------------- website / launchpad filter & entry scoring
+def _extract_pair_websites(pair):
+    urls = []
+    if not isinstance(pair, dict):
+        return ""
+    if not pair.get("_synthetic") and pair.get("url"):
+        urls.append(str(pair.get("url")))
+    info = pair.get("info") if isinstance(pair.get("info"), dict) else {}
+    for w in (info.get("websites") or []):
+        if isinstance(w, dict) and w.get("url"):
+            urls.append(str(w.get("url")))
+        elif isinstance(w, str):
+            urls.append(w)
+    for s in (info.get("socials") or []):
+        if isinstance(s, dict) and s.get("url"):
+            urls.append(str(s.get("url")))
+    return " ".join(urls).lower()
+
+def matches_enabled_platforms(pair, mint="", source="", cfg=None):
+    """Check whether pair/mint/source matches user-checked websites in enabled_platforms ([] = all allowed)."""
+    selected_raw = (cfg or {}).get("enabled_platforms") if isinstance(cfg, dict) else None
+    if not isinstance(selected_raw, list) or not selected_raw:
+        return True, "all"
+    selected = [str(x).strip().lower() for x in selected_raw if str(x).strip()]
+    if not selected:
+        return True, "all"
+
+    mint_str = str(mint or (pair.get("baseToken") or {}).get("address") or "").strip()
+    mint_low = mint_str.lower()
+    dex_raw = str((pair or {}).get("dexId") or "").strip().lower()
+    dex_norm = dex_raw.replace("-", "").replace("_", "").replace(" ", "")
+    labels_blob = " ".join(str(x).lower() for x in ((pair or {}).get("labels") or []))
+    websites_blob = _extract_pair_websites(pair)
+    src_low = str(source or (pair or {}).get("_source") or "").strip().lower()
+
+    is_pumpfun = dex_norm in ("pumpfun", "pump") or mint_low.endswith("pump") or "pump.fun" in websites_blob
+    is_pumpswap = dex_norm in ("pumpswap", "pumpfunamm") or "swap.pump.fun" in websites_blob
+    is_letsbonk = "bonk" in dex_norm or mint_low.endswith("bonk") or "letsbonk.fun" in websites_blob or "bonk.fun" in websites_blob
+    is_raydium = "raydium" in dex_norm or "launchlab" in dex_norm or "launchlab" in labels_blob or "raydium.io" in websites_blob
+    is_meteora = "meteora" in dex_norm or "dlmm" in labels_blob or "damm" in labels_blob or "meteora.ag" in websites_blob
+    is_moonshot = "moonshot" in dex_norm or mint_low.endswith("moon") or "moonshot" in websites_blob
+    is_bags = "bags" in dex_norm or mint_str.endswith("BAGS") or "bags.fm" in websites_blob
+    is_believe = "believe" in dex_norm or "believe.app" in websites_blob or "launchcoin" in websites_blob
+    is_boop = "boop" in dex_norm or mint_low.endswith("boop") or "boop.fun" in websites_blob
+    is_orca = "orca" in dex_norm or "whirlpool" in dex_norm or "orca.so" in websites_blob
+    is_jupiter = src_low == "jup" or "jupiter" in dex_norm or dex_norm == "jup" or mint_low.endswith("jup") or "jup.ag" in websites_blob
+    is_dexscreener = src_low in ("profiles", "boosts") or (not (pair or {}).get("_synthetic") and "dexscreener.com" in websites_blob)
+    is_gecko = src_low == "gecko" or "geckoterminal.com" in websites_blob
+
+    checks = {
+        "pumpfun": is_pumpfun and not is_pumpswap,
+        "pumpswap": is_pumpswap,
+        "axiom": (
+            "axiom.trade" in websites_blob
+            or is_pumpfun or is_pumpswap or is_letsbonk or is_raydium
+            or is_meteora or is_moonshot or is_bags or is_believe or is_boop
+        ),
+        "letsbonk": is_letsbonk,
+        "raydium": is_raydium,
+        "meteora": is_meteora,
+        "moonshot": is_moonshot,
+        "bags": is_bags,
+        "believe": is_believe,
+        "boop": is_boop,
+        "orca": is_orca,
+        "jupiter": is_jupiter,
+        "gmgn": (
+            "gmgn.ai" in websites_blob
+            or is_pumpfun or is_pumpswap or is_letsbonk or is_raydium or is_meteora or is_moonshot
+        ),
+        "photon": (
+            "tinyastro" in websites_blob or "photon" in websites_blob
+            or is_pumpfun or is_pumpswap or is_raydium or is_meteora or is_moonshot
+        ),
+        "bullx": (
+            "bullx.io" in websites_blob
+            or is_pumpfun or is_pumpswap or is_raydium or is_meteora or is_moonshot
+        ),
+        "dexscreener": is_dexscreener,
+        "geckoterminal": is_gecko,
+    }
+    # If user explicitly selected pumpfun, allow migrated pumpswap coins whose mint ends in 'pump' only if pumpswap wasn't excluded, or treat *pump mints on pumpfun as matching pumpfun
+    if "pumpfun" in selected and is_pumpfun:
+        return True, "pumpfun"
+    for plat in selected:
+        if checks.get(plat):
+            return True, plat
+    return False, f"dex={dex_raw or '?'} src={src_low or '?'} not in [{','.join(selected)}]"
+
+def passes_filters(pair, cfg, now_ms=None, source=None):
     """Returns (ok, short_reason_code, detail)."""
+    mint_addr = (pair.get("baseToken") or {}).get("address") or ""
+    src_hint = source if source is not None else _src_of.get(mint_addr, "")
+    ok_plat, plat_detail = matches_enabled_platforms(pair, mint_addr, src_hint, cfg)
+    if not ok_plat:
+        return False, "wrong website", plat_detail
     now_ms = now_ms or int(time.time() * 1000)
     created = int(pair.get("pairCreatedAt") or 0)
     if created <= 0: return False, "missing data", "no pairCreatedAt"
@@ -1926,7 +2020,7 @@ def scan_and_buy(acct, cfg):
             return
         if mint in acct.state["positions"] or mint in acct.state["blacklist"]: continue
         symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
-        okp, code, detail = passes_filters(pair, cfg, now_ms)
+        okp, code, detail = passes_filters(pair, cfg, now_ms, source=_src_of.get(mint, ""))
         with _stats_lock: _stats["checked"] += 1
         if not okp:
             if code == "too old":
@@ -2161,7 +2255,8 @@ def probe(cfg):
             m5 = (p.get("txns") or {}).get("m5") or {}
             buys, sells = int(m5.get("buys") or 0), int(m5.get("sells") or 0)
             chg = _f((p.get("priceChange") or {}).get("m5"))
-            ok, code, detail = passes_filters(p, cfg, now_ms)
+            pmint = (p.get("baseToken") or {}).get("address") or ""
+            ok, code, detail = passes_filters(p, cfg, now_ms, source=_src_of.get(pmint, ""))
             tag = "WOULD BUY → rug check" if ok else f"filtered: {code} ({detail})"
             early = " [ultra-early]" if 0 <= age <= grace else ""
             log(f"probe: {sym:<10} {str(p.get('dexId', '?'))[:10]:<10} age={age:6.1f}s{early} liq=${liq:8.0f} {buys}b/{sells}s m5={chg if chg is not None else '?'}% → {tag}")
@@ -2242,6 +2337,8 @@ def run(once=False):
         if bal_sol is not None:
             log(f"Wallet balance: {float(bal_sol):.4f} SOL (${float(bal_usd):.2f}) | trade size ${CONFIG['trade_size_usd']:.2f}")
     log(f"Sources: gecko={CONFIG['use_gecko']} jupiter={CONFIG['use_jupiter_recent']} profiles={CONFIG['use_dex_profiles']} pumpportal={CONFIG['use_pumpportal']} boosts={CONFIG['use_promoted_feeds']}{sol_banner}")
+    plats = CONFIG.get("enabled_platforms") if isinstance(CONFIG.get("enabled_platforms"), list) else []
+    log(f"Websites: {', '.join(str(x) for x in plats) if plats else 'ALL (no restriction)'}")
     tp_cfg = float(CONFIG.get("take_profit_pct", 50) or 0.0)
     tr_cfg = float(CONFIG.get("trailing_stop_pct", 0) or 0.0)
     rec_enabled = bool(CONFIG.get("recover_principal_enabled", False))

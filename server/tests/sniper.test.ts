@@ -1094,9 +1094,9 @@ test('v1.32.0: afk +73.1% -> +25.36% trailing stop fires even with recover_princ
     // 5. passes_filters: honeypot pattern (12 buys / 0 sells after 30s) & no grace bypass at grace=0
     'now_ms = int(time.time() * 1000)',
     'honeypot_pair = {"pairCreatedAt": now_ms - 45000, "priceUsd": "0.001", "liquidity": {"usd": 5000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 14, "sells": 0}}}',
-    'out["honeypot_filter"] = bot.passes_filters(honeypot_pair, dict(bot.CONFIG), now_ms)',
+    'out["honeypot_filter"] = bot.passes_filters(honeypot_pair, dict(bot.CONFIG, enabled_platforms=[]), now_ms)',
     'low_liq_young = {"pairCreatedAt": now_ms - 5000, "priceUsd": "0.001", "liquidity": {"usd": 400}, "volume": {"m5": 2000}, "txns": {"m5": {"buys": 10, "sells": 2}}}',
-    'out["no_grace_bypass"] = bot.passes_filters(low_liq_young, dict(bot.CONFIG), now_ms)',
+    'out["no_grace_bypass"] = bot.passes_filters(low_liq_young, dict(bot.CONFIG, enabled_platforms=[]), now_ms)',
     // 6. hard_rug_check: Token-2022 disallowed extension rejection
     'cfg = dict(bot.CONFIG)',
     'bot._check_sell_route = lambda *a, **k: (True, "ok")',
@@ -1616,7 +1616,7 @@ test('v1.33.0: bot.py blocks bundled insider RugCheck reports, creator holds/dum
     'import bot',
     'out = {}',
     'out["defaults"] = {"liq": bot.CONFIG["min_liquidity_usd"], "ratio": bot.CONFIG["min_buy_sell_ratio_m5"], "bundles": bot.CONFIG["block_insider_bundles"]}',
-    'cfg = dict(bot.CONFIG)',
+    'cfg = dict(bot.CONFIG, enabled_platforms=[])',
     'now_ms = int(time.time() * 1000)',
     'slow_pair = {"baseToken": {"address": "M1", "symbol": "SLOW"}, "pairCreatedAt": now_ms - 25000, "priceUsd": "0.0001", "liquidity": {"usd": 6500}, "txns": {"m5": {"buys": 12, "sells": 5}}, "volume": {"m5": 3000}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 1, "sells_60s": 0}}',
     'out["low_vel"] = list(bot.passes_filters(slow_pair, cfg, now_ms))',
@@ -1769,4 +1769,69 @@ test('v1.33.2: defaults auto_rug_exit & require_lp_locked to False, unblocks Pum
   assert.equal(out.goat_pumpswap_ok[0], true);
   assert.equal(out.pumpswap_ok_even_when_lp_req[0], true);
 });
+
+test('v1.34.0: website/launchpad checkboxes normalize in SniperManager and strictly filter coins in bot.py', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1340-'));
+  try {
+    const manager = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const updated = manager.updateSettings({
+      enabled_platforms: [' PumpFun ', 'axiom', 'pumpfun', ''],
+    });
+    assert.equal(updated.ok, true);
+    assert.deepEqual(updated.settings?.enabled_platforms, ['pumpfun', 'axiom']);
+    const saved = JSON.parse(fs.readFileSync(path.join(tmpDir, 'settings.json'), 'utf-8'));
+    assert.deepEqual(saved.enabled_platforms, ['pumpfun', 'axiom']);
+    const cleared = manager.updateSettings({ enabled_platforms: [] });
+    assert.equal(cleared.ok, true);
+    assert.deepEqual(cleared.settings?.enabled_platforms, []);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  const pyScript = [
+    'import sys, types, json, time',
+    'req = types.ModuleType("requests")',
+    'class DummySess:',
+    '    def get(self, *a, **k): raise RuntimeError("no net")',
+    '    def post(self, *a, **k): raise RuntimeError("no net")',
+    'req.Session = lambda: DummySess()',
+    'sys.modules["requests"] = req',
+    'sys.path.insert(0, "sniper")',
+    'import bot',
+    'now_ms = int(time.time() * 1000)',
+    'base_metrics = {"pairCreatedAt": now_ms - 30000, "priceUsd": "0.0001", "liquidity": {"usd": 8000}, "volume": {"m5": 4000}, "txns": {"m5": {"buys": 12, "sells": 4}}, "priceChange": {"m5": 15}}',
+    'p_pump = {**base_metrics, "dexId": "pumpfun", "baseToken": {"address": "Mint111pump", "symbol": "PMP"}}',
+    'p_orca = {**base_metrics, "dexId": "orca", "baseToken": {"address": "Mint222orca", "symbol": "ORC"}}',
+    'p_bonk = {**base_metrics, "dexId": "raydium", "baseToken": {"address": "Mint333bonk", "symbol": "BNK"}, "info": {"websites": [{"url": "https://letsbonk.fun/token/Mint333bonk"}]}}',
+    'p_synth = {**base_metrics, "_synthetic": True, "url": "https://dexscreener.com/solana/MintSynth", "dexId": "pumpfun", "baseToken": {"address": "Mint444pump", "symbol": "SYN"}}',
+    'out = {}',
+    // Empty list allows everything
+    'cfg_all = dict(bot.CONFIG, enabled_platforms=[])',
+    'out["all_allows_orca"] = bot.passes_filters(p_orca, cfg_all, now_ms=now_ms, source="gecko")[0]',
+    // Pump.fun only allows pumpfun, rejects orca and letsbonk
+    'cfg_pump = dict(bot.CONFIG, enabled_platforms=["pumpfun"])',
+    'out["pump_allows_pump"] = bot.passes_filters(p_pump, cfg_pump, now_ms=now_ms, source="pumpportal")[0]',
+    'r_orca = bot.passes_filters(p_orca, cfg_pump, now_ms=now_ms, source="gecko")',
+    'out["pump_rejects_orca"] = (r_orca[0], r_orca[1])',
+    // Axiom allows trenches (pumpfun/letsbonk) and rejects orca-only
+    'cfg_axiom = dict(bot.CONFIG, enabled_platforms=["axiom"])',
+    'out["axiom_allows_bonk"] = bot.passes_filters(p_bonk, cfg_axiom, now_ms=now_ms, source="profiles")[0]',
+    'out["axiom_rejects_orca"] = bot.passes_filters(p_orca, cfg_axiom, now_ms=now_ms, source="gecko")[0]',
+    // Synthetic PumpPortal fallback dexscreener URL must NOT falsely match dexscreener checkbox
+    'cfg_dex = dict(bot.CONFIG, enabled_platforms=["dexscreener"])',
+    'out["dex_ignores_synth"] = bot.passes_filters(p_synth, cfg_dex, now_ms=now_ms, source="pumpportal")[0]',
+    'print(json.dumps(out))',
+  ].join('\n');
+
+  const raw = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+  const out = JSON.parse(raw.trim().split('\n').pop() || '{}');
+
+  assert.equal(out.all_allows_orca, true);
+  assert.equal(out.pump_allows_pump, true);
+  assert.deepEqual(out.pump_rejects_orca, [false, 'wrong website']);
+  assert.equal(out.axiom_allows_bonk, true);
+  assert.equal(out.axiom_rejects_orca, false);
+  assert.equal(out.dex_ignores_synth, false);
+});
+
 

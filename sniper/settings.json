@@ -38,6 +38,7 @@
   "use_dex_profiles": true,
   "use_pumpportal": true,
   "use_promoted_feeds": false,
+  "enabled_platforms": [],
   "slippage_pct": 3,
   "fee_pct": 1,
   "priority_fee_tier": "fast",

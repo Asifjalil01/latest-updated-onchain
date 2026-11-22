@@ -2,6 +2,18 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.34.0 — Target Websites & Launchpads Checkboxes (`pump.fun`, `axiom.trade`, `pumpswap`, `letsbonk.fun`, `raydium`, `meteora`, `moonshot`, `bags.fm`, `believe.app`, `gmgn.ai`, `photon`, `bullx.io` & more) (`bot.py`, `settings.json`, `sniperManager.ts`, `PythonSniperView.tsx`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added
+- **Target Websites & Launchpads Filter (`PythonSniperView.tsx`, `bot.py`, `settings.json`, `sniperManager.ts`)**:
+  - Added a multi-select checkbox grid under **Python Sniper Bot → Settings** covering 17 Solana websites, launchpads, DEXes, and trading terminals: **Pump.fun** (`pump.fun`), **Axiom Trade** (`axiom.trade`), **PumpSwap** (`swap.pump.fun`), **LetsBonk** (`letsbonk.fun`), **Raydium / LaunchLab** (`raydium.io`), **Meteora** (`meteora.ag`), **Moonshot** (`moonshot.cc`), **Bags** (`bags.fm`), **Believe** (`believe.app`), **Boop** (`boop.fun`), **Orca** (`orca.so`), **Jupiter** (`jup.ag`), **GMGN** (`gmgn.ai`), **Photon** (`photon-sol.tinyastro.io`), **BullX** (`bullx.io`), **DexScreener** (`dexscreener.com`), and **GeckoTerminal** (`geckoterminal.com`), each with a concise note showing which coins/pools it searches.
+  - Added quick-selection shortcuts (**All Websites (Any)**, **Pump.fun Only**, **Axiom / Trenches**) and saved selections in `enabled_platforms` inside `settings.json`.
+  - When one or more website checkboxes are checked, `bot.py` (`matches_enabled_platforms` inside `passes_filters`, `scan_and_buy`, and `probe`) strictly restricts scanning and buying only to coins matching the checked website(s). Leaving all unchecked searches all websites.
+
+---
+
 ## v1.33.2 — Unblock Buys (`require_lp_locked` Fix on PumpSwap/Meteora), Streamline Settings & Purpose Notes on Every Field (`bot.py`, `settings.json`, `sniperManager.ts`, `PythonSniperView.tsx`)
 
 **Risk Warning: Trading can lose all of your money.**

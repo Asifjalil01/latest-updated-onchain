@@ -637,6 +637,7 @@ export class SniperManager {
       use_dex_profiles: true,
       use_pumpportal: true,
       use_promoted_feeds: false,
+      enabled_platforms: [],
       slippage_pct: 3.0,
       fee_pct: 1.0,
       priority_fee_tier: 'fast',
@@ -1107,6 +1108,17 @@ export class SniperManager {
             ? 'paper'
             : 'live'
           : 'paper',
+        enabled_platforms: Array.isArray(newSettings.enabled_platforms)
+          ? Array.from(
+              new Set(
+                newSettings.enabled_platforms
+                  .map((v: any) => String(v || '').trim().toLowerCase())
+                  .filter(Boolean)
+              )
+            )
+          : Array.isArray(current.enabled_platforms)
+            ? current.enabled_platforms
+            : [],
       };
       const validation = validatePythonSniperSettings(updated, this.solPriceUsd);
       if (!validation.valid) {
