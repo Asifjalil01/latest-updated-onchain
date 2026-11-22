@@ -100,8 +100,6 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['take_profit_pct', 'Take profit % (arms trailing stop, 0 = off)', 'float'],
   ['trailing_stop_pct', 'Trailing stop % from peak (0 = off)', 'float'],
   ['stop_loss_pct', 'Stop loss % (0 = off)', 'float'],
-  ['auto_rug_exit', 'Auto emergency sell on LP drain (rug exit)', 'bool'],
-  ['rug_liq_drop_pct', 'LP drain emergency sell trigger % (e.g. 50)', 'float'],
   ['slippage_pct', 'Slippage % (used in paper & live sells)', 'float'],
   ['use_real_swap_quotes', 'Exit monitor: real Jupiter reverse swap quotes', 'bool'],
 
@@ -116,7 +114,6 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   // Hard Anti-Rug & Anti-Bundle Protections (Important)
   ['use_rugcheck', 'Hard RugCheck (score + risks)', 'bool'],
   ['strict_rugcheck', 'Strict: reject ANY danger & missing reports', 'bool'],
-  ['require_lp_locked', 'Require LP burned/locked >= 80% (AMM pools)', 'bool'],
   ['block_insider_bundles', 'Block bundled / insider RugCheck wallets', 'bool'],
   ['max_dev_hold_pct', 'Max creator/dev wallet holdings %', 'float'],
   ['rugcheck_max_score', 'Max RugCheck risk score (0-100)', 'float'],
@@ -127,7 +124,10 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['jito_tip_sol', 'Optional Jito tip (SOL, 0 = off, e.g. 0.0001)', 'float'],
   ['custom_rpc_url', 'Private RPC URL (optional, Helius / QuickNode)', 'string'],
 
-  // --- Optional / Unimportant / Auto-Managed Settings (uncomment any line if needed later) ---
+  // --- Optional / Commented Settings (uncomment any line if needed later) ---
+  // ['auto_rug_exit', 'Auto emergency sell on LP drain (rug exit)', 'bool'],
+  // ['rug_liq_drop_pct', 'LP drain emergency sell trigger % (e.g. 50)', 'float'],
+  // ['require_lp_locked', 'Require LP burned/locked >= 80% (AMM pools)', 'bool'],
   // ['start_balance_usd', 'Start balance $ (paper reset only)', 'float'],
   // ['min_recent_buys_60s', 'Min buys in last 60s (PumpPortal stream)', 'int'],
   // ['recover_principal_enabled', 'Recover investment at TP (sell % + trailing ladder)', 'bool'],
@@ -152,6 +152,30 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   // ['jupiter_api_key', 'Jupiter API Key (optional)', 'string'],
   // ['python_binary_path', 'Python executable / path (auto, py, python, or full path to python.exe)', 'string'],
 ];
+
+const PYTHON_SETTING_NOTES: Record<string, string> = {
+  trade_size_usd: 'USD invested per coin buy (converted automatically to SOL in Live mode).',
+  max_open_positions: 'Max coins held at the same time; scanning pauses when all slots are full.',
+  daily_loss_limit_usd: 'Stops opening new buys for the day if realized daily loss reaches this $ cap.',
+  take_profit_pct: 'Profit target %: sells directly if Trailing Stop is 0, or arms Trailing Stop when > 0.',
+  slippage_pct: 'Max swap price tolerance % for fills and sells; higher speeds up fills on volatile launches.',
+  use_real_swap_quotes: 'Prices exits from live Jupiter token→SOL swap quotes instead of cached chart prices.',
+  max_age_minutes: 'Only buys brand-new coins launched within this many minutes; skips older tokens.',
+  min_liquidity_usd: 'Minimum pool liquidity $ required before entry to avoid shallow illiquid traps.',
+  min_volume_m5_usd: 'Minimum 5-minute trading volume $ to verify real active trader demand (0 = off).',
+  min_buys_m5: 'Minimum number of buy swaps in the last 5 minutes required to enter.',
+  min_buy_sell_ratio_m5: 'Buys must outnumber sells by this multiplier (e.g. 1.5 = 1.5× more buys than sells).',
+  max_price_change_m5_pct: 'Skips coins already up more than +X% in 5 minutes to avoid buying at the top.',
+  use_rugcheck: 'Runs on-chain RPC + RugCheck audit to block mintable, freezable, and Token-2022 scams.',
+  strict_rugcheck: 'Fail-closed guard: rejects tokens with missing RugCheck/RPC reports or critical risk flags.',
+  block_insider_bundles: 'Blocks bundled insider wallet clusters and tokens where the dev dumped during launch.',
+  max_dev_hold_pct: 'Rejects launches where the creator wallet still holds more than this % of total supply.',
+  rugcheck_max_score: 'Maximum allowed RugCheck risk score 0–100 (brand-new Solana launches baseline ~52).',
+  max_top10_holder_pct: 'Caps combined % held by top-10 private wallets (excludes DEX pool and burn addresses).',
+  priority_fee_tier: 'Solana compute priority fee speed (Fast/Turbo automatically boosts urgent stop/rug sells).',
+  jito_tip_sol: 'Optional Jito validator tip in SOL on live swaps for faster block landing (0 = disabled).',
+  custom_rpc_url: 'Optional private Helius/QuickNode RPC placed first ahead of free public RPCs.',
+};
 
 function fmtHeld(minutes: number): string {
   if (minutes < 1) {
@@ -418,6 +442,8 @@ export function PythonSniperView() {
           payload[key] = String(raw ?? '');
         }
       }
+      if (!('auto_rug_exit' in payload)) payload.auto_rug_exit = false;
+      if (!('require_lp_locked' in payload)) payload.require_lp_locked = false;
 
       const clientCheck = validatePythonSniperSettings({ ...payload, mode }, solPriceUsd);
       if (!clientCheck.valid) {
@@ -1484,7 +1510,7 @@ export function PythonSniperView() {
                     take_profit_pct: 35,
                     trailing_stop_pct: 12,
                     stop_loss_pct: 30,
-                    auto_rug_exit: true,
+                    auto_rug_exit: false,
                     rug_liq_drop_pct: 50,
                     slippage_pct: 3,
                     use_real_swap_quotes: true,
@@ -1498,7 +1524,7 @@ export function PythonSniperView() {
                     max_price_change_m5_pct: 250,
                     use_rugcheck: true,
                     strict_rugcheck: true,
-                    require_lp_locked: true,
+                    require_lp_locked: false,
                     block_insider_bundles: true,
                     max_dev_hold_pct: 5,
                     rugcheck_max_score: 55,
@@ -1554,7 +1580,6 @@ export function PythonSniperView() {
             Number(draftSettings.ultra_early_grace_sec ?? 0) > 0 ||
             draftSettings.use_rugcheck === false ||
             draftSettings.strict_rugcheck === false ||
-            draftSettings.require_lp_locked === false ||
             Number(draftSettings.max_top10_holder_pct ?? 100) > 45 ||
             Number(draftSettings.rugcheck_max_score ?? 100) > 60) && (
             <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-800 dark:text-amber-300 flex flex-wrap items-center justify-between gap-3">
@@ -1563,7 +1588,7 @@ export function PythonSniperView() {
                 <div>
                   <p className="font-bold">Weak Anti-Rug Filter Settings Detected</p>
                   <p className="text-[11px] opacity-90">
-                    Low liquidity (&lt;$1,500), non-zero ultra-early bypass, unlocked LP allowance, or high Top-10% (&gt;45%) increases rugpull risk on brand-new coins. Click <strong>Apply Quick Profit &amp; Safe Preset</strong> to harden protection.
+                    Low liquidity (&lt;$1,500), non-zero ultra-early bypass, disabled RugCheck/strict safety, or high Top-10% (&gt;45%) increases rugpull risk on brand-new coins. Click <strong>Apply Quick Profit &amp; Safe Preset</strong> to harden protection.
                   </p>
                 </div>
               </div>
@@ -1593,12 +1618,14 @@ export function PythonSniperView() {
                         !isNaN(numericVal) ? numericVal : 0
                       )
                     : null;
-                const rugHelper =
-                  key === 'auto_rug_exit'
-                    ? val === true || val === 'true'
-                      ? 'Skips Pump.fun curves · needs 2 confirmed LP-drain polls (set False to hold all dips)'
-                      : 'LP-drain emergency sell off — only TP/SL/Trail exits apply'
+                const stopLossHelper =
+                  key === 'stop_loss_pct'
+                    ? !isNaN(numericVal) && numericVal > 0
+                      ? `Force-sells if PnL drops to -${numericVal}% to cap downside loss.`
+                      : 'Disabled — holds through dips (exits only on Take Profit / Trailing).'
                     : null;
+                const purposeNote = trailHelper || stopLossHelper || PYTHON_SETTING_NOTES[key] || null;
+                const isDynamicHint = Boolean(trailHelper || stopLossHelper);
 
                     const hasTpRecoveryError =
                       key === 'take_profit_pct' && recoverPrincipalOn && !draftValidation.valid;
@@ -1665,14 +1692,15 @@ export function PythonSniperView() {
                             }`}
                           />
                         )}
-                        {trailHelper && (
-                          <p className="font-mono text-[11px] font-medium text-teal-600 dark:text-teal-400">
-                            {trailHelper}
-                          </p>
-                        )}
-                        {rugHelper && (
-                          <p className="font-mono text-[11px] font-medium text-slate-500 dark:text-slate-400">
-                            {rugHelper}
+                        {purposeNote && (
+                          <p
+                            className={`text-[11px] leading-snug ${
+                              isDynamicHint
+                                ? 'font-mono font-medium text-teal-600 dark:text-teal-400'
+                                : 'font-sans text-slate-500 dark:text-slate-400'
+                            }`}
+                          >
+                            {purposeNote}
                           </p>
                         )}
                         {hasTpRecoveryError && draftValidation.error && (

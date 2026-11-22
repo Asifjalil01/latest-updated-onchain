@@ -1106,9 +1106,9 @@ test('v1.32.0: afk +73.1% -> +25.36% trailing stop fires even with recover_princ
     'bot._rpc_mint_account_info = lambda m: {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": []}',
     'bot.get_json = lambda *a, **k: None',
     'out["missing_report_young"] = bot.hard_rug_check("MintNoReport", cfg, age_s=20)',
-    // 8. hard_rug_check: Reject unlocked LP on AMM pool (not bonding curve)
+    // 8. hard_rug_check: Reject unlocked LP on AMM pool when require_lp_locked is enabled
     'bot.get_json = lambda url, **k: {"score_normalised": 5, "risks": [], "markets": [{"pubkey": "Pool1", "lp": {"lpLockedPct": 0, "lpBurned": False}}], "topHolders": [{"address": "Pool1", "owner": "Pool1", "pct": 70.0}, {"address": "W1", "owner": "W1", "pct": 5.0}]} if "rugcheck" in url else None',
-    'out["unlocked_lp_reject"] = bot.hard_rug_check("MintUnlockedLP", cfg, age_s=25, pair={"dexId": "raydium", "pairAddress": "Pool1", "liquidity": {"usd": 5000}})',
+    'out["unlocked_lp_reject"] = bot.hard_rug_check("MintUnlockedLP", dict(cfg, require_lp_locked=True), age_s=25, pair={"dexId": "raydium", "pairAddress": "Pool1", "liquidity": {"usd": 5000}})',
     // 9. hard_rug_check: Reject non-pool Top-10 concentration > 35%
     'bot.get_json = lambda url, **k: {"score_normalised": 5, "risks": [], "markets": [{"pubkey": "Pool1", "lp": {"lpLockedPct": 100, "lpBurned": True}}], "topHolders": [{"address": "Pool1", "owner": "Pool1", "pct": 50.0}, {"address": "W1", "owner": "W1", "pct": 25.0}, {"address": "W2", "owner": "W2", "pct": 18.0}]} if "rugcheck" in url else None',
     'out["non_pool_top10_reject"] = bot.hard_rug_check("MintWhaleTop10", cfg, age_s=25, pair={"dexId": "raydium", "pairAddress": "Pool1", "liquidity": {"usd": 5000}})',
@@ -1736,3 +1736,37 @@ test('v1.33.1: prevents false rug_liquidity_drop sells on Pump.fun curves, missi
   assert.equal(out.mon_kept_missing_liq, true);
   assert.equal(out.mon_liq_preserved, 5000.0);
 });
+
+test('v1.33.2: defaults auto_rug_exit & require_lp_locked to False, unblocks PumpSwap/Meteora/RugCheck unlocked-LP launches, and excludes market pubkeys from Top-10', () => {
+  const pyScript = [
+    'import sys, types, json',
+    'req = types.ModuleType("requests")',
+    'class DummySess:',
+    '    def get(self, *a, **k): raise RuntimeError("no net")',
+    '    def post(self, *a, **k): raise RuntimeError("no net")',
+    'req.Session = lambda: DummySess()',
+    'sys.modules["requests"] = req',
+    'sys.path.insert(0, "sniper")',
+    'import bot',
+    'out = {}',
+    'out["defaults"] = {"auto_rug": bot.CONFIG["auto_rug_exit"], "lp_lock": bot.CONFIG["require_lp_locked"]}',
+    'cfg = dict(bot.CONFIG)',
+    'bot._rpc_mint_account_info = lambda m, c=None: {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": []}',
+    'bot._check_sell_route = lambda *a, **k: (True, "ok")',
+    // Simulate GOAT / PumpSwap / Meteora launch with 0% lpLockedPct, Large Amount of LP Unlocked danger, and 85% held in market pubkey PoolPump1
+    'bot.get_json = lambda url, **k: {"score_normalised": 12, "risks": [{"level": "danger", "name": "Large Amount of LP Unlocked", "description": "LP unlocked"}], "markets": [{"pubkey": "PoolPump1", "marketType": "pump_fun_amm", "lp": {"lpLockedPct": 0, "lpBurned": False}}], "topHolders": [{"address": "PoolPump1", "owner": "PoolPump1", "pct": 85.0}, {"address": "Wallet1", "owner": "Wallet1", "pct": 4.0}]} if "rugcheck" in url else None',
+    'out["goat_pumpswap_ok"] = list(bot.hard_rug_check("MintGoat1", cfg, age_s=30, pair={"dexId": "pumpswap", "pairAddress": "", "priceUsd": "0.0001", "liquidity": {"usd": 9000}}))',
+    // Even if require_lp_locked=True is explicitly enabled later, canonical PumpSwap/Meteora pools still pass without false LP 0% rejection
+    'out["pumpswap_ok_even_when_lp_req"] = list(bot.hard_rug_check("MintGoat2", dict(cfg, require_lp_locked=True), age_s=30, pair={"dexId": "pumpswap", "pairAddress": "", "priceUsd": "0.0001", "liquidity": {"usd": 9000}}))',
+    'print(json.dumps(out))',
+  ].join('\n');
+
+  const raw = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+  const out = JSON.parse(raw.trim().split('\n').pop() || '{}');
+
+  assert.equal(out.defaults.auto_rug, false);
+  assert.equal(out.defaults.lp_lock, false);
+  assert.equal(out.goat_pumpswap_ok[0], true);
+  assert.equal(out.pumpswap_ok_even_when_lp_req[0], true);
+});
+

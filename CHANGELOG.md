@@ -2,6 +2,20 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.33.2 — Unblock Buys (`require_lp_locked` Fix on PumpSwap/Meteora), Streamline Settings & Purpose Notes on Every Field (`bot.py`, `settings.json`, `sniperManager.ts`, `PythonSniperView.tsx`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed & Improved
+- **Unblocked New-Launch Buys (`sniper/bot.py`, `sniper/settings.json`, `server/sniperManager.ts`, `PythonSniperView.tsx`)**:
+  - Fixed `hard_rug_check` rejecting 100% of passing Pump.fun / PumpSwap / Meteora / LaunchLab launches with `LP burned/locked 0% < 80% minimum (rug risk)` (because RugCheck reports `0%` LP lock/burn on canonical non-burnable pools).
+  - Set `require_lp_locked: false` and `auto_rug_exit: false` by default (and in **Apply Quick Profit & Safe Preset**), skipped canonical AMM pool types even if `require_lp_locked` is later enabled, prevented RugCheck `Large Amount of LP Unlocked` warnings from tripping the generic `danger` catch-all when LP lock checks are off, and always registered RugCheck market pool pubkeys into `known_pools` so pool balances never inflate Top-10 holder %.
+- **Streamlined Settings & Per-Field Purpose Notes (`PythonSniperView.tsx`)**:
+  - Commented out `auto_rug_exit`, `rug_liq_drop_pct`, and `require_lp_locked` from the active UI configuration list (`PYTHON_SETTINGS_METADATA`) so they can be easily re-enabled if needed in the future.
+  - Added clear, concise purpose notes directly beneath every active Python Sniper setting (including dynamic behavior descriptions for `stop_loss_pct` and `trailing_stop_pct`), and updated the weak-filter alert banner so it no longer flags `require_lp_locked = false`.
+
+---
+
 ## v1.33.1 — Prevent False `rug_liquidity_drop` Loss Sells on Dips, Pump.fun Curves & Missing DexScreener Liquidity (`bot.py`, `PythonSniperView.tsx`)
 
 **Risk Warning: Trading can lose all of your money.**

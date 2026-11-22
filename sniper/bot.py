@@ -39,7 +39,7 @@ CONFIG = {
     "recover_principal_sell_pct": 50.0,
     "scale_out_sell_pct": 25.0,
     "scale_out_step_gain_pct": 100.0,
-    "auto_rug_exit": True,
+    "auto_rug_exit": False,
     "rug_liq_drop_pct": 50.0,
     # sniper window: buy ONLY coins younger than this
     "max_age_minutes": 2.0,
@@ -54,7 +54,7 @@ CONFIG = {
     "max_price_change_m5_pct": 250.0,
     "min_holders": 0,
     # hard rug screen
-    "use_rugcheck": True, "strict_rugcheck": True, "require_lp_locked": True,
+    "use_rugcheck": True, "strict_rugcheck": True, "require_lp_locked": False,
     "block_insider_bundles": True, "block_creator_dump": True, "max_dev_hold_pct": 5.0,
     "rugcheck_max_score": 55.0, "max_top10_holder_pct": 35.0, "rug_recheck_minutes": 15,
     # candidate sources (any-DEX coverage)
@@ -903,7 +903,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                                         verdict = (False, f"creator wallet holds {c_pct:.1f}% > {max_dev_pct:.0f}% limit")
                                     break
 
-                # Enforce LP lock/burn check on AMM pools (non-bonding-curve) when require_lp_locked is active
+                # Always register AMM/pool pubkeys from RugCheck markets so they are excluded from Top-10 holder %
                 known_pools = set()
                 if pair_addr:
                     known_pools.add(pair_addr)
@@ -913,14 +913,25 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                         if ktype in ("AMM", "LOCKER", "POOL", "CLOB"):
                             known_pools.add(addr)
 
-                if verdict[0] and cfg.get("require_lp_locked", True) and not is_bonding_curve:
-                    markets = rep.get("markets")
+                markets = rep.get("markets")
+                has_canonical_pool = is_bonding_curve or any(
+                    k in dex_id for k in ("pumpswap", "pump", "meteora", "orca", "whirlpool", "launchlab", "moonshot")
+                )
+                if isinstance(markets, list) and markets:
+                    for m in markets:
+                        if not isinstance(m, dict): continue
+                        if m.get("pubkey"):
+                            known_pools.add(str(m.get("pubkey")))
+                        mtype = str(m.get("marketType") or "").lower()
+                        if any(k in mtype for k in ("pump", "meteora", "dlmm", "damm", "orca", "whirlpool", "cpmm", "clmm", "launchlab")):
+                            has_canonical_pool = True
+
+                require_lp_lock = bool(cfg.get("require_lp_locked", False))
+                if verdict[0] and require_lp_lock and not has_canonical_pool:
                     if isinstance(markets, list) and markets:
                         max_lp_pct = 0.0
                         for m in markets:
                             if not isinstance(m, dict): continue
-                            if m.get("pubkey"):
-                                known_pools.add(str(m.get("pubkey")))
                             lp = m.get("lp") or {}
                             locked_pct = _f(lp.get("lpLockedPct")) or 0.0
                             burned_pct = 100.0 if lp.get("lpBurned") else 0.0
@@ -964,9 +975,11 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                             if m and float(m.group(1)) > max_top10:
                                 verdict = (False, f"{name} ({m.group(1)}% > {max_top10:.0f}% limit)")
                                 break
-                        if "unlocked" in low and ("lp" in low or "liquidity" in low) and cfg.get("require_lp_locked", True):
-                            verdict = (False, f"LP risk: {name}")
-                            break
+                        if "unlocked" in low and ("lp" in low or "liquidity" in low):
+                            if require_lp_lock and not has_canonical_pool:
+                                verdict = (False, f"LP risk: {name}")
+                                break
+                            continue
                         if cfg.get("block_insider_bundles", True) and any(k in low for k in ("bundle", "bundled", "insider", "sniper")):
                             verdict = (False, f"bundle/insider risk: {name}")
                             break
@@ -1660,7 +1673,7 @@ class TradingAccount:
         recover_sell_pct = float(self.cfg.get("recover_principal_sell_pct", 50.0) or 50.0)
         scale_sell_pct = float(self.cfg.get("scale_out_sell_pct", 25.0) or 25.0)
         scale_step = float(self.cfg.get("scale_out_step_gain_pct", 100.0) or 0.0)
-        auto_rug = bool(self.cfg.get("auto_rug_exit", True))
+        auto_rug = bool(self.cfg.get("auto_rug_exit", False))
         rug_drop = float(self.cfg.get("rug_liq_drop_pct", 60.0) or 60.0)
         now_ts = time.time()
         self.state["last_price_time"] = now_ts
@@ -2081,7 +2094,7 @@ def monitor(acct):
     liquidities = {}
     dex_updates = {}
     missing = [mint for mint in mints if mint not in prices]
-    need_liq_check = bool(acct.cfg.get("auto_rug_exit", True)) and (time.time() - _last_liq_poll[0] >= 3.0)
+    need_liq_check = bool(acct.cfg.get("auto_rug_exit", False)) and (time.time() - _last_liq_poll[0] >= 3.0)
     ds_targets = mints if need_liq_check else missing
     if need_liq_check and ds_targets:
         _last_liq_poll[0] = time.time()
