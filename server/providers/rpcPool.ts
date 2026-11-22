@@ -51,6 +51,8 @@ export class SolanaRpcPool {
   private readonly largestAccountsCooldownUntil = new Map<string, number>();
   private readonly endpointCooldownUntil = new Map<string, number>();
 
+  private customPrimaryUrl: string | null = null;
+
   constructor(customUrls: string[] = []) {
     const merged: RpcEndpointConfig[] = [];
     const seen = new Set<string>();
@@ -92,6 +94,52 @@ export class SolanaRpcPool {
     }
   }
 
+  setPrimaryCustomRpc(url?: string | null): boolean {
+    const clean = typeof url === 'string' ? url.trim() : '';
+    const isValid = /^https?:\/\/.+/i.test(clean);
+    const nextUrl = isValid ? clean : null;
+    if (nextUrl === this.customPrimaryUrl) return false;
+
+    if (this.customPrimaryUrl && this.customPrimaryUrl !== nextUrl) {
+      const prevUrl = this.customPrimaryUrl;
+      const isDefault = DEFAULT_PUBLIC_MAINNET_RPCS.some((d) => d.url === prevUrl);
+      if (!isDefault) {
+        const idx = this.endpoints.findIndex((e) => e.url === prevUrl);
+        if (idx >= 0) this.endpoints.splice(idx, 1);
+        this.connections.delete(prevUrl);
+        this.healthMap.delete(prevUrl);
+        this.endpointCooldownUntil.delete(prevUrl);
+        this.largestAccountsCooldownUntil.delete(prevUrl);
+      }
+    }
+
+    this.customPrimaryUrl = nextUrl;
+    if (nextUrl) {
+      const existingIdx = this.endpoints.findIndex((e) => e.url === nextUrl);
+      if (existingIdx > 0) {
+        const [ep] = this.endpoints.splice(existingIdx, 1);
+        this.endpoints.unshift(ep);
+      } else if (existingIdx < 0) {
+        this.endpoints.unshift({ url: nextUrl, label: 'Private Sniper RPC' });
+        this.connections.set(
+          nextUrl,
+          new Connection(nextUrl, { commitment: 'confirmed', disableRetryOnRateLimit: true })
+        );
+        this.healthMap.set(nextUrl, {
+          url: nextUrl,
+          label: 'Private Sniper RPC',
+          healthy: true,
+          latencyMs: 0,
+          slot: 0,
+          errorCount: 0,
+          lastCheckedMs: 0,
+          lastError: null,
+        });
+      }
+    }
+    return true;
+  }
+
   getEndpoints(): RpcEndpointConfig[] {
     return [...this.endpoints];
   }
@@ -111,6 +159,10 @@ export class SolanaRpcPool {
         const hb = this.healthMap.get(b.url);
         const healthyDiff = Number(Boolean(hb?.healthy)) - Number(Boolean(ha?.healthy));
         if (healthyDiff !== 0) return healthyDiff;
+        if (this.customPrimaryUrl) {
+          if (a.url === this.customPrimaryUrl && ha?.healthy) return -1;
+          if (b.url === this.customPrimaryUrl && hb?.healthy) return 1;
+        }
         return (ha?.latencyMs ?? 9999) - (hb?.latencyMs ?? 9999);
       })
       .map((ep) => ({ ep, conn: this.connections.get(ep.url)! }));

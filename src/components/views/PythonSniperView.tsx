@@ -90,7 +90,7 @@ const USD_SETTING_KEYS = new Set([
   'min_volume_m5_usd',
 ]);
 
-const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' | 'string']> = [
+const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' | 'string' | 'tier']> = [
   // Core Position & Risk Management (Important)
   ['trade_size_usd', 'Trade size $', 'float'],
   ['max_open_positions', 'Max open positions', 'int'],
@@ -103,6 +103,7 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['auto_rug_exit', 'Auto emergency sell on LP drain (rug exit)', 'bool'],
   ['rug_liq_drop_pct', 'LP drain emergency sell trigger % (e.g. 50)', 'float'],
   ['slippage_pct', 'Slippage % (used in paper & live sells)', 'float'],
+  ['use_real_swap_quotes', 'Exit monitor: real Jupiter reverse swap quotes', 'bool'],
 
   // Entry Momentum & Liquidity Filters (Important)
   ['max_age_minutes', 'Sniper window: max coin age (minutes)', 'float'],
@@ -112,15 +113,23 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['min_buy_sell_ratio_m5', 'Min buy/sell ratio (5 min)', 'float'],
   ['max_price_change_m5_pct', 'Skip if pumped +X% in 5 min', 'float'],
 
-  // Hard Anti-Rug Protections (Important)
+  // Hard Anti-Rug & Anti-Bundle Protections (Important)
   ['use_rugcheck', 'Hard RugCheck (score + risks)', 'bool'],
   ['strict_rugcheck', 'Strict: reject ANY danger & missing reports', 'bool'],
   ['require_lp_locked', 'Require LP burned/locked >= 80% (AMM pools)', 'bool'],
+  ['block_insider_bundles', 'Block bundled / insider RugCheck wallets', 'bool'],
+  ['max_dev_hold_pct', 'Max creator/dev wallet holdings %', 'float'],
   ['rugcheck_max_score', 'Max RugCheck risk score (0-100)', 'float'],
   ['max_top10_holder_pct', 'Max top-10 non-pool holders %', 'float'],
 
+  // Fast Execution (Private RPC, Priority & Jito)
+  ['priority_fee_tier', 'Priority fee speed tier (live swaps)', 'tier'],
+  ['jito_tip_sol', 'Optional Jito tip (SOL, 0 = off, e.g. 0.0001)', 'float'],
+  ['custom_rpc_url', 'Private RPC URL (optional, Helius / QuickNode)', 'string'],
+
   // --- Optional / Unimportant / Auto-Managed Settings (uncomment any line if needed later) ---
   // ['start_balance_usd', 'Start balance $ (paper reset only)', 'float'],
+  // ['min_recent_buys_60s', 'Min buys in last 60s (PumpPortal stream)', 'int'],
   // ['recover_principal_enabled', 'Recover investment at TP (sell % + trailing ladder)', 'bool'],
   // ['recover_principal_sell_pct', 'Step 1: Sell % at TP to recover money (default 50)', 'float'],
   // ['scale_out_sell_pct', 'Step 2: Sell % of remaining on extra pumps (0 = off)', 'float'],
@@ -1478,18 +1487,23 @@ export function PythonSniperView() {
                     auto_rug_exit: true,
                     rug_liq_drop_pct: 50,
                     slippage_pct: 3,
+                    use_real_swap_quotes: true,
                     max_age_minutes: 2,
                     ultra_early_grace_sec: 0,
-                    min_liquidity_usd: 3000,
-                    min_volume_m5_usd: 1500,
+                    min_liquidity_usd: 5000,
+                    min_volume_m5_usd: 2000,
                     min_buys_m5: 8,
-                    min_buy_sell_ratio_m5: 1.25,
+                    min_buy_sell_ratio_m5: 1.5,
+                    min_recent_buys_60s: 3,
                     max_price_change_m5_pct: 250,
                     use_rugcheck: true,
                     strict_rugcheck: true,
                     require_lp_locked: true,
+                    block_insider_bundles: true,
+                    max_dev_hold_pct: 5,
                     rugcheck_max_score: 55,
                     max_top10_holder_pct: 35,
+                    priority_fee_tier: 'fast',
                     recover_principal_enabled: false,
                     use_promoted_feeds: false,
                   });
@@ -1613,12 +1627,27 @@ export function PythonSniperView() {
                             <option value="true">True (Enabled)</option>
                             <option value="false">False (Disabled)</option>
                           </select>
+                        ) : kind === 'tier' ? (
+                          <select
+                            id={`py-set-${key}`}
+                            value={String(val || 'fast')}
+                            onChange={(e) => {
+                              setDraftSettings({ ...draftSettings, [key]: e.target.value });
+                              markSettingsDirty(true);
+                            }}
+                            className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100"
+                          >
+                            <option value="standard">Standard (auto)</option>
+                            <option value="fast">Fast (high priority)</option>
+                            <option value="turbo">Turbo (veryHigh + urgent exits)</option>
+                          </select>
                         ) : (
                           <input
                             id={`py-set-${key}`}
                             type={kind === 'int' || kind === 'float' ? 'number' : 'text'}
                             step={kind === 'float' ? 'any' : '1'}
                             value={val ?? ''}
+                            placeholder={key === 'custom_rpc_url' ? 'https://mainnet.helius-rpc.com/?api-key=...' : undefined}
                             onChange={(e) => {
                               setDraftSettings({ ...draftSettings, [key]: e.target.value });
                               markSettingsDirty(true);

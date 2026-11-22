@@ -9,6 +9,7 @@ skip the liquidity/buy-volume floors (true "first seconds" entries).
 """
 from concurrent.futures import ThreadPoolExecutor
 import csv
+import inspect
 import io
 import json
 import math
@@ -47,24 +48,29 @@ CONFIG = {
     # scan speed
     "scan_interval_sec": 1, "monitor_interval_sec": 1.0,
     # entry guards (applied after the grace window)
-    "min_liquidity_usd": 3000.0, "min_volume_m5_usd": 1500.0,
-    "min_buys_m5": 8, "min_buy_sell_ratio_m5": 1.25,
+    "min_liquidity_usd": 5000.0, "min_volume_m5_usd": 2000.0,
+    "min_buys_m5": 8, "min_buy_sell_ratio_m5": 1.5,
+    "min_recent_buys_60s": 3,
     "max_price_change_m5_pct": 250.0,
     "min_holders": 0,
     # hard rug screen
     "use_rugcheck": True, "strict_rugcheck": True, "require_lp_locked": True,
+    "block_insider_bundles": True, "block_creator_dump": True, "max_dev_hold_pct": 5.0,
     "rugcheck_max_score": 55.0, "max_top10_holder_pct": 35.0, "rug_recheck_minutes": 15,
     # candidate sources (any-DEX coverage)
     "use_gecko": True, "use_jupiter_recent": True, "use_dex_profiles": True,
     "use_pumpportal": True, "use_promoted_feeds": False,
-    # misc
+    # execution & speed
     "slippage_pct": 3.0, "fee_pct": 1.0,
+    "priority_fee_tier": "fast", "jito_tip_sol": 0.0,
+    "custom_rpc_url": "",
     "state_file": "state.json", "trades_csv": "trades.csv",
     "log_rejects": False, "jupiter_api_key": "",
     # compatibility keys kept so old settings files still load
     "cooldown_minutes": 60, "min_volume_h1_usd": 0.0, "min_age_minutes": 0,
     "max_age_hours": 24, "min_buys_h1": 0, "min_buy_sell_ratio_h1": 0.0,
-    "use_jupiter_price": True, "pool_keep_hours": 1, "pool_max_size": 500,
+    "use_jupiter_price": True, "use_real_swap_quotes": True,
+    "pool_keep_hours": 1, "pool_max_size": 500,
     "rescan_delay_after_sell_sec": 0,
 }
 
@@ -184,6 +190,13 @@ RPC_URLS = [
     "https://api.zan.top/solana-mainnet",
     "https://api.mainnet-beta.solana.com",
 ]
+
+def _get_rpc_urls(cfg=None):
+    c = cfg or CONFIG
+    custom = str(c.get("custom_rpc_url") or "").strip()
+    if custom.startswith("http://") or custom.startswith("https://"):
+        return [custom] + [u for u in RPC_URLS if u != custom]
+    return list(RPC_URLS)
 KNOWN_POOL_OR_BURN_OWNERS = {
     "11111111111111111111111111111111",
     "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
@@ -330,6 +343,7 @@ _too_old_mints = {}
 _pending_dex_retry = {}  # mint -> [first_seen_ts, last_retry_ts]
 _src_of = {}
 _gecko_pairs = {}
+_pumpportal_pairs = {}
 _gecko_backoff_until = 0.0
 
 def _parse_iso_ms(iso_str):
@@ -481,8 +495,19 @@ def _src_pumpportal(cfg):
     if not cfg.get("use_pumpportal", True): return []
     if _bridge_base_url():
         resp = bridge_get("/api/sniper/pumpportal-mints", timeout=4)
-        if isinstance(resp, dict) and resp.get("ok") and isinstance(resp.get("mints"), list):
-            return [m for m in resp["mints"] if isinstance(m, str) and m]
+        if isinstance(resp, dict) and resp.get("ok"):
+            raw_pairs = resp.get("pairs")
+            if isinstance(raw_pairs, list):
+                for p in raw_pairs:
+                    if not isinstance(p, dict): continue
+                    pmint = (p.get("baseToken") or {}).get("address")
+                    if pmint:
+                        _pumpportal_pairs[pmint] = p
+                if len(_pumpportal_pairs) > 500:
+                    for k in list(_pumpportal_pairs.keys())[:250]:
+                        _pumpportal_pairs.pop(k, None)
+            if isinstance(resp.get("mints"), list):
+                return [m for m in resp["mints"] if isinstance(m, str) and m]
     data = get_json(f"{PUMPP}/coins/new")
     if not isinstance(data, list): return []
     return [c.get("mint") for c in data if isinstance(c, dict) and c.get("mint")]
@@ -535,7 +560,7 @@ def fetch_candidate_mints(cfg, force=False):
         fresh = fresh + due_retries
     return fresh
 
-# ---------------------------------------------------------------- entry filters
+# ---------------------------------------------------------------- entry filters & momentum ranking
 def passes_filters(pair, cfg, now_ms=None):
     """Returns (ok, short_reason_code, detail)."""
     now_ms = now_ms or int(time.time() * 1000)
@@ -544,15 +569,27 @@ def passes_filters(pair, cfg, now_ms=None):
     age_s = (now_ms - created) / 1000.0
     if age_s > cfg.get("max_age_minutes", 2) * 60: return False, "too old", f"{age_s / 60:.1f}m > window"
     if age_s < -10: return False, "clock skew", "sync your PC clock"
-    if _f(pair.get("priceUsd")) is None: return False, "no price", "no price on DexScreener yet"
+    px = _f(pair.get("priceUsd"))
+    if px is None or px <= 0: return False, "no price", "no price on DexScreener/curve yet"
 
     m5 = (pair.get("txns") or {}).get("m5") or {}
     buys, sells = int(m5.get("buys") or 0), int(m5.get("sells") or 0)
-    ratio = cfg.get("min_buy_sell_ratio_m5", 1.0)
+    ratio = float(cfg.get("min_buy_sell_ratio_m5", 1.5) or 0)
     if ratio > 0 and buys < sells * ratio:
         return False, "selling pressure", f"{buys}b/{sells}s in last 5m"
     if age_s >= 30 and buys >= 12 and sells == 0:
         return False, "honeypot pattern", f"{buys} buys / 0 sells in 5m"
+
+    pp = pair.get("_pumpportal") if isinstance(pair.get("_pumpportal"), dict) else None
+    if pp and pp.get("has_trade_stream"):
+        buys_60s = int(pp.get("buys_60s") or 0)
+        sells_60s = int(pp.get("sells_60s") or 0)
+        if buys_60s < sells_60s:
+            return False, "selling pressure (60s)", f"{buys_60s}b/{sells_60s}s last 60s"
+        min_60s = int(cfg.get("min_recent_buys_60s", 3) or 0)
+        grace_sec_pp = max(0, float(cfg.get("ultra_early_grace_sec", 0) or 0))
+        if age_s > grace_sec_pp and min_60s > 0 and buys_60s < min_60s:
+            return False, "low 60s velocity", f"{buys_60s} buys < {min_60s} in 60s"
 
     m5c = _f((pair.get("priceChange") or {}).get("m5"))
     if m5c is not None and m5c > cfg.get("max_price_change_m5_pct", 300):
@@ -565,7 +602,7 @@ def passes_filters(pair, cfg, now_ms=None):
 
     grace_sec = max(0, float(cfg.get("ultra_early_grace_sec", 0) or 0))
     if age_s > grace_sec:
-        min_liq = float(cfg.get("min_liquidity_usd", 3000) or 0)
+        min_liq = float(cfg.get("min_liquidity_usd", 5000) or 0)
         if liq < min_liq:
             return False, "low liquidity", f"${liq:.0f} < ${min_liq:.0f}"
         if buys < cfg.get("min_buys_m5", 8):
@@ -578,13 +615,47 @@ def passes_filters(pair, cfg, now_ms=None):
             if h1b < cfg["min_holders"]: return False, "too few h1 buys", f"{h1b}"
     return True, "ok", ""
 
+def score_candidate(pair, cfg, now_ms=None):
+    """Deterministic momentum + freshness + liquidity velocity score for ranking multiple passing coins."""
+    now_ms = now_ms or int(time.time() * 1000)
+    created = int(pair.get("pairCreatedAt") or 0)
+    age_s = max(0.0, (now_ms - created) / 1000.0) if created > 0 else 120.0
+    max_age_s = max(10.0, float(cfg.get("max_age_minutes", 2) or 2) * 60.0)
+
+    m5 = (pair.get("txns") or {}).get("m5") or {}
+    buys = int(m5.get("buys") or 0)
+    sells = int(m5.get("sells") or 0)
+    ratio = min(10.0, buys / max(1.0, float(sells)))
+
+    liq = max(1.0, _f((pair.get("liquidity") or {}).get("usd")) or 1.0)
+    mv5 = _f((pair.get("volume") or {}).get("m5")) or 0.0
+    turnover = min(10.0, mv5 / liq)
+
+    pp = pair.get("_pumpportal") if isinstance(pair.get("_pumpportal"), dict) else {}
+    buys_60s = int(pp.get("buys_60s") or 0)
+    sol_vol_60s = float(pp.get("sol_vol_60s") or 0.0)
+    vel_bonus = min(60.0, buys_60s * 3.5 + sol_vol_60s * 4.0)
+
+    freshness = max(0.0, 1.0 - min(1.0, age_s / max_age_s)) * 20.0
+    score = (ratio * 20.0) + (turnover * 15.0) + vel_bonus + freshness + min(15.0, buys * 0.25)
+    return round(score, 4)
+
+def rank_candidates(items, cfg, now_ms=None):
+    """Sort passing [(mint, pair), ...] strongest momentum first."""
+    now_ms = now_ms or int(time.time() * 1000)
+    return sorted(
+        items,
+        key=lambda item: score_candidate(item[1], cfg, now_ms),
+        reverse=True,
+    )
+
 # ---------------------------------------------------------------- hard rug screen
 _rug_cache, _rug_lock = {}, threading.Lock()
 
-def _rpc_mint_account_info(mint):
+def _rpc_mint_account_info(mint, cfg=None):
     """Direct on-chain check of SPL/Token-2022 mint. Returns dict or None if RPC failed."""
     body = {"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [mint, {"encoding": "jsonParsed"}]}
-    for url in RPC_URLS:
+    for url in _get_rpc_urls(cfg):
         try:
             r = _session.post(url, json=body, timeout=6, headers={**HEADERS, "Content-Type": "application/json"})
             if r.status_code != 200: continue
@@ -618,14 +689,14 @@ def _rpc_mint_authorities(mint):
         return False, None, None
     return True, info.get("mint_auth"), info.get("freeze_auth")
 
-def _rpc_top_holders(mint, supply_ui, exclude_addrs=None):
+def _rpc_top_holders(mint, supply_ui, exclude_addrs=None, cfg=None):
     """Best-effort RPC largest holder calculation excluding known pool/burn addresses."""
     if not supply_ui or supply_ui <= 0:
         return None, None
     excl = set(KNOWN_POOL_OR_BURN_OWNERS)
     if exclude_addrs:
         excl.update(exclude_addrs)
-    for url in RPC_URLS:
+    for url in _get_rpc_urls(cfg):
         try:
             r = _session.post(
                 url,
@@ -725,7 +796,11 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
     px_usd = _f(pair.get("priceUsd")) if pair is not None else None
 
     pool = ThreadPoolExecutor(max_workers=3)
-    rpc_fut = pool.submit(_rpc_mint_account_info, mint)
+    try:
+        _rpc_params = len(inspect.signature(_rpc_mint_account_info).parameters)
+    except Exception:
+        _rpc_params = 1
+    rpc_fut = pool.submit(_rpc_mint_account_info, mint, cfg) if _rpc_params >= 2 else pool.submit(_rpc_mint_account_info, mint)
     rc_fut = pool.submit(_fetch_rugcheck_report, mint) if use_rc else None
     sell_fut = pool.submit(_check_sell_route, mint, 6, px_usd, cfg) if (px_usd and px_usd > 0) else None
 
@@ -781,6 +856,11 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                     elif rep.get("freezeAuthority"):
                         verdict = (False, "RugCheck reports active freeze authority")
 
+                # Block creator dump detected on PumpPortal stream on fresh launches
+                pp_meta = (pair or {}).get("_pumpportal") if isinstance((pair or {}).get("_pumpportal"), dict) else None
+                if verdict[0] and pp_meta and pp_meta.get("creator_sold") and cfg.get("block_creator_dump", True) and young:
+                    verdict = (False, "creator/dev already sold during launch curve")
+
                 # Enforce RugCheck risk score at EVERY age (never skip young tokens)
                 if verdict[0]:
                     sn = _f(rep.get("score_normalised"))
@@ -792,6 +872,36 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                         max_rc_score = float(cfg.get("rugcheck_max_score", 55) or 55)
                         if sn >= max_rc_score:
                             verdict = (False, f"rugcheck risk score {sn:.0f}/100 >= {max_rc_score:.0f}")
+
+                # Catch bundled / insider wallet networks & excessive dev holdings before buying
+                if verdict[0] and cfg.get("block_insider_bundles", True):
+                    insiders = rep.get("insiderNetworks")
+                    insiders_cnt = int(rep.get("insidersDetected") or 0)
+                    if (isinstance(insiders, list) and len(insiders) > 0) or insiders_cnt > 0:
+                        verdict = (False, f"bundled insider wallets detected ({max(insiders_cnt, len(insiders or []))} clusters)")
+
+                if verdict[0]:
+                    max_dev_pct = float(cfg.get("max_dev_hold_pct", 5.0) or 0.0)
+                    if max_dev_pct > 0:
+                        creator_addr = str(rep.get("creator") or (pp_meta or {}).get("creator") or "")
+                        creator_bal = _f(rep.get("creatorBalance"))
+                        token_meta = rep.get("token") if isinstance(rep.get("token"), dict) else {}
+                        raw_sup = _f(token_meta.get("supply"))
+                        tok_dec = int(token_meta.get("decimals") if token_meta.get("decimals") is not None else decimals)
+                        eff_sup = supply_ui if supply_ui > 0 else ((raw_sup / (10 ** tok_dec)) if (raw_sup and tok_dec >= 0) else 0.0)
+                        if creator_bal is not None and eff_sup > 0:
+                            # RugCheck creatorBalance may be UI or raw units; normalize conservatively
+                            dev_ui = creator_bal / (10 ** tok_dec) if creator_bal > eff_sup * 10 else creator_bal
+                            dev_pct = (dev_ui / eff_sup) * 100.0
+                            if dev_pct > max_dev_pct:
+                                verdict = (False, f"creator/dev holds {dev_pct:.1f}% > {max_dev_pct:.0f}% limit")
+                        if verdict[0] and creator_addr and isinstance(rep.get("topHolders"), list):
+                            for th in rep["topHolders"][:20]:
+                                if isinstance(th, dict) and (th.get("owner") == creator_addr or th.get("address") == creator_addr):
+                                    c_pct = _f(th.get("pct")) or 0.0
+                                    if c_pct > max_dev_pct:
+                                        verdict = (False, f"creator wallet holds {c_pct:.1f}% > {max_dev_pct:.0f}% limit")
+                                    break
 
                 # Enforce LP lock/burn check on AMM pools (non-bonding-curve) when require_lp_locked is active
                 known_pools = set()
@@ -840,7 +950,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                     single_max_pct = max(non_pool_pcts) if non_pool_pcts else 0.0
 
                 if top10_pct is None and supply_ui > 0:
-                    top10_pct, single_max_pct = _rpc_top_holders(mint, supply_ui, known_pools)
+                    top10_pct, single_max_pct = _rpc_top_holders(mint, supply_ui, known_pools, cfg=cfg)
 
                 risks = rep.get("risks") if isinstance(rep.get("risks"), list) else []
                 if verdict[0]:
@@ -856,6 +966,9 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                                 break
                         if "unlocked" in low and ("lp" in low or "liquidity" in low) and cfg.get("require_lp_locked", True):
                             verdict = (False, f"LP risk: {name}")
+                            break
+                        if cfg.get("block_insider_bundles", True) and any(k in low for k in ("bundle", "bundled", "insider", "sniper")):
+                            verdict = (False, f"bundle/insider risk: {name}")
                             break
                         if level not in ("danger", "critical"):
                             if strict and any(k in low for k in ("transfer fee", "permanent delegate", "honeypot", "insider", "copycat", "freeze", "mint")):
@@ -1710,19 +1823,39 @@ def scan_and_buy(acct, cfg):
             cur = pairs.get(mint)
             if cur is None or liq > cur[0]: pairs[mint] = (liq, p)
     for mint in fresh:
-        if mint not in pairs and mint in _gecko_pairs:
+        if mint in pairs and mint in _pumpportal_pairs:
+            # Enrich DexScreener pair with real-time PumpPortal 60s trade stream & creator telemetry
+            pp_info = _pumpportal_pairs[mint].get("_pumpportal")
+            if pp_info and isinstance(pairs[mint][1], dict):
+                pairs[mint][1]["_pumpportal"] = pp_info
+        elif mint not in pairs and mint in _pumpportal_pairs:
+            ppp = _pumpportal_pairs[mint]
+            liq = _f((ppp.get("liquidity") or {}).get("usd")) or 0.0
+            pairs[mint] = (liq, ppp)
+        elif mint not in pairs and mint in _gecko_pairs:
             gp = _gecko_pairs[mint]
             liq = _f((gp.get("liquidity") or {}).get("usd")) or 0.0
             pairs[mint] = (liq, gp)
+
+    # Backfill price via Jupiter if a real-time synthetic launch pair has liq/buys but missing priceUsd
+    missing_px_mints = [
+        m for m, (_l, p) in pairs.items()
+        if (_f(p.get("priceUsd")) or 0.0) <= 0.0
+    ]
+    if missing_px_mints:
+        jup_px = _jupiter_prices(missing_px_mints[:30], cfg)
+        for m, px in jup_px.items():
+            if m in pairs and px > 0:
+                pairs[m][1]["priceUsd"] = str(px)
+
     _update_pending_dex_mints(fresh, pairs)
     with _stats_lock: _stats["no_pair"] += max(0, len(fresh) - len(pairs))
 
+    # 1. Filter all candidates first so we can rank passing launches by momentum instead of arbitrary dict order
+    passing = []
     for mint, (_liq, pair) in pairs.items():
         if _should_stop():
             return
-        if acct.is_slots_full()[0]:
-            break
-        if not acct.can_open()[0]: break
         if mint in acct.state["positions"] or mint in acct.state["blacklist"]: continue
         symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
         okp, code, detail = passes_filters(pair, cfg, now_ms)
@@ -1734,8 +1867,25 @@ def scan_and_buy(acct, cfg):
             with _stats_lock: _stats["rejects"][code] = _stats["rejects"].get(code, 0) + 1
             if cfg.get("log_rejects"): log(f"– {symbol} filtered: {code} ({detail})")
             continue
+        passing.append((mint, pair))
+
+    if not passing:
+        return
+
+    ranked = rank_candidates(passing, cfg, now_ms)
+    if len(ranked) > 1:
+        top_sym = (ranked[0][1].get("baseToken") or {}).get("symbol") or "?"
+        top_score = score_candidate(ranked[0][1], cfg, now_ms)
+        log(f"⚡ Ranked {len(ranked)} passing launches (top: {top_sym} score={top_score:.1f})")
+
+    # 2. Run parallel hard_rug_check and enter in highest-momentum order until slots fill
+    for mint, pair in ranked:
         if _should_stop():
             return
+        if acct.is_slots_full()[0]:
+            break
+        if not acct.can_open()[0]: break
+        symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
         age_s = max(0.0, (now_ms - int(pair.get("pairCreatedAt") or 0)) / 1000.0)
         rok, rwhy = hard_rug_check(mint, cfg, age_s, pair=pair)
         if not rok:
@@ -1746,13 +1896,42 @@ def scan_and_buy(acct, cfg):
         if _should_stop():
             return
         price = _f(pair.get("priceUsd"))
-        if price is None: continue
+        if price is None or price <= 0: continue
         liq_usd = _f((pair.get("liquidity") or {}).get("usd"))
         meta = {"dex": pair.get("dexId") or "?", "source": _src_of.get(mint, "?"), "age_s": age_s, "liquidity_usd": liq_usd}
         if acct.buy(mint, symbol, price, pair.get("url"), meta):
             with _stats_lock: _stats["bought"] += 1
             if acct.is_slots_full()[0]:
                 break
+
+def _reverse_quote_prices(pos_dict, cfg, sol_px):
+    """Fetch true executable exit prices (mint -> WSOL quote) for open positions."""
+    if not cfg.get("use_real_swap_quotes", True) or not pos_dict:
+        return {}
+    if _bridge_base_url():
+        payload_pos = [
+            {
+                "mint": mint,
+                "qty": float(p.get("qty") or 0.0),
+                "decimals": int(p.get("decimals") if p.get("decimals") is not None else 6),
+                "rawAmount": p.get("raw_amount"),
+            }
+            for mint, p in list(pos_dict.items())[:10]
+            if float(p.get("qty") or 0.0) > 0
+        ]
+        if payload_pos:
+            resp = bridge_post(
+                "/api/sniper/reverse-quotes",
+                {"positions": payload_pos, "solPriceUsd": sol_px},
+                timeout=4,
+            )
+            if isinstance(resp, dict) and resp.get("ok") and isinstance(resp.get("prices"), dict):
+                return {
+                    m: float(v)
+                    for m, v in resp["prices"].items()
+                    if _f(v) and float(v) > 0
+                }
+    return {}
 
 def _jupiter_prices(mints, cfg):
     if not cfg.get("use_jupiter_price", True) or not mints:
@@ -1835,6 +2014,9 @@ def monitor(acct):
 
     mints = list(pos.keys())
     prices = _jupiter_prices(mints, acct.cfg)
+    rev_prices = _reverse_quote_prices(pos, acct.cfg, sol_px)
+    if rev_prices:
+        prices.update(rev_prices)
     liquidities = {}
     missing = [mint for mint in mints if mint not in prices]
     need_liq_check = bool(acct.cfg.get("auto_rug_exit", True)) and (time.time() - _last_liq_poll[0] >= 3.0)

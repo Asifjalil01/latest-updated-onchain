@@ -273,7 +273,14 @@ export class SniperManager {
   public attachOrchestrator(orchestrator: BotOrchestrator, customTxAdapter?: LiveTxAdapter): void {
     this.orchestrator = orchestrator;
     this.txAdapter = customTxAdapter ?? new DefaultLiveTxAdapter(orchestrator.rpcPool);
-    if (this.getMode() === 'live') {
+    const settings = this.readSettings();
+    if (typeof settings.custom_rpc_url === 'string' && settings.custom_rpc_url.trim()) {
+      (orchestrator.rpcPool as any)?.setPrimaryCustomRpc?.(settings.custom_rpc_url);
+    }
+    if (typeof settings.jupiter_api_key === 'string' && settings.jupiter_api_key.trim()) {
+      (orchestrator.jupiter as any)?.setApiKey?.(settings.jupiter_api_key);
+    }
+    if (this.getMode(settings) === 'live') {
       void this.refreshLiveWalletInfo(true);
     }
   }
@@ -608,26 +615,33 @@ export class SniperManager {
       ultra_early_grace_sec: 0,
       scan_interval_sec: 1,
       monitor_interval_sec: 1.0,
-      min_liquidity_usd: 3000.0,
-      min_volume_m5_usd: 1500.0,
+      min_liquidity_usd: 5000.0,
+      min_volume_m5_usd: 2000.0,
       min_buys_m5: 8,
-      min_buy_sell_ratio_m5: 1.25,
+      min_buy_sell_ratio_m5: 1.5,
+      min_recent_buys_60s: 3,
       max_price_change_m5_pct: 250.0,
       min_holders: 0,
       use_rugcheck: true,
       strict_rugcheck: true,
       require_lp_locked: true,
+      block_insider_bundles: true,
+      max_dev_hold_pct: 5.0,
       rugcheck_max_score: 55.0,
       max_top10_holder_pct: 35.0,
       rug_recheck_minutes: 15,
       use_gecko: true,
       use_jupiter_recent: true,
       use_jupiter_price: true,
+      use_real_swap_quotes: true,
       use_dex_profiles: true,
       use_pumpportal: true,
       use_promoted_feeds: false,
       slippage_pct: 3.0,
       fee_pct: 1.0,
+      priority_fee_tier: 'fast',
+      jito_tip_sol: 0.0,
+      custom_rpc_url: '',
       log_rejects: false,
       jupiter_api_key: '',
       python_binary_path: 'auto',
@@ -977,10 +991,115 @@ export class SniperManager {
     return this.orchestrator.pumpPortal.drainRecentMints(maxAgeMs);
   }
 
+  public getPumpPortalFeed(maxAgeMs = 180_000): {
+    mints: string[];
+    pairs: any[];
+    solPriceUsd: number | null;
+  } {
+    if (!this.orchestrator?.pumpPortal) {
+      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd };
+    }
+    const settings = this.readSettings();
+    if (settings.use_pumpportal === false) {
+      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd };
+    }
+    this.orchestrator.pumpPortal.start();
+    const mints = this.orchestrator.pumpPortal.drainRecentMints(maxAgeMs);
+    const pp: any = this.orchestrator.pumpPortal;
+    const pairs =
+      typeof pp.getSyntheticPairs === 'function'
+        ? pp.getSyntheticPairs(this.solPriceUsd, maxAgeMs)
+        : [];
+    return { mints, pairs, solPriceUsd: this.solPriceUsd };
+  }
+
+  public async getReverseExitPrices(
+    positions: Array<{ mint: string; qty: number; decimals?: number; rawAmount?: string | null }>,
+    solPriceOverride?: number | null
+  ): Promise<{ ok: boolean; prices: Record<string, number>; solPriceUsd: number | null }> {
+    const jupiter = this.orchestrator?.jupiter as any;
+    if (!jupiter || typeof jupiter.getReverseExitPricesUsd !== 'function') {
+      return { ok: false, prices: {}, solPriceUsd: this.solPriceUsd };
+    }
+    let solPx =
+      solPriceOverride && Number.isFinite(solPriceOverride) && solPriceOverride > 0
+        ? solPriceOverride
+        : this.solPriceUsd;
+    if (!solPx || solPx <= 0) {
+      solPx = (await jupiter.getLiveSolPriceUsd?.()) ?? (await this.refreshSolPrice()) ?? null;
+    }
+    if (!solPx || solPx <= 0) {
+      return { ok: false, prices: {}, solPriceUsd: null };
+    }
+    const prices = await jupiter.getReverseExitPricesUsd(positions, solPx);
+    return { ok: true, prices, solPriceUsd: solPx };
+  }
+
+  private resolveSwapExecutionFees(
+    settings: Record<string, any>,
+    isUrgentExit: boolean,
+    overrides?: { priorityFeeTier?: string; jitoTipSol?: number }
+  ): {
+    priorityFeeLamports: number | 'auto';
+    priorityLevel: 'medium' | 'high' | 'veryHigh';
+    maxPriorityFeeLamports: number;
+    jitoTipLamports: number;
+  } {
+    const rawTier = String(overrides?.priorityFeeTier ?? settings.priority_fee_tier ?? 'fast').toLowerCase();
+    const tier: 'standard' | 'fast' | 'turbo' =
+      rawTier === 'turbo' ? 'turbo' : rawTier === 'standard' ? 'standard' : 'fast';
+    const rawJitoSol = Number(overrides?.jitoTipSol ?? settings.jito_tip_sol ?? 0);
+    const safeJitoSol = Number.isFinite(rawJitoSol) && rawJitoSol > 0 ? Math.min(0.01, rawJitoSol) : 0;
+    const jitoTipLamports = safeJitoSol > 0 ? Math.max(10_000, Math.round(safeJitoSol * LAMPORTS_PER_SOL)) : 0;
+
+    if (isUrgentExit || tier === 'turbo') {
+      return {
+        priorityFeeLamports: 'auto',
+        priorityLevel: 'veryHigh',
+        maxPriorityFeeLamports: 1_000_000,
+        jitoTipLamports,
+      };
+    }
+    if (tier === 'fast') {
+      return {
+        priorityFeeLamports: 'auto',
+        priorityLevel: 'high',
+        maxPriorityFeeLamports: 350_000,
+        jitoTipLamports,
+      };
+    }
+    return {
+      priorityFeeLamports: 'auto',
+      priorityLevel: 'medium',
+      maxPriorityFeeLamports: 150_000,
+      jitoTipLamports,
+    };
+  }
+
+  private broadcastToJitoBestEffort(rawSigned: Uint8Array, jitoTipLamports: number): void {
+    if (jitoTipLamports <= 0 || typeof fetch !== 'function') return;
+    try {
+      const b64 = Buffer.from(rawSigned).toString('base64');
+      void fetch('https://mainnet.block-engine.jito.wtf/api/v1/transactions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'sendTransaction',
+          params: [b64, { encoding: 'base64' }],
+        }),
+        signal: AbortSignal.timeout(2500),
+      }).catch(() => undefined);
+    } catch {
+      // non-blocking best-effort Jito bundle relay
+    }
+  }
+
   public updateSettings(newSettings: Record<string, any>) {
     try {
       const current = this.readSettings();
-      const updated = {
+      const updated: Record<string, any> = {
         ...current,
         ...newSettings,
         mode: newSettings.mode === 'live' || current.mode === 'live'
@@ -997,6 +1116,10 @@ export class SniperManager {
         };
       }
       fs.writeFileSync(this.settingsFile, JSON.stringify(updated, null, 2), 'utf-8');
+      if (this.orchestrator) {
+        (this.orchestrator.rpcPool as any)?.setPrimaryCustomRpc?.(updated.custom_rpc_url);
+        (this.orchestrator.jupiter as any)?.setApiKey?.(updated.jupiter_api_key);
+      }
       this.appendLog('INFO', 'Python bot settings updated and saved.');
       return { ok: true, settings: updated };
     } catch (err) {
@@ -1178,12 +1301,17 @@ export class SniperManager {
     }
 
     // 4. Build, sign, send (skipPreflight on fast snipe entry), confirm
+    const savedSettings = this.readSettings();
+    const execFees = this.resolveSwapExecutionFees(savedSettings, false);
     let swapTxResp;
     try {
       swapTxResp = await jupiter.buildSwapTransaction({
         quoteResponse: quote,
         userPublicKey: owner,
-        priorityFeeLamports: 'auto',
+        priorityFeeLamports: execFees.priorityFeeLamports,
+        priorityLevel: execFees.priorityLevel,
+        maxPriorityFeeLamports: execFees.maxPriorityFeeLamports,
+        ...(execFees.jitoTipLamports > 0 ? { jitoTipLamports: execFees.jitoTipLamports } : {}),
       });
     } catch (err) {
       return {
@@ -1196,6 +1324,7 @@ export class SniperManager {
     const versionedTx = VersionedTransaction.deserialize(txBytes);
     await signer.signVersionedTransaction(versionedTx);
     const rawSigned = versionedTx.serialize();
+    this.broadcastToJitoBestEffort(rawSigned, execFees.jitoTipLamports);
 
     let sig: string;
     try {
@@ -1459,11 +1588,16 @@ export class SniperManager {
       quote = q;
 
       let swapTxResp;
+      const savedSettings = this.readSettings();
+      const sellExecFees = this.resolveSwapExecutionFees(savedSettings, isUrgentExit);
       try {
         swapTxResp = await jupiter.buildSwapTransaction({
           quoteResponse: q,
           userPublicKey: owner,
-          priorityFeeLamports: 'auto',
+          priorityFeeLamports: sellExecFees.priorityFeeLamports,
+          priorityLevel: sellExecFees.priorityLevel,
+          maxPriorityFeeLamports: sellExecFees.maxPriorityFeeLamports,
+          ...(sellExecFees.jitoTipLamports > 0 ? { jitoTipLamports: sellExecFees.jitoTipLamports } : {}),
           dynamicSlippage: true,
         });
       } catch (err) {
@@ -1475,6 +1609,7 @@ export class SniperManager {
       const versionedTx = VersionedTransaction.deserialize(txBytes);
       await signer.signVersionedTransaction(versionedTx);
       const rawSigned = versionedTx.serialize();
+      this.broadcastToJitoBestEffort(rawSigned, sellExecFees.jitoTipLamports);
 
       let sentSig: string | null = null;
       const preferSkipPreflight = idx > 0 || isUrgentExit;

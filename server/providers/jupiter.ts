@@ -45,8 +45,8 @@ export class JupiterProvider {
   private readonly priceHttp: HttpProvider;
   private readonly swapHttp: HttpProvider;
   private readonly tokensHttp: HttpProvider;
-  private readonly apiKey?: string;
-  private readonly baseUrl: string;
+  private apiKey?: string;
+  private baseUrl: string;
 
   constructor(apiKey?: string) {
     this.apiKey = apiKey?.trim() || undefined;
@@ -74,6 +74,14 @@ export class JupiterProvider {
       timeoutMs: 8000,
       cacheTtlMs: 30_000,
     });
+  }
+
+  setApiKey(apiKey?: string): void {
+    const clean = apiKey?.trim() || undefined;
+    if (clean === this.apiKey) return;
+    this.apiKey = clean;
+    const domain = this.apiKey ? 'api.jup.ag' : 'lite-api.jup.ag';
+    this.baseUrl = `https://${domain}`;
   }
 
   private getHeaders(): Record<string, string> {
@@ -322,8 +330,29 @@ export class JupiterProvider {
     quoteResponse: JupiterQuoteResponse;
     userPublicKey: string;
     priorityFeeLamports: number | 'auto';
+    priorityLevel?: 'medium' | 'high' | 'veryHigh';
+    maxPriorityFeeLamports?: number;
+    jitoTipLamports?: number;
     dynamicSlippage?: boolean;
   }): Promise<JupiterSwapResponse> {
+    let prioritizationFeeLamports: unknown;
+    if (params.jitoTipLamports && params.jitoTipLamports > 0) {
+      prioritizationFeeLamports = {
+        jitoTipLamports: Math.max(1000, Math.round(params.jitoTipLamports)),
+      };
+    } else if (typeof params.priorityFeeLamports === 'number') {
+      prioritizationFeeLamports = Math.max(1000, Math.round(params.priorityFeeLamports));
+    } else if (params.priorityLevel) {
+      prioritizationFeeLamports = {
+        priorityLevelWithMaxLamports: {
+          maxLamports: Math.max(50_000, Math.round(params.maxPriorityFeeLamports ?? 500_000)),
+          priorityLevel: params.priorityLevel,
+        },
+      };
+    } else {
+      prioritizationFeeLamports = { autoMultiplier: 2 };
+    }
+
     return this.swapHttp.fetchJson<JupiterSwapResponse>(
       `${this.baseUrl}/swap/v1/swap`,
       {
@@ -338,15 +367,55 @@ export class JupiterProvider {
           wrapAndUnwrapSol: true,
           dynamicComputeUnitLimit: true,
           ...(params.dynamicSlippage ? { dynamicSlippage: true } : {}),
-          prioritizationFeeLamports:
-            params.priorityFeeLamports === 'auto'
-              ? { autoMultiplier: 2 }
-              : params.priorityFeeLamports,
+          prioritizationFeeLamports,
         }),
       },
       '',
       0
     );
+  }
+
+  /**
+   * Computes real exitable token prices (USD) via reverse Jupiter quotes (mint -> WSOL)
+   * so exit decisions react to actual pool depth & slippage rather than stale cached prices.
+   */
+  async getReverseExitPricesUsd(
+    positions: Array<{ mint: string; qty: number; decimals?: number; rawAmount?: string | null }>,
+    solPriceUsd: number
+  ): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+    if (!solPriceUsd || solPriceUsd <= 0 || positions.length === 0) return out;
+
+    await Promise.all(
+      positions.slice(0, 10).map(async (p) => {
+        const mint = (p.mint || '').trim();
+        const qty = Number(p.qty || 0);
+        if (!mint || qty <= 0) return;
+        const decimals = typeof p.decimals === 'number' && p.decimals >= 0 ? p.decimals : 6;
+        const rawAmount =
+          p.rawAmount && /^\d+$/.test(p.rawAmount) && BigInt(p.rawAmount) > 0n
+            ? p.rawAmount
+            : String(Math.max(1, Math.floor(qty * 10 ** decimals)));
+        const quote = await this.getQuote({
+          inputMint: mint,
+          outputMint: WSOL_MINT,
+          amountRaw: rawAmount,
+          slippageBps: 500,
+          allowRelaxFallback: true,
+          bypassCache: true,
+        }).catch(() => null);
+        if (quote && Number(quote.outAmount) > 0) {
+          const outSol = Number(quote.outAmount) / 1e9;
+          const exitUsd = outSol * solPriceUsd;
+          const unitPriceUsd = exitUsd / qty;
+          if (Number.isFinite(unitPriceUsd) && unitPriceUsd > 0) {
+            out[mint] = unitPriceUsd;
+          }
+        }
+      })
+    );
+
+    return out;
   }
 
   /**

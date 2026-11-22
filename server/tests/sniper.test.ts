@@ -1433,6 +1433,246 @@ test('v1.32.1: bot.py parallel hard_rug_check allows clean <2m score 52 under de
   assert.deepEqual(out.retry_after_found, []);
 });
 
+test('v1.33.0: PumpPortalWsProvider tracks live trades, curve reserves, creator sells, and builds synthetic pairs', async () => {
+  const { PumpPortalWsProvider } = await import('../providers/pumpportal.ts');
+  const pp = new PumpPortalWsProvider();
+  const baseNow = 1_700_000_000_000;
+  const mintA = 'MintPumpLive111111111111111111111111111111';
+  const creatorA = 'CreatorWallet1111111111111111111111111111';
+
+  pp.ingestFrame(
+    {
+      mint: mintA,
+      symbol: 'FAST',
+      name: 'Fast Launch',
+      txType: 'create',
+      traderPublicKey: creatorA,
+      initialBuy: 1.5,
+      bondingCurveKey: 'CurveKey111',
+      vSolInBondingCurve: 31.5,
+      vTokensInBondingCurve: 950_000_000,
+      marketCapSol: 33.15,
+    },
+    baseNow - 15_000
+  );
+
+  for (let i = 0; i < 4; i += 1) {
+    pp.ingestFrame(
+      {
+        mint: mintA,
+        txType: 'buy',
+        traderPublicKey: `BuyerWallet${i}1111111111111111111111111111`,
+        solAmount: 2.0,
+        vSolInBondingCurve: 31.5 + (i + 1) * 2.0,
+        vTokensInBondingCurve: 900_000_000 - i * 20_000_000,
+      },
+      baseNow - (10 - i) * 1000
+    );
+  }
+
+  pp.ingestFrame(
+    {
+      mint: mintA,
+      txType: 'sell',
+      traderPublicKey: creatorA,
+      solAmount: 1.0,
+      vSolInBondingCurve: 38.5,
+      vTokensInBondingCurve: 860_000_000,
+    },
+    baseNow - 2000
+  );
+
+  const pairs = pp.getSyntheticPairs(100, 180_000, baseNow);
+  assert.equal(pairs.length, 1);
+  assert.equal(pairs[0].baseToken.address, mintA);
+  assert.equal(pairs[0].baseToken.symbol, 'FAST');
+  assert.equal(pairs[0].dexId, 'pumpfun');
+  assert.ok(Number(pairs[0].priceUsd) > 0);
+  assert.ok(pairs[0].liquidity.usd > 7000);
+  assert.equal(pairs[0]._pumpportal.buys_60s, 5);
+  assert.equal(pairs[0]._pumpportal.sells_60s, 1);
+  assert.equal(pairs[0]._pumpportal.creator_sold, true);
+  assert.ok(pairs[0]._pumpportal.sol_vol_60s >= 10);
+});
+
+test('v1.33.0: custom primary RPC, priority/Jito swap options, and reverse swap exit quotes work end-to-end', async () => {
+  const { SolanaRpcPool } = await import('../providers/rpcPool.ts');
+  const pool = new SolanaRpcPool();
+  const changed = pool.setPrimaryCustomRpc('https://private-helius.example.invalid/?api-key=test');
+  assert.equal(changed, true);
+  assert.equal(pool.getOrderedConnections()[0].ep.url, 'https://private-helius.example.invalid/?api-key=test');
+  pool.setPrimaryCustomRpc('');
+  assert.ok(!pool.getEndpoints().some((e) => e.url.includes('private-helius')));
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1330-exec-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    mgr.updateSettings({
+      mode: 'live',
+      priority_fee_tier: 'turbo',
+      jito_tip_sol: 0.0002,
+      use_real_swap_quotes: true,
+    });
+
+    const kp = await Keypair.generate();
+    const signer = new ServerSignerManager(path.join(tmpDir, 'ks.json'));
+    await signer.initFromEnv(JSON.stringify(Array.from(kp.secretKey)));
+    const mockTxBase64 = createBase64MockTx(kp);
+    let capturedSwapParams: any = null;
+
+    const mockOrchestrator = {
+      signer,
+      rpcPool: {
+        setPrimaryCustomRpc: () => true,
+        checkAllEndpoints: async () => [],
+        getHealthSnapshot: () => [],
+        getAgreedBalanceSol: async () => ({ agreed: true, balanceSol: 1.0, readings: [1.0, 1.0] }),
+        getAgreedTokenBalanceUi: async () => ({
+          agreed: true,
+          balanceUi: 100,
+          rawAmount: '100000000',
+          decimals: 6,
+          readings: [100, 100],
+        }),
+        inspectTokenOnChain: async () => ({ decimals: 6 }),
+      },
+      jupiter: {
+        setApiKey: () => {},
+        getLiveSolPriceUsd: async () => 100,
+        getLastQuoteError: () => null,
+        getQuote: async (params: any) => ({
+          inputMint: params.inputMint,
+          inAmount: params.amountRaw,
+          outputMint: params.outputMint,
+          outAmount: '50000000',
+          slippageBps: params.slippageBps,
+          priceImpactPct: '0.001',
+          routePlan: [],
+        }),
+        buildSwapTransaction: async (params: any) => {
+          capturedSwapParams = params;
+          return { swapTransaction: mockTxBase64 };
+        },
+        getReverseExitPricesUsd: async (positions: any[], solPx: number) => {
+          const res: Record<string, number> = {};
+          for (const p of positions) {
+            res[p.mint] = (0.05 * solPx) / p.qty;
+          }
+          return res;
+        },
+      },
+    } as unknown as BotOrchestrator;
+
+    const mockAdapter: LiveTxAdapter = {
+      sendSignedTransaction: async () => 'sigV1330Sell111',
+      pollConfirmation: async () => ({ status: 'confirmed' }),
+      reconcileParsedSwapSolDelta: async () => ({
+        found: true,
+        solDeltaLamports: 50_000_000,
+        feeLamports: 10_000,
+        closedAtaRentLamports: 0,
+      }),
+      findRecentSellSignature: async () => null,
+    };
+
+    mgr.attachOrchestrator(mockOrchestrator, mockAdapter);
+
+    const rev = await mgr.getReverseExitPrices(
+      [{ mint: 'MintReverse111111111111111111111111111111', qty: 100, decimals: 6 }],
+      100
+    );
+    assert.equal(rev.ok, true);
+    assert.equal(rev.prices['MintReverse111111111111111111111111111111'], 0.05);
+
+    const sellRes = await mgr.executeLiveSell({
+      mint: 'MintReverse111111111111111111111111111111',
+      symbol: 'REV',
+      qty: 100,
+      rawAmount: '100000000',
+      decimals: 6,
+      costUsd: 3.0,
+      costSol: 0.03,
+      reason: 'trailing_stop_12',
+      solPriceUsd: 100,
+    });
+    assert.equal(sellRes.ok, true);
+    assert.equal(capturedSwapParams.priorityLevel, 'veryHigh');
+    assert.equal(capturedSwapParams.jitoTipLamports, 200_000);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('v1.33.0: bot.py blocks bundled insider RugCheck reports, creator holds/dumps, enforces 60s velocity & $5k/1.5x defaults, and ranks strongest momentum first', () => {
+  const pyScript = [
+    'import sys, types, json, time, tempfile, shutil',
+    'req = types.ModuleType("requests")',
+    'class DummySess:',
+    '    def get(self, *a, **k): raise RuntimeError("no net")',
+    '    def post(self, *a, **k): raise RuntimeError("no net")',
+    'req.Session = lambda: DummySess()',
+    'sys.modules["requests"] = req',
+    'sys.path.insert(0, "sniper")',
+    'import bot',
+    'out = {}',
+    'out["defaults"] = {"liq": bot.CONFIG["min_liquidity_usd"], "ratio": bot.CONFIG["min_buy_sell_ratio_m5"], "bundles": bot.CONFIG["block_insider_bundles"]}',
+    'cfg = dict(bot.CONFIG)',
+    'now_ms = int(time.time() * 1000)',
+    'slow_pair = {"baseToken": {"address": "M1", "symbol": "SLOW"}, "pairCreatedAt": now_ms - 25000, "priceUsd": "0.0001", "liquidity": {"usd": 6500}, "txns": {"m5": {"buys": 12, "sells": 5}}, "volume": {"m5": 3000}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 1, "sells_60s": 0}}',
+    'out["low_vel"] = list(bot.passes_filters(slow_pair, cfg, now_ms))',
+    'good_pair = {"baseToken": {"address": "M2", "symbol": "GOOD"}, "pairCreatedAt": now_ms - 25000, "priceUsd": "0.0001", "liquidity": {"usd": 6500}, "txns": {"m5": {"buys": 20, "sells": 4}}, "volume": {"m5": 5000}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 8, "sells_60s": 2, "sol_vol_60s": 6.0}}',
+    'out["good_vel"] = list(bot.passes_filters(good_pair, cfg, now_ms))',
+    'bot._rpc_mint_account_info = lambda m, c=None: {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": []}',
+    'bot._check_sell_route = lambda *a, **k: (True, "ok")',
+    'bot.get_json = lambda u, **k: {"score_normalised": 15, "insiderNetworks": [{"id": "net1", "size": 12}], "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
+    'out["insider_net"] = list(bot.hard_rug_check("MintIns1", cfg, age_s=20, pair=good_pair))',
+    'bot.get_json = lambda u, **k: {"score_normalised": 15, "creator": "Dev1", "creatorBalance": 90000, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
+    'out["dev_hold"] = list(bot.hard_rug_check("MintDev1", cfg, age_s=20, pair=good_pair))',
+    'bot.get_json = lambda u, **k: {"score_normalised": 15, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
+    'dump_pair = dict(good_pair); dump_pair["_pumpportal"] = {"has_trade_stream": True, "buys_60s": 6, "sells_60s": 2, "creator_sold": True}',
+    'out["creator_sold"] = list(bot.hard_rug_check("MintDump1", cfg, age_s=20, pair=dump_pair))',
+    'mint_weak = "MintWeakAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"',
+    'mint_strong = "MintStrongBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"',
+    'weak_pair = {"baseToken": {"address": mint_weak, "symbol": "WEAK"}, "dexId": "pumpfun", "pairCreatedAt": now_ms - 50000, "priceUsd": "0.0001", "liquidity": {"usd": 6000}, "txns": {"m5": {"buys": 10, "sells": 6}}, "volume": {"m5": 2200}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 3, "sells_60s": 2, "sol_vol_60s": 0.8}}',
+    'strong_pair = {"baseToken": {"address": mint_strong, "symbol": "STRG"}, "dexId": "pumpfun", "pairCreatedAt": now_ms - 12000, "priceUsd": "0.0002", "liquidity": {"usd": 8000}, "txns": {"m5": {"buys": 35, "sells": 5}}, "volume": {"m5": 14000}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 14, "sells_60s": 1, "sol_vol_60s": 8.0}}',
+    'bot._pumpportal_pairs.clear()',
+    'bot._pumpportal_pairs[mint_weak] = weak_pair',
+    'bot._pumpportal_pairs[mint_strong] = strong_pair',
+    'bot.fetch_candidate_mints = lambda c, force=False: [mint_weak, mint_strong]',
+    'bot.get_json = lambda u, **k: {"score_normalised": 10, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
+    'tmp_dir = tempfile.mkdtemp()',
+    'orig_base = bot._base_dir',
+    'bot._base_dir = lambda: tmp_dir',
+    'try:',
+    '    rcfg = dict(cfg, max_open_positions=1, max_age_minutes=3)',
+    '    acct = bot.TradingAccount(rcfg, mode="paper")',
+    '    bot.scan_and_buy(acct, rcfg)',
+    '    out["bought_mints"] = list(acct.state["positions"].keys())',
+    'finally:',
+    '    bot._base_dir = orig_base',
+    '    shutil.rmtree(tmp_dir, ignore_errors=True)',
+    'print(json.dumps(out))',
+  ].join('\n');
+
+  const raw = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+  const out = JSON.parse(raw.trim().split('\n').pop() || '{}');
+
+  assert.equal(out.defaults.liq, 5000);
+  assert.equal(out.defaults.ratio, 1.5);
+  assert.equal(out.defaults.bundles, true);
+  assert.equal(out.low_vel[0], false);
+  assert.equal(out.low_vel[1], 'low 60s velocity');
+  assert.equal(out.good_vel[0], true);
+  assert.equal(out.insider_net[0], false);
+  assert.match(out.insider_net[1], /bundled insider wallets/i);
+  assert.equal(out.dev_hold[0], false);
+  assert.match(out.dev_hold[1], /creator\/dev holds/i);
+  assert.equal(out.creator_sold[0], false);
+  assert.match(out.creator_sold[1], /creator\/dev already sold/i);
+  assert.deepEqual(out.bought_mints, ['MintStrongBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB']);
+});
+
+
 
 
 

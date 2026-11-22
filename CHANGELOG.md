@@ -2,6 +2,26 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.33.0 — Sub-20s Direct PumpPortal Curve Entry, Private RPC + Jito/Priority Execution, Anti-Bundle Rug Screening & Momentum Ranking (`pumpportal.ts`, `rpcPool.ts`, `jupiter.ts`, `sniperManager.ts`, `api.ts`, `bot.py`, `settings.json`, `PythonSniperView.tsx`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Direct PumpPortal Trade Stream & Sub-20s Launch Entry (`pumpportal.ts`, `sniperManager.ts`, `api.ts`, `bot.py`)**:
+  - Extended `PumpPortalWsProvider` to auto-subscribe to live `subscribeTokenTrade` streams for brand-new PumpPortal launches, tracking live `vSolInBondingCurve` / `vTokensInBondingCurve` reserves, real-time 60s buy/sell velocity (`buys_60s`, `sells_60s`, `sol_vol_60s`), and creator/dev sell events (`creator_sold`).
+  - `/api/sniper/pumpportal-mints` now returns DexScreener-compatible synthetic launch pairs alongside recent mints, allowing `bot.py` (`scan_and_buy`) to price and evaluate fresh coins at **5–20 seconds old** (with Jupiter price backfill) instead of waiting 30–100s for DexScreener indexing.
+- **Execution Speed, Private RPC, Priority Tiers, Jito Tips & Real Swap Exit Quotes (`rpcPool.ts`, `jupiter.ts`, `sniperManager.ts`, `api.ts`, `bot.py`, `PythonSniperView.tsx`)**:
+  - Added `custom_rpc_url` (e.g. Helius / QuickNode) wired directly into `SolanaRpcPool.setPrimaryCustomRpc` and Python on-chain mint/holder RPC checks, plus live `jupiter_api_key` propagation on `JupiterProvider`.
+  - Added `priority_fee_tier` (`standard` | `fast` | `turbo`) and optional `jito_tip_sol` with Jupiter native priority/Jito tip swap parameters, urgent `veryHigh` priority escalation on `trailing_stop` / `stop_loss` / `rug_liquidity_drop` / `manual_exit` sells, and parallel best-effort Jito Block Engine relay when `jito_tip_sol > 0`.
+  - Added `use_real_swap_quotes` and `POST /api/sniper/reverse-quotes` (`JupiterProvider.getReverseExitPricesUsd`) so `monitor()` prices open positions using live `mint -> WSOL` reverse quotes reflecting actual executable pool liquidity.
+- **Bundled / Insider Rug Detection & Stronger Velocity/Liquidity Defaults (`bot.py`, `settings.json`, `sniperManager.ts`, `PythonSniperView.tsx`)**:
+  - Upgraded `hard_rug_check` to block RugCheck `insiderNetworks` / `insidersDetected > 0` clusters (`block_insider_bundles`), bundle/sniper risks, creator/dev holdings exceeding `max_dev_hold_pct` (`5%`), and early bonding-curve creator dumps (`creator_sold`).
+  - Tightened default quick-profit entry quality floors to `min_liquidity_usd: $5,000`, `min_volume_m5_usd: $2,000`, `min_buy_sell_ratio_m5: 1.5`, and 60s PumpPortal stream velocity checks (`min_recent_buys_60s: 3`, `buys_60s >= sells_60s`).
+- **Momentum-First Candidate Ranking (`bot.py`)**:
+  - Added deterministic `score_candidate` and `rank_candidates` in `scan_and_buy()` so when multiple launches pass entry filters in the same scan cycle, slots are allocated to the strongest momentum + turnover + 60s velocity launch first instead of arbitrary dictionary order.
+
+---
+
 ## v1.32.1 — Fast Live Buy Execution, Parallel Rug Screening, Streamlined Quick-Profit Settings UI & Young-Coin Rug Score Calibration (`rpcPool.ts`, `liveEngine.ts`, `sniperManager.ts`, `bot.py`, `settings.json`, `PythonSniperView.tsx`)
 
 **Risk Warning: Trading can lose all of your money.**

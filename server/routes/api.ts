@@ -856,7 +856,14 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
   });
 
   router.get('/sniper/pumpportal-mints', (_req: Request, res: Response) => {
-    res.json({ ok: true, mints: sniperManager.getPumpPortalMints() });
+    const feed = sniperManager.getPumpPortalFeed();
+    res.json({ ok: true, mints: feed.mints, pairs: feed.pairs, solPriceUsd: feed.solPriceUsd });
+  });
+
+  router.post('/sniper/reverse-quotes', async (req: Request, res: Response) => {
+    const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
+    const solPriceUsd = req.body?.solPriceUsd !== undefined ? Number(req.body.solPriceUsd) : undefined;
+    res.json(await sniperManager.getReverseExitPrices(positions, solPriceUsd));
   });
 
   return router;
