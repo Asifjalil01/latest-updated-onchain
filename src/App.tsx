@@ -14,6 +14,7 @@ import { ScannerView } from './components/views/ScannerView';
 import { ShadowCompareView } from './components/views/ShadowCompareView';
 import { HistoryView } from './components/views/HistoryView';
 import { SettingsView } from './components/views/SettingsView';
+import { ProDeskView } from './components/views/ProDeskView';
 import { WalletsView } from './components/views/WalletsView';
 import { LogsView } from './components/views/LogsView';
 import { PipelineConfigView } from './components/views/PipelineConfigView';
@@ -79,6 +80,8 @@ export default function App() {
         return <HistoryView />;
       case 'settings':
         return <SettingsView />;
+      case 'pro_desk':
+        return <ProDeskView />;
       case 'wallets':
         return <WalletsView />;
       case 'logs':

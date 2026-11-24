@@ -4,7 +4,9 @@ import { snapshotExitParams } from '../engine/fees';
 import { resolveTrailingAllowedDrop } from '../engine/exits';
 import type {
   BotSettings,
+  DexScorecardRow,
   ExecutionMode,
+  ExecutionTelemetryRecord,
   LogEntry,
   LogSeverity,
   PaperVsLiveGapRecord,
@@ -249,6 +251,38 @@ export class BotDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_creator_history_creator ON creator_history(creator);
       CREATE INDEX IF NOT EXISTS idx_creator_history_mint ON creator_history(mint);
+
+      CREATE TABLE IF NOT EXISTS social_history (
+        social_url TEXT NOT NULL,
+        mint TEXT NOT NULL,
+        symbol TEXT NOT NULL DEFAULT '',
+        rugged INTEGER NOT NULL DEFAULT 0,
+        first_seen_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (social_url, mint)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_social_history_url ON social_history(social_url);
+      CREATE INDEX IF NOT EXISTS idx_social_history_mint ON social_history(mint);
+
+      CREATE TABLE IF NOT EXISTS execution_telemetry (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_id TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        side TEXT NOT NULL,
+        mint TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        dex TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        quoted_price_usd REAL NOT NULL,
+        actual_fill_price_usd REAL NOT NULL,
+        slippage_pct REAL NOT NULL,
+        latency_ms INTEGER NOT NULL,
+        jito_protected INTEGER NOT NULL DEFAULT 0,
+        created_at_ms INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_telemetry_created ON execution_telemetry(created_at_ms DESC);
     `);
 
     // Migrate existing databases to include triggered_sl_tiers_json
@@ -998,6 +1032,201 @@ export class BotDatabase {
       ruggedAtMs: r.rugged_at_ms === null ? null : Number(r.rugged_at_ms),
       rugReason: r.rug_reason ? String(r.rug_reason) : null,
     }));
+  }
+
+  recordSocialObservation(params: {
+    socialUrls: string[];
+    mint: string;
+    symbol?: string;
+    rugged?: boolean;
+    nowMs?: number;
+  }): void {
+    const mint = (params.mint || '').trim();
+    if (!mint || !Array.isArray(params.socialUrls) || params.socialUrls.length === 0) return;
+    const nowMs = params.nowMs ?? Date.now();
+    const stmt = this.db.prepare(
+      `INSERT INTO social_history (social_url, mint, symbol, rugged, first_seen_ms, updated_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(social_url, mint) DO UPDATE SET
+         symbol = CASE WHEN excluded.symbol != '' THEN excluded.symbol ELSE social_history.symbol END,
+         rugged = CASE WHEN excluded.rugged = 1 THEN 1 ELSE social_history.rugged END,
+         updated_at_ms = excluded.updated_at_ms`
+    );
+    const tx = this.db.transaction(() => {
+      for (const rawUrl of params.socialUrls) {
+        const cleanUrl = String(rawUrl || '').trim().toLowerCase();
+        if (!cleanUrl) continue;
+        stmt.run(cleanUrl, mint, params.symbol ?? '', params.rugged ? 1 : 0, nowMs, nowMs);
+      }
+    });
+    tx();
+  }
+
+  markMintRuggedSocials(mint: string, nowMs = Date.now()): void {
+    const cleanMint = (mint || '').trim();
+    if (!cleanMint) return;
+    this.db
+      .prepare('UPDATE social_history SET rugged = 1, updated_at_ms = ? WHERE mint = ?')
+      .run(nowMs, cleanMint);
+  }
+
+  getSocialHistoryForUrls(
+    urls: string[],
+    excludeMint?: string
+  ): Array<{ url: string; priorMints: number; ruggedMints: number; symbols: string[] }> {
+    if (!Array.isArray(urls) || urls.length === 0) return [];
+    const results: Array<{ url: string; priorMints: number; ruggedMints: number; symbols: string[] }> = [];
+    const stmt = this.db.prepare(
+      'SELECT mint, symbol, rugged FROM social_history WHERE social_url = ?'
+    );
+    for (const u of urls) {
+      const clean = String(u || '').trim().toLowerCase();
+      if (!clean) continue;
+      const rows = stmt.all(clean) as Array<{ mint: string; symbol: string; rugged: number }>;
+      const filtered = excludeMint ? rows.filter((r) => r.mint !== excludeMint) : rows;
+      if (filtered.length > 0) {
+        results.push({
+          url: clean,
+          priorMints: filtered.length,
+          ruggedMints: filtered.filter((r) => Number(r.rugged) === 1).length,
+          symbols: filtered.map((r) => String(r.symbol || '')).filter(Boolean).slice(0, 6),
+        });
+      }
+    }
+    return results;
+  }
+
+  recordExecutionTelemetry(rec: Omit<ExecutionTelemetryRecord, 'id'>): void {
+    this.db
+      .prepare(
+        `INSERT INTO execution_telemetry (
+          trade_id, mode, side, mint, symbol, dex, platform,
+          quoted_price_usd, actual_fill_price_usd, slippage_pct, latency_ms,
+          jito_protected, created_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        rec.tradeId,
+        rec.mode,
+        rec.side,
+        rec.mint,
+        rec.symbol,
+        rec.dex || 'unknown',
+        rec.platform || 'unknown',
+        rec.quotedPriceUsd,
+        rec.actualFillPriceUsd,
+        rec.slippagePct,
+        Math.max(0, Math.round(rec.latencyMs)),
+        rec.jitoProtected ? 1 : 0,
+        rec.createdAtMs
+      );
+  }
+
+  getRecentTelemetry(mode?: ExecutionMode, limit = 100): ExecutionTelemetryRecord[] {
+    const rows = mode
+      ? (this.db
+          .prepare('SELECT * FROM execution_telemetry WHERE mode = ? ORDER BY id DESC LIMIT ?')
+          .all(mode, limit) as Array<Record<string, unknown>>)
+      : (this.db
+          .prepare('SELECT * FROM execution_telemetry ORDER BY id DESC LIMIT ?')
+          .all(limit) as Array<Record<string, unknown>>);
+    return rows.map((r) => ({
+      id: Number(r.id),
+      tradeId: String(r.trade_id),
+      mode: r.mode as ExecutionMode,
+      side: (String(r.side) === 'SELL' ? 'SELL' : 'BUY') as 'BUY' | 'SELL',
+      mint: String(r.mint),
+      symbol: String(r.symbol),
+      dex: String(r.dex),
+      platform: String(r.platform),
+      quotedPriceUsd: Number(r.quoted_price_usd),
+      actualFillPriceUsd: Number(r.actual_fill_price_usd),
+      slippagePct: Number(r.slippage_pct),
+      latencyMs: Number(r.latency_ms),
+      jitoProtected: Number(r.jito_protected) === 1,
+      createdAtMs: Number(r.created_at_ms),
+    }));
+  }
+
+  getDexTelemetryScorecard(mode?: ExecutionMode): DexScorecardRow[] {
+    const telemetry = this.getRecentTelemetry(mode, 500);
+    const trades = this.getTrades(mode, false);
+    const map = new Map<
+      string,
+      {
+        dex: string;
+        platform: string;
+        slips: number[];
+        latencies: number[];
+        buyCount: number;
+        sellCount: number;
+        tradeWins: number;
+        tradeTotal: number;
+        netPnlSol: number;
+      }
+    >();
+
+    const ensure = (dexRaw: string, platformRaw: string) => {
+      const dex = (dexRaw || 'unknown').toLowerCase();
+      const platform = (platformRaw || 'unknown').toLowerCase();
+      const key = `${dex}::${platform}`;
+      let entry = map.get(key);
+      if (!entry) {
+        entry = {
+          dex,
+          platform,
+          slips: [],
+          latencies: [],
+          buyCount: 0,
+          sellCount: 0,
+          tradeWins: 0,
+          tradeTotal: 0,
+          netPnlSol: 0,
+        };
+        map.set(key, entry);
+      }
+      return entry;
+    };
+
+    for (const t of telemetry) {
+      const b = ensure(t.dex, t.platform);
+      if (t.side === 'BUY') b.buyCount += 1;
+      else b.sellCount += 1;
+      if (Number.isFinite(t.slippagePct)) b.slips.push(t.slippagePct);
+      if (Number.isFinite(t.latencyMs) && t.latencyMs > 0) b.latencies.push(t.latencyMs);
+    }
+
+    for (const tr of trades) {
+      const b = ensure(tr.dex, tr.source);
+      b.tradeTotal += 1;
+      if (tr.pnlSol > 0) b.tradeWins += 1;
+      b.netPnlSol += tr.pnlSol;
+    }
+
+    return Array.from(map.values())
+      .map((b) => {
+        const avgSlip =
+          b.slips.length > 0 ? b.slips.reduce((s, v) => s + v, 0) / b.slips.length : 0;
+        const maxSlip =
+          b.slips.length > 0 ? Math.max(...b.slips.map((s) => Math.abs(s))) : 0;
+        const avgLat =
+          b.latencies.length > 0
+            ? b.latencies.reduce((s, v) => s + v, 0) / b.latencies.length
+            : 0;
+        return {
+          dex: b.dex,
+          platform: b.platform,
+          tradeCount: Math.max(b.tradeTotal, b.buyCount + b.sellCount),
+          buyCount: b.buyCount,
+          sellCount: b.sellCount,
+          avgSlippagePct: Number(avgSlip.toFixed(3)),
+          maxSlippagePct: Number(maxSlip.toFixed(3)),
+          avgLatencyMs: Math.round(avgLat),
+          winRatePct: b.tradeTotal > 0 ? Number(((b.tradeWins / b.tradeTotal) * 100).toFixed(1)) : 0,
+          netPnlSol: Number(b.netPnlSol.toFixed(6)),
+        };
+      })
+      .sort((a, b) => b.tradeCount - a.tradeCount);
   }
 
   close(): void {

@@ -301,6 +301,89 @@ export function validateSettingsDraft(draft: BotSettings): SettingsValidationRes
     addError('paperCompetitionPenaltyPct', 'Must be between 0% and 20%.');
   }
 
+  // Pro Desk options (validated only when their checkbox/toggle is active)
+  if (draft.antiSybilEnabled && optOn('antiSybilEnabled')) {
+    if (!Number.isFinite(draft.freshWalletMinutes) || draft.freshWalletMinutes < 1 || draft.freshWalletMinutes > 1440) {
+      addError('freshWalletMinutes', 'Fresh wallet window must be between 1 and 1440 minutes.');
+    }
+    if (!Number.isFinite(draft.maxSharedFunderCount) || draft.maxSharedFunderCount < 2 || draft.maxSharedFunderCount > 20) {
+      addError('maxSharedFunderCount', 'Max shared-funder cluster count must be between 2 and 20.');
+    }
+  }
+  if (draft.smartMoneyEnabled && optOn('smartMoneyEnabled')) {
+    if (!Number.isFinite(draft.smartMoneyMinConfluence) || draft.smartMoneyMinConfluence < 1 || draft.smartMoneyMinConfluence > 10) {
+      addError('smartMoneyMinConfluence', 'Min Smart Money confluence must be between 1 and 10 wallets.');
+    }
+    if (!Number.isFinite(draft.smartMoneySizeBoostPct) || draft.smartMoneySizeBoostPct < 0 || draft.smartMoneySizeBoostPct > 200) {
+      addError('smartMoneySizeBoostPct', 'Smart Money size boost must be between 0% and 200%.');
+    }
+  }
+  if (draft.reusedSocialsEnabled && optOn('reusedSocialsEnabled')) {
+    if (!Number.isFinite(draft.maxSocialReuseCount) || draft.maxSocialReuseCount < 1 || draft.maxSocialReuseCount > 50) {
+      addError('maxSocialReuseCount', 'Max allowed social link reuse must be between 1 and 50.');
+    }
+  }
+  if (draft.jitoDontFrontEnabled && optOn('jitoDontFrontEnabled')) {
+    if (!Number.isFinite(draft.jitoTipSol) || draft.jitoTipSol < 0 || draft.jitoTipSol > 0.05) {
+      addError('jitoTipSol', 'Jito tip must be between 0 and 0.05 SOL.');
+    }
+  }
+  if (draft.postMigrationPullbackEnabled && optOn('postMigrationPullbackEnabled')) {
+    if (!Number.isFinite(draft.migrationMinDipPct) || draft.migrationMinDipPct < 1 || draft.migrationMinDipPct > 80) {
+      addError('migrationMinDipPct', 'Post-migration min dip must be between 1% and 80%.');
+    }
+    if (!Number.isFinite(draft.migrationWaitSec) || draft.migrationWaitSec < 5 || draft.migrationWaitSec > 600) {
+      addError('migrationWaitSec', 'Post-migration wait must be between 5 and 600 seconds.');
+    }
+  }
+  if (draft.preMigrationCurveEnabled && optOn('preMigrationCurveEnabled')) {
+    if (!Number.isFinite(draft.preMigrationCurveMinPct) || draft.preMigrationCurveMinPct < 10 || draft.preMigrationCurveMinPct > 99) {
+      addError('preMigrationCurveMinPct', 'Bonding curve min % must be between 10% and 99%.');
+    }
+    if (!Number.isFinite(draft.preMigrationCurveMaxPct) || draft.preMigrationCurveMaxPct < draft.preMigrationCurveMinPct || draft.preMigrationCurveMaxPct > 100) {
+      addError('preMigrationCurveMaxPct', 'Bonding curve max % must be >= min % and <= 100%.');
+    }
+  }
+  if (draft.washTradeFilterEnabled && optOn('washTradeFilterEnabled')) {
+    if (!Number.isFinite(draft.minUniqueMakersRatio) || draft.minUniqueMakersRatio < 0.05 || draft.minUniqueMakersRatio > 1) {
+      addError('minUniqueMakersRatio', 'Min unique makers ratio must be between 0.05 and 1.0.');
+    }
+    if (!Number.isFinite(draft.minUniqueTraders5m) || draft.minUniqueTraders5m < 1 || draft.minUniqueTraders5m > 200) {
+      addError('minUniqueTraders5m', 'Min 5m unique traders must be between 1 and 200.');
+    }
+  }
+  if (draft.solRegimeFilterEnabled && optOn('solRegimeFilterEnabled')) {
+    if (!Number.isFinite(draft.solRegimeMaxDropPct) || draft.solRegimeMaxDropPct < 0.2 || draft.solRegimeMaxDropPct > 25) {
+      addError('solRegimeMaxDropPct', 'SOL 15m drop threshold must be between 0.2% and 25%.');
+    }
+  }
+  if (draft.antiTopWickEnabled && optOn('antiTopWickEnabled')) {
+    if (!Number.isFinite(draft.maxShortSpikePct) || draft.maxShortSpikePct < 5 || draft.maxShortSpikePct > 500) {
+      addError('maxShortSpikePct', 'Anti-Top-Wick max short spike must be between 5% and 500%.');
+    }
+  }
+  if (draft.convictionSizingEnabled && optOn('convictionSizingEnabled')) {
+    if (!Number.isFinite(draft.convictionMinMult) || draft.convictionMinMult < 0.1 || draft.convictionMinMult > 1.5) {
+      addError('convictionMinMult', 'Conviction min multiplier must be between 0.1x and 1.5x.');
+    }
+    if (!Number.isFinite(draft.convictionMaxMult) || draft.convictionMaxMult < draft.convictionMinMult || draft.convictionMaxMult > 3) {
+      addError('convictionMaxMult', 'Conviction max multiplier must be >= min multiplier and <= 3.0x.');
+    }
+  }
+  if (draft.streakThrottleEnabled && optOn('streakThrottleEnabled')) {
+    if (!Number.isFinite(draft.streakLossLimit) || draft.streakLossLimit < 1 || draft.streakLossLimit > 20) {
+      addError('streakLossLimit', 'Streak loss limit must be between 1 and 20 trades.');
+    }
+    if (!Number.isFinite(draft.streakCooldownMinutes) || draft.streakCooldownMinutes < 1 || draft.streakCooldownMinutes > 240) {
+      addError('streakCooldownMinutes', 'Streak cooldown must be between 1 and 240 minutes.');
+    }
+  }
+  if (draft.narrativeCapEnabled && optOn('narrativeCapEnabled')) {
+    if (!Number.isFinite(draft.maxSameNarrativePositions) || draft.maxSameNarrativePositions < 1 || draft.maxSameNarrativePositions > 10) {
+      addError('maxSameNarrativePositions', 'Max concurrent same-narrative positions must be between 1 and 10.');
+    }
+  }
+
   return {
     valid: errors.length === 0,
     fieldErrors,

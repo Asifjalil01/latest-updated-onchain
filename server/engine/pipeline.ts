@@ -3,12 +3,17 @@ import type {
   BotRunState,
   BotSettings,
   BotStatusSnapshot,
+  BacktestRequest,
+  BacktestResult,
   CandidateToken,
+  DexScorecardRow,
   ExecutionMode,
   ExitReason,
   ExplanationRecord,
   LogSeverity,
+  OrphanSweepResult,
   PositionRecord,
+  RentAuditReport,
   SecurityReport,
   SourceHealthRecord,
   SseEventPayload,
@@ -24,7 +29,15 @@ import { WSOL_MINT } from '../providers/jupiter';
 import type { DexScreenerProvider } from '../providers/dexscreener';
 import type { GeckoTerminalProvider } from '../providers/geckoterminal';
 import type { RugCheckProvider } from '../providers/rugcheck';
-import type { PumpPortalWsProvider } from '../providers/pumpportal';
+import type { PumpPortalTradeTick, PumpPortalWsProvider } from '../providers/pumpportal';
+import {
+  SolRegimeTracker,
+  MarketStructureTracker,
+  evaluateLosingStreakThrottle,
+  calculateConvictionMultiplier,
+  extractTickerStem,
+  runSpotBacktest,
+} from '../providers/proSignals';
 import { evaluateHardFilters, validateCandidateData } from './filters';
 import { runSecurityChecks } from './security';
 import { scoreCandidate } from './scoring';
@@ -93,6 +106,10 @@ export class BotOrchestrator {
   private readonly sellingPositionIds = new Set<string>();
   private readonly youngPoolWatchlist = new Map<string, number>();
   private readonly liveEngine: LiveExecutionEngine;
+  private readonly solRegimeTracker = new SolRegimeTracker();
+  private readonly marketStructure = new MarketStructureTracker();
+  private lastOrphanSweepMs = 0;
+  private pumpTradeUnsub: (() => void) | null = null;
 
   constructor(
     public readonly db: BotDatabase,
@@ -168,12 +185,14 @@ export class BotOrchestrator {
     if (jupPrice && jupPrice > 0) {
       this.solPriceUsd = jupPrice;
       this.solPriceSource = 'jupiter_v3';
+      this.solRegimeTracker.record(jupPrice);
       return jupPrice;
     }
     const dsPrice = await this.dexScreener.getLiveSolPriceUsd().catch(() => null);
     if (dsPrice && dsPrice > 0) {
       this.solPriceUsd = dsPrice;
       this.solPriceSource = 'dexscreener_fallback';
+      this.solRegimeTracker.record(dsPrice);
       return dsPrice;
     }
     if (this.solPriceUsd === null) {
@@ -391,9 +410,20 @@ export class BotOrchestrator {
 
     this.runState = 'running';
     const settings = this.db.getSettings();
-    if (settings.enablePumpPortalWs) {
+    const wsExitsOn = Boolean(settings.wsExitStreamEnabled && isOptionEnabled(settings, 'wsExitStreamEnabled'));
+    if (settings.enablePumpPortalWs || wsExitsOn) {
       this.pumpPortal.start();
     }
+    if (this.pumpTradeUnsub) {
+      this.pumpTradeUnsub();
+      this.pumpTradeUnsub = null;
+    }
+    if (wsExitsOn && typeof this.pumpPortal.onTrade === 'function') {
+      this.pumpTradeUnsub = this.pumpPortal.onTrade((tick) => {
+        void this.handleLiveTradeTick(tick);
+      });
+    }
+    this.syncPinnedWsMints();
 
     this.log('INFO', 'ENGINE', `Bot started in ${this.mode.toUpperCase()} mode.`);
     this.broadcastStatus();
@@ -420,6 +450,11 @@ export class BotOrchestrator {
       clearInterval(this.exitTimer);
       this.exitTimer = null;
     }
+    if (this.pumpTradeUnsub) {
+      this.pumpTradeUnsub();
+      this.pumpTradeUnsub = null;
+    }
+    this.pumpPortal.setPinnedOpenMints([]);
     this.pumpPortal.stop();
     this.runState = 'stopped';
     this.log('INFO', 'ENGINE', 'Bot stopped.');
@@ -444,6 +479,11 @@ export class BotOrchestrator {
       clearInterval(this.exitTimer);
       this.exitTimer = null;
     }
+    if (this.pumpTradeUnsub) {
+      this.pumpTradeUnsub();
+      this.pumpTradeUnsub = null;
+    }
+    this.pumpPortal.setPinnedOpenMints([]);
     this.pumpPortal.stop();
     this.log('CRITICAL', 'KILL_SWITCH', 'KILL SWITCH ACTIVATED: stopping bot and exiting all open positions.');
     this.broadcastStatus();
@@ -544,6 +584,10 @@ export class BotOrchestrator {
     }
 
     const filterResult = evaluateHardFilters(candidate, settings, buyImpactPct);
+    const wsSnap =
+      typeof this.pumpPortal.getLiveMintSnapshots === 'function'
+        ? this.pumpPortal.getLiveMintSnapshots([mint], solPrice)[mint]
+        : undefined;
     const security = await runSecurityChecks({
       mint,
       symbol: candidate.symbol,
@@ -551,6 +595,8 @@ export class BotOrchestrator {
       solPriceUsd: solPrice ?? 0,
       testSizeSol: probeTradeSizeSol,
       poolCreatedAtMs: candidate.poolCreatedAtMs,
+      socialUrls: candidate.socialUrls,
+      smartWalletBuyers: wsSnap?.recentBuyers ?? candidate.smartWalletBuyers,
       settings,
       rpcPool: this.rpcPool,
       rugCheckProvider: this.rugCheck,
@@ -614,6 +660,31 @@ export class BotOrchestrator {
       const solPriceUsd = await this.refreshSolPrice();
       if (!solPriceUsd) {
         this.log('WARN', 'PRICE', 'Live SOL/USD price unavailable from Jupiter & DexScreener; skipping buy pass.');
+        this.broadcastStatus();
+        return { evaluated: 0, bought: 0 };
+      }
+
+      // Pro Desk Group 3C: SOL Market Regime Filter ("Red Market Pause")
+      const regime = this.solRegimeTracker.evaluate(settings);
+      if (regime.pauseEntries) {
+        this.log(
+          'WARN',
+          'PRO_REGIME',
+          `SOL 15m drop -${regime.dropPct15m.toFixed(2)}% >= ${settings.solRegimeMaxDropPct}% cap — pausing fresh entries.`
+        );
+        this.broadcastStatus();
+        return { evaluated: 0, bought: 0 };
+      }
+
+      // Pro Desk Group 4B: Drawdown / Losing-Streak Throttle
+      const recentClosed = this.db.getTrades(this.mode, false);
+      const streak = evaluateLosingStreakThrottle(recentClosed, settings);
+      if (streak.pauseEntries) {
+        this.log(
+          'WARN',
+          'PRO_STREAK',
+          `Losing-streak throttle (${streak.consecutiveLosses} losses) active — pausing entries for ${streak.cooldownRemainingSec}s.`
+        );
         this.broadcastStatus();
         return { evaluated: 0, bought: 0 };
       }
@@ -746,6 +817,13 @@ export class BotOrchestrator {
       }
 
       const candidates = Array.from(rawCandidates.values());
+      const liveWsSnapshots =
+        typeof this.pumpPortal.getLiveMintSnapshots === 'function'
+          ? this.pumpPortal.getLiveMintSnapshots(
+              candidates.map((c) => c.mint),
+              solPriceUsd
+            )
+          : {};
       this.funnel.discovered += candidates.length;
       this.broadcastStatus();
 
@@ -757,6 +835,21 @@ export class BotOrchestrator {
         if (isOptionEnabled(settings, 'cooldownMinutes') && this.db.isInCooldown(candidate.mint, this.mode)) continue;
         if (this.db.isMintAttempted(candidate.mint, this.mode)) continue;
         if (this.db.hasTradedMint(candidate.mint, this.mode)) continue;
+
+        const liveSnap = liveWsSnapshots[candidate.mint];
+        if (liveSnap) {
+          if (liveSnap.uniqueTraders5m > 0 && candidate.uniqueTraders5m === undefined) {
+            candidate.uniqueTraders5m = liveSnap.uniqueTraders5m;
+          }
+          if (liveSnap.realSol > 0 && candidate.realSolInCurve === undefined) {
+            candidate.realSolInCurve = liveSnap.realSol;
+          }
+          if (liveSnap.recentBuyers.length > 0) {
+            candidate.smartWalletBuyers = Array.from(
+              new Set([...(candidate.smartWalletBuyers ?? []), ...liveSnap.recentBuyers])
+            );
+          }
+        }
 
         evaluated += 1;
 
@@ -780,6 +873,20 @@ export class BotOrchestrator {
             0,
             0,
             { filterResult: preFilter }
+          );
+          continue;
+        }
+
+        // Pro Desk Group 3: Market-Structure / Entry-Timing Guards (Post-Migration Pullback, Pre-Migration Curve, Wash Trade, Anti-Top-Wick)
+        const timingCheck = this.marketStructure.evaluateEntryTiming(candidate, settings);
+        if (!timingCheck.passed) {
+          this.recordRejection(
+            candidate,
+            'PRO_TIMING',
+            timingCheck.reasons[0] || 'Pro market-structure guard blocked entry',
+            0,
+            0,
+            { timingCheck }
           );
           continue;
         }
@@ -815,7 +922,7 @@ export class BotOrchestrator {
         }
         this.funnel.filtered += 1;
 
-        // Stage 4 & 5: SECURITY & SELL-ROUTE TEST
+        // Stage 4 & 5: SECURITY & SELL-ROUTE TEST (includes Anti-Sybil, Reused Socials, Smart Money matching)
         const securityReport = await runSecurityChecks({
           mint: candidate.mint,
           symbol: candidate.symbol,
@@ -823,6 +930,8 @@ export class BotOrchestrator {
           solPriceUsd,
           testSizeSol: effectiveTradeSizeSol,
           poolCreatedAtMs: candidate.poolCreatedAtMs,
+          socialUrls: candidate.socialUrls,
+          smartWalletBuyers: candidate.smartWalletBuyers,
           settings,
           rpcPool: this.rpcPool,
           rugCheckProvider: this.rugCheck,
@@ -913,6 +1022,37 @@ export class BotOrchestrator {
           }
         }
 
+        // Pro Desk Group 4C: Meta / Narrative Duplicate Guard
+        if (settings.narrativeCapEnabled && isOptionEnabled(settings, 'narrativeCapEnabled')) {
+          const stem = extractTickerStem(candidate.symbol);
+          const maxSame = Math.max(1, settings.maxSameNarrativePositions || 1);
+          const sameNarrativeCount = openPositions.filter(
+            (p) => extractTickerStem(p.symbol) === stem
+          ).length;
+          if (sameNarrativeCount >= maxSame) {
+            this.recordRejection(
+              candidate,
+              'RISK_SIZE',
+              `Meta narrative cap: already holding ${sameNarrativeCount}/${maxSame} position(s) in "${stem}"`,
+              explanation.qualityScore,
+              explanation.tradeScore,
+              { stem, sameNarrativeCount, maxSame }
+            );
+            continue;
+          }
+        }
+
+        // Pro Desk Group 4A + Regime + Streak Multiplier
+        const smartMatchesCount = securityReport.smartMoneyBuyers?.length ?? 0;
+        const convictionMult = calculateConvictionMultiplier({
+          token: candidate,
+          settings,
+          smartWalletMatches: smartMatchesCount,
+        });
+        const proSizeMultiplier = Number(
+          (convictionMult * regime.sizeMultiplier * streak.sizeMultiplier).toFixed(3)
+        );
+
         const sizing = calculatePositionSize({
           settings,
           availableBalanceSol: availableBalance,
@@ -922,6 +1062,7 @@ export class BotOrchestrator {
           poolLiquidityUsd: candidate.liquidityUsd,
           solPriceUsd,
           tokenClassMultiplier: explanation.sizeMultiplier,
+          proSizeMultiplier,
         });
 
         if (!sizing.approved) {
@@ -971,6 +1112,7 @@ export class BotOrchestrator {
           if (res.ok && res.position) {
             bought += 1;
             this.funnel.bought += 1;
+            this.syncPinnedWsMints();
             this.broadcast({ type: 'trade_event', data: { kind: 'BUY', position: res.position } });
             const latestOpenCount = this.db.getPositions(this.mode, false).length;
             if (
@@ -1015,6 +1157,7 @@ export class BotOrchestrator {
               ? await this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
               : null;
           const paperSlippageBps = isOptionEnabled(settings, 'slippageBps') ? settings.slippageBps : 150;
+          const paperBuyStartMs = Date.now();
           const paperBuy = await executeRealisticPaperBuy({
             mode: this.mode,
             token: paperCandidate,
@@ -1049,8 +1192,34 @@ export class BotOrchestrator {
           if (paperBuy.executed && paperBuy.position) {
             this.db.upsertPosition(paperBuy.position);
             this.db.setModeBalanceSol(this.mode, availableBalance - paperBuy.totalSpentSol);
+            if (typeof this.db.recordExecutionTelemetry === 'function') {
+              const quotedBuyPx =
+                Number(buyQuote.outAmount) > 0
+                  ? (sizing.solAmount / (Number(buyQuote.outAmount) / 10 ** resolvedDecimals)) * solPriceUsd
+                  : candidate.priceUsd;
+              const slipPct =
+                quotedBuyPx > 0
+                  ? ((paperBuy.effectiveFillPriceUsd - quotedBuyPx) / quotedBuyPx) * 100
+                  : 0;
+              this.db.recordExecutionTelemetry({
+                tradeId: paperBuy.position.id,
+                mode: this.mode,
+                side: 'BUY',
+                mint: candidate.mint,
+                symbol: candidate.symbol,
+                dex: candidate.dex || 'jupiter',
+                platform: candidate.source || 'spot_bot',
+                quotedPriceUsd: quotedBuyPx,
+                actualFillPriceUsd: paperBuy.effectiveFillPriceUsd,
+                slippagePct: Number(slipPct.toFixed(3)),
+                latencyMs: Math.max(1, Date.now() - paperBuyStartMs),
+                jitoProtected: false,
+                createdAtMs: Date.now(),
+              });
+            }
             bought += 1;
             this.funnel.bought += 1;
+            this.syncPinnedWsMints();
             this.log(
               'INFO',
               'PAPER_BUY',
@@ -1246,10 +1415,94 @@ export class BotOrchestrator {
     }
   }
 
+  private syncPinnedWsMints(): void {
+    const settings = this.db.getSettings();
+    const wsOn = Boolean(settings.wsExitStreamEnabled && isOptionEnabled(settings, 'wsExitStreamEnabled'));
+    if (!wsOn) {
+      if (typeof this.pumpPortal.setPinnedOpenMints === 'function') {
+        this.pumpPortal.setPinnedOpenMints([]);
+      }
+      return;
+    }
+    const open = this.db
+      .getPositions(this.mode, false)
+      .filter((p) => p.status === 'OPEN')
+      .map((p) => p.mint);
+    if (typeof this.pumpPortal.setPinnedOpenMints === 'function') {
+      this.pumpPortal.setPinnedOpenMints(open);
+    }
+  }
+
+  private async handleLiveTradeTick(tick: PumpPortalTradeTick): Promise<void> {
+    if (this.runState !== 'running') return;
+    const settings = this.db.getSettings();
+    if (!settings.wsExitStreamEnabled || !isOptionEnabled(settings, 'wsExitStreamEnabled')) return;
+    const pos = this.db.getOpenPositionByMint(this.mode, tick.mint);
+    if (!pos || pos.status !== 'OPEN' || this.sellingPositionIds.has(pos.id)) return;
+    const solPriceUsd = this.solPriceUsd;
+    if (!solPriceUsd || solPriceUsd <= 0) return;
+
+    // Auto-exit immediately if a tracked Smart Money wallet sells this mint
+    if (
+      tick.side === 'sell' &&
+      tick.trader &&
+      settings.smartMoneyEnabled &&
+      isOptionEnabled(settings, 'smartMoneyEnabled') &&
+      settings.smartMoneyAutoExitOnSell &&
+      isOptionEnabled(settings, 'smartMoneyAutoExitOnSell') &&
+      (settings.smartWallets || []).includes(tick.trader)
+    ) {
+      this.log(
+        'WARN',
+        'SMART_MONEY',
+        `${pos.symbol}: Tracked Smart Wallet ${tick.trader.slice(0, 6)}... sold via WS stream (<200ms) — exiting immediately.`
+      );
+      await this.sellPosition(pos.id, 'SMART_MONEY_SELL', true);
+      return;
+    }
+
+    const tickPriceUsd = tick.priceSol > 0 ? tick.priceSol * solPriceUsd : 0;
+    const tickLiqUsd = tick.vSol > 0 ? tick.vSol * 2 * solPriceUsd : pos.currentLiquidityUsd;
+    if (tickPriceUsd <= 0) return;
+
+    const evalExit = evaluatePositionExit(pos, {
+      currentPriceUsd: tickPriceUsd,
+      currentLiquidityUsd: tickLiqUsd,
+    });
+    if (evalExit.shouldExit && evalExit.reason) {
+      this.log(
+        'INFO',
+        'WS_EXIT',
+        `${pos.symbol}: Sub-second WS exit trigger (${evalExit.reason}) @ $${tickPriceUsd.toFixed(6)}`
+      );
+      await this.sellPosition(
+        pos.id,
+        evalExit.reason,
+        evalExit.isEmergency,
+        evalExit.sellFraction ?? 1,
+        evalExit.triggeredStopLossTier
+      );
+    }
+  }
+
   async evaluateOpenPositionsTick(): Promise<void> {
     if (this.exitTickInFlight) return;
     this.exitTickInFlight = true;
     try {
+      const settings = this.db.getSettings();
+      this.syncPinnedWsMints();
+
+      // Pro Desk Group 2C: Periodic Orphan Wallet Position Sweep (live mode, every ~25s)
+      if (
+        this.mode === 'live' &&
+        settings.orphanSweepEnabled &&
+        isOptionEnabled(settings, 'orphanSweepEnabled') &&
+        Date.now() - this.lastOrphanSweepMs >= 25_000
+      ) {
+        this.lastOrphanSweepMs = Date.now();
+        void this.sweepOrphanPositions().catch(() => undefined);
+      }
+
       const openPositions = this.db
         .getPositions(this.mode, false)
         .filter((p) => p.status === 'OPEN' && !this.sellingPositionIds.has(p.id));
@@ -1267,8 +1520,13 @@ export class BotOrchestrator {
         this.jupiter.getLivePricesUsd(mints).catch(() => ({} as Record<string, number>)),
         this.dexScreener.enrichMintsBatch(mints).catch(() => new Map()),
       ]);
+      const wsSnapshots =
+        settings.wsExitStreamEnabled &&
+        isOptionEnabled(settings, 'wsExitStreamEnabled') &&
+        typeof this.pumpPortal.getLiveMintSnapshots === 'function'
+          ? this.pumpPortal.getLiveMintSnapshots(mints, solPriceUsd)
+          : {};
 
-      const settings = this.db.getSettings();
       const deltas: Array<{
         id: string;
         currentPriceUsd: number;
@@ -1301,9 +1559,39 @@ export class BotOrchestrator {
         }
 
         const ds = dsMap.get(pos.mint);
-        let livePrice = jupPrices[pos.mint] ?? ds?.priceUsd ?? pos.currentPriceUsd;
-        const liveLiquidity = ds?.liquidityUsd ?? pos.currentLiquidityUsd;
-        const isStale = !jupPrices[pos.mint] && !ds;
+        const ws = wsSnapshots[pos.mint];
+        const wsFresh = Boolean(ws && ws.priceUsd > 0 && Date.now() - ws.lastTradeAtMs <= 4_000);
+        let livePrice =
+          (wsFresh ? ws.priceUsd : undefined) ??
+          jupPrices[pos.mint] ??
+          ds?.priceUsd ??
+          pos.currentPriceUsd;
+        const liveLiquidity =
+          (wsFresh && ws.liquidityUsd > 0 ? ws.liquidityUsd : undefined) ??
+          ds?.liquidityUsd ??
+          pos.currentLiquidityUsd;
+        const isStale = !wsFresh && !jupPrices[pos.mint] && !ds;
+
+        // Smart Money seller exit fallback on polling tick
+        if (
+          ws &&
+          settings.smartMoneyEnabled &&
+          isOptionEnabled(settings, 'smartMoneyEnabled') &&
+          settings.smartMoneyAutoExitOnSell &&
+          isOptionEnabled(settings, 'smartMoneyAutoExitOnSell')
+        ) {
+          const smartSet = new Set(settings.smartWallets || []);
+          const sellerHit = ws.recentSellers.find((s) => smartSet.has(s));
+          if (sellerHit) {
+            this.log(
+              'WARN',
+              'SMART_MONEY',
+              `${pos.symbol}: Tracked Smart Wallet ${sellerHit.slice(0, 6)}... sold — triggering immediate exit.`
+            );
+            await this.sellPosition(pos.id, 'SMART_MONEY_SELL', true);
+            continue;
+          }
+        }
 
         let evalExit = evaluatePositionExit(pos, {
           currentPriceUsd: livePrice,
@@ -1448,14 +1736,19 @@ export class BotOrchestrator {
         });
         if (res.ok && res.trade) {
           if (
-            typeof this.db.markMintRuggedForCreator === 'function' &&
-            (reason === 'EMERGENCY_LIQUIDITY_DRAIN' ||
-              reason === 'EMERGENCY_LIQUIDITY_FLOOR' ||
-              reason === 'WRITE_OFF_UNSELLABLE')
+            reason === 'EMERGENCY_LIQUIDITY_DRAIN' ||
+            reason === 'EMERGENCY_LIQUIDITY_FLOOR' ||
+            reason === 'WRITE_OFF_UNSELLABLE'
           ) {
-            this.db.markMintRuggedForCreator(pos.mint, reason);
+            if (typeof this.db.markMintRuggedForCreator === 'function') {
+              this.db.markMintRuggedForCreator(pos.mint, reason);
+            }
+            if (typeof this.db.markMintRuggedSocials === 'function') {
+              this.db.markMintRuggedSocials(pos.mint);
+            }
           }
           this.lastLiveBalanceSyncByPos.delete(positionId);
+          this.syncPinnedWsMints();
           this.broadcast({ type: 'trade_event', data: { kind: 'SELL', trade: res.trade } });
           this.broadcastStatus();
         }
@@ -1481,6 +1774,7 @@ export class BotOrchestrator {
       const exitSlippageBps = isOptionEnabled(settings, 'slippageBps') ? settings.slippageBps : 150;
 
       // Paper or Testnet simulated realistic exit
+      const paperSellStartMs = Date.now();
       const res = await executeRealisticPaperSell({
         position: sellPos,
         exitReason: reason,
@@ -1575,15 +1869,39 @@ export class BotOrchestrator {
       if (isOptionEnabled(settings, 'cooldownMinutes')) {
         this.db.setCooldown(pos.mint, pos.mode, settings.cooldownMinutes);
       }
-      if (
-        typeof this.db.markMintRuggedForCreator === 'function' &&
-        (reason === 'EMERGENCY_LIQUIDITY_DRAIN' || reason === 'EMERGENCY_LIQUIDITY_FLOOR')
-      ) {
-        this.db.markMintRuggedForCreator(pos.mint, reason);
+      if (reason === 'EMERGENCY_LIQUIDITY_DRAIN' || reason === 'EMERGENCY_LIQUIDITY_FLOOR') {
+        if (typeof this.db.markMintRuggedForCreator === 'function') {
+          this.db.markMintRuggedForCreator(pos.mint, reason);
+        }
+        if (typeof this.db.markMintRuggedSocials === 'function') {
+          this.db.markMintRuggedSocials(pos.mint);
+        }
+      }
+
+      if (typeof this.db.recordExecutionTelemetry === 'function') {
+        const qPx = pos.currentPriceUsd > 0 ? pos.currentPriceUsd : res.trade.exitPrice;
+        const fillPx = res.trade.exitPrice;
+        const slip = qPx > 0 ? ((qPx - fillPx) / qPx) * 100 : 0;
+        this.db.recordExecutionTelemetry({
+          tradeId: res.trade.tradeId,
+          mode: pos.mode,
+          side: 'SELL',
+          mint: pos.mint,
+          symbol: pos.symbol,
+          dex: pos.dex || 'jupiter',
+          platform: pos.source || 'spot_bot',
+          quotedPriceUsd: qPx,
+          actualFillPriceUsd: fillPx,
+          slippagePct: Number(slip.toFixed(3)),
+          latencyMs: Math.max(1, Date.now() - paperSellStartMs),
+          jitoProtected: false,
+          createdAtMs: Date.now(),
+        });
       }
 
       const curBal = this.db.getModeBalanceSol(pos.mode);
       this.db.setModeBalanceSol(pos.mode, curBal + res.solReturnedNet);
+      this.syncPinnedWsMints();
 
       this.log(
         'INFO',
@@ -1676,8 +1994,54 @@ export class BotOrchestrator {
     return { ok: true };
   }
 
-  async reclaimRent(): Promise<{ closedCount: number; reclaimedSol: number; txSig: string | null }> {
-    return this.liveEngine.reclaimEmptyTokenAccounts();
+  async auditRentAccounts(): Promise<RentAuditReport> {
+    const solPrice = this.solPriceUsd ?? (await this.refreshSolPrice().catch(() => null));
+    return this.liveEngine.auditTokenAccounts(solPrice);
+  }
+
+  async reclaimRent(
+    targetMint?: string,
+    burnDust = false
+  ): Promise<{ closedCount: number; burnedCount: number; reclaimedSol: number; txSig: string | null }> {
+    const res = await this.liveEngine.reclaimEmptyTokenAccounts(targetMint, { burnDust });
+    if (res.closedCount > 0) {
+      this.log(
+        'INFO',
+        'RENT_RECLAIM',
+        `Closed ${res.closedCount} ATA(s)${res.burnedCount > 0 ? ` (burned ${res.burnedCount} dust account(s))` : ''}, reclaimed ${res.reclaimedSol.toFixed(5)} SOL.`
+      );
+    }
+    return res;
+  }
+
+  async sweepOrphanPositions(): Promise<OrphanSweepResult> {
+    const solPrice = this.solPriceUsd ?? (await this.refreshSolPrice().catch(() => null));
+    const settings = this.db.getSettings();
+    const res = await this.liveEngine.detectAndAdoptOrphanPositions({
+      dexScreener: this.dexScreener,
+      solPriceUsd: solPrice,
+      settings,
+    });
+    if (res.adopted > 0) {
+      this.log(
+        'WARN',
+        'ORPHAN_SWEEP',
+        `Auto-adopted ${res.adopted} untracked wallet token(s) into TP/SL monitor: ${res.adoptedSymbols.join(', ')}`
+      );
+      this.syncPinnedWsMints();
+      this.broadcastStatus();
+    }
+    return res;
+  }
+
+  getDexScorecard(mode?: ExecutionMode): DexScorecardRow[] {
+    return this.db.getDexTelemetryScorecard(mode ?? this.mode);
+  }
+
+  runBacktest(req: BacktestRequest): BacktestResult {
+    const targetMode = req.mode ?? this.mode;
+    const trades = this.db.getTrades(targetMode, false);
+    return runSpotBacktest(trades, req);
   }
 
   getAllSourceHealth(): SourceHealthRecord[] {

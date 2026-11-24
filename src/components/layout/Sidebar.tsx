@@ -10,6 +10,7 @@ import {
   Radar,
   Settings,
   ShieldAlert,
+  ShieldCheck,
   Sliders,
   Terminal,
   TrendingUp,
@@ -61,6 +62,12 @@ const NAV_ITEMS: Array<{
     label: 'Settings',
     description: 'Configure trade size, risk limits, stop-loss/take-profit rules, trailing ladder, filters, and Paper Realism.',
     icon: Settings,
+  },
+  {
+    id: 'pro_desk',
+    label: 'Pro Desk',
+    description: 'Anti-Sybil, Smart Money, Jito dontfront, WS exit stream, market-structure filters, ATA rent reclaim & backtester.',
+    icon: ShieldCheck,
   },
   {
     id: 'wallets',

@@ -55,12 +55,38 @@ export interface SyntheticPumpPortalPair {
     buys_60s: number;
     sells_60s: number;
     sol_vol_60s: number;
+    unique_traders_5m: number;
     v_sol: number;
     real_sol: number;
     creator: string;
     creator_sold: boolean;
     initial_buy_sol: number;
+    recent_buyers: string[];
   };
+}
+
+export interface PumpPortalTradeTick {
+  mint: string;
+  side: 'buy' | 'sell';
+  solAmount: number;
+  trader: string;
+  priceSol: number;
+  vSol: number;
+  vTokens: number;
+  tsMs: number;
+  migrated: boolean;
+}
+
+export interface PumpPortalLiveSnapshot {
+  mint: string;
+  priceUsd: number;
+  priceSol: number;
+  liquidityUsd: number;
+  lastTradeAtMs: number;
+  uniqueTraders5m: number;
+  recentSellers: string[];
+  recentBuyers: string[];
+  realSol: number;
 }
 
 export interface PumpPortalRawMessage {
@@ -95,6 +121,8 @@ export class PumpPortalWsProvider {
   private migrationBuffer: PumpPortalEvent[] = [];
   private tokenStates = new Map<string, PumpPortalTokenState>();
   private subscribedMints = new Set<string>();
+  private pinnedOpenMints = new Set<string>();
+  private tradeListeners = new Set<(tick: PumpPortalTradeTick) => void>();
   private itemsCount = 0;
   private lastOkMs: number | null = null;
   private errorCount = 0;
@@ -128,15 +156,41 @@ export class PumpPortalWsProvider {
     }
   }
 
+  onTrade(listener: (tick: PumpPortalTradeTick) => void): () => void {
+    this.tradeListeners.add(listener);
+    return () => {
+      this.tradeListeners.delete(listener);
+    };
+  }
+
+  setPinnedOpenMints(mints: string[]): void {
+    const clean = new Set(mints.map((m) => String(m || '').trim()).filter((m) => m.length >= 32));
+    const newlyAdded: string[] = [];
+    for (const m of clean) {
+      if (!this.pinnedOpenMints.has(m)) newlyAdded.push(m);
+    }
+    this.pinnedOpenMints = clean;
+    for (const m of newlyAdded) {
+      this.subscribeMintTrades(m);
+    }
+  }
+
   private subscribeMintTrades(mint: string): void {
     if (!mint || this.subscribedMints.has(mint)) return;
     if (this.subscribedMints.size >= MAX_SUBSCRIBED_MINTS) {
-      const oldest = this.subscribedMints.values().next().value;
-      if (oldest) {
-        this.subscribedMints.delete(oldest);
+      // Never evict a pinned open position mint when rolling discovery slots
+      let evictCandidate: string | null = null;
+      for (const existing of this.subscribedMints) {
+        if (!this.pinnedOpenMints.has(existing)) {
+          evictCandidate = existing;
+          break;
+        }
+      }
+      if (evictCandidate) {
+        this.subscribedMints.delete(evictCandidate);
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
           try {
-            this.ws.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [oldest] }));
+            this.ws.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [evictCandidate] }));
           } catch {
             // ignore
           }
@@ -156,6 +210,7 @@ export class PumpPortalWsProvider {
   private pruneTokenStates(nowMs: number): void {
     if (this.tokenStates.size <= MAX_TRACKED_TOKENS) {
       for (const [mint, st] of this.tokenStates.entries()) {
+        if (this.pinnedOpenMints.has(mint)) continue;
         if (nowMs - st.createdAtMs > TOKEN_RETENTION_MS && nowMs - st.lastTradeAtMs > TOKEN_RETENTION_MS) {
           this.tokenStates.delete(mint);
           if (this.subscribedMints.has(mint)) {
@@ -165,11 +220,11 @@ export class PumpPortalWsProvider {
       }
       return;
     }
-    const entries = Array.from(this.tokenStates.entries()).sort(
-      (a, b) => a[1].lastTradeAtMs - b[1].lastTradeAtMs
-    );
-    const toRemove = entries.length - MAX_TRACKED_TOKENS;
-    for (let i = 0; i < toRemove; i += 1) {
+    const entries = Array.from(this.tokenStates.entries())
+      .filter(([mint]) => !this.pinnedOpenMints.has(mint))
+      .sort((a, b) => a[1].lastTradeAtMs - b[1].lastTradeAtMs);
+    const toRemove = Math.max(0, this.tokenStates.size - MAX_TRACKED_TOKENS);
+    for (let i = 0; i < Math.min(toRemove, entries.length); i += 1) {
       const mint = entries[i][0];
       this.tokenStates.delete(mint);
       this.subscribedMints.delete(mint);
@@ -242,6 +297,26 @@ export class PumpPortalWsProvider {
       const cutoff = nowMs - TRADE_WINDOW_MS;
       if (state.trades.length > 250 || (state.trades[0] && state.trades[0].tsMs < cutoff)) {
         state.trades = state.trades.filter((t) => t.tsMs >= cutoff).slice(-250);
+      }
+      if (this.tradeListeners.size > 0 && state.vSolInBondingCurve > 0 && state.vTokensInBondingCurve > 0) {
+        const tick: PumpPortalTradeTick = {
+          mint,
+          side,
+          solAmount: Math.max(0, solAmt),
+          trader,
+          priceSol: state.vSolInBondingCurve / state.vTokensInBondingCurve,
+          vSol: state.vSolInBondingCurve,
+          vTokens: state.vTokensInBondingCurve,
+          tsMs: nowMs,
+          migrated: state.migrated,
+        };
+        for (const cb of this.tradeListeners) {
+          try {
+            cb(tick);
+          } catch {
+            // keep stream healthy
+          }
+        }
       }
     } else {
       // Seed initial creator buy when creation frame reports solAmount/initialBuy > 0
@@ -378,8 +453,15 @@ export class PumpPortalWsProvider {
       let sells60s = 0;
       let vol60sSol = 0;
 
+      const traders5m = new Set<string>();
+      const buyers5m = new Set<string>();
+
       for (const tr of st.trades) {
         if (tr.tsMs < cutoff5m) continue;
+        if (tr.trader) {
+          traders5m.add(tr.trader);
+          if (tr.side === 'buy') buyers5m.add(tr.trader);
+        }
         if (tr.side === 'buy') buys5m += 1;
         else sells5m += 1;
         vol5mSol += tr.solAmount;
@@ -429,11 +511,13 @@ export class PumpPortalWsProvider {
           buys_60s: buys60s,
           sells_60s: sells60s,
           sol_vol_60s: Number(vol60sSol.toFixed(4)),
+          unique_traders_5m: traders5m.size,
           v_sol: Number(st.vSolInBondingCurve.toFixed(4)),
           real_sol: realSol,
           creator: st.creator,
           creator_sold: st.creatorSold,
           initial_buy_sol: Number(st.creatorInitialBuySol.toFixed(4)),
+          recent_buyers: Array.from(buyers5m).slice(0, 60),
         },
       });
     }
@@ -441,6 +525,54 @@ export class PumpPortalWsProvider {
     // Most recently active/created tokens first
     pairs.sort((a, b) => b.pairCreatedAt - a.pairCreatedAt);
     return pairs;
+  }
+
+  getLiveMintSnapshots(
+    mints: string[],
+    solPriceUsd: number | null,
+    nowMs = Date.now()
+  ): Record<string, PumpPortalLiveSnapshot> {
+    const solPx = solPriceUsd && Number.isFinite(solPriceUsd) && solPriceUsd > 0 ? solPriceUsd : 0;
+    const cutoff5m = nowMs - TRADE_WINDOW_MS;
+    const out: Record<string, PumpPortalLiveSnapshot> = {};
+
+    for (const rawMint of mints) {
+      const mint = String(rawMint || '').trim();
+      if (!mint) continue;
+      const st = this.tokenStates.get(mint);
+      if (!st) continue;
+      const hasCurve = st.vSolInBondingCurve > 0 && st.vTokensInBondingCurve > 0;
+      const priceSol = hasCurve ? st.vSolInBondingCurve / st.vTokensInBondingCurve : 0;
+      const priceUsd = solPx > 0 && priceSol > 0 ? priceSol * solPx : 0;
+      const liquidityUsd =
+        solPx > 0 && st.vSolInBondingCurve > 0 ? Number((st.vSolInBondingCurve * 2 * solPx).toFixed(2)) : 0;
+      const realSol = st.vSolInBondingCurve > 30 ? Number((st.vSolInBondingCurve - 30).toFixed(4)) : 0;
+
+      const traders5m = new Set<string>();
+      const recentSellers = new Set<string>();
+      const recentBuyers = new Set<string>();
+      for (const tr of st.trades) {
+        if (tr.tsMs < cutoff5m) continue;
+        if (tr.trader) {
+          traders5m.add(tr.trader);
+          if (tr.side === 'sell' && nowMs - tr.tsMs <= 90_000) recentSellers.add(tr.trader);
+          if (tr.side === 'buy') recentBuyers.add(tr.trader);
+        }
+      }
+      out[mint] = {
+        mint,
+        priceUsd,
+        priceSol,
+        liquidityUsd,
+        lastTradeAtMs: st.lastTradeAtMs,
+        uniqueTraders5m: traders5m.size,
+        recentSellers: Array.from(recentSellers),
+        recentBuyers: Array.from(recentBuyers),
+        realSol,
+      };
+    }
+
+    return out;
   }
 
   getHealth(): SourceHealthRecord {

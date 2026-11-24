@@ -378,7 +378,7 @@ export function PythonSniperView() {
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [exportingCsv, setExportingCsv] = useState(false);
   const [clearingLogs, setClearingLogs] = useState(false);
-  const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'logs' | 'settings'>('positions');
+  const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'logs' | 'settings' | 'pro_desk'>('positions');
   const [historySearch, setHistorySearch] = useState('');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [confirmSellMint, setConfirmSellMint] = useState<string | null>(null);
@@ -1048,6 +1048,7 @@ export function PythonSniperView() {
           { id: 'history', label: `Trade history (${trades.length})`, icon: History },
           { id: 'logs', label: 'Scan log', icon: Terminal },
           { id: 'settings', label: `Settings${isSettingsDirty ? ' •' : ''}`, icon: Sliders },
+          { id: 'pro_desk', label: 'Pro Desk', icon: ShieldCheck },
         ].map((tab) => {
           const Icon = tab.icon;
           return (

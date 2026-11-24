@@ -5,6 +5,7 @@ import {
   VersionedTransaction,
 } from '@solana/web3.js';
 import {
+  createBurnInstruction,
   createCloseAccountInstruction,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -14,7 +15,10 @@ import type {
   CandidateToken,
   ExitReason,
   ExplanationRecord,
+  OrphanSweepResult,
   PositionRecord,
+  RentAuditAccount,
+  RentAuditReport,
   TradeRecord,
 } from '../types';
 import type { BotDatabase } from '../store/db';
@@ -22,6 +26,8 @@ import type { ServerSignerManager } from '../security/signer';
 import type { SolanaRpcPool } from '../providers/rpcPool';
 import type { JupiterProvider, JupiterQuoteResponse } from '../providers/jupiter';
 import { WSOL_MINT } from '../providers/jupiter';
+import type { DexScreenerProvider } from '../providers/dexscreener';
+import { injectDontFrontMarker } from '../providers/proSignals';
 import {
   ATA_RENT_SOL,
   computeBreakEvenPrices,
@@ -319,11 +325,20 @@ export class LiveExecutionEngine {
       timestampMs: Date.now(),
     });
 
+    const execStartMs = Date.now();
     const priorityFeeSol = priorityFeeEnabled ? resolvePriorityFeeSol(settings, autoPriority?.sol) : 0;
     const priorityFeeLamports: number | 'auto' =
       priorityFeeEnabled && settings.priorityFeePreset === 'auto'
         ? 'auto'
         : Math.round(priorityFeeSol * LAMPORTS_PER_SOL);
+    const jitoDontFrontActive =
+      Boolean(settings.jitoDontFrontEnabled) && isOptionEnabled(settings, 'jitoDontFrontEnabled');
+    const jitoTipLamports =
+      jitoDontFrontActive && settings.jitoTipSol > 0
+        ? Math.max(10_000, Math.round(settings.jitoTipSol * LAMPORTS_PER_SOL))
+        : jitoDontFrontActive
+          ? 100_000
+          : 0;
 
     let swapTxResp;
     try {
@@ -331,6 +346,7 @@ export class LiveExecutionEngine {
         quoteResponse: quote,
         userPublicKey: owner,
         priorityFeeLamports,
+        ...(jitoTipLamports > 0 ? { jitoTipLamports } : {}),
       });
     } catch (err) {
       return {
@@ -344,12 +360,17 @@ export class LiveExecutionEngine {
       symbol: token.symbol,
       side: 'BUY',
       step: 'sign',
-      message: 'Signing transaction with server keypair',
+      message: jitoDontFrontActive
+        ? 'Injecting Jito dontfront MEV guard & signing transaction'
+        : 'Signing transaction with server keypair',
       timestampMs: Date.now(),
     });
 
     const txBytes = Buffer.from(swapTxResp.swapTransaction, 'base64');
     const versionedTx = VersionedTransaction.deserialize(txBytes);
+    if (jitoDontFrontActive) {
+      injectDontFrontMarker(versionedTx);
+    }
     await this.signer.signVersionedTransaction(versionedTx);
     const rawSigned = versionedTx.serialize();
 
@@ -361,9 +382,15 @@ export class LiveExecutionEngine {
       symbol: token.symbol,
       side: 'BUY',
       step: 'send',
-      message: 'Submitting transaction (skipPreflight=false)',
+      message: jitoDontFrontActive
+        ? 'Submitting via Jito MEV-protected block engine + RPC'
+        : 'Submitting transaction (skipPreflight=false)',
       timestampMs: Date.now(),
     });
+
+    if (jitoDontFrontActive) {
+      this.sendToJitoBlockEngine(rawSigned, true);
+    }
 
     let sig: string;
     try {
@@ -624,7 +651,7 @@ export class LiveExecutionEngine {
     this.db.upsertPosition(confirmedPos);
     this.db.markMintAttempted(pendingPos.mint, 'live', 'CONFIRMED', sig);
 
-    // Record Paper vs Live reality gap
+    // Record Paper vs Live reality gap & DEX Execution Telemetry
     if (quotedPriceUsd > 0 && realEntryPriceUsd > 0) {
       const gapPct = ((realEntryPriceUsd - quotedPriceUsd) / quotedPriceUsd) * 100;
       this.db.recordPaperVsLiveGap({
@@ -636,6 +663,25 @@ export class LiveExecutionEngine {
         gapPct,
         createdAtMs: Date.now(),
       });
+      if (typeof this.db.recordExecutionTelemetry === 'function') {
+        const jitoOn =
+          Boolean(settings.jitoDontFrontEnabled) && isOptionEnabled(settings, 'jitoDontFrontEnabled');
+        this.db.recordExecutionTelemetry({
+          tradeId: confirmedPos.id,
+          mode: 'live',
+          side: 'BUY',
+          mint: confirmedPos.mint,
+          symbol: confirmedPos.symbol,
+          dex: confirmedPos.dex || 'jupiter',
+          platform: confirmedPos.source || 'spot_bot',
+          quotedPriceUsd,
+          actualFillPriceUsd: realEntryPriceUsd,
+          slippagePct: Number(gapPct.toFixed(3)),
+          latencyMs: Math.max(0, Date.now() - pendingPos.openedAtMs),
+          jitoProtected: jitoOn,
+          createdAtMs: Date.now(),
+        });
+      }
     }
 
     return confirmedPos;
@@ -918,6 +964,7 @@ export class LiveExecutionEngine {
     }
 
     try {
+      const sellStartMs = Date.now();
       const priorityFeeEnabled = isOptionEnabled(settings, 'priorityFeePreset');
       const autoExitPriority =
         priorityFeeEnabled &&
@@ -932,16 +979,32 @@ export class LiveExecutionEngine {
         priorityFeeEnabled && settings.priorityFeePreset === 'auto' && !isEmergency
           ? 'auto'
           : Math.round(resolvedExitPrioritySol * (isEmergency ? 2 : 1) * LAMPORTS_PER_SOL);
+      const jitoSellActive =
+        Boolean(settings.jitoDontFrontEnabled) && isOptionEnabled(settings, 'jitoDontFrontEnabled');
+      const jitoSellTipLamports =
+        jitoSellActive && settings.jitoTipSol > 0
+          ? Math.max(10_000, Math.round(settings.jitoTipSol * LAMPORTS_PER_SOL))
+          : jitoSellActive
+            ? 100_000
+            : 0;
       const swapResp = await this.jupiter.buildSwapTransaction({
         quoteResponse: quote,
         userPublicKey: owner,
         priorityFeeLamports,
+        ...(jitoSellTipLamports > 0 ? { jitoTipLamports: jitoSellTipLamports } : {}),
       });
       const versionedTx = VersionedTransaction.deserialize(
         Buffer.from(swapResp.swapTransaction, 'base64')
       );
+      if (jitoSellActive) {
+        injectDontFrontMarker(versionedTx);
+      }
       await this.signer.signVersionedTransaction(versionedTx);
-      const sig = await this.txAdapter.sendSignedTransaction(versionedTx.serialize(), 3);
+      const rawSignedSell = versionedTx.serialize();
+      if (jitoSellActive) {
+        this.sendToJitoBlockEngine(rawSignedSell, true);
+      }
+      const sig = await this.txAdapter.sendSignedTransaction(rawSignedSell, 3);
       const conf = await this.txAdapter.pollConfirmation(sig, 45_000);
       if (conf.status !== 'confirmed') {
         const retryPos: PositionRecord = {
@@ -994,6 +1057,25 @@ export class LiveExecutionEngine {
       const netPnlSol = realSolOut - soldSolIn - totalFeesSol - remainingRentSol;
       const exitPriceSol = soldQty > 0 ? realSolOut / soldQty : position.currentPriceSol;
       const exitPriceUsd = exitPriceSol * solPriceUsd;
+      const quotedSellPriceUsd = soldQty > 0 ? (estSolOut / soldQty) * solPriceUsd : exitPriceUsd;
+      if (quotedSellPriceUsd > 0 && exitPriceUsd > 0 && typeof this.db.recordExecutionTelemetry === 'function') {
+        const sellSlipPct = ((quotedSellPriceUsd - exitPriceUsd) / quotedSellPriceUsd) * 100;
+        this.db.recordExecutionTelemetry({
+          tradeId: `live_tr_${closedAtMs}_${position.mint.slice(0, 6)}`,
+          mode: 'live',
+          side: 'SELL',
+          mint: position.mint,
+          symbol: position.symbol,
+          dex: position.dex || 'jupiter',
+          platform: position.source || 'spot_bot',
+          quotedPriceUsd: quotedSellPriceUsd,
+          actualFillPriceUsd: exitPriceUsd,
+          slippagePct: Number(sellSlipPct.toFixed(3)),
+          latencyMs: Math.max(0, closedAtMs - sellStartMs),
+          jitoProtected: jitoSellActive,
+          createdAtMs: closedAtMs,
+        });
+      }
 
       const trade: TradeRecord = {
         tradeId: `live_tr_${closedAtMs}_${position.mint.slice(0, 6)}`,
@@ -1089,9 +1171,102 @@ export class LiveExecutionEngine {
     }
   }
 
+  private sendToJitoBlockEngine(rawSigned: Uint8Array, bundleOnly = true): void {
+    if (typeof fetch !== 'function') return;
+    try {
+      const b64 = Buffer.from(rawSigned).toString('base64');
+      const url = bundleOnly
+        ? 'https://mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true'
+        : 'https://mainnet.block-engine.jito.wtf/api/v1/transactions';
+      void fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'sendTransaction',
+          params: [b64, { encoding: 'base64' }],
+        }),
+        signal: AbortSignal.timeout(2500),
+      }).catch(() => undefined);
+    } catch {
+      // non-blocking Jito relay
+    }
+  }
+
+  async auditTokenAccounts(solPriceUsd: number | null): Promise<RentAuditReport> {
+    const owner = this.signer.getPublicKey();
+    if (!owner) {
+      return {
+        walletAddress: null,
+        emptyCount: 0,
+        dustCount: 0,
+        emptyReclaimableSol: 0,
+        dustReclaimableSol: 0,
+        accounts: [],
+        solPriceUsd,
+      };
+    }
+
+    const ownerPk = new PublicKey(owner);
+    const openPositions = this.db.getPositions('live', false);
+    const openMints = new Set(openPositions.map((p) => p.mint));
+
+    const accounts: RentAuditAccount[] = [];
+    await this.rpcPool.withFailover(async (conn) => {
+      const [splAccs, t22Accs] = await Promise.all([
+        conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_PROGRAM_ID }),
+        conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_2022_PROGRAM_ID }),
+      ]);
+
+      const pushAccounts = (list: typeof splAccs.value, programTag: 'spl-token' | 'token-2022') => {
+        for (const acc of list) {
+          const info = (acc.account.data.parsed as {
+            info?: { mint?: string; tokenAmount?: { amount?: string; uiAmount?: number | null } };
+          })?.info;
+          const mint = String(info?.mint || '').trim();
+          if (!mint || mint === WSOL_MINT) continue;
+          const amountRaw = String(info?.tokenAmount?.amount ?? '0');
+          const uiAmount = Number(info?.tokenAmount?.uiAmount ?? 0);
+          const isEmpty = BigInt(/^\d+$/.test(amountRaw) ? amountRaw : '0') === 0n;
+          const isOpenPosition = openMints.has(mint);
+          const isDust = !isEmpty && !isOpenPosition;
+          accounts.push({
+            pubkey: acc.pubkey.toBase58(),
+            mint,
+            programId: programTag,
+            amountRaw,
+            uiAmount,
+            estValueUsd: null,
+            estRentSol: ATA_RENT_SOL,
+            isEmpty,
+            isDust,
+            isOpenPosition,
+          });
+        }
+      };
+
+      pushAccounts(splAccs.value, 'spl-token');
+      pushAccounts(t22Accs.value, 'token-2022');
+    });
+
+    const emptyCount = accounts.filter((a) => a.isEmpty).length;
+    const dustCount = accounts.filter((a) => a.isDust).length;
+    return {
+      walletAddress: owner,
+      emptyCount,
+      dustCount,
+      emptyReclaimableSol: Number((emptyCount * ATA_RENT_SOL).toFixed(6)),
+      dustReclaimableSol: Number((dustCount * ATA_RENT_SOL).toFixed(6)),
+      accounts,
+      solPriceUsd,
+    };
+  }
+
   async reclaimEmptyTokenAccounts(
-    targetMint?: string
-  ): Promise<{ closedCount: number; reclaimedSol: number; txSig: string | null }> {
+    targetMint?: string,
+    options?: { burnDust?: boolean }
+  ): Promise<{ closedCount: number; burnedCount: number; reclaimedSol: number; txSig: string | null }> {
     const owner = this.signer.getPublicKey();
     if (!this.signer.isUnlocked() || !owner) {
       throw new Error('Server signer must be unlocked to reclaim ATA rent.');
@@ -1099,45 +1274,64 @@ export class LiveExecutionEngine {
 
     const ownerPk = new PublicKey(owner);
     const kp = this.signer.getKeypairForInternalSigning();
+    const burnDust = Boolean(options?.burnDust);
+    const openMints = new Set(this.db.getPositions('live', false).map((p) => p.mint));
 
     return this.rpcPool.withFailover(async (conn) => {
-      const scanEmpty = async () => {
+      const scanClosables = async () => {
         const [splAccs, t22Accs] = await Promise.all([
           conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_PROGRAM_ID }),
           conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_2022_PROGRAM_ID }),
         ]);
 
-        const list: Array<{ pubkey: PublicKey; programId: PublicKey }> = [];
-        for (const acc of splAccs.value) {
-          const info = (acc.account.data.parsed as { info?: { mint?: string; tokenAmount?: { amount?: string } } })
-            ?.info;
-          if (targetMint && info?.mint !== targetMint) continue;
-          const amt = Number(info?.tokenAmount?.amount ?? '1');
-          if (amt === 0) list.push({ pubkey: acc.pubkey, programId: TOKEN_PROGRAM_ID });
-        }
-        for (const acc of t22Accs.value) {
-          const info = (acc.account.data.parsed as { info?: { mint?: string; tokenAmount?: { amount?: string } } })
-            ?.info;
-          if (targetMint && info?.mint !== targetMint) continue;
-          const amt = Number(info?.tokenAmount?.amount ?? '1');
-          if (amt === 0) list.push({ pubkey: acc.pubkey, programId: TOKEN_2022_PROGRAM_ID });
-        }
+        const list: Array<{
+          pubkey: PublicKey;
+          mintPk: PublicKey;
+          programId: PublicKey;
+          rawAmount: bigint;
+        }> = [];
+        const process = (accs: typeof splAccs.value, programId: PublicKey) => {
+          for (const acc of accs) {
+            const info = (acc.account.data.parsed as {
+              info?: { mint?: string; tokenAmount?: { amount?: string } };
+            })?.info;
+            const mintStr = String(info?.mint || '').trim();
+            if (!mintStr || mintStr === WSOL_MINT) continue;
+            if (targetMint && mintStr !== targetMint) continue;
+            const rawStr = String(info?.tokenAmount?.amount ?? '0');
+            const rawAmt = /^\d+$/.test(rawStr) ? BigInt(rawStr) : 1n;
+            if (rawAmt === 0n) {
+              list.push({ pubkey: acc.pubkey, mintPk: new PublicKey(mintStr), programId, rawAmount: 0n });
+            } else if (burnDust && !openMints.has(mintStr)) {
+              list.push({ pubkey: acc.pubkey, mintPk: new PublicKey(mintStr), programId, rawAmount: rawAmt });
+            }
+          }
+        };
+        process(splAccs.value, TOKEN_PROGRAM_ID);
+        process(t22Accs.value, TOKEN_2022_PROGRAM_ID);
         return list;
       };
 
-      let emptyClosures = await scanEmpty();
-      if (emptyClosures.length === 0 && targetMint) {
+      let closables = await scanClosables();
+      if (closables.length === 0 && targetMint) {
         await new Promise((r) => setTimeout(r, 500));
-        emptyClosures = await scanEmpty();
+        closables = await scanClosables();
       }
 
-      if (emptyClosures.length === 0) {
-        return { closedCount: 0, reclaimedSol: 0, txSig: null };
+      if (closables.length === 0) {
+        return { closedCount: 0, burnedCount: 0, reclaimedSol: 0, txSig: null };
       }
 
-      const batch = emptyClosures.slice(0, 10);
+      const batch = closables.slice(0, 8);
       const tx = new Transaction();
+      let burnedCount = 0;
       for (const item of batch) {
+        if (item.rawAmount > 0n) {
+          tx.add(
+            createBurnInstruction(item.pubkey, item.mintPk, ownerPk, item.rawAmount, [], item.programId)
+          );
+          burnedCount += 1;
+        }
         tx.add(createCloseAccountInstruction(item.pubkey, ownerPk, ownerPk, [], item.programId));
       }
       const { blockhash } = await conn.getLatestBlockhash('confirmed');
@@ -1148,9 +1342,113 @@ export class LiveExecutionEngine {
       const sig = await conn.sendRawTransaction(serialized, { skipPreflight: false });
       return {
         closedCount: batch.length,
+        burnedCount,
         reclaimedSol: Number((batch.length * ATA_RENT_SOL).toFixed(6)),
         txSig: sig,
       };
     });
+  }
+
+  async detectAndAdoptOrphanPositions(params: {
+    dexScreener: DexScreenerProvider;
+    solPriceUsd: number | null;
+    settings: BotSettings;
+  }): Promise<OrphanSweepResult> {
+    const owner = this.signer.getPublicKey();
+    if (!owner) {
+      return { scanned: 0, adopted: 0, adoptedSymbols: [], skipped: 0, errors: ['Wallet not connected'] };
+    }
+    const solPx = params.solPriceUsd && params.solPriceUsd > 0 ? params.solPriceUsd : 0;
+    const audit = await this.auditTokenAccounts(params.solPriceUsd);
+    const nonEmptyUntracked = audit.accounts.filter((a) => !a.isEmpty && !a.isOpenPosition);
+    if (nonEmptyUntracked.length === 0) {
+      return { scanned: audit.accounts.length, adopted: 0, adoptedSymbols: [], skipped: 0, errors: [] };
+    }
+
+    const enriched = await params.dexScreener
+      .enrichMintsBatch(nonEmptyUntracked.map((a) => a.mint))
+      .catch(() => new Map());
+
+    let adopted = 0;
+    let skipped = 0;
+    const adoptedSymbols: string[] = [];
+    const errors: string[] = [];
+    const nowMs = Date.now();
+
+    for (const acc of nonEmptyUntracked) {
+      const ds = enriched.get(acc.mint);
+      const priceUsd = ds?.priceUsd ?? 0;
+      const valueUsd = priceUsd > 0 ? acc.uiAmount * priceUsd : 0;
+      if (valueUsd > 0 && valueUsd < 0.05) {
+        skipped += 1;
+        continue;
+      }
+      if (priceUsd <= 0 || solPx <= 0) {
+        skipped += 1;
+        continue;
+      }
+
+      const decimalsRaw = acc.amountRaw && acc.uiAmount > 0
+        ? Math.max(0, Math.min(12, Math.round(Math.log10(Number(acc.amountRaw) / acc.uiAmount))))
+        : 6;
+      const estSolIn = Math.max(0.0001, valueUsd / solPx);
+      const pos: PositionRecord = {
+        id: `orphan_pos_${nowMs}_${acc.mint.slice(0, 6)}`,
+        mode: 'live',
+        mint: acc.mint,
+        symbol: ds?.symbol || acc.mint.slice(0, 6),
+        name: ds?.name || 'Adopted Wallet Token',
+        source: 'orphan_sweep',
+        dex: ds?.dex || 'unknown',
+        tokenClass: 'early_stage',
+        status: 'OPEN',
+        openedAtMs: nowMs,
+        updatedAtMs: nowMs,
+        tokenAgeAtEntryMin: ds?.poolCreatedAtMs ? Math.max(0, (nowMs - ds.poolCreatedAtMs) / 60_000) : 0,
+        decimals: Number.isFinite(decimalsRaw) ? decimalsRaw : 6,
+        quantity: acc.uiAmount,
+        entryPriceUsd: priceUsd,
+        entryPriceSol: priceUsd / solPx,
+        currentPriceUsd: priceUsd,
+        currentPriceSol: priceUsd / solPx,
+        breakEvenPriceUsd: priceUsd * 1.02,
+        breakEvenPriceSol: (priceUsd / solPx) * 1.02,
+        entryLiquidityUsd: ds?.liquidityUsd ?? 0,
+        currentLiquidityUsd: ds?.liquidityUsd ?? 0,
+        solIn: estSolIn,
+        entryFeesSol: 0,
+        entryRentSol: ATA_RENT_SOL,
+        solPriceUsdAtEntry: solPx,
+        peakPriceUsd: priceUsd,
+        peakPnlPct: 0,
+        trailingFloorPct: null,
+        trailingArmed: false,
+        gapDownTriggered: false,
+        exitParams: snapshotExitParams(params.settings, 1.5),
+        txBuy: null,
+        confirmationLabel: 'confirmed',
+        qualityScore: 65,
+        tradeScore: 65,
+        explanationJson: JSON.stringify({ note: 'Auto-adopted by Orphan Wallet Sweep' }),
+        sellAttempts: 0,
+        firstSellFailureAtMs: null,
+        lastSellError: null,
+        consecutiveZeroBalanceReads: 0,
+        reviewReason: null,
+        isStaleData: false,
+        priceHistory: [priceUsd],
+      };
+      this.db.upsertPosition(pos);
+      adopted += 1;
+      adoptedSymbols.push(pos.symbol);
+    }
+
+    return {
+      scanned: audit.accounts.length,
+      adopted,
+      adoptedSymbols,
+      skipped,
+      errors,
+    };
   }
 }

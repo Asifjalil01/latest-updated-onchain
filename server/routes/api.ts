@@ -104,6 +104,47 @@ const settingsPatchSchema = z
     paperInitialBalanceSol: z.number().min(0.1).max(10000).optional(),
     shadowCompareEnabled: z.boolean().optional(),
     shadowLiveSizeSol: z.number().min(0.005).max(0.5).optional(),
+    // Pro Desk — Group 1: Deeper Wallet & Scam Intelligence
+    antiSybilEnabled: z.boolean().optional(),
+    freshWalletMinutes: z.number().min(1).max(1440).optional(),
+    maxSharedFunderCount: z.number().int().min(2).max(20).optional(),
+    smartMoneyEnabled: z.boolean().optional(),
+    smartWallets: z.array(z.string()).optional(),
+    smartMoneyMinConfluence: z.number().int().min(1).max(10).optional(),
+    smartMoneySizeBoostPct: z.number().min(0).max(200).optional(),
+    smartMoneyAutoExitOnSell: z.boolean().optional(),
+    reusedSocialsEnabled: z.boolean().optional(),
+    maxSocialReuseCount: z.number().int().min(1).max(50).optional(),
+    // Pro Desk — Group 2: Zero-Lag Exits & MEV / Wallet Sweep
+    wsExitStreamEnabled: z.boolean().optional(),
+    jitoDontFrontEnabled: z.boolean().optional(),
+    jitoTipSol: z.number().min(0).max(0.05).optional(),
+    orphanSweepEnabled: z.boolean().optional(),
+    // Pro Desk — Group 3: Market Structure & Entry Timing
+    postMigrationPullbackEnabled: z.boolean().optional(),
+    migrationMinDipPct: z.number().min(1).max(90).optional(),
+    migrationWaitSec: z.number().min(5).max(600).optional(),
+    preMigrationCurveEnabled: z.boolean().optional(),
+    preMigrationCurveMinPct: z.number().min(0).max(99).optional(),
+    preMigrationCurveMaxPct: z.number().min(1).max(100).optional(),
+    washTradeFilterEnabled: z.boolean().optional(),
+    minUniqueMakersRatio: z.number().min(0.05).max(1).optional(),
+    minUniqueTraders5m: z.number().int().min(1).max(500).optional(),
+    solRegimeFilterEnabled: z.boolean().optional(),
+    solRegimeMaxDropPct: z.number().min(0.1).max(50).optional(),
+    solRegimeAction: z.enum(['pause', 'half_size']).optional(),
+    antiTopWickEnabled: z.boolean().optional(),
+    maxShortSpikePct: z.number().min(5).max(500).optional(),
+    // Pro Desk — Group 4: Dynamic Sizing & Capital Efficiency
+    convictionSizingEnabled: z.boolean().optional(),
+    convictionMinMult: z.number().min(0.1).max(2.0).optional(),
+    convictionMaxMult: z.number().min(0.5).max(3.0).optional(),
+    streakThrottleEnabled: z.boolean().optional(),
+    streakLossLimit: z.number().int().min(1).max(20).optional(),
+    streakCooldownMinutes: z.number().min(1).max(1440).optional(),
+    streakAction: z.enum(['half_size', 'pause']).optional(),
+    narrativeCapEnabled: z.boolean().optional(),
+    maxSameNarrativePositions: z.number().int().min(1).max(10).optional(),
     optionToggles: z.record(z.string(), z.boolean()).optional(),
     applyToOpenPositions: z.boolean().optional(),
   })
@@ -699,18 +740,74 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.json(result);
   });
 
-  router.post('/rent/reclaim', async (_req: Request, res: Response) => {
+  router.get('/rent/audit', async (_req: Request, res: Response) => {
     try {
-      const result = await orchestrator.reclaimRent();
+      res.json(await orchestrator.auditRentAccounts());
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Rent audit failed' });
+    }
+  });
+
+  router.post('/rent/reclaim', async (req: Request, res: Response) => {
+    try {
+      const targetMint = typeof req.body?.mint === 'string' ? req.body.mint.trim() : undefined;
+      const burnDust = req.body?.burnDust === true;
+      const result = await orchestrator.reclaimRent(targetMint || undefined, burnDust);
       orchestrator.log(
         'INFO',
         'RENT',
-        `Reclaimed ${result.reclaimedSol} SOL from ${result.closedCount} empty token accounts.`
+        `Reclaimed ${result.reclaimedSol} SOL from ${result.closedCount} token accounts.`
       );
       res.json(result);
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Rent reclaim failed' });
     }
+  });
+
+  router.post('/rent/reclaim-all', async (req: Request, res: Response) => {
+    try {
+      const targetMint = typeof req.body?.mint === 'string' ? req.body.mint.trim() : undefined;
+      const burnDust = req.body?.burnDust === true;
+      const result = await orchestrator.reclaimRent(targetMint || undefined, burnDust);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Rent reclaim failed' });
+    }
+  });
+
+  router.post('/wallet/sweep-orphans', async (_req: Request, res: Response) => {
+    try {
+      res.json(await orchestrator.sweepOrphanPositions());
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Orphan sweep failed' });
+    }
+  });
+
+  router.get('/telemetry/scorecard', (req: Request, res: Response) => {
+    const modeParam =
+      typeof req.query.mode === 'string' && ['paper', 'testnet', 'live'].includes(req.query.mode)
+        ? (req.query.mode as ExecutionMode)
+        : undefined;
+    res.json({ scorecard: orchestrator.getDexScorecard(modeParam) });
+  });
+
+  router.post('/backtest', (req: Request, res: Response) => {
+    const schema = z.object({
+      mode: z.enum(['paper', 'testnet', 'live']).optional(),
+      lookbackHours: z.number().min(0).max(8760).optional(),
+      takeProfitPct: z.number().min(1).max(5000),
+      stopLossPct: z.number().min(1).max(99),
+      trailingEnabled: z.boolean(),
+      trailingDropPct: z.number().min(0.1).max(90),
+      minAgeMinutes: z.number().min(0).optional(),
+      maxAgeMinutes: z.number().min(0).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid backtest parameters' });
+      return;
+    }
+    res.json(orchestrator.runBacktest(parsed.data));
   });
 
   router.post('/probe', async (req: Request, res: Response) => {
@@ -867,13 +964,74 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
 
   router.get('/sniper/pumpportal-mints', (_req: Request, res: Response) => {
     const feed = sniperManager.getPumpPortalFeed();
-    res.json({ ok: true, mints: feed.mints, pairs: feed.pairs, solPriceUsd: feed.solPriceUsd });
+    res.json({
+      ok: true,
+      mints: feed.mints,
+      pairs: feed.pairs,
+      solPriceUsd: feed.solPriceUsd,
+      open_prices: feed.open_prices,
+      smart_sells: feed.smart_sells,
+    });
+  });
+
+  router.post('/sniper/ws-watch', (req: Request, res: Response) => {
+    const mints = Array.isArray(req.body?.mints) ? req.body.mints : [];
+    res.json(sniperManager.setWsWatchedMints(mints));
   });
 
   router.post('/sniper/reverse-quotes', async (req: Request, res: Response) => {
     const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
     const solPriceUsd = req.body?.solPriceUsd !== undefined ? Number(req.body.solPriceUsd) : undefined;
     res.json(await sniperManager.getReverseExitPrices(positions, solPriceUsd));
+  });
+
+  router.get('/sniper/rent/audit', async (_req: Request, res: Response) => {
+    try {
+      res.json(await sniperManager.auditRentAccounts());
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Rent audit failed' });
+    }
+  });
+
+  router.post('/sniper/rent/reclaim', async (req: Request, res: Response) => {
+    try {
+      const burnDust = req.body?.burnDust === true;
+      const targetMint = typeof req.body?.mint === 'string' ? req.body.mint.trim() : undefined;
+      res.json(await sniperManager.reclaimRentAccounts(burnDust, targetMint || undefined));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Rent reclaim failed' });
+    }
+  });
+
+  router.post('/sniper/sweep-orphans', async (_req: Request, res: Response) => {
+    try {
+      res.json(await sniperManager.sweepOrphanPositions());
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Orphan sweep failed' });
+    }
+  });
+
+  router.get('/sniper/telemetry', (_req: Request, res: Response) => {
+    res.json({ ok: true, scorecard: sniperManager.getTelemetryScorecard() });
+  });
+
+  router.post('/sniper/backtest', (req: Request, res: Response) => {
+    const schema = z.object({
+      mode: z.enum(['paper', 'live']).optional(),
+      lookbackHours: z.number().min(0).max(8760).optional(),
+      takeProfitPct: z.number().min(1).max(5000),
+      stopLossPct: z.number().min(1).max(99),
+      trailingEnabled: z.boolean(),
+      trailingDropPct: z.number().min(0.1).max(90),
+      minAgeMinutes: z.number().min(0).optional(),
+      maxAgeMinutes: z.number().min(0).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid sniper backtest parameters' });
+      return;
+    }
+    res.json(sniperManager.runBacktest(parsed.data));
   });
 
   return router;

@@ -2,7 +2,13 @@ import { spawn, spawnSync, ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
-import { LAMPORTS_PER_SOL, VersionedTransaction } from '@solana/web3.js';
+import { LAMPORTS_PER_SOL, PublicKey, Transaction, VersionedTransaction } from '@solana/web3.js';
+import {
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  createBurnInstruction,
+  createCloseAccountInstruction,
+} from '@solana/spl-token';
 import {
   isPyOptionEnabled,
   pairTradesWithEntryAndExit,
@@ -13,6 +19,9 @@ import { loadAppEnv } from './config/env';
 import type { BotOrchestrator } from './engine/pipeline';
 import { DefaultLiveTxAdapter, type LiveTxAdapter } from './engine/liveEngine';
 import { WSOL_MINT } from './providers/jupiter';
+import { injectDontFrontMarker } from './providers/proSignals';
+
+const SNIPER_ATA_RENT_SOL = 0.00203928;
 
 const SNIPER_DIR = path.resolve(process.cwd(), 'sniper');
 
@@ -244,6 +253,7 @@ export class SniperManager {
   private refreshingLiveWallet = false;
   private liveSwapActiveCount = 0;
   private lastLiveSwapAtMs = 0;
+  private wsWatchedMints: string[] = [];
 
   constructor(options?: { baseDir?: string; startTimers?: boolean }) {
     this.baseDir = options?.baseDir || SNIPER_DIR;
@@ -677,8 +687,61 @@ export class SniperManager {
       anti_rug_copycat_cooldown_enabled: true,
       python_binary_path: 'auto',
       rescan_delay_after_sell_sec: 0,
+      anti_sybil_enabled: true,
+      fresh_wallet_minutes: 30,
+      max_shared_funder_count: 3,
+      smart_money_enabled: true,
+      smart_wallets: [],
+      smart_money_min_confluence: 1,
+      smart_money_size_boost_pct: 35,
+      smart_money_auto_exit_on_sell: true,
+      reused_socials_enabled: true,
+      max_social_reuse_count: 2,
+      ws_exit_stream_enabled: true,
+      jito_dontfront_enabled: true,
+      orphan_sweep_enabled: true,
+      post_migration_pullback_enabled: false,
+      migration_min_dip_pct: 15,
+      migration_wait_sec: 45,
+      pre_migration_curve_enabled: false,
+      pre_migration_curve_min_pct: 75,
+      pre_migration_curve_max_pct: 92,
+      wash_trade_filter_enabled: true,
+      min_unique_makers_ratio: 0.25,
+      min_unique_traders_5m: 6,
+      sol_regime_filter_enabled: true,
+      sol_regime_max_drop_pct: 2.0,
+      sol_regime_action: 'pause',
+      anti_top_wick_enabled: true,
+      max_short_spike_pct: 70,
+      conviction_sizing_enabled: true,
+      conviction_min_mult: 0.5,
+      conviction_max_mult: 1.5,
+      streak_throttle_enabled: true,
+      streak_loss_limit: 3,
+      streak_cooldown_minutes: 20,
+      streak_action: 'half_size',
+      narrative_cap_enabled: true,
+      max_same_narrative_positions: 1,
+      auto_reclaim_rent_enabled: true,
       option_enabled: {
         min_age_minutes: false,
+        anti_sybil_enabled: true,
+        smart_money_enabled: true,
+        smart_money_auto_exit_on_sell: true,
+        reused_socials_enabled: true,
+        ws_exit_stream_enabled: true,
+        jito_dontfront_enabled: true,
+        orphan_sweep_enabled: true,
+        post_migration_pullback_enabled: false,
+        pre_migration_curve_enabled: false,
+        wash_trade_filter_enabled: true,
+        sol_regime_filter_enabled: true,
+        anti_top_wick_enabled: true,
+        conviction_sizing_enabled: true,
+        streak_throttle_enabled: true,
+        narrative_cap_enabled: true,
+        auto_reclaim_rent_enabled: true,
       },
     };
     fs.writeFileSync(this.settingsFile, JSON.stringify(defaults, null, 2), 'utf-8');
@@ -1035,26 +1098,77 @@ export class SniperManager {
     return this.orchestrator.pumpPortal.drainRecentMints(maxAgeMs);
   }
 
+  public setWsWatchedMints(mints: string[]): { ok: boolean; watched: string[] } {
+    const clean = Array.from(
+      new Set(
+        (Array.isArray(mints) ? mints : [])
+          .map((m) => String(m || '').trim())
+          .filter((m) => m.length >= 32)
+      )
+    );
+    this.wsWatchedMints = clean;
+    if (this.orchestrator?.pumpPortal && typeof this.orchestrator.pumpPortal.setPinnedOpenMints === 'function') {
+      if (clean.length > 0) this.orchestrator.pumpPortal.start();
+      this.orchestrator.pumpPortal.setPinnedOpenMints(clean);
+    }
+    return { ok: true, watched: clean };
+  }
+
   public getPumpPortalFeed(maxAgeMs = 180_000): {
     mints: string[];
     pairs: any[];
     solPriceUsd: number | null;
+    open_prices: Record<string, { priceUsd: number; liquidityUsd: number; lastTradeAtMs: number }>;
+    smart_sells: Record<string, string[]>;
   } {
     if (!this.orchestrator?.pumpPortal) {
-      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd };
+      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd, open_prices: {}, smart_sells: {} };
     }
     const settings = this.readSettings();
-    if (!isPyOptionEnabled(settings, 'use_pumpportal', true) || settings.use_pumpportal === false) {
-      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd };
+    const usePump = isPyOptionEnabled(settings, 'use_pumpportal', true) && settings.use_pumpportal !== false;
+    const useWsExits =
+      isPyOptionEnabled(settings, 'ws_exit_stream_enabled', true) && settings.ws_exit_stream_enabled !== false;
+    if (!usePump && !useWsExits) {
+      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd, open_prices: {}, smart_sells: {} };
     }
     this.orchestrator.pumpPortal.start();
-    const mints = this.orchestrator.pumpPortal.drainRecentMints(maxAgeMs);
+    const mints = usePump ? this.orchestrator.pumpPortal.drainRecentMints(maxAgeMs) : [];
     const pp: any = this.orchestrator.pumpPortal;
     const pairs =
-      typeof pp.getSyntheticPairs === 'function'
+      usePump && typeof pp.getSyntheticPairs === 'function'
         ? pp.getSyntheticPairs(this.solPriceUsd, maxAgeMs)
         : [];
-    return { mints, pairs, solPriceUsd: this.solPriceUsd };
+
+    const open_prices: Record<string, { priceUsd: number; liquidityUsd: number; lastTradeAtMs: number }> = {};
+    const smart_sells: Record<string, string[]> = {};
+    if (useWsExits && this.wsWatchedMints.length > 0 && typeof pp.getLiveMintSnapshots === 'function') {
+      const snaps = pp.getLiveMintSnapshots(this.wsWatchedMints, this.solPriceUsd);
+      const smartSet = new Set<string>(
+        Array.isArray(settings.smart_wallets)
+          ? settings.smart_wallets.map((w: any) => String(w || '').trim()).filter(Boolean)
+          : []
+      );
+      const smartSellActive =
+        isPyOptionEnabled(settings, 'smart_money_enabled', true) &&
+        settings.smart_money_enabled !== false &&
+        isPyOptionEnabled(settings, 'smart_money_auto_exit_on_sell', true) &&
+        settings.smart_money_auto_exit_on_sell !== false &&
+        smartSet.size > 0;
+      for (const [mint, snap] of Object.entries<any>(snaps)) {
+        if (snap && snap.priceUsd > 0) {
+          open_prices[mint] = {
+            priceUsd: snap.priceUsd,
+            liquidityUsd: snap.liquidityUsd ?? 0,
+            lastTradeAtMs: snap.lastTradeAtMs ?? Date.now(),
+          };
+        }
+        if (smartSellActive && Array.isArray(snap?.recentSellers)) {
+          const hits = snap.recentSellers.filter((w: string) => smartSet.has(w));
+          if (hits.length > 0) smart_sells[mint] = hits;
+        }
+      }
+    }
+    return { mints, pairs, solPriceUsd: this.solPriceUsd, open_prices, smart_sells };
   }
 
   public async getReverseExitPrices(
@@ -1106,9 +1220,17 @@ export class SniperManager {
     const tier: 'standard' | 'fast' | 'turbo' =
       rawTier === 'turbo' ? 'turbo' : rawTier === 'standard' ? 'standard' : 'fast';
     const jitoOn = isPyOptionEnabled(settings, 'jito_tip_sol', true);
+    const dontFrontOn =
+      isPyOptionEnabled(settings, 'jito_dontfront_enabled', true) &&
+      settings.jito_dontfront_enabled !== false;
     const rawJitoSol = jitoOn ? Number(overrides?.jitoTipSol ?? settings.jito_tip_sol ?? 0) : 0;
     const safeJitoSol = Number.isFinite(rawJitoSol) && rawJitoSol > 0 ? Math.min(0.01, rawJitoSol) : 0;
-    const jitoTipLamports = safeJitoSol > 0 ? Math.max(10_000, Math.round(safeJitoSol * LAMPORTS_PER_SOL)) : 0;
+    const jitoTipLamports =
+      safeJitoSol > 0
+        ? Math.max(10_000, Math.round(safeJitoSol * LAMPORTS_PER_SOL))
+        : dontFrontOn
+          ? 100_000
+          : 0;
 
     if (isUrgentExit || tier === 'turbo') {
       return {
@@ -1134,11 +1256,14 @@ export class SniperManager {
     };
   }
 
-  private broadcastToJitoBestEffort(rawSigned: Uint8Array, jitoTipLamports: number): void {
+  private broadcastToJitoBestEffort(rawSigned: Uint8Array, jitoTipLamports: number, bundleOnly = true): void {
     if (jitoTipLamports <= 0 || typeof fetch !== 'function') return;
     try {
       const b64 = Buffer.from(rawSigned).toString('base64');
-      void fetch('https://mainnet.block-engine.jito.wtf/api/v1/transactions', {
+      const url = bundleOnly
+        ? 'https://mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true'
+        : 'https://mainnet.block-engine.jito.wtf/api/v1/transactions';
+      void fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1185,6 +1310,17 @@ export class SniperManager {
             )
           : Array.isArray(current.enabled_platforms)
             ? current.enabled_platforms
+            : [],
+        smart_wallets: Array.isArray(newSettings.smart_wallets)
+          ? Array.from(
+              new Set(
+                newSettings.smart_wallets
+                  .map((v: any) => String(v || '').trim())
+                  .filter(Boolean)
+              )
+            )
+          : Array.isArray(current.smart_wallets)
+            ? current.smart_wallets
             : [],
       };
       const validation = validatePythonSniperSettings(updated, this.solPriceUsd);
@@ -1284,6 +1420,7 @@ export class SniperManager {
     }
 
     this.liveSwapActiveCount += 1;
+    const buyStartMs = Date.now();
     try {
 
     let solPriceUsd =
@@ -1400,6 +1537,9 @@ export class SniperManager {
 
     const decimals = mintInfo?.decimals ?? preBal.decimals ?? preDecimals ?? 6;
     const execFees = this.resolveSwapExecutionFees(savedSettings, false);
+    const jitoDontFrontOn =
+      isPyOptionEnabled(savedSettings, 'jito_dontfront_enabled', true) &&
+      savedSettings.jito_dontfront_enabled !== false;
     const priorityFeeSolFallback =
       typeof execFees.priorityFeeLamports === 'number'
         ? execFees.priorityFeeLamports / LAMPORTS_PER_SOL
@@ -1435,6 +1575,7 @@ export class SniperManager {
           });
           const txBytes = Buffer.from(swapTxResp.swapTransaction, 'base64');
           const versionedTx = VersionedTransaction.deserialize(txBytes);
+          if (jitoDontFrontOn) injectDontFrontMarker(versionedTx);
           await signer.signVersionedTransaction(versionedTx);
           return { ok: true, rawSigned: versionedTx.serialize(), quoteUsed: q };
         } catch (err) {
@@ -1666,6 +1807,30 @@ export class SniperManager {
     const costUsd = realSolSpent * solPriceUsd;
     const entryPriceUsd = realQty > 0 ? costUsd / realQty : 0;
 
+    // Pro Desk telemetry record for live buy
+    try {
+      const quotedBuyPriceUsd =
+        quotedQty > 0 ? (quotedSolIn * solPriceUsd) / quotedQty : entryPriceUsd;
+      const buySlipPct =
+        quotedBuyPriceUsd > 0 && entryPriceUsd > 0
+          ? ((entryPriceUsd - quotedBuyPriceUsd) / quotedBuyPriceUsd) * 100
+          : 0;
+      this.appendTelemetryRecord({
+        tsMs: Date.now(),
+        mode: 'live',
+        side: 'BUY',
+        mint: params.mint,
+        symbol: params.symbol,
+        dex: params.dex || 'jupiter',
+        platform: 'python_sniper',
+        quotedPriceUsd: quotedBuyPriceUsd,
+        actualFillPriceUsd: entryPriceUsd,
+        slippagePct: Number(buySlipPct.toFixed(3)),
+        latencyMs: Math.max(1, Date.now() - buyStartMs),
+        jitoProtected: jitoDontFrontOn,
+      });
+    } catch {}
+
     // Optimistically update wallet SOL balance immediately and refresh authoritative balance in background
     if (this.liveWalletBalanceSol !== null) {
       this.liveWalletBalanceSol = Math.max(0, this.liveWalletBalanceSol - realSolSpent - feeSol - rentSol);
@@ -1875,6 +2040,9 @@ export class SniperManager {
       let swapTxResp;
       const savedSettings = this.readSettings();
       const sellExecFees = this.resolveSwapExecutionFees(savedSettings, isUrgentExit);
+      const jitoSellDontFront =
+        isPyOptionEnabled(savedSettings, 'jito_dontfront_enabled', true) &&
+        savedSettings.jito_dontfront_enabled !== false;
       try {
         swapTxResp = await jupiter.buildSwapTransaction({
           quoteResponse: q,
@@ -1896,9 +2064,10 @@ export class SniperManager {
 
       const txBytes = Buffer.from(swapTxResp.swapTransaction, 'base64');
       const versionedTx = VersionedTransaction.deserialize(txBytes);
+      if (jitoSellDontFront) injectDontFrontMarker(versionedTx);
       await signer.signVersionedTransaction(versionedTx);
       const rawSigned = versionedTx.serialize();
-      this.broadcastToJitoBestEffort(rawSigned, sellExecFees.jitoTipLamports);
+      this.broadcastToJitoBestEffort(rawSigned, sellExecFees.jitoTipLamports, jitoSellDontFront);
 
       let sentSig: string | null = null;
       const preferSkipPreflight = idx > 0 || isUrgentExit;
@@ -2083,6 +2252,41 @@ export class SniperManager {
     const pnlUsd = netSolDelta * solPriceUsd;
     const pnlPct = allocatedCostUsd > 0 ? (pnlUsd / allocatedCostUsd) * 100 : 0;
     const exitPriceUsd = soldQty > 0 ? proceedsUsd / soldQty : 0;
+
+    // Auto-reclaim empty ATA rent immediately after full live sell if enabled
+    const sellCfgAfter = this.readSettings();
+    const autoReclaimOn =
+      isPyOptionEnabled(sellCfgAfter, 'auto_reclaim_rent_enabled', true) &&
+      sellCfgAfter.auto_reclaim_rent_enabled !== false;
+    if (!isPartial && reclaimedRentSol <= 0 && autoReclaimOn) {
+      const reclaimed = await this.reclaimRentAccounts(false, params.mint).catch(() => null);
+      if (reclaimed && reclaimed.reclaimedSol > 0) {
+        reclaimedRentSol += reclaimed.reclaimedSol;
+      }
+    }
+
+    try {
+      const quotedSellPx = soldQty > 0 && quotedSolOut > 0 ? (quotedSolOut * solPriceUsd) / soldQty : exitPriceUsd;
+      const sellSlipPct =
+        quotedSellPx > 0 && exitPriceUsd > 0 ? ((quotedSellPx - exitPriceUsd) / quotedSellPx) * 100 : 0;
+      const jitoSellFlag =
+        isPyOptionEnabled(sellCfgAfter, 'jito_dontfront_enabled', true) &&
+        sellCfgAfter.jito_dontfront_enabled !== false;
+      this.appendTelemetryRecord({
+        tsMs: Date.now(),
+        mode: 'live',
+        side: 'SELL',
+        mint: params.mint,
+        symbol: params.symbol,
+        dex: 'jupiter',
+        platform: 'python_sniper',
+        quotedPriceUsd: quotedSellPx,
+        actualFillPriceUsd: exitPriceUsd,
+        slippagePct: Number(sellSlipPct.toFixed(3)),
+        latencyMs: 0,
+        jitoProtected: jitoSellFlag,
+      });
+    } catch {}
 
     if (typeof rpcPool.getAgreedBalanceSol === 'function') {
       const newBal = await rpcPool.getAgreedBalanceSol(owner).catch(() => null);
@@ -2540,6 +2744,470 @@ export class SniperManager {
       fs.writeFileSync(pnlCsv, synthesized, 'utf-8');
     } catch {}
     return synthesized;
+  }
+
+  public appendTelemetryRecord(rec: {
+    tsMs: number;
+    mode: string;
+    side: 'BUY' | 'SELL';
+    mint: string;
+    symbol: string;
+    dex: string;
+    platform: string;
+    quotedPriceUsd: number;
+    actualFillPriceUsd: number;
+    slippagePct: number;
+    latencyMs: number;
+    jitoProtected: boolean;
+  }) {
+    try {
+      const fp = path.join(this.baseDir, 'telemetry.json');
+      let list: any[] = [];
+      if (fs.existsSync(fp)) {
+        const parsed = JSON.parse(fs.readFileSync(fp, 'utf-8'));
+        if (Array.isArray(parsed)) list = parsed;
+      }
+      list.push(rec);
+      if (list.length > 500) list = list.slice(-500);
+      this.writeStateAtomic(fp, list);
+    } catch {}
+  }
+
+  public getTelemetryScorecard() {
+    const mode = this.getMode();
+    const fp = path.join(this.baseDir, 'telemetry.json');
+    let records: any[] = [];
+    if (fs.existsSync(fp)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(fp, 'utf-8'));
+        if (Array.isArray(parsed)) records = parsed;
+      } catch {}
+    }
+
+    const csvStr = this.exportPnlCsv(mode);
+    const lines = csvStr.replace(/\r/g, '').split('\n').filter((l) => l.trim().length > 0);
+    const map = new Map<
+      string,
+      {
+        dex: string;
+        platform: string;
+        slips: number[];
+        latencies: number[];
+        buyCount: number;
+        sellCount: number;
+        tradeWins: number;
+        tradeTotal: number;
+        netPnlUsd: number;
+      }
+    >();
+    const ensure = (dexRaw: string, platRaw: string) => {
+      const dex = (dexRaw || 'unknown').toLowerCase();
+      const platform = (platRaw || 'python_sniper').toLowerCase();
+      const key = `${dex}::${platform}`;
+      let b = map.get(key);
+      if (!b) {
+        b = {
+          dex,
+          platform,
+          slips: [],
+          latencies: [],
+          buyCount: 0,
+          sellCount: 0,
+          tradeWins: 0,
+          tradeTotal: 0,
+          netPnlUsd: 0,
+        };
+        map.set(key, b);
+      }
+      return b;
+    };
+
+    for (const r of records) {
+      const b = ensure(r.dex, r.platform);
+      if (r.side === 'BUY') b.buyCount += 1;
+      else b.sellCount += 1;
+      if (Number.isFinite(Number(r.slippagePct))) b.slips.push(Number(r.slippagePct));
+      if (Number.isFinite(Number(r.latencyMs)) && Number(r.latencyMs) > 0) b.latencies.push(Number(r.latencyMs));
+    }
+
+    for (let i = 1; i < lines.length; i += 1) {
+      const p = lines[i].split(',').map((s) => s.trim());
+      if (p.length < 15) continue;
+      const dex = p[13] || 'unknown';
+      const source = p[14] || 'python_sniper';
+      const pnlUsd = Number(p[8]) || 0;
+      const b = ensure(dex, source);
+      b.tradeTotal += 1;
+      if (pnlUsd > 0) b.tradeWins += 1;
+      b.netPnlUsd += pnlUsd;
+    }
+
+    return Array.from(map.values())
+      .map((b) => {
+        const avgSlip = b.slips.length > 0 ? b.slips.reduce((s, v) => s + v, 0) / b.slips.length : 0;
+        const maxSlip = b.slips.length > 0 ? Math.max(...b.slips.map((s) => Math.abs(s))) : 0;
+        const avgLat =
+          b.latencies.length > 0 ? b.latencies.reduce((s, v) => s + v, 0) / b.latencies.length : 0;
+        return {
+          dex: b.dex,
+          platform: b.platform,
+          tradeCount: Math.max(b.tradeTotal, b.buyCount + b.sellCount),
+          buyCount: b.buyCount,
+          sellCount: b.sellCount,
+          avgSlippagePct: Number(avgSlip.toFixed(3)),
+          maxSlippagePct: Number(maxSlip.toFixed(3)),
+          avgLatencyMs: Math.round(avgLat),
+          winRatePct: b.tradeTotal > 0 ? Number(((b.tradeWins / b.tradeTotal) * 100).toFixed(1)) : 0,
+          netPnlSol: Number(b.netPnlUsd.toFixed(4)),
+        };
+      })
+      .sort((a, b) => b.tradeCount - a.tradeCount);
+  }
+
+  public async auditRentAccounts() {
+    if (!this.orchestrator) {
+      return {
+        walletAddress: null,
+        emptyCount: 0,
+        dustCount: 0,
+        emptyReclaimableSol: 0,
+        dustReclaimableSol: 0,
+        accounts: [],
+        solPriceUsd: this.solPriceUsd,
+      };
+    }
+    const { signer, rpcPool } = this.orchestrator;
+    const owner = signer.getPublicKey();
+    if (!owner) {
+      return {
+        walletAddress: null,
+        emptyCount: 0,
+        dustCount: 0,
+        emptyReclaimableSol: 0,
+        dustReclaimableSol: 0,
+        accounts: [],
+        solPriceUsd: this.solPriceUsd,
+      };
+    }
+
+    const ownerPk = new PublicKey(owner);
+    const { stateFile } = getSniperFilePaths('live', this.baseDir);
+    const openMints = new Set<string>();
+    const symbolMap = new Map<string, string>();
+    if (fs.existsSync(stateFile)) {
+      try {
+        const st = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+        for (const [m, p] of Object.entries<any>(st?.positions || {})) {
+          openMints.add(m);
+          if (p?.symbol) symbolMap.set(m, String(p.symbol));
+        }
+      } catch {}
+    }
+
+    const accounts: any[] = [];
+    await rpcPool.withFailover(async (conn) => {
+      const [splAccs, t22Accs] = await Promise.all([
+        conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_PROGRAM_ID }),
+        conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_2022_PROGRAM_ID }),
+      ]);
+      const pushList = (list: typeof splAccs.value, programId: 'spl-token' | 'token-2022') => {
+        for (const acc of list) {
+          const info = (acc.account.data.parsed as {
+            info?: { mint?: string; tokenAmount?: { amount?: string; uiAmount?: number | null } };
+          })?.info;
+          const mint = String(info?.mint || '').trim();
+          if (!mint || mint === WSOL_MINT) continue;
+          const amountRaw = String(info?.tokenAmount?.amount ?? '0');
+          const uiAmount = Number(info?.tokenAmount?.uiAmount ?? 0);
+          const isEmpty = BigInt(/^\d+$/.test(amountRaw) ? amountRaw : '0') === 0n;
+          const isOpenPosition = openMints.has(mint);
+          const isDust = !isEmpty && !isOpenPosition;
+          accounts.push({
+            pubkey: acc.pubkey.toBase58(),
+            mint,
+            symbol: symbolMap.get(mint),
+            programId,
+            amountRaw,
+            uiAmount,
+            estValueUsd: null,
+            estRentSol: SNIPER_ATA_RENT_SOL,
+            isEmpty,
+            isDust,
+            isOpenPosition,
+          });
+        }
+      };
+      pushList(splAccs.value, 'spl-token');
+      pushList(t22Accs.value, 'token-2022');
+    });
+
+    const emptyCount = accounts.filter((a) => a.isEmpty).length;
+    const dustCount = accounts.filter((a) => a.isDust).length;
+    return {
+      walletAddress: owner,
+      emptyCount,
+      dustCount,
+      emptyReclaimableSol: Number((emptyCount * SNIPER_ATA_RENT_SOL).toFixed(6)),
+      dustReclaimableSol: Number((dustCount * SNIPER_ATA_RENT_SOL).toFixed(6)),
+      accounts,
+      solPriceUsd: this.solPriceUsd,
+    };
+  }
+
+  public async reclaimRentAccounts(burnDust = false, targetMint?: string) {
+    if (!this.orchestrator) {
+      throw new Error('Orchestrator not initialized.');
+    }
+    const { signer, rpcPool } = this.orchestrator;
+    const owner = signer.getPublicKey();
+    if (!signer.isUnlocked() || !owner) {
+      throw new Error('Server signer must be unlocked to reclaim SOL rent.');
+    }
+
+    const ownerPk = new PublicKey(owner);
+    const kp = signer.getKeypairForInternalSigning();
+    const { stateFile } = getSniperFilePaths('live', this.baseDir);
+    const openMints = new Set<string>();
+    if (fs.existsSync(stateFile)) {
+      try {
+        const st = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+        for (const m of Object.keys(st?.positions || {})) openMints.add(m);
+      } catch {}
+    }
+
+    const res = await rpcPool.withFailover(async (conn) => {
+      const scanClosables = async () => {
+        const [splAccs, t22Accs] = await Promise.all([
+          conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_PROGRAM_ID }),
+          conn.getParsedTokenAccountsByOwner(ownerPk, { programId: TOKEN_2022_PROGRAM_ID }),
+        ]);
+        const list: Array<{ pubkey: PublicKey; mintPk: PublicKey; programId: PublicKey; rawAmount: bigint }> = [];
+        const process = (accs: typeof splAccs.value, programId: PublicKey) => {
+          for (const acc of accs) {
+            const info = (acc.account.data.parsed as {
+              info?: { mint?: string; tokenAmount?: { amount?: string } };
+            })?.info;
+            const mintStr = String(info?.mint || '').trim();
+            if (!mintStr || mintStr === WSOL_MINT) continue;
+            if (targetMint && mintStr !== targetMint) continue;
+            const rawStr = String(info?.tokenAmount?.amount ?? '0');
+            const rawAmt = /^\d+$/.test(rawStr) ? BigInt(rawStr) : 1n;
+            if (rawAmt === 0n) {
+              list.push({ pubkey: acc.pubkey, mintPk: new PublicKey(mintStr), programId, rawAmount: 0n });
+            } else if (burnDust && !openMints.has(mintStr)) {
+              list.push({ pubkey: acc.pubkey, mintPk: new PublicKey(mintStr), programId, rawAmount: rawAmt });
+            }
+          }
+        };
+        process(splAccs.value, TOKEN_PROGRAM_ID);
+        process(t22Accs.value, TOKEN_2022_PROGRAM_ID);
+        return list;
+      };
+
+      const closables = await scanClosables();
+      if (closables.length === 0) {
+        return { closedCount: 0, burnedCount: 0, reclaimedSol: 0, txSig: null };
+      }
+      const batch = closables.slice(0, 8);
+      const tx = new Transaction();
+      let burnedCount = 0;
+      for (const item of batch) {
+        if (item.rawAmount > 0n) {
+          tx.add(createBurnInstruction(item.pubkey, item.mintPk, ownerPk, item.rawAmount, [], item.programId));
+          burnedCount += 1;
+        }
+        tx.add(createCloseAccountInstruction(item.pubkey, ownerPk, ownerPk, [], item.programId));
+      }
+      const { blockhash } = await conn.getLatestBlockhash('confirmed');
+      tx.recentBlockhash = blockhash;
+      tx.feePayer = ownerPk;
+      await tx.sign(kp);
+      const sig = await conn.sendRawTransaction(await tx.serialize(), { skipPreflight: false });
+      return {
+        closedCount: batch.length,
+        burnedCount,
+        reclaimedSol: Number((batch.length * SNIPER_ATA_RENT_SOL).toFixed(6)),
+        txSig: sig,
+      };
+    });
+
+    if (res.closedCount > 0) {
+      this.appendLog(
+        'INFO',
+        `Rent Reclaim: closed ${res.closedCount} ATA(s)${res.burnedCount > 0 ? ` (${res.burnedCount} dust burned)` : ''}, recovered ${res.reclaimedSol.toFixed(5)} SOL.`
+      );
+    }
+    return res;
+  }
+
+  public async sweepOrphanPositions() {
+    if (!this.orchestrator) {
+      return { scanned: 0, adopted: 0, adoptedSymbols: [] as string[], skipped: 0, errors: ['Not attached'] };
+    }
+    const audit = await this.auditRentAccounts();
+    const untracked = (audit.accounts || []).filter((a: any) => !a.isEmpty && !a.isOpenPosition);
+    if (untracked.length === 0) {
+      return { scanned: audit.accounts.length, adopted: 0, adoptedSymbols: [], skipped: 0, errors: [] };
+    }
+
+    const enriched = await this.orchestrator.dexScreener
+      .enrichMintsBatch(untracked.map((a: any) => a.mint))
+      .catch(() => new Map());
+
+    const { stateFile } = getSniperFilePaths('live', this.baseDir);
+    let state: any = { mode: 'live', positions: {}, closed: 0, wins: 0, total_pnl: 0, day_pnl: 0 };
+    if (fs.existsSync(stateFile)) {
+      try {
+        state = { ...state, ...JSON.parse(fs.readFileSync(stateFile, 'utf-8')) };
+      } catch {}
+    }
+    if (!state.positions || typeof state.positions !== 'object') state.positions = {};
+
+    const adoptedSymbols: string[] = [];
+    let adopted = 0;
+    let skipped = 0;
+    const nowSec = Date.now() / 1000;
+    const solPx = this.solPriceUsd || 0;
+
+    for (const acc of untracked) {
+      if (state.positions[acc.mint]) continue;
+      const ds = enriched.get(acc.mint);
+      const px = ds?.priceUsd ?? 0;
+      const valUsd = px > 0 ? acc.uiAmount * px : 0;
+      if (px <= 0 || valUsd < 0.05) {
+        skipped += 1;
+        continue;
+      }
+      const decimals = acc.amountRaw && acc.uiAmount > 0
+        ? Math.max(0, Math.min(12, Math.round(Math.log10(Number(acc.amountRaw) / acc.uiAmount))))
+        : 6;
+      const sym = ds?.symbol || acc.mint.slice(0, 6);
+      state.positions[acc.mint] = {
+        symbol: sym,
+        mint: acc.mint,
+        qty: acc.uiAmount,
+        raw_amount: acc.amountRaw,
+        decimals,
+        entry_price: px,
+        current_price: px,
+        peak_price: px,
+        low_price: px,
+        cost: valUsd,
+        cost_sol: solPx > 0 ? valUsd / solPx : 0,
+        opened: nowSec,
+        last_updated: nowSec,
+        trailing_active: false,
+        entry_liq: ds?.liquidityUsd ?? 0,
+        source: 'orphan_sweep',
+        dex: ds?.dex || 'unknown',
+        age_at_entry: ds?.poolCreatedAtMs ? Math.max(0, Math.round((Date.now() - ds.poolCreatedAtMs) / 1000)) : 0,
+        url: ds?.url || `https://dexscreener.com/solana/${acc.mint}`,
+      };
+      adopted += 1;
+      adoptedSymbols.push(sym);
+    }
+
+    if (adopted > 0) {
+      this.stateRevision += 1;
+      this.writeStateAtomic(stateFile, state);
+      this.appendLog('WARN', `Orphan Sweep adopted ${adopted} untracked token(s): ${adoptedSymbols.join(', ')}`);
+    }
+
+    return {
+      scanned: audit.accounts.length,
+      adopted,
+      adoptedSymbols,
+      skipped,
+      errors: [],
+    };
+  }
+
+  public runBacktest(req: {
+    mode?: SniperMode;
+    lookbackHours?: number;
+    takeProfitPct: number;
+    stopLossPct: number;
+    trailingEnabled: boolean;
+    trailingDropPct: number;
+    minAgeMinutes?: number;
+    maxAgeMinutes?: number;
+  }) {
+    const mode = req.mode || this.getMode();
+    const csv = this.exportPnlCsv(mode);
+    const lines = csv.replace(/\r/g, '').split('\n').filter((l) => l.trim().length > 0);
+    const nowMs = Date.now();
+    const lookbackMs = req.lookbackHours && req.lookbackHours > 0 ? req.lookbackHours * 3600_000 : 0;
+
+    let sampleSize = 0;
+    let evaluatedTrades = 0;
+    let filteredOutCount = 0;
+    let baseWins = 0;
+    let baseNet = 0;
+    let basePeak = 0;
+    let baseMaxDd = 0;
+    let simWins = 0;
+    let simNet = 0;
+    let simPeak = 0;
+    let simMaxDd = 0;
+
+    for (let i = 1; i < lines.length; i += 1) {
+      const p = lines[i].split(',').map((s) => s.trim());
+      if (p.length < 13) continue;
+      const ts = Date.parse(p[0]);
+      if (lookbackMs > 0 && Number.isFinite(ts) && nowMs - ts > lookbackMs) continue;
+
+      sampleSize += 1;
+      const costUsd = Number(p[6]) || 5.0;
+      const pnlUsd = Number(p[8]) || 0;
+      const pnlPct = Number(p[10]) || 0;
+      const holdOrAgeMin = (Number(p[12]) || 0) / 60;
+
+      baseNet += pnlUsd;
+      if (pnlUsd > 0) baseWins += 1;
+      if (baseNet > basePeak) basePeak = baseNet;
+      baseMaxDd = Math.max(baseMaxDd, basePeak - baseNet);
+
+      if (
+        (req.minAgeMinutes !== undefined && holdOrAgeMin < req.minAgeMinutes) ||
+        (req.maxAgeMinutes !== undefined && req.maxAgeMinutes > 0 && holdOrAgeMin > req.maxAgeMinutes)
+      ) {
+        filteredOutCount += 1;
+        continue;
+      }
+
+      evaluatedTrades += 1;
+      const estPeakPct = Math.max(0, pnlPct);
+      let simPct = pnlPct;
+      if (estPeakPct >= req.takeProfitPct) {
+        simPct = req.takeProfitPct;
+      } else if (req.trailingEnabled && estPeakPct > req.trailingDropPct && req.trailingDropPct > 0) {
+        simPct = Math.max(estPeakPct - req.trailingDropPct, pnlPct);
+      } else if (pnlPct <= -Math.abs(req.stopLossPct)) {
+        simPct = -Math.abs(req.stopLossPct);
+      }
+
+      const simPnlUsd = costUsd * (simPct / 100);
+      simNet += simPnlUsd;
+      if (simPnlUsd > 0) simWins += 1;
+      if (simNet > simPeak) simPeak = simNet;
+      simMaxDd = Math.max(simMaxDd, simPeak - simNet);
+    }
+
+    return {
+      sampleSize,
+      evaluatedTrades,
+      baselineWinRatePct: sampleSize > 0 ? Number(((baseWins / sampleSize) * 100).toFixed(1)) : 0,
+      baselineNetPnl: Number(baseNet.toFixed(4)),
+      baselineMaxDrawdown: Number(baseMaxDd.toFixed(4)),
+      simulatedWinRatePct: evaluatedTrades > 0 ? Number(((simWins / evaluatedTrades) * 100).toFixed(1)) : 0,
+      simulatedNetPnl: Number(simNet.toFixed(4)),
+      simulatedMaxDrawdown: Number(simMaxDd.toFixed(4)),
+      filteredOutCount,
+      pnlUnit: 'USD' as const,
+      notes: [
+        `Replayed ${sampleSize} closed ${mode.toUpperCase()} sniper trades (${evaluatedTrades} matched filters).`,
+      ],
+    };
   }
 
   private parseAndLogStdout(line: string) {

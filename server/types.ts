@@ -16,6 +16,7 @@ export type ExitReason =
   | 'EMERGENCY_TRADING_DISABLED'
   | 'EMERGENCY_OWNER_TAKEOVER'
   | 'EMERGENCY_LIQUIDITY_FLOOR'
+  | 'SMART_MONEY_SELL'
   | 'MANUAL_SELL'
   | 'KILL_SWITCH'
   | 'SLOT_ROTATION'
@@ -31,6 +32,9 @@ export interface StopLossTier {
   triggerDropPct: number;
   sellPct: number;
 }
+
+export type SolRegimeAction = 'pause' | 'half_size';
+export type StreakThrottleAction = 'half_size' | 'pause';
 
 export interface BotSettings {
   // Sizing & Risk
@@ -121,6 +125,51 @@ export interface BotSettings {
   shadowCompareEnabled: boolean;
   shadowLiveSizeSol: number;
 
+  // Pro Desk — Group 1: Deeper Wallet & Scam Intelligence
+  antiSybilEnabled: boolean;
+  freshWalletMinutes: number;
+  maxSharedFunderCount: number;
+  smartMoneyEnabled: boolean;
+  smartWallets: string[];
+  smartMoneyMinConfluence: number;
+  smartMoneySizeBoostPct: number;
+  smartMoneyAutoExitOnSell: boolean;
+  reusedSocialsEnabled: boolean;
+  maxSocialReuseCount: number;
+
+  // Pro Desk — Group 2: Zero-Lag Exits & MEV / Wallet Sweep
+  wsExitStreamEnabled: boolean;
+  jitoDontFrontEnabled: boolean;
+  jitoTipSol: number;
+  orphanSweepEnabled: boolean;
+
+  // Pro Desk — Group 3: Market Structure & Entry Timing
+  postMigrationPullbackEnabled: boolean;
+  migrationMinDipPct: number;
+  migrationWaitSec: number;
+  preMigrationCurveEnabled: boolean;
+  preMigrationCurveMinPct: number;
+  preMigrationCurveMaxPct: number;
+  washTradeFilterEnabled: boolean;
+  minUniqueMakersRatio: number;
+  minUniqueTraders5m: number;
+  solRegimeFilterEnabled: boolean;
+  solRegimeMaxDropPct: number;
+  solRegimeAction: SolRegimeAction;
+  antiTopWickEnabled: boolean;
+  maxShortSpikePct: number;
+
+  // Pro Desk — Group 4: Dynamic Sizing & Capital Efficiency
+  convictionSizingEnabled: boolean;
+  convictionMinMult: number;
+  convictionMaxMult: number;
+  streakThrottleEnabled: boolean;
+  streakLossLimit: number;
+  streakCooldownMinutes: number;
+  streakAction: StreakThrottleAction;
+  narrativeCapEnabled: boolean;
+  maxSameNarrativePositions: number;
+
   // Per-option enable/disable toggles (omitted or true = active)
   optionToggles?: Record<string, boolean>;
 }
@@ -168,6 +217,10 @@ export interface CandidateToken {
   sells5m?: number;
   buys1h?: number;
   sells1h?: number;
+  socialUrls?: string[];
+  uniqueTraders5m?: number;
+  realSolInCurve?: number;
+  smartWalletBuyers?: string[];
   tokenDecimals?: number;
   isToken2022?: boolean;
   rawUpdatedAtMs: number;
@@ -214,6 +267,10 @@ export interface SecurityReport {
   creatorLaunchCount?: number;
   creatorRuggedCount?: number;
   creatorFastestRugMinutes?: number | null;
+  sybilClusterCount?: number;
+  sybilSharedFunder?: string | null;
+  reusedSocialMatch?: { url: string; priorMints: number; ruggedMints: number } | null;
+  smartMoneyBuyers?: string[];
   sellRouteExists: boolean;
   sellRouteImpactPct: number | null;
   sellTaxPct: number | null;
@@ -496,6 +553,95 @@ export interface AnalyticsSummary {
   bySource: Array<{ source: string; count: number; winRatePct: number; netPnlSol: number }>;
   byHour: Array<{ hour: number; count: number; netPnlSol: number }>;
   equityCurve: Array<{ timestamp: string; cumulativeNetSol: number; drawdownSol: number }>;
+}
+
+export interface ExecutionTelemetryRecord {
+  id?: number;
+  tradeId: string;
+  mode: ExecutionMode;
+  side: 'BUY' | 'SELL';
+  mint: string;
+  symbol: string;
+  dex: string;
+  platform: string;
+  quotedPriceUsd: number;
+  actualFillPriceUsd: number;
+  slippagePct: number;
+  latencyMs: number;
+  jitoProtected: boolean;
+  createdAtMs: number;
+}
+
+export interface DexScorecardRow {
+  dex: string;
+  platform: string;
+  tradeCount: number;
+  buyCount: number;
+  sellCount: number;
+  avgSlippagePct: number;
+  maxSlippagePct: number;
+  avgLatencyMs: number;
+  winRatePct: number;
+  netPnlSol: number;
+}
+
+export interface RentAuditAccount {
+  pubkey: string;
+  mint: string;
+  symbol?: string;
+  programId: 'spl-token' | 'token-2022';
+  amountRaw: string;
+  uiAmount: number;
+  estValueUsd: number | null;
+  estRentSol: number;
+  isEmpty: boolean;
+  isDust: boolean;
+  isOpenPosition: boolean;
+}
+
+export interface RentAuditReport {
+  walletAddress: string | null;
+  emptyCount: number;
+  dustCount: number;
+  emptyReclaimableSol: number;
+  dustReclaimableSol: number;
+  accounts: RentAuditAccount[];
+  solPriceUsd: number | null;
+}
+
+export interface OrphanSweepResult {
+  scanned: number;
+  adopted: number;
+  adoptedSymbols: string[];
+  skipped: number;
+  errors: string[];
+}
+
+export interface BacktestRequest {
+  mode?: ExecutionMode;
+  lookbackHours?: number;
+  takeProfitPct: number;
+  stopLossPct: number;
+  trailingEnabled: boolean;
+  trailingDropPct: number;
+  minAgeMinutes?: number;
+  maxAgeMinutes?: number;
+  minLiquidityUsd?: number;
+  solRegimeMaxDropPct?: number;
+}
+
+export interface BacktestResult {
+  sampleSize: number;
+  evaluatedTrades: number;
+  baselineWinRatePct: number;
+  baselineNetPnl: number;
+  baselineMaxDrawdown: number;
+  simulatedWinRatePct: number;
+  simulatedNetPnl: number;
+  simulatedMaxDrawdown: number;
+  filteredOutCount: number;
+  pnlUnit: 'SOL' | 'USD';
+  notes: string[];
 }
 
 export interface SseEventPayload {

@@ -2,6 +2,38 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.38.0 — Pro Trader Intelligence & Execution Desk (`Pro Desk` Tab on Both Bots, Per-Option Checkboxes, Anti-Sybil, Jito `dontfront`, Live WS Exits, Rent Audit & Backtester)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Dedicated `Pro Desk` Tab Immediately After `Settings` on BOTH Bots (`ProDeskView.tsx`, `PythonSniperView.tsx`, `Sidebar.tsx`)**:
+  - Every single Pro Desk capability across all 6 trading intelligence & execution groups includes its own **enable/disable checkbox** (`optionToggles[key]` on Solana Spot Bot; `option_enabled[key]` on Python Sniper Bot). Checked = actively enforced & validated; unchecked = dimmed (`OFF`) and completely bypassed at runtime.
+- **Group 1 — Deeper Wallet & Scam Intelligence ("Hidden Rug" Catchers)**:
+  - **Fresh-Wallet / Shared-Funder Cluster Detection (`antiSybilEnabled` / `anti_sybil_enabled`)**: Inspects early buyers & top holders for freshly funded wallets (`freshWalletMinutes`) sharing the same distributor/CEX hot-wallet funder above `maxSharedFunderCount` to catch split-wallet bundles.
+  - **Smart Money / Whale Watchlist (`smartMoneyEnabled` / `smart_money_enabled`)**: Track profitable KOL/smart wallets (`smartWallets` / `smart_wallets`), boost trade size on confluence (`smartMoneySizeBoostPct` / `smart_money_size_boost_pct`), and optionally auto-exit immediately if tracked smart wallets dump (`smartMoneyAutoExitOnSell` / `smart_money_auto_exit_on_sell`, exit reason `SMART_MONEY_SELL`).
+  - **Reused Socials Detection (`reusedSocialsEnabled` / `reused_socials_enabled`)**: Normalizes X/Twitter, Telegram, and website links into persistent history (`social_history` SQLite / `social_history.json`) to block serial ruggers recycling the same socials across new dev wallets.
+- **Group 2 — Zero-Lag Exit Speed & MEV / Wallet Protection**:
+  - **Live PumpPortal WS Open-Position Price & Trade Streaming (`wsExitStreamEnabled` / `ws_exit_stream_enabled`)**: Subscribes directly to bought mints over WebSocket (`<200ms`) so dump spikes and TP wicks trigger exits without waiting for slow HTTP polling loops.
+  - **Jito Sandwich Protection `dontfront` (`jitoDontFrontEnabled` / `jito_dont_front_enabled`)**: Injects the Jito `jitodontfront...` read-only marker into VersionedTransaction messages (with ALT index remapping) and Jito block-engine tips (`jitoTipSol` / `jito_tip_sol`) to block MEV sandwich attacks on volatile swaps.
+  - **Orphan Token Auto-Adopter Wallet Sweep (`orphanSweepEnabled` / `orphan_sweep_enabled`)**: Scans wallet SPL/Token-2022 accounts (automatic + manual **Run Orphan Sweep** button) so confirmed buys after RPC timeout are immediately adopted into live TP/SL/Trail monitoring.
+- **Group 3 — Market Structure & Pro Entry Timing**:
+  - **Post-Migration Pullback / Reclaim (`postMigrationPullbackEnabled` / `post_migration_pullback_enabled`)** & **Pre-Migration Bonding Curve Surge (`preMigrationCurveEnabled` / `pre_migration_curve_enabled`)**: Time entries cleanly around Pump.fun curve graduation or the post-migration dip & reclaim bounce.
+  - **Wash-Trading / Fake Volume Filter (`washTradeFilterEnabled` / `wash_trade_filter_enabled`)**: Checks unique buyers/traders vs. total transactions (`minUniqueMakersRatio`, `minUniqueTraders5m`) to skip ping-pong bot volume.
+  - **SOL 15m Market Regime Filter (`solRegimeFilterEnabled` / `sol_regime_filter_enabled`)**: Automatically pauses new entries (`pause`) or halves position size (`half_size`) when SOL drops fast (`>= solRegimeMaxDropPct` in 15m).
+  - **Anti-Top-Wick Guard (`antiTopWickEnabled` / `anti_top_wick_enabled`)**: Blocks market-buying straight into vertical parabolic candles (`> maxShortSpikePct`).
+- **Group 4 — Dynamic Position Sizing & Capital Efficiency**:
+  - **Conviction-Based Sizing (`convictionSizingEnabled` / `conviction_sizing_enabled`)**: Scales trade size between `convictionMinMult` and `convictionMaxMult` based on liquidity depth, unique makers, creator reputation, and Smart Money confluence.
+  - **Losing-Streak / Drawdown Throttle (`streakThrottleEnabled` / `streak_throttle_enabled`)**: Halves size or pauses new entries for `streakCooldownMinutes` after `streakLossLimit` consecutive stop-losses.
+  - **Meta / Narrative Duplicate Cap (`narrativeCapEnabled` / `narrative_cap_enabled`)**: Caps simultaneous open positions sharing the same normalized ticker stem (e.g., `MINIPEPE2` -> `PEPE`) to prevent correlated meta losses.
+- **Group 5 — Hidden Profit Leaks (Empty ATA Rent & DEX Scorecard)**:
+  - **Empty ATA Rent Audit, Reclaim & Burn Dust (`autoReclaimRent` / `auto_reclaim_rent_enabled`)**: Inspects empty and dust token accounts on both bots (`/api/rent/*`, `/api/sniper/rent/*`), closes zero-balance ATAs (`~0.00204 SOL` each), and includes a two-step **Burn Dust & Reclaim All** action.
+  - **Real Slippage & Latency DEX Scorecard**: Persistent execution telemetry (`execution_telemetry` / `telemetry.json`) displaying average/max slippage, fill latency (ms), win rate, and net P&L per DEX and platform.
+- **Group 6 — Local Strategy What-If Backtester (`POST /api/backtest`, `POST /api/sniper/backtest`)**:
+  - Replay historical closed trades on either bot to compare baseline vs. simulated win rate, net P&L, and max drawdown before risking live SOL.
+
+---
+
 ## v1.37.0 — Per-Option Enable/Disable Checkboxes (Both Bots), Owner/Creator Rugpull Speed History & Python Sniper Min–Max Coin Age Gap (`SettingsView.tsx`, `PipelineConfigView.tsx`, `PythonSniperView.tsx`, `bot.py`, `creatorHistory.ts`, `security.ts`, `pipeline.ts`, `db.ts`)
 
 **Risk Warning: Trading can lose all of your money.**

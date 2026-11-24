@@ -77,10 +77,70 @@ CONFIG = {
     "anti_rug_sell_sim_enabled": False,
     "anti_rug_copycat_cooldown_enabled": True,
     "axiom_pulse_migrated_only_enabled": False,
+    # Pro Desk — Group 1: Deeper Wallet & Scam Intelligence
+    "anti_sybil_enabled": True,
+    "fresh_wallet_minutes": 30.0,
+    "max_shared_funder_count": 3,
+    "smart_money_enabled": True,
+    "smart_wallets": [],
+    "smart_money_min_confluence": 1,
+    "smart_money_size_boost_pct": 35.0,
+    "smart_money_auto_exit_on_sell": True,
+    "reused_socials_enabled": True,
+    "max_social_reuse_count": 2,
+    # Pro Desk — Group 2: Zero-Lag Exits & MEV / Wallet Sweep
+    "ws_exit_stream_enabled": True,
+    "jito_dontfront_enabled": True,
+    "orphan_sweep_enabled": True,
+    # Pro Desk — Group 3: Market Structure & Entry Timing
+    "post_migration_pullback_enabled": False,
+    "migration_min_dip_pct": 15.0,
+    "migration_wait_sec": 45.0,
+    "pre_migration_curve_enabled": False,
+    "pre_migration_curve_min_pct": 75.0,
+    "pre_migration_curve_max_pct": 92.0,
+    "wash_trade_filter_enabled": True,
+    "min_unique_makers_ratio": 0.25,
+    "min_unique_traders_5m": 6,
+    "sol_regime_filter_enabled": True,
+    "sol_regime_max_drop_pct": 2.0,
+    "sol_regime_action": "pause",
+    "anti_top_wick_enabled": True,
+    "max_short_spike_pct": 70.0,
+    # Pro Desk — Group 4: Dynamic Sizing & Capital Efficiency
+    "conviction_sizing_enabled": True,
+    "conviction_min_mult": 0.5,
+    "conviction_max_mult": 1.5,
+    "streak_throttle_enabled": True,
+    "streak_loss_limit": 3,
+    "streak_cooldown_minutes": 20.0,
+    "streak_action": "half_size",
+    "narrative_cap_enabled": True,
+    "max_same_narrative_positions": 1,
+    # Pro Desk — Group 5: Solana Rent Reclaim
+    "auto_reclaim_rent_enabled": True,
     "state_file": "state.json", "trades_csv": "trades.csv",
     "log_rejects": False, "jupiter_api_key": "",
     # per-option enable/disable toggles (true = enforce, false = ignore)
-    "option_enabled": {"min_age_minutes": False},
+    "option_enabled": {
+        "min_age_minutes": False,
+        "anti_sybil_enabled": True,
+        "smart_money_enabled": True,
+        "smart_money_auto_exit_on_sell": True,
+        "reused_socials_enabled": True,
+        "ws_exit_stream_enabled": True,
+        "jito_dontfront_enabled": True,
+        "orphan_sweep_enabled": True,
+        "post_migration_pullback_enabled": False,
+        "pre_migration_curve_enabled": False,
+        "wash_trade_filter_enabled": True,
+        "sol_regime_filter_enabled": True,
+        "anti_top_wick_enabled": True,
+        "conviction_sizing_enabled": True,
+        "streak_throttle_enabled": True,
+        "narrative_cap_enabled": True,
+        "auto_reclaim_rent_enabled": True,
+    },
     # compatibility keys kept so old settings files still load
     "cooldown_minutes": 60, "min_volume_h1_usd": 0.0,
     "max_age_hours": 24, "min_buys_h1": 0, "min_buy_sell_ratio_h1": 0.0,
@@ -98,6 +158,12 @@ _BOOL_OPTION_KEYS = {
     "direct_dex_fallback_enabled", "anti_rug_tight_score_enabled",
     "anti_rug_pool_depth_check_enabled", "anti_rug_sell_sim_enabled",
     "anti_rug_copycat_cooldown_enabled", "axiom_pulse_migrated_only_enabled", "log_rejects",
+    "anti_sybil_enabled", "smart_money_enabled", "smart_money_auto_exit_on_sell",
+    "reused_socials_enabled", "ws_exit_stream_enabled", "jito_dontfront_enabled",
+    "orphan_sweep_enabled", "post_migration_pullback_enabled", "pre_migration_curve_enabled",
+    "wash_trade_filter_enabled", "sol_regime_filter_enabled", "anti_top_wick_enabled",
+    "conviction_sizing_enabled", "streak_throttle_enabled", "narrative_cap_enabled",
+    "auto_reclaim_rent_enabled",
 }
 
 def opt_on(cfg, key, default=True):
@@ -333,6 +399,46 @@ def bridge_post(path, payload, timeout=45):
 
 _sol_cache = {"price": None, "updated_at": 0.0}
 _sol_lock = threading.Lock()
+_sol_regime_samples = []  # list of (ts_sec, price_usd)
+
+def _record_sol_regime_sample(price, ts_sec=None):
+    if not price or price <= 0:
+        return
+    t = ts_sec if ts_sec is not None else time.time()
+    with _sol_lock:
+        _sol_regime_samples.append((t, float(price)))
+        cutoff = t - 1200.0  # keep rolling 20 minutes
+        while _sol_regime_samples and _sol_regime_samples[0][0] < cutoff:
+            _sol_regime_samples.pop(0)
+        if len(_sol_regime_samples) > 400:
+            del _sol_regime_samples[:len(_sol_regime_samples) - 400]
+
+def _evaluate_sol_regime(cfg, now_ts=None):
+    """Evaluate 15-minute SOL drop % and return {action, drop_pct, peak, current}."""
+    t = now_ts if now_ts is not None else time.time()
+    cutoff = t - 900.0
+    with _sol_lock:
+        recent = [px for ts, px in _sol_regime_samples if ts >= cutoff]
+    drop_pct = 0.0
+    peak = 0.0
+    cur = 0.0
+    if len(recent) >= 2:
+        peak = max(recent)
+        cur = recent[-1]
+        if peak > 0:
+            drop_pct = max(0.0, ((peak - cur) / peak) * 100.0)
+    if not opt_on(cfg, "sol_regime_filter_enabled", True):
+        return {"action": "allow", "drop_pct": round(drop_pct, 3), "peak": peak, "current": cur}
+    max_drop = max(0.1, float((cfg or {}).get("sol_regime_max_drop_pct", 2.0) or 2.0))
+    if drop_pct >= max_drop:
+        raw_act = str((cfg or {}).get("sol_regime_action") or "pause").strip().lower()
+        return {
+            "action": "half_size" if raw_act == "half_size" else "pause",
+            "drop_pct": round(drop_pct, 3),
+            "peak": peak,
+            "current": cur,
+        }
+    return {"action": "allow", "drop_pct": round(drop_pct, 3), "peak": peak, "current": cur}
 
 def get_sol_price_usd(cfg=None, force=False):
     """Fetch and cache live SOL/USD price every 12s via Jupiter / DexScreener."""
@@ -368,6 +474,7 @@ def get_sol_price_usd(cfg=None, force=False):
         with _sol_lock:
             _sol_cache["price"] = price
             _sol_cache["updated_at"] = now_ts
+        _record_sol_regime_sample(price, now_ts)
         return price, now_ts
 
     with _sol_lock:
@@ -586,11 +693,43 @@ def _src_boosts(cfg):
     return [d.get("tokenAddress") for d in data
             if isinstance(d, dict) and d.get("chainId") == "solana" and d.get("tokenAddress")]
 
+_ws_open_prices = {}
+_ws_smart_sells = {}
+_ws_feed_lock = threading.Lock()
+_last_ws_poll_ts = [0.0]
+
+def _ingest_ws_bridge_payload(resp):
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return
+    with _ws_feed_lock:
+        op = resp.get("open_prices")
+        if isinstance(op, dict):
+            for k, v in op.items():
+                if isinstance(v, dict) and (_f(v.get("priceUsd")) or 0.0) > 0:
+                    _ws_open_prices[k] = v
+        ss = resp.get("smart_sells")
+        if isinstance(ss, dict):
+            for k, v in ss.items():
+                if isinstance(v, list) and v:
+                    _ws_smart_sells[k] = v
+
+def _poll_ws_monitor_feed(cfg, force=False):
+    if not opt_on(cfg, "ws_exit_stream_enabled", True) or not _bridge_base_url():
+        return {}, {}
+    now_ts = time.time()
+    if force or now_ts - _last_ws_poll_ts[0] >= 0.8:
+        _last_ws_poll_ts[0] = now_ts
+        resp = bridge_get("/api/sniper/pumpportal-mints", timeout=2.5)
+        _ingest_ws_bridge_payload(resp)
+    with _ws_feed_lock:
+        return dict(_ws_open_prices), dict(_ws_smart_sells)
+
 def _src_pumpportal(cfg):
     if not opt_on(cfg, "use_pumpportal", True): return []
     if _bridge_base_url():
         resp = bridge_get("/api/sniper/pumpportal-mints", timeout=4)
         if isinstance(resp, dict) and resp.get("ok"):
+            _ingest_ws_bridge_payload(resp)
             raw_pairs = resp.get("pairs")
             if isinstance(raw_pairs, list):
                 for p in raw_pairs:
@@ -790,6 +929,24 @@ def _is_symbol_on_cooldown(symbol, liq, cfg):
         return (liq or 0.0) < 15000.0
     return False
 
+_short_px_window = {}
+_migration_peaks = {}
+_market_struct_lock = threading.Lock()
+
+def _extract_ticker_stem(symbol):
+    s = re.sub(r"[^A-Z0-9.]", "", str(symbol or "").upper())
+    if not s:
+        return "UNKNOWN"
+    s = re.sub(r"\d+$", "", s)
+    for _ in range(2):
+        after_s = re.sub(r"(MINI|BABY|SUPER|MEGA|MICRO|TURBO|COIN|TOKEN|INU|WIF|SOL|AI|2\.0)$", "", s)
+        if len(after_s) >= 2:
+            s = after_s
+        after_p = re.sub(r"^(MINI|BABY|SUPER|MEGA|MICRO|TURBO)", "", s)
+        if len(after_p) >= 2:
+            s = after_p
+    return s or str(symbol or "").upper()
+
 def passes_filters(pair, cfg, now_ms=None, source=None):
     """Returns (ok, short_reason_code, detail)."""
     mint_addr = (pair.get("baseToken") or {}).get("address") or ""
@@ -837,8 +994,85 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
             if age_s > grace_sec and min_60s > 0 and buys_60s < min_60s:
                 return False, "low 60s velocity", f"{buys_60s} buys < {min_60s} in 60s"
 
+    # Pro Desk Group 3A: Pre-Migration Bonding Curve Surge Filter
+    dex_low = str(pair.get("dexId") or "").strip().lower()
+    is_curve_dex = dex_low in ("pumpfun", "pump")
+    is_migrated_dex = not is_curve_dex and (
+        any(k in dex_low for k in ("pumpswap", "pumpfunamm", "raydium", "meteora", "dlmm", "orca"))
+        or mint_addr.lower().endswith("pump")
+    )
+    if opt_on(cfg, "pre_migration_curve_enabled", False) and is_curve_dex:
+        real_sol = _f((pp or {}).get("real_sol_in_curve")) if pp else None
+        if real_sol is None:
+            real_sol = _f(pair.get("_real_sol_in_curve"))
+        if real_sol is not None:
+            curve_pct = min(100.0, max(0.0, (real_sol / 85.0) * 100.0))
+            c_min = float(cfg.get("pre_migration_curve_min_pct", 75.0) or 0.0)
+            c_max = float(cfg.get("pre_migration_curve_max_pct", 92.0) or 100.0)
+            if curve_pct < c_min or curve_pct > c_max:
+                return False, "curve out of range", f"curve {curve_pct:.1f}% not in {c_min:g}-{c_max:g}%"
+
+    # Pro Desk Group 3B: Post-Migration Pullback / Reclaim Entry
+    m5c = _f((pair.get("priceChange") or {}).get("m5"))
+    if opt_on(cfg, "post_migration_pullback_enabled", False) and is_migrated_dex:
+        wait_s = max(5.0, float(cfg.get("migration_wait_sec", 45.0) or 45.0))
+        min_dip = max(1.0, float(cfg.get("migration_min_dip_pct", 15.0) or 15.0))
+        with _market_struct_lock:
+            peak_rec = _migration_peaks.get(mint_addr)
+            if peak_rec is None:
+                peak_rec = px
+                _migration_peaks[mint_addr] = px
+                if len(_migration_peaks) > 500:
+                    _migration_peaks.pop(next(iter(_migration_peaks)), None)
+            elif px > peak_rec:
+                peak_rec = px
+                _migration_peaks[mint_addr] = px
+        if age_s < wait_s:
+            return False, "waiting migration settle", f"age {age_s:.0f}s < {wait_s:g}s"
+        dip_pct = ((peak_rec - px) / peak_rec * 100.0) if peak_rec > 0 else 0.0
+        m5_dip = -m5c if (m5c is not None and m5c < 0) else 0.0
+        eff_dip = max(dip_pct, m5_dip)
+        if eff_dip < min_dip:
+            return False, "waiting post-migration dip", f"dip {eff_dip:.1f}% < {min_dip:g}%"
+
+    # Pro Desk Group 3C: Wash-Trading / Fake Volume Guard
+    if opt_on(cfg, "wash_trade_filter_enabled", True):
+        min_ratio = max(0.05, min(1.0, float(cfg.get("min_unique_makers_ratio", 0.25) or 0.25)))
+        min_uniq = max(1, int(cfg.get("min_unique_traders_5m", 6) or 6))
+        total_m5 = buys + sells
+        uniq_5m = int(
+            ((pp or {}).get("unique_traders_5m") or 0)
+            or (m5.get("makers") or 0)
+            or (pair.get("_unique_traders_5m") or 0)
+        )
+        if total_m5 >= 6 and (uniq_5m > 0 or (pp and pp.get("has_trade_stream"))):
+            ratio_5m = uniq_5m / max(1, total_m5)
+            if uniq_5m < min_uniq:
+                return False, "wash trading", f"{uniq_5m} unique 5m traders < {min_uniq}"
+            if ratio_5m < min_ratio:
+                return False, "wash trading", f"unique ratio {ratio_5m*100:.0f}% < {min_ratio*100:.0f}% ({uniq_5m}/{total_m5})"
+
+    # Pro Desk Group 3D: Anti-Top-Wick Guard (20s rolling window)
+    now_t = now_ms / 1000.0
+    with _market_struct_lock:
+        win = _short_px_window.get(mint_addr, [])
+        win = [(ts, val) for ts, val in win if now_t - ts <= 25.0]
+        win.append((now_t, px))
+        _short_px_window[mint_addr] = win[-20:]
+        if len(_short_px_window) > 600:
+            _short_px_window.pop(next(iter(_short_px_window)), None)
+    if opt_on(cfg, "anti_top_wick_enabled", True):
+        max_spike = max(5.0, float(cfg.get("max_short_spike_pct", 70.0) or 70.0))
+        if len(win) >= 2:
+            base_px = win[0][1]
+            surge_pct = ((px - base_px) / base_px * 100.0) if base_px > 0 else 0.0
+            if surge_pct > max_spike:
+                return False, "top wick spike", f"+{surge_pct:.1f}% vertical spike > +{max_spike:g}% cap"
+        pp_spike = _f((pp or {}).get("spike_15s_pct")) if pp else None
+        if pp_spike is not None and pp_spike > max_spike:
+            return False, "top wick spike", f"+{pp_spike:.1f}% 15s spike > +{max_spike:g}% cap"
+
     if opt_on(cfg, "max_price_change_m5_pct", True):
-        m5c = _f((pair.get("priceChange") or {}).get("m5"))
         max_m5c = float(cfg.get("max_price_change_m5_pct", 300) or 0)
         if m5c is not None and max_m5c > 0 and m5c > max_m5c:
             return False, "already pumped", f"+{m5c:.0f}% in 5m"
@@ -1374,16 +1608,380 @@ def _evaluate_creator_history(mint, creator_addr, rep, cfg, pair=None):
         "fast_rug_min": fast_rug_min, "serial_launch_min": serial_launch_min,
     }
 
+# ---------------------------------------------------------------- Pro Desk: Reused Socials, Anti-Sybil, Smart Money, Sizing & Telemetry
+_social_lock = threading.Lock()
+_IGNORED_SOCIAL_HOSTS = {
+    "dexscreener.com", "www.dexscreener.com", "pump.fun", "www.pump.fun",
+    "solscan.io", "www.solscan.io", "birdeye.so", "www.birdeye.so",
+    "gmgn.ai", "jup.ag", "raydium.io", "axiom.trade",
+    "photon-sol.tinyastro.io", "rugcheck.xyz",
+}
+
+def _social_history_path():
+    return os.path.join(_base_dir(), "social_history.json")
+
+def _normalize_social_urls(urls):
+    if not isinstance(urls, (list, tuple)):
+        return []
+    out = []
+    seen = set()
+    from urllib.parse import urlparse
+    for raw in urls:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        try:
+            u = urlparse(s if "://" in s else f"https://{s}")
+            host = (u.hostname or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+            if not host or host in _IGNORED_SOCIAL_HOSTS:
+                continue
+            if host == "twitter.com":
+                host = "x.com"
+            path = (u.path or "").rstrip("/").lower()
+            if not path and host in ("x.com", "t.me"):
+                continue
+            norm = f"{host}{path}"
+        except Exception:
+            norm = s.lower().rstrip("/")
+        if len(norm) >= 4 and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+def _extract_pair_social_urls(pair):
+    if not isinstance(pair, dict):
+        return []
+    raw = []
+    info = pair.get("info") if isinstance(pair.get("info"), dict) else {}
+    for w in (info.get("websites") or []):
+        if isinstance(w, dict) and w.get("url"):
+            raw.append(str(w.get("url")))
+        elif isinstance(w, str):
+            raw.append(w)
+    for s in (info.get("socials") or []):
+        if isinstance(s, dict) and s.get("url"):
+            raw.append(str(s.get("url")))
+        elif isinstance(s, dict) and s.get("handle"):
+            t = str(s.get("type") or "").lower()
+            h = str(s.get("handle") or "").lstrip("@")
+            if h and ("twitter" in t or t == "x"):
+                raw.append(f"https://x.com/{h}")
+            elif h and "telegram" in t:
+                raw.append(f"https://t.me/{h}")
+    return _normalize_social_urls(raw)
+
+def _load_social_history():
+    p = _social_history_path()
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _save_social_history(hist):
+    p = _social_history_path()
+    tmp = p + f".tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(hist, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+def _check_reused_socials(mint, symbol, urls, max_reuse=2):
+    norm = _normalize_social_urls(urls)
+    if not norm or not mint:
+        return True, "ok", None
+    now_ms = int(time.time() * 1000)
+    with _social_lock:
+        hist = _load_social_history()
+        blocked = None
+        for url in norm:
+            rec = hist.get(url)
+            if not isinstance(rec, dict):
+                continue
+            mints = rec.get("mints") if isinstance(rec.get("mints"), dict) else {}
+            prior = {m: info for m, info in mints.items() if m != mint}
+            rugged_cnt = sum(1 for info in prior.values() if isinstance(info, dict) and info.get("rugged"))
+            if rugged_cnt > 0:
+                blocked = (False, f"reused social linked to prior rugpull ({url} · {rugged_cnt} rug)", url)
+                break
+            if len(prior) >= max(1, int(max_reuse or 2)):
+                blocked = (False, f"reused social recycled across {len(prior)} prior coins ({url})", url)
+                break
+        for url in norm:
+            rec = hist.get(url) if isinstance(hist.get(url), dict) else {"mints": {}}
+            mints = rec.setdefault("mints", {})
+            if mint not in mints:
+                mints[mint] = {"symbol": symbol, "seen_ms": now_ms, "rugged": False}
+            if len(mints) > 50:
+                for ok in list(mints.keys())[:-50]:
+                    mints.pop(ok, None)
+            hist[url] = rec
+        if len(hist) > 2000:
+            for hk in list(hist.keys())[:-2000]:
+                hist.pop(hk, None)
+        _save_social_history(hist)
+    if blocked:
+        return blocked
+    return True, "ok", None
+
+def _mark_social_rugged(mint):
+    if not mint:
+        return
+    with _social_lock:
+        hist = _load_social_history()
+        changed = False
+        for _url, rec in hist.items():
+            if not isinstance(rec, dict):
+                continue
+            mints = rec.get("mints")
+            if isinstance(mints, dict) and mint in mints and isinstance(mints[mint], dict):
+                mints[mint]["rugged"] = True
+                changed = True
+        if changed:
+            _save_social_history(hist)
+
+def _analyze_sybil_funders(mint, rep, cfg):
+    """Inspect top non-pool holders' earliest funding tx within tight 2.5s budget."""
+    holders = rep.get("topHolders") if isinstance(rep, dict) else None
+    if not isinstance(holders, list) or len(holders) < 2:
+        return 0, None
+    fresh_min = max(1.0, float((cfg or {}).get("fresh_wallet_minutes", 30.0) or 30.0))
+    cutoff_sec = time.time() - (fresh_min * 60.0)
+    rpc_urls = _get_rpc_urls(cfg)
+    targets = []
+    for h in holders[:12]:
+        if not isinstance(h, dict):
+            continue
+        owner = str(h.get("owner") or "").strip()
+        addr = str(h.get("address") or "").strip()
+        pct = _f(h.get("pct")) or 0.0
+        if not owner or owner in KNOWN_POOL_OR_BURN_OWNERS or addr in KNOWN_POOL_OR_BURN_OWNERS or pct < 0.3:
+            continue
+        if owner not in targets:
+            targets.append(owner)
+        if len(targets) >= 6:
+            break
+    if len(targets) < 2:
+        return 0, None
+
+    def _probe_owner(owner_addr):
+        url = rpc_urls[0]
+        try:
+            r = _session.post(
+                url,
+                json={"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress", "params": [owner_addr, {"limit": 15}]},
+                timeout=1.4,
+                headers={**HEADERS, "Content-Type": "application/json"},
+            )
+            if r.status_code != 200:
+                return None
+            sigs = (r.json().get("result") or [])
+            if not sigs or len(sigs) >= 15:
+                return None
+            oldest = sigs[-1]
+            bt = oldest.get("blockTime")
+            if bt and float(bt) < cutoff_sec:
+                return None
+            sig_str = oldest.get("signature")
+            if not sig_str:
+                return None
+            tr = _session.post(
+                url,
+                json={"jsonrpc": "2.0", "id": 2, "method": "getTransaction", "params": [sig_str, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]},
+                timeout=1.4,
+                headers={**HEADERS, "Content-Type": "application/json"},
+            )
+            if tr.status_code != 200:
+                return None
+            keys = ((((tr.json().get("result") or {}).get("transaction") or {}).get("message") or {}).get("accountKeys") or [])
+            for k in keys:
+                pk = k.get("pubkey") if isinstance(k, dict) else k
+                is_sig = k.get("signer", True) if isinstance(k, dict) else True
+                if pk and pk != owner_addr and is_sig:
+                    return str(pk)
+        except Exception:
+            return None
+        return None
+
+    funder_counts = {}
+    pool = ThreadPoolExecutor(max_workers=min(6, len(targets)))
+    try:
+        futs = [pool.submit(_probe_owner, o) for o in targets]
+        deadline = time.time() + 2.5
+        for f in futs:
+            rem = max(0.05, deadline - time.time())
+            try:
+                funder = f.result(timeout=rem)
+                if funder:
+                    funder_counts[funder] = funder_counts.get(funder, 0) + 1
+            except Exception:
+                pass
+    finally:
+        pool.shutdown(wait=False)
+    if not funder_counts:
+        return 0, None
+    best_funder = max(funder_counts, key=funder_counts.get)
+    return funder_counts[best_funder], best_funder
+
+def _get_pair_smart_buyers(pair, rep, cfg):
+    if not opt_on(cfg, "smart_money_enabled", True):
+        return []
+    raw_wallets = (cfg or {}).get("smart_wallets") or []
+    smart_set = {str(w).strip() for w in raw_wallets if str(w).strip()}
+    if not smart_set:
+        return []
+    hits = set()
+    pp = (pair or {}).get("_pumpportal") if isinstance((pair or {}).get("_pumpportal"), dict) else {}
+    for w in (pp.get("buyers") or []):
+        ws = str(w or "").strip()
+        if ws in smart_set:
+            hits.add(ws)
+    holders = rep.get("topHolders") if isinstance(rep, dict) else []
+    if isinstance(holders, list):
+        for h in holders:
+            if not isinstance(h, dict):
+                continue
+            own = str(h.get("owner") or "").strip()
+            adr = str(h.get("address") or "").strip()
+            if own in smart_set:
+                hits.add(own)
+            elif adr in smart_set:
+                hits.add(adr)
+    return list(hits)
+
+def _evaluate_conviction_mult(pair, cfg, smart_count=0):
+    mult = 1.0
+    if opt_on(cfg, "conviction_sizing_enabled", True):
+        min_m = max(0.1, float((cfg or {}).get("conviction_min_mult", 0.5) or 0.5))
+        max_m = max(min_m, float((cfg or {}).get("conviction_max_mult", 1.5) or 1.5))
+        score = 0.5
+        liq = _f(((pair or {}).get("liquidity") or {}).get("usd")) or 0.0
+        if liq >= 50000.0:
+            score += 0.2
+        elif liq >= 15000.0:
+            score += 0.1
+        elif liq < 5000.0:
+            score -= 0.15
+        m5 = ((pair or {}).get("txns") or {}).get("m5") or {}
+        buys = int(m5.get("buys") or 0)
+        sells = int(m5.get("sells") or 0)
+        tot = buys + sells
+        ratio = (buys / tot) if tot > 0 else 0.5
+        if ratio >= 0.65:
+            score += 0.15
+        elif ratio < 0.45:
+            score -= 0.15
+        pp = (pair or {}).get("_pumpportal") if isinstance((pair or {}).get("_pumpportal"), dict) else {}
+        if int(pp.get("unique_traders_5m") or 0) >= 15 or int(buys) >= 40:
+            score += 0.15
+        clamped = max(0.0, min(1.0, score))
+        mult = min_m + clamped * (max_m - min_m)
+
+    if opt_on(cfg, "smart_money_enabled", True):
+        min_conf = max(1, int((cfg or {}).get("smart_money_min_confluence", 1) or 1))
+        if smart_count >= min_conf:
+            boost_pct = max(0.0, min(200.0, float((cfg or {}).get("smart_money_size_boost_pct", 35.0) or 0.0)))
+            mult *= (1.0 + boost_pct / 100.0)
+    return round(max(0.1, min(3.0, mult)), 3)
+
+_py_tel_lock = threading.Lock()
+
+def _append_py_telemetry(mode, side, mint, symbol, dex, platform, quoted_px, fill_px, latency_ms=50, jito_protected=False):
+    fp = os.path.join(_base_dir(), "telemetry.json")
+    try:
+        slip_pct = 0.0
+        if quoted_px and quoted_px > 0 and fill_px and fill_px > 0:
+            slip_pct = ((fill_px - quoted_px) / quoted_px * 100.0) if side == "BUY" else ((quoted_px - fill_px) / quoted_px * 100.0)
+        rec = {
+            "tsMs": int(time.time() * 1000),
+            "mode": mode,
+            "side": side,
+            "mint": mint,
+            "symbol": symbol,
+            "dex": dex or "unknown",
+            "platform": platform or "python_sniper",
+            "quotedPriceUsd": float(quoted_px or fill_px or 0.0),
+            "actualFillPriceUsd": float(fill_px or 0.0),
+            "slippagePct": round(slip_pct, 3),
+            "latencyMs": int(max(1, latency_ms)),
+            "jitoProtected": bool(jito_protected),
+        }
+        with _py_tel_lock:
+            items = []
+            if os.path.exists(fp):
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                        if isinstance(d, list):
+                            items = d
+                except Exception:
+                    pass
+            items.append(rec)
+            if len(items) > 500:
+                items = items[-500:]
+            tmp = fp + f".tmp.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(items, f, indent=2)
+            os.replace(tmp, fp)
+    except Exception:
+        pass
+
+def _evaluate_streak_throttle(acct, cfg, now_ts=None):
+    """Inspect closed trades trailing loss streak to pause or half-size entries."""
+    if not opt_on(cfg, "streak_throttle_enabled", True):
+        return {"active": False, "action": "allow", "size_mult": 1.0, "losses": 0}
+    limit = max(1, int((cfg or {}).get("streak_loss_limit", 3) or 3))
+    cd_sec = max(1.0, float((cfg or {}).get("streak_cooldown_minutes", 20.0) or 20.0)) * 60.0
+    csv_path = getattr(acct, "pnl_csv_path", "")
+    if not csv_path or not os.path.exists(csv_path):
+        return {"active": False, "action": "allow", "size_mult": 1.0, "losses": 0}
+    losses = 0
+    latest_loss_ts = 0.0
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        for r in reversed(rows):
+            pnl = _f(r.get("pnl_usd"))
+            if pnl is None:
+                continue
+            if pnl < 0:
+                losses += 1
+                if latest_loss_ts <= 0:
+                    ms = _parse_iso_ms(r.get("time"))
+                    latest_loss_ts = ms / 1000.0 if ms > 0 else 0.0
+            else:
+                break
+    except Exception:
+        return {"active": False, "action": "allow", "size_mult": 1.0, "losses": 0}
+    if losses < limit or latest_loss_ts <= 0:
+        return {"active": False, "action": "allow", "size_mult": 1.0, "losses": losses}
+    t = now_ts if now_ts is not None else time.time()
+    if (t - latest_loss_ts) >= cd_sec:
+        return {"active": False, "action": "allow", "size_mult": 1.0, "losses": losses}
+    raw_act = str((cfg or {}).get("streak_action") or "half_size").strip().lower()
+    if raw_act == "pause":
+        return {"active": True, "action": "pause", "size_mult": 0.0, "losses": losses}
+    return {"active": True, "action": "half_size", "size_mult": 0.5, "losses": losses}
+
 def hard_rug_check(mint, cfg, age_s, pair=None):
-    """Return (ok, reason). Fail-closed parallel RPC SPL/Token-2022 + RugCheck + creator history + holder concentration + sell-route test."""
+    """Return (ok, reason). Fail-closed parallel RPC SPL/Token-2022 + RugCheck + creator history + Sybil + reused socials + holder concentration + sell-route test."""
     tight_score_on = opt_on(cfg, "anti_rug_tight_score_enabled", False)
     pool_depth_on = opt_on(cfg, "anti_rug_pool_depth_check_enabled", True)
     sell_sim_on = opt_on(cfg, "anti_rug_sell_sim_enabled", False)
     lp_req_on = opt_on(cfg, "require_lp_locked", False)
     creator_chk_on = opt_on(cfg, "check_creator_history", True)
+    sybil_on = opt_on(cfg, "anti_sybil_enabled", True)
+    socials_on = opt_on(cfg, "reused_socials_enabled", True)
     cache_key = (
         f"{mint}:{int(tight_score_on)}:{int(pool_depth_on)}:{int(sell_sim_on)}:{int(lp_req_on)}:"
-        f"{int(creator_chk_on)}:{int(opt_on(cfg, 'use_rugcheck', True))}:{int(opt_on(cfg, 'strict_rugcheck', True))}:"
+        f"{int(creator_chk_on)}:{int(sybil_on)}:{int(socials_on)}:{int(opt_on(cfg, 'use_rugcheck', True))}:{int(opt_on(cfg, 'strict_rugcheck', True))}:"
         f"{int(cfg.get('max_creator_launches', 5))}:{int(cfg.get('max_creator_rugged_coins', 0))}:"
         f"{float(cfg.get('creator_fast_rug_window_min', 60) or 0):g}"
     )
@@ -1657,6 +2255,28 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                         elif single_max_pct is not None and single_max_pct > max_single:
                             verdict = (False, f"single holder owns {single_max_pct:.1f}% > {max_single:.0f}% limit")
 
+                # Pro Desk Group 1A: Anti-Sybil Fresh-Wallet Shared-Funder Cluster Check
+                if verdict[0] and sybil_on and not is_bonding_curve:
+                    max_shared = max(2, int(cfg.get("max_shared_funder_count", 3) or 3))
+                    shared_cnt, shared_funder = _analyze_sybil_funders(mint, rep, cfg)
+                    if shared_cnt >= max_shared:
+                        f_short = f"{shared_funder[:6]}..." if shared_funder else "unknown"
+                        verdict = (False, f"sybil cluster: {shared_cnt} fresh holders funded by {f_short} (>= {max_shared})")
+
+        # Pro Desk Group 1C: Reused Socials (Twitter/Telegram/Website recycling)
+        if verdict[0] and socials_on and isinstance(pair, dict):
+            sym_s = str(((pair.get("baseToken") or {}).get("symbol") or "?"))
+            social_urls = _extract_pair_social_urls(pair)
+            if social_urls:
+                max_reuse = max(1, int(cfg.get("max_social_reuse_count", 2) or 2))
+                s_ok, s_reason, _ = _check_reused_socials(mint, sym_s, social_urls, max_reuse)
+                if not s_ok:
+                    verdict = (False, s_reason)
+
+        # Pro Desk Group 1B: Smart Money Confluence Tracking
+        if verdict[0] and isinstance(pair, dict):
+            pair["_smart_buyers"] = _get_pair_smart_buyers(pair, rep, cfg)
+
         # Pre-buy Jupiter sell-route check (reuses parallel future)
         if verdict[0] and need_sell_probe:
             if sell_fut is not None and decimals == 6:
@@ -1678,6 +2298,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
 
     if not verdict[0] and creator_addr and any(w in verdict[1].lower() for w in ("rug", "honeypot", "authority", "freeze", "lp burned")):
         _mark_creator_coin_rugged(mint, verdict[1], creator=creator_addr)
+        _mark_social_rugged(mint)
 
     with _rug_lock:
         if len(_rug_cache) > 5000: _rug_cache.clear()
@@ -1896,7 +2517,9 @@ class TradingAccount:
             ok, _why = self.can_open()
             if not ok or mint in self.state["positions"] or self.is_slots_full()[0]:
                 return False
-            size = float(c.get("trade_size_usd", 5.0) or 5.0) if opt_on(c, "trade_size_usd", True) else 5.0
+            base_size = float(c.get("trade_size_usd", 5.0) or 5.0) if opt_on(c, "trade_size_usd", True) else 5.0
+            size_mult = float(meta.get("size_mult", 1.0) or 1.0)
+            size = round(max(0.5, base_size * size_mult), 4)
             sol_px = self.state.get("sol_price_usd")
             tx_buy = ""
             cost_sol = (size / sol_px) if sol_px and sol_px > 0 else 0.0
@@ -2047,6 +2670,12 @@ class TradingAccount:
                 self.state["scan_paused"] = True
                 log(f"⏸ Slots full ({cnt}/{max_pos}) — stopped scanning for new coins until a slot frees up.")
             self.save()
+        if self.mode == "paper":
+            _append_py_telemetry(
+                self.mode, "BUY", mint, symbol,
+                meta.get("dex", "?"), meta.get("source", "python_sniper"),
+                price, fill, latency_ms=40, jito_protected=False,
+            )
         return True
 
     def sell(self, mint, price, reason, sell_fraction=1.0):
@@ -2181,6 +2810,14 @@ class TradingAccount:
 
         if str(reason) == "rug_liquidity_drop":
             _mark_creator_coin_rugged(mint, str(reason), creator=(pos or {}).get("creator"))
+            _mark_social_rugged(mint)
+
+        if self.mode == "paper":
+            _append_py_telemetry(
+                self.mode, "SELL", mint, pos.get("symbol", "?"),
+                pos.get("dex", "?"), pos.get("source", "python_sniper"),
+                price, fill, latency_ms=40, jito_protected=False,
+            )
 
         with self.lock:
             self._roll_day()
@@ -2595,6 +3232,20 @@ def scan_and_buy(acct, cfg):
         log(f"▶ Slot freed ({cnt}/{max_pos}) — resuming scan for new coins.")
 
     _maybe_summary()
+    regime = _evaluate_sol_regime(cfg)
+    if regime["action"] == "pause":
+        if time.time() - _last_block_log[0] > 30:
+            _last_block_log[0] = time.time()
+            log(f"⏸ SOL 15m Red Market Pause active (-{regime['drop_pct']:.2f}% drop in 15m) — skipping fresh entries.")
+        return
+
+    streak = _evaluate_streak_throttle(acct, cfg)
+    if streak["action"] == "pause":
+        if time.time() - _last_block_log[0] > 30:
+            _last_block_log[0] = time.time()
+            log(f"⏸ Losing-Streak Throttle Pause active ({streak['losses']} consecutive losses) — cooling down.")
+        return
+
     ok, why = acct.can_open()
     if not ok:
         if time.time() - _last_block_log[0] > 30:
@@ -2725,9 +3376,23 @@ def scan_and_buy(acct, cfg):
             continue
         if _should_stop():
             return
+        # Pro Desk Group 4C: Narrative / Ticker Stem Duplicate Cap
+        if opt_on(cfg, "narrative_cap_enabled", True):
+            max_same = max(1, int(cfg.get("max_same_narrative_positions", 1) or 1))
+            cand_stem = _extract_ticker_stem(symbol)
+            open_stems = sum(1 for op in acct.state["positions"].values() if _extract_ticker_stem(op.get("symbol", "")) == cand_stem)
+            if open_stems >= max_same:
+                with _stats_lock: _stats["rejects"]["narrative_cap"] = _stats["rejects"].get("narrative_cap", 0) + 1
+                if opt_on(cfg, "log_rejects", False):
+                    log(f"– {symbol} skipped: narrative stem '{cand_stem}' cap ({open_stems}/{max_same})")
+                continue
+
         price = _f(pair.get("priceUsd"))
         if price is None or price <= 0: continue
         liq_usd = _f((pair.get("liquidity") or {}).get("usd"))
+        smart_buyers = pair.get("_smart_buyers") if isinstance(pair.get("_smart_buyers"), list) else []
+        conv_mult = _evaluate_conviction_mult(pair, cfg, len(smart_buyers))
+        total_size_mult = round(max(0.1, min(3.0, conv_mult * regime["size_mult"] * streak["size_mult"])), 3)
         meta = {
             "dex": pair.get("dexId") or "?",
             "source": _src_of.get(mint, "?"),
@@ -2736,6 +3401,7 @@ def scan_and_buy(acct, cfg):
             "liquidity_usd": liq_usd,
             "liq_source": "pumpportal" if pair.get("_synthetic") else "dexscreener",
             "decimals": _last_mint_decimals.get(mint),
+            "size_mult": total_size_mult,
         }
         if acct.buy(mint, symbol, price, pair.get("url"), meta):
             with _stats_lock: _stats["bought"] += 1
@@ -2849,6 +3515,8 @@ def _process_sell_queue(acct, prices):
         pass
 
 _last_liq_poll = [0.0]
+_last_orphan_sweep = [0.0]
+_last_ws_watch_sig = ["", 0.0]
 
 def monitor(acct):
     if _should_stop():
@@ -2866,8 +3534,34 @@ def monitor(acct):
                 acct.save()
     if acct.mode == "live":
         acct.sync_live_wallet()
+        # Pro Desk Group 2C: Periodic live wallet orphan position sweep (~25s)
+        if (
+            opt_on(acct.cfg, "orphan_sweep_enabled", True)
+            and _bridge_base_url()
+            and time.time() - _last_orphan_sweep[0] >= 25.0
+        ):
+            _last_orphan_sweep[0] = time.time()
+            try:
+                sw = bridge_post("/api/sniper/sweep-orphans", {}, timeout=6)
+                if isinstance(sw, dict) and int(sw.get("adopted") or 0) > 0:
+                    acct.load()
+                    log(f"🔎 Orphan Sweep adopted {sw.get('adopted')} wallet token(s): {', '.join(sw.get('adoptedSymbols') or [])}")
+            except Exception:
+                pass
 
     pos = acct.state["positions"]
+    # Sync open position mints to Node PumpPortal WS stream for <200ms exits
+    if opt_on(acct.cfg, "ws_exit_stream_enabled", True) and _bridge_base_url():
+        cur_mints = sorted(list(pos.keys()))
+        mints_sig = ",".join(cur_mints)
+        if mints_sig != _last_ws_watch_sig[0] or (cur_mints and time.time() - _last_ws_watch_sig[1] >= 10.0):
+            _last_ws_watch_sig[0] = mints_sig
+            _last_ws_watch_sig[1] = time.time()
+            try:
+                bridge_post("/api/sniper/ws-watch", {"mints": cur_mints}, timeout=2.5)
+            except Exception:
+                pass
+
     if not pos:
         full, cnt, max_pos = acct.is_slots_full()
         if not full and acct.state.get("scan_paused"):
@@ -2880,11 +3574,37 @@ def monitor(acct):
         return {}
 
     mints = list(pos.keys())
+    ws_open, ws_smart_sells = _poll_ws_monitor_feed(acct.cfg, force=False)
     prices = _jupiter_prices(mints, acct.cfg)
+    liquidities = {}
+    for wm, snap in ws_open.items():
+        if wm in pos and isinstance(snap, dict):
+            wpx = _f(snap.get("priceUsd"))
+            wliq = _f(snap.get("liquidityUsd"))
+            if wpx and wpx > 0:
+                prices[wm] = wpx
+            if wliq and wliq > 0:
+                liquidities[wm] = wliq
+
+    # Auto-exit immediately when a tracked Smart Money wallet sells an open position
+    if (
+        ws_smart_sells
+        and opt_on(acct.cfg, "smart_money_enabled", True)
+        and opt_on(acct.cfg, "smart_money_auto_exit_on_sell", True)
+    ):
+        for sm_mint, sellers in list(ws_smart_sells.items()):
+            if sm_mint in pos and sellers:
+                p_ref = pos[sm_mint]
+                sell_px = prices.get(sm_mint) or p_ref.get("current_price") or p_ref.get("entry_price")
+                if sell_px and sell_px > 0:
+                    log(f"🚨 SMART MONEY SELL detected for {p_ref.get('symbol', sm_mint[:6])} ({sellers[0][:6]}...) — exiting immediately.")
+                    acct.sell(sm_mint, sell_px, "smart_money_sell")
+        with _ws_feed_lock:
+            _ws_smart_sells.clear()
+
     rev_prices = _reverse_quote_prices(pos, acct.cfg, sol_px, acct=acct)
     if rev_prices:
         prices.update(rev_prices)
-    liquidities = {}
     dex_updates = {}
     missing = [mint for mint in mints if mint not in prices]
     need_liq_check = bool(acct.cfg.get("auto_rug_exit", False)) and (time.time() - _last_liq_poll[0] >= 3.0)

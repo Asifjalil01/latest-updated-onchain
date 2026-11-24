@@ -28,6 +28,14 @@ export type {
   TrailingTier,
   WalletDiagnostics,
   WalletFeeProfile,
+  SolRegimeAction,
+  StreakThrottleAction,
+  DexScorecardRow,
+  RentAuditAccount,
+  RentAuditReport,
+  OrphanSweepResult,
+  BacktestRequest,
+  BacktestResult,
 } from '../server/types';
 
 export interface SettingsHistoryEntry {
@@ -55,6 +63,7 @@ export type AppTab =
   | 'shadow'
   | 'history'
   | 'settings'
+  | 'pro_desk'
   | 'wallets'
   | 'logs'
   | 'pipeline'

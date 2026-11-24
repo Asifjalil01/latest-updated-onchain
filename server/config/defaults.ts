@@ -126,6 +126,51 @@ export const DEFAULT_SETTINGS: BotSettings = {
   shadowCompareEnabled: false,
   shadowLiveSizeSol: 0.01,
 
+  // Pro Desk — Group 1: Deeper Wallet & Scam Intelligence
+  antiSybilEnabled: false,
+  freshWalletMinutes: 30,
+  maxSharedFunderCount: 3,
+  smartMoneyEnabled: false,
+  smartWallets: [],
+  smartMoneyMinConfluence: 1,
+  smartMoneySizeBoostPct: 35,
+  smartMoneyAutoExitOnSell: true,
+  reusedSocialsEnabled: false,
+  maxSocialReuseCount: 2,
+
+  // Pro Desk — Group 2: Zero-Lag Exits & MEV / Wallet Sweep
+  wsExitStreamEnabled: false,
+  jitoDontFrontEnabled: false,
+  jitoTipSol: 0.0002,
+  orphanSweepEnabled: false,
+
+  // Pro Desk — Group 3: Market Structure & Entry Timing
+  postMigrationPullbackEnabled: false,
+  migrationMinDipPct: 15,
+  migrationWaitSec: 45,
+  preMigrationCurveEnabled: false,
+  preMigrationCurveMinPct: 75,
+  preMigrationCurveMaxPct: 92,
+  washTradeFilterEnabled: false,
+  minUniqueMakersRatio: 0.25,
+  minUniqueTraders5m: 6,
+  solRegimeFilterEnabled: false,
+  solRegimeMaxDropPct: 2.0,
+  solRegimeAction: 'pause',
+  antiTopWickEnabled: false,
+  maxShortSpikePct: 70,
+
+  // Pro Desk — Group 4: Dynamic Sizing & Capital Efficiency
+  convictionSizingEnabled: false,
+  convictionMinMult: 0.5,
+  convictionMaxMult: 1.5,
+  streakThrottleEnabled: false,
+  streakLossLimit: 3,
+  streakCooldownMinutes: 20,
+  streakAction: 'half_size',
+  narrativeCapEnabled: false,
+  maxSameNarrativePositions: 1,
+
   // Per-option enable/disable toggles (omitted or true = active)
   optionToggles: {},
 };
@@ -568,6 +613,89 @@ export function validateSettingsUpdate(
           );
         }
       });
+    }
+  }
+
+  // Pro Desk validations (guarded by both feature bool and optionToggles)
+  if (merged.antiSybilEnabled && optOn('antiSybilEnabled')) {
+    if (!Number.isFinite(merged.freshWalletMinutes) || merged.freshWalletMinutes < 1 || merged.freshWalletMinutes > 1440) {
+      pushErr('freshWalletMinutes', 'Fresh wallet window must be between 1 and 1440 minutes.');
+    }
+    if (!Number.isFinite(merged.maxSharedFunderCount) || merged.maxSharedFunderCount < 2 || merged.maxSharedFunderCount > 20) {
+      pushErr('maxSharedFunderCount', 'Max shared-funder cluster count must be between 2 and 20.');
+    }
+  }
+  if (merged.smartMoneyEnabled && optOn('smartMoneyEnabled')) {
+    if (!Number.isFinite(merged.smartMoneyMinConfluence) || merged.smartMoneyMinConfluence < 1 || merged.smartMoneyMinConfluence > 10) {
+      pushErr('smartMoneyMinConfluence', 'Min Smart Money confluence must be between 1 and 10.');
+    }
+    if (!Number.isFinite(merged.smartMoneySizeBoostPct) || merged.smartMoneySizeBoostPct < 0 || merged.smartMoneySizeBoostPct > 200) {
+      pushErr('smartMoneySizeBoostPct', 'Smart Money size boost must be between 0% and 200%.');
+    }
+  }
+  if (merged.reusedSocialsEnabled && optOn('reusedSocialsEnabled')) {
+    if (!Number.isFinite(merged.maxSocialReuseCount) || merged.maxSocialReuseCount < 1 || merged.maxSocialReuseCount > 50) {
+      pushErr('maxSocialReuseCount', 'Max allowed social reuse count must be between 1 and 50.');
+    }
+  }
+  if (merged.jitoDontFrontEnabled && optOn('jitoDontFrontEnabled')) {
+    if (!Number.isFinite(merged.jitoTipSol) || merged.jitoTipSol < 0 || merged.jitoTipSol > 0.05) {
+      pushErr('jitoTipSol', 'Jito tip must be between 0 and 0.05 SOL.');
+    }
+  }
+  if (merged.postMigrationPullbackEnabled && optOn('postMigrationPullbackEnabled')) {
+    if (!Number.isFinite(merged.migrationMinDipPct) || merged.migrationMinDipPct < 1 || merged.migrationMinDipPct > 80) {
+      pushErr('migrationMinDipPct', 'Post-migration min dip must be between 1% and 80%.');
+    }
+    if (!Number.isFinite(merged.migrationWaitSec) || merged.migrationWaitSec < 5 || merged.migrationWaitSec > 600) {
+      pushErr('migrationWaitSec', 'Post-migration wait must be between 5 and 600 seconds.');
+    }
+  }
+  if (merged.preMigrationCurveEnabled && optOn('preMigrationCurveEnabled')) {
+    if (!Number.isFinite(merged.preMigrationCurveMinPct) || merged.preMigrationCurveMinPct < 10 || merged.preMigrationCurveMinPct > 99) {
+      pushErr('preMigrationCurveMinPct', 'Bonding curve min % must be between 10% and 99%.');
+    }
+    if (!Number.isFinite(merged.preMigrationCurveMaxPct) || merged.preMigrationCurveMaxPct < merged.preMigrationCurveMinPct || merged.preMigrationCurveMaxPct > 100) {
+      pushErr('preMigrationCurveMaxPct', 'Bonding curve max % must be >= min % and <= 100%.');
+    }
+  }
+  if (merged.washTradeFilterEnabled && optOn('washTradeFilterEnabled')) {
+    if (!Number.isFinite(merged.minUniqueMakersRatio) || merged.minUniqueMakersRatio < 0.05 || merged.minUniqueMakersRatio > 1) {
+      pushErr('minUniqueMakersRatio', 'Min unique makers ratio must be between 0.05 and 1.0.');
+    }
+    if (!Number.isFinite(merged.minUniqueTraders5m) || merged.minUniqueTraders5m < 1 || merged.minUniqueTraders5m > 200) {
+      pushErr('minUniqueTraders5m', 'Min 5m unique traders must be between 1 and 200.');
+    }
+  }
+  if (merged.solRegimeFilterEnabled && optOn('solRegimeFilterEnabled')) {
+    if (!Number.isFinite(merged.solRegimeMaxDropPct) || merged.solRegimeMaxDropPct < 0.2 || merged.solRegimeMaxDropPct > 25) {
+      pushErr('solRegimeMaxDropPct', 'SOL 15m drop threshold must be between 0.2% and 25%.');
+    }
+  }
+  if (merged.antiTopWickEnabled && optOn('antiTopWickEnabled')) {
+    if (!Number.isFinite(merged.maxShortSpikePct) || merged.maxShortSpikePct < 5 || merged.maxShortSpikePct > 500) {
+      pushErr('maxShortSpikePct', 'Anti-Top-Wick max spike must be between 5% and 500%.');
+    }
+  }
+  if (merged.convictionSizingEnabled && optOn('convictionSizingEnabled')) {
+    if (!Number.isFinite(merged.convictionMinMult) || merged.convictionMinMult < 0.1 || merged.convictionMinMult > 1.5) {
+      pushErr('convictionMinMult', 'Conviction min multiplier must be between 0.1x and 1.5x.');
+    }
+    if (!Number.isFinite(merged.convictionMaxMult) || merged.convictionMaxMult < merged.convictionMinMult || merged.convictionMaxMult > 3) {
+      pushErr('convictionMaxMult', 'Conviction max multiplier must be >= min multiplier and <= 3.0x.');
+    }
+  }
+  if (merged.streakThrottleEnabled && optOn('streakThrottleEnabled')) {
+    if (!Number.isFinite(merged.streakLossLimit) || merged.streakLossLimit < 1 || merged.streakLossLimit > 20) {
+      pushErr('streakLossLimit', 'Streak loss limit must be between 1 and 20.');
+    }
+    if (!Number.isFinite(merged.streakCooldownMinutes) || merged.streakCooldownMinutes < 1 || merged.streakCooldownMinutes > 240) {
+      pushErr('streakCooldownMinutes', 'Streak cooldown must be between 1 and 240 minutes.');
+    }
+  }
+  if (merged.narrativeCapEnabled && optOn('narrativeCapEnabled')) {
+    if (!Number.isFinite(merged.maxSameNarrativePositions) || merged.maxSameNarrativePositions < 1 || merged.maxSameNarrativePositions > 10) {
+      pushErr('maxSameNarrativePositions', 'Max concurrent same-narrative positions must be between 1 and 10.');
     }
   }
 

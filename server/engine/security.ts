@@ -8,6 +8,7 @@ import { inspectCreatorHistory } from '../providers/creatorHistory';
 import type { JupiterProvider } from '../providers/jupiter';
 import type { BotDatabase } from '../store/db';
 import { WSOL_MINT } from '../providers/jupiter';
+import { analyzeSybilFunders, normalizeSocialUrls, type SybilClusterResult } from '../providers/proSignals';
 
 export interface SecurityEvaluationInputs {
   onChain: OnChainTokenInspection | null;
@@ -16,6 +17,9 @@ export interface SecurityEvaluationInputs {
   sellRouteExists: boolean;
   knownBadDeployers?: Set<string>;
   creatorHistory?: CreatorHistorySummary | null;
+  sybilResult?: SybilClusterResult | null;
+  reusedSocialMatches?: Array<{ url: string; priorMints: number; ruggedMints: number; symbols: string[] }>;
+  smartWalletBuyers?: string[];
   sellTaxPct?: number | null;
   tradingEnabled?: boolean;
 }
@@ -159,6 +163,67 @@ export function evaluateSecurityRules(
     }
   }
 
+  // Pro Desk Group 1A: Anti-Sybil Fresh-Wallet / Shared-Funder Cluster Detection
+  const sybil = inputs.sybilResult ?? null;
+  if (
+    settings.antiSybilEnabled &&
+    isOptionEnabled(settings, 'antiSybilEnabled') &&
+    sybil &&
+    sybil.maxSharedCount >= Math.max(2, settings.maxSharedFunderCount || 3)
+  ) {
+    reasons.push(
+      `Anti-Sybil bundle detected: ${sybil.maxSharedCount} fresh holders (<${settings.freshWalletMinutes}m) funded by same wallet ${sybil.sharedFunder?.slice(0, 6) ?? ''}...`
+    );
+    criticalFlags.push('SYBIL_SHARED_FUNDER_CLUSTER');
+  }
+
+  // Pro Desk Group 1C: Reused Socials / Recycled Handle Detection
+  let topSocialMatch: { url: string; priorMints: number; ruggedMints: number } | null = null;
+  if (
+    settings.reusedSocialsEnabled &&
+    isOptionEnabled(settings, 'reusedSocialsEnabled') &&
+    Array.isArray(inputs.reusedSocialMatches) &&
+    inputs.reusedSocialMatches.length > 0
+  ) {
+    const worst = [...inputs.reusedSocialMatches].sort(
+      (a, b) => b.ruggedMints - a.ruggedMints || b.priorMints - a.priorMints
+    )[0];
+    topSocialMatch = {
+      url: worst.url,
+      priorMints: worst.priorMints,
+      ruggedMints: worst.ruggedMints,
+    };
+    const maxReuse = Math.max(1, settings.maxSocialReuseCount || 2);
+    if (worst.ruggedMints > 0) {
+      reasons.push(
+        `Reused Socials blocked: ${worst.url} was linked to ${worst.ruggedMints} rugged prior coin(s)`
+      );
+      criticalFlags.push('REUSED_RUGGED_SOCIALS');
+    } else if (worst.priorMints >= maxReuse) {
+      reasons.push(
+        `Reused Socials blocked: ${worst.url} already recycled across ${worst.priorMints} prior coins (limit ${maxReuse})`
+      );
+      criticalFlags.push('REUSED_SERIAL_SOCIALS');
+    }
+  }
+
+  // Pro Desk Group 1B: Smart Money Confluence Matching
+  const smartSet = new Set(
+    (settings.smartWallets || []).map((w) => String(w || '').trim()).filter(Boolean)
+  );
+  const holderMatches = effectiveHolders
+    .filter((h) => !h.isExcludedPoolOrBurn && smartSet.has(h.address))
+    .map((h) => h.address);
+  const streamMatches = (inputs.smartWalletBuyers || []).filter((w) => smartSet.has(w));
+  const smartMoneyBuyers = Array.from(new Set([...holderMatches, ...streamMatches]));
+  if (
+    settings.smartMoneyEnabled &&
+    isOptionEnabled(settings, 'smartMoneyEnabled') &&
+    smartMoneyBuyers.length > 0
+  ) {
+    warnings.push(`Smart Money confluence: ${smartMoneyBuyers.length} tracked wallet(s) active`);
+  }
+
   // Owner / Creator wallet prior launches & rugpull speed guard
   const creatorHist = inputs.creatorHistory ?? null;
   const maxCreatorLaunches = Math.max(0, settings.maxCreatorLaunches ?? 5);
@@ -273,6 +338,10 @@ export function evaluateSecurityRules(
     creatorLaunchCount: creatorHist?.launchCount ?? 0,
     creatorRuggedCount: creatorHist?.ruggedCount ?? 0,
     creatorFastestRugMinutes: creatorHist?.fastestRugMinutes ?? null,
+    sybilClusterCount: sybil?.maxSharedCount ?? 0,
+    sybilSharedFunder: sybil?.sharedFunder ?? null,
+    reusedSocialMatch: topSocialMatch,
+    smartMoneyBuyers,
     sellRouteExists,
     sellRouteImpactPct: sellQuoteImpactPct,
     sellTaxPct,
@@ -288,6 +357,8 @@ export async function runSecurityChecks(params: {
   priceUsd: number;
   solPriceUsd: number;
   testSizeSol: number;
+  socialUrls?: string[];
+  smartWalletBuyers?: string[];
   settings: BotSettings;
   rpcPool: SolanaRpcPool;
   rugCheckProvider: RugCheckProvider;
@@ -309,7 +380,22 @@ export async function runSecurityChecks(params: {
   let sellRouteExists = false;
   let sellQuoteImpactPct: number | null = null;
 
-  const [quoteRes, creatorHistory] = await Promise.all([
+  const holdersForSybil = onChain?.holders ?? rugCheck?.holders ?? [];
+  const normalizedSocials = normalizeSocialUrls(params.socialUrls);
+  const reusedSocialMatches =
+    params.db && normalizedSocials.length > 0
+      ? (() => {
+          const hist = params.db.getSocialHistoryForUrls(normalizedSocials, mint);
+          params.db.recordSocialObservation({
+            socialUrls: normalizedSocials,
+            mint,
+            symbol: params.symbol,
+          });
+          return hist;
+        })()
+      : [];
+
+  const [quoteRes, creatorHistory, sybilResult] = await Promise.all([
     onChain && priceUsd > 0 && solPriceUsd > 0
       ? (() => {
           const testTokenUi = (testSizeSol * solPriceUsd) / priceUsd;
@@ -336,6 +422,13 @@ export async function runSecurityChecks(params: {
           db: params.db,
         }).catch(() => null)
       : Promise.resolve(null),
+    settings.antiSybilEnabled && isOptionEnabled(settings, 'antiSybilEnabled') && holdersForSybil.length >= 2
+      ? analyzeSybilFunders({
+          holders: holdersForSybil,
+          rpcPool,
+          freshWalletMinutes: settings.freshWalletMinutes || 30,
+        }).catch(() => null)
+      : Promise.resolve(null),
   ]);
 
   if (quoteRes && Number(quoteRes.outAmount) > 0) {
@@ -348,6 +441,9 @@ export async function runSecurityChecks(params: {
       onChain,
       rugCheck,
       creatorHistory,
+      sybilResult,
+      reusedSocialMatches,
+      smartWalletBuyers: params.smartWalletBuyers,
       sellRouteExists,
       sellQuoteImpactPct,
     },

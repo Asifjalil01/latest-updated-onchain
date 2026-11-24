@@ -20,6 +20,10 @@ interface DexScreenerPair {
   liquidity?: { usd?: number };
   fdv?: number;
   pairCreatedAt?: number;
+  info?: {
+    websites?: Array<{ label?: string; url?: string }>;
+    socials?: Array<{ type?: string; url?: string }>;
+  };
 }
 
 const ROTATING_SWEEP_TERMS = [
@@ -93,6 +97,13 @@ export class DexScreenerProvider {
       rawM5Change !== undefined && rawM5Change !== null && Number.isFinite(Number(rawM5Change))
         ? Number(rawM5Change)
         : undefined;
+    const socialUrls: string[] = [];
+    for (const w of pair.info?.websites ?? []) {
+      if (w?.url && typeof w.url === 'string') socialUrls.push(w.url.trim());
+    }
+    for (const s of pair.info?.socials ?? []) {
+      if (s?.url && typeof s.url === 'string') socialUrls.push(s.url.trim());
+    }
 
     return {
       mint: pair.baseToken.address,
@@ -118,6 +129,7 @@ export class DexScreenerProvider {
       sells5m,
       buys1h,
       sells1h,
+      socialUrls: socialUrls.length > 0 ? socialUrls : undefined,
       rawUpdatedAtMs: Date.now(),
     };
   }

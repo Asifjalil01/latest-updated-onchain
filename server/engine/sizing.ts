@@ -10,6 +10,7 @@ export function calculatePositionSize(params: {
   poolLiquidityUsd: number;
   solPriceUsd: number | null;
   tokenClassMultiplier: number;
+  proSizeMultiplier?: number;
 }): SizingResult {
   const {
     settings,
@@ -90,7 +91,11 @@ export function calculatePositionSize(params: {
   // Gas reserve check removed: evaluate directly against available wallet balance
   const spendableBalance = Math.max(0, availableBalanceSol);
   const twoPctLiquiditySol = (poolLiquidityUsd * 0.02) / solPriceUsd;
-  const targetByClass = settings.tradeSizeSol * tokenClassMultiplier;
+  const effectiveProMult =
+    params.proSizeMultiplier !== undefined && Number.isFinite(params.proSizeMultiplier) && params.proSizeMultiplier > 0
+      ? params.proSizeMultiplier
+      : 1.0;
+  const targetByClass = settings.tradeSizeSol * tokenClassMultiplier * effectiveProMult;
 
   const targetNeedSol = Math.max(0.005, Math.min(targetByClass, settings.maxPositionSizeSol));
   if (spendableBalance <= 0 || spendableBalance < 0.005) {

@@ -376,8 +376,180 @@ export function validatePythonSniperSettings(
     };
   }
 
-  return { valid: true, error: null, recovery };
+  // Pro Desk range validation (only enforced when respective checkbox is enabled)
+  if (isPyOptionEnabled(settings, 'pre_migration_curve_enabled', false)) {
+    const cMin = parseFloat(String(settings.pre_migration_curve_min_pct ?? 75));
+    const cMax = parseFloat(String(settings.pre_migration_curve_max_pct ?? 92));
+    if (!Number.isFinite(cMin) || !Number.isFinite(cMax) || cMin < 0 || cMax > 100 || cMin >= cMax) {
+      return {
+        valid: false,
+        error: 'Pre-migration bonding curve range must satisfy 0 <= Min % < Max % <= 100.',
+        recovery: null,
+      };
+    }
+  }
+  if (isPyOptionEnabled(settings, 'conviction_sizing_enabled', true)) {
+    const mMin = parseFloat(String(settings.conviction_min_mult ?? 0.5));
+    const mMax = parseFloat(String(settings.conviction_max_mult ?? 1.5));
+    if (!Number.isFinite(mMin) || !Number.isFinite(mMax) || mMin <= 0 || mMin > mMax) {
+      return {
+        valid: false,
+        error: 'Conviction size multiplier must satisfy 0 < Min <= Max.',
+        recovery: null,
+      };
+    }
+  }
+  if (isPyOptionEnabled(settings, 'wash_trade_filter_enabled', true)) {
+    const ratio = parseFloat(String(settings.min_unique_makers_ratio ?? 0.25));
+    if (!Number.isFinite(ratio) || ratio <= 0 || ratio > 1) {
+      return {
+        valid: false,
+        error: 'Min unique makers ratio must be between 0.01 and 1.0.',
+        recovery: null,
+      };
+    }
+  }
+
+  return { valid: true, error: null, recovery: null };
 }
+
+export interface SniperProModuleMeta {
+  key: string;
+  label: string;
+  group: 'scam_intel' | 'execution' | 'entry_timing' | 'sizing' | 'capital';
+  defaultEnabled: boolean;
+  description: string;
+  linkedTo?: string;
+}
+
+export const SNIPER_PRO_MODULES: SniperProModuleMeta[] = [
+  {
+    key: 'anti_sybil_enabled',
+    label: 'Anti-Sybil Fresh-Wallet Cluster Guard',
+    group: 'scam_intel',
+    defaultEnabled: true,
+    description: 'Blocks launches where multiple fresh top-holder wallets were funded from the same distributor wallet just before launch.',
+    linkedTo: 'Links to fresh_wallet_minutes & max_shared_funder_count',
+  },
+  {
+    key: 'smart_money_enabled',
+    label: 'Smart Money / KOL Watchlist & Confluence',
+    group: 'scam_intel',
+    defaultEnabled: true,
+    description: 'Boosts conviction sizing when tracked profitable wallets buy early in PumpPortal WS trades.',
+    linkedTo: 'Links to smart_wallets, smart_money_min_confluence & smart_money_size_boost_pct',
+  },
+  {
+    key: 'smart_money_auto_exit_on_sell',
+    label: 'Smart Wallet Auto-Exit on Sell',
+    group: 'scam_intel',
+    defaultEnabled: true,
+    description: 'Immediately sells an open position when any tracked smart wallet exits that mint via the live WS stream.',
+    linkedTo: 'Requires Smart Money Watchlist & Live WS Exit Stream',
+  },
+  {
+    key: 'reused_socials_enabled',
+    label: 'Reused Socials / Recycled Handle Detector',
+    group: 'scam_intel',
+    defaultEnabled: true,
+    description: 'Flags tokens reusing Telegram, X/Twitter, or website URLs previously seen on rugged or repeat serial launches.',
+    linkedTo: 'Links to max_social_reuse_count (/sniper/social_history.json)',
+  },
+  {
+    key: 'ws_exit_stream_enabled',
+    label: 'Live WS Open-Position Price & Trade Streaming (<200ms)',
+    group: 'execution',
+    defaultEnabled: true,
+    description: 'Pins open mints on Node PumpPortal WS so TP, SL, Trailing Stop, and Smart-Sell exit triggers react sub-second without Jupiter 429 polling lag.',
+  },
+  {
+    key: 'jito_dontfront_enabled',
+    label: 'Jito Sandwich Protection (dontfront)',
+    group: 'execution',
+    defaultEnabled: true,
+    description: 'Injects the official jitodontfront marker account into live Jupiter swap txs and routes bundles privately through Jito block-engine.',
+    linkedTo: 'Pairs with Settings -> Jito Tip (SOL)',
+  },
+  {
+    key: 'orphan_sweep_enabled',
+    label: 'Orphan Token Auto-Adopter (Wallet Sweep)',
+    group: 'execution',
+    defaultEnabled: true,
+    description: 'Periodically checks on-chain SPL/Token-2022 balances in LIVE mode and adopts any unmonitored tokens so TP/SL/Trail protection attaches automatically.',
+  },
+  {
+    key: 'post_migration_pullback_enabled',
+    label: 'Post-Migration Pullback / Reclaim Entry',
+    group: 'entry_timing',
+    defaultEnabled: false,
+    description: 'For migrated PumpSwap/Raydium pools (including Axiom Pulse Migrated), waits out the post-migration dump window until a pullback dip occurs.',
+    linkedTo: 'Links to migration_wait_sec & migration_min_dip_pct',
+  },
+  {
+    key: 'pre_migration_curve_enabled',
+    label: 'Pre-Migration Bonding Curve Surge Filter',
+    group: 'entry_timing',
+    defaultEnabled: false,
+    description: 'Filters Pump.fun bonding-curve tokens to the late-stage migration push sweet spot (e.g. 75%-92% curve fill).',
+    linkedTo: 'Links to pre_migration_curve_min_pct & pre_migration_curve_max_pct',
+  },
+  {
+    key: 'wash_trade_filter_enabled',
+    label: 'Wash-Trading / Fake Volume Guard',
+    group: 'entry_timing',
+    defaultEnabled: true,
+    description: 'Rejects coins with high transaction counts generated by too few unique trader wallets (ping-pong volume bots).',
+    linkedTo: 'Links to min_unique_makers_ratio & min_unique_traders_5m',
+  },
+  {
+    key: 'sol_regime_filter_enabled',
+    label: 'SOL 15m Market Regime Filter ("Red Market Pause")',
+    group: 'entry_timing',
+    defaultEnabled: true,
+    description: 'Pauses new entries or cuts trade size by 50% when SOL drops sharply over the trailing 15-minute window.',
+    linkedTo: 'Links to sol_regime_max_drop_pct & sol_regime_action',
+  },
+  {
+    key: 'anti_top_wick_enabled',
+    label: 'Anti-Top-Wick Guard',
+    group: 'entry_timing',
+    defaultEnabled: true,
+    description: 'Prevents market-buying vertical green peak candles that spiked aggressively right before evaluation.',
+    linkedTo: 'Links to max_short_spike_pct',
+  },
+  {
+    key: 'conviction_sizing_enabled',
+    label: 'Conviction-Based Dynamic Sizing',
+    group: 'sizing',
+    defaultEnabled: true,
+    description: 'Scales USD position size between min and max multipliers based on liquidity depth, buy pressure, unique makers, and Smart Money confluence.',
+    linkedTo: 'Links to conviction_min_mult & conviction_max_mult',
+  },
+  {
+    key: 'streak_throttle_enabled',
+    label: 'Drawdown / Losing-Streak Throttle',
+    group: 'sizing',
+    defaultEnabled: true,
+    description: 'Automatically halves size or pauses fresh entries after consecutive losing closes until cooldown expires.',
+    linkedTo: 'Links to streak_loss_limit, streak_cooldown_minutes & streak_action',
+  },
+  {
+    key: 'narrative_cap_enabled',
+    label: 'Meta / Narrative Ticker Duplicate Guard',
+    group: 'sizing',
+    defaultEnabled: true,
+    description: 'Caps simultaneous open positions sharing the same normalized meme ticker stem (e.g. DOGE / DOGE2 / MINIDOGE).',
+    linkedTo: 'Links to max_same_narrative_positions',
+  },
+  {
+    key: 'auto_reclaim_rent_enabled',
+    label: 'Auto-Reclaim Empty ATA Rent (0.00204 SOL)',
+    group: 'capital',
+    defaultEnabled: true,
+    description: 'Automatically closes empty token accounts right after a full live sell to recover ~0.00204 SOL lockup rent.',
+  },
+];
+
 
 
 
