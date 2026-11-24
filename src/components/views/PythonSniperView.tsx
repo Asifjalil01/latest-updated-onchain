@@ -22,6 +22,11 @@ import {
   Globe,
   Zap,
   ShieldCheck,
+  Save,
+  Users,
+  TrendingDown,
+  Coins,
+  BarChart3,
 } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import {
@@ -38,6 +43,12 @@ import {
   validatePythonSniperSettings,
   type EnrichedSniperTrade,
 } from '../../utils/sniperFormat';
+import type {
+  RentAuditReport,
+  OrphanSweepResult,
+  DexScorecardRow,
+  BacktestResult,
+} from '../../types';
 
 interface SniperPosition {
   symbol: string;
@@ -93,6 +104,47 @@ const USD_SETTING_KEYS = new Set([
   'min_liquidity_usd',
   'min_volume_m5_usd',
 ]);
+
+const PYTHON_PRO_DESK_KEYS: Array<[string, 'bool' | 'int' | 'float' | 'string' | 'list']> = [
+  ['anti_sybil_enabled', 'bool'],
+  ['fresh_wallet_minutes', 'int'],
+  ['max_shared_funder_count', 'int'],
+  ['smart_money_enabled', 'bool'],
+  ['smart_wallets', 'list'],
+  ['smart_money_min_confluence', 'int'],
+  ['smart_money_size_boost_pct', 'float'],
+  ['smart_money_auto_exit_on_sell', 'bool'],
+  ['reused_socials_enabled', 'bool'],
+  ['max_social_reuse_count', 'int'],
+  ['ws_exit_stream_enabled', 'bool'],
+  ['jito_dont_front_enabled', 'bool'],
+  ['jito_tip_sol', 'float'],
+  ['orphan_sweep_enabled', 'bool'],
+  ['post_migration_pullback_enabled', 'bool'],
+  ['migration_min_dip_pct', 'float'],
+  ['migration_wait_sec', 'int'],
+  ['pre_migration_curve_enabled', 'bool'],
+  ['pre_migration_curve_min_pct', 'float'],
+  ['pre_migration_curve_max_pct', 'float'],
+  ['wash_trade_filter_enabled', 'bool'],
+  ['min_unique_makers_ratio', 'float'],
+  ['min_unique_traders_5m', 'int'],
+  ['sol_regime_filter_enabled', 'bool'],
+  ['sol_regime_max_drop_pct', 'float'],
+  ['sol_regime_action', 'string'],
+  ['anti_top_wick_enabled', 'bool'],
+  ['max_short_spike_pct', 'float'],
+  ['conviction_sizing_enabled', 'bool'],
+  ['conviction_min_mult', 'float'],
+  ['conviction_max_mult', 'float'],
+  ['streak_throttle_enabled', 'bool'],
+  ['streak_loss_limit', 'int'],
+  ['streak_cooldown_minutes', 'int'],
+  ['streak_action', 'string'],
+  ['narrative_cap_enabled', 'bool'],
+  ['max_same_narrative_positions', 'int'],
+  ['auto_reclaim_rent_enabled', 'bool'],
+];
 
 const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' | 'string' | 'tier']> = [
   // Core Position & Risk Management (Important)
@@ -380,6 +432,121 @@ export function PythonSniperView() {
   const [clearingLogs, setClearingLogs] = useState(false);
   const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'logs' | 'settings' | 'pro_desk'>('positions');
   const [historySearch, setHistorySearch] = useState('');
+
+  // Python Pro Desk Tool States
+  const [pyRentReport, setPyRentReport] = useState<RentAuditReport | null>(null);
+  const [pyRentLoading, setPyRentLoading] = useState(false);
+  const [pyBurnDust, setPyBurnDust] = useState(false);
+  const [pySweepResult, setPySweepResult] = useState<OrphanSweepResult | null>(null);
+  const [pySweepLoading, setPySweepLoading] = useState(false);
+  const [pyScorecardRows, setPyScorecardRows] = useState<DexScorecardRow[]>([]);
+  const [pyScorecardLoading, setPyScorecardLoading] = useState(false);
+  const [pyBacktestReq, setPyBacktestReq] = useState({
+    lookbackHours: 24,
+    takeProfitPct: 35,
+    stopLossPct: 15,
+    trailingEnabled: true,
+    trailingDropPct: 12,
+  });
+  const [pyBacktestResult, setPyBacktestResult] = useState<BacktestResult | null>(null);
+  const [pyBacktestLoading, setPyBacktestLoading] = useState(false);
+  const [pyNewWalletInput, setPyNewWalletInput] = useState('');
+
+  useEffect(() => {
+    if (activeTab === 'pro_desk') {
+      void loadPyRentAudit();
+      void loadPyScorecard();
+    }
+  }, [activeTab]);
+
+  const loadPyRentAudit = async () => {
+    setPyRentLoading(true);
+    try {
+      const res = await apiFetch('/api/sniper/rent/audit');
+      setPyRentReport(res as RentAuditReport);
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Rent audit failed', body: err instanceof Error ? err.message : 'Error' });
+    } finally {
+      setPyRentLoading(false);
+    }
+  };
+
+  const handlePyReclaimRent = async (burnDust: boolean) => {
+    setPyRentLoading(true);
+    try {
+      const res = (await apiFetch('/api/sniper/rent/reclaim', {
+        method: 'POST',
+        body: JSON.stringify({ burnDust }),
+      })) as { closedCount: number; burnedCount: number; reclaimedSol: number; txSig?: string };
+      pushToast({
+        kind: 'success',
+        title: 'ATA Rent Reclaimed',
+        body: `Closed ${res.closedCount} empty ATAs, burned ${res.burnedCount} dust accounts. Reclaimed +${res.reclaimedSol.toFixed(4)} SOL!`,
+      });
+      await loadPyRentAudit();
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Reclaim failed', body: err instanceof Error ? err.message : 'Error' });
+    } finally {
+      setPyRentLoading(false);
+    }
+  };
+
+  const handlePyRunOrphanSweep = async () => {
+    setPySweepLoading(true);
+    try {
+      const res = (await apiFetch('/api/sniper/sweep-orphans', {
+        method: 'POST',
+      })) as OrphanSweepResult;
+      setPySweepResult(res);
+      pushToast({
+        kind: 'success',
+        title: 'Orphan Sweep Complete',
+        body: `Scanned ${res.scanned} accounts, adopted ${res.adopted} unmonitored positions (${res.adoptedSymbols.join(', ') || 'none'}).`,
+      });
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Orphan sweep failed', body: err instanceof Error ? err.message : 'Error' });
+    } finally {
+      setPySweepLoading(false);
+    }
+  };
+
+  const loadPyScorecard = async () => {
+    setPyScorecardLoading(true);
+    try {
+      const res = (await apiFetch('/api/sniper/telemetry')) as { scorecard: DexScorecardRow[] };
+      setPyScorecardRows(res.scorecard || []);
+    } catch (err) {
+      // ignore
+    } finally {
+      setPyScorecardLoading(false);
+    }
+  };
+
+  const handlePyRunBacktest = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPyBacktestLoading(true);
+    try {
+      const res = (await apiFetch('/api/sniper/backtest', {
+        method: 'POST',
+        body: JSON.stringify({
+          mode: mode,
+          lookbackHours: Number(pyBacktestReq.lookbackHours),
+          takeProfitPct: Number(pyBacktestReq.takeProfitPct),
+          stopLossPct: Number(pyBacktestReq.stopLossPct),
+          trailingEnabled: Boolean(pyBacktestReq.trailingEnabled),
+          trailingDropPct: Number(pyBacktestReq.trailingDropPct),
+          minAgeMinutes: Number(draftSettings.min_age_minutes ?? 0),
+          maxAgeMinutes: Number(draftSettings.max_age_minutes ?? 1440),
+        }),
+      })) as BacktestResult;
+      setPyBacktestResult(res);
+      pushToast({ kind: 'success', title: 'Backtest Completed', body: `Evaluated ${res.evaluatedTrades} historical trades.` });
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Backtest failed', body: err instanceof Error ? err.message : 'Error' });
+    } finally {
+      setPyBacktestLoading(false);
+    }
+  };
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [confirmSellMint, setConfirmSellMint] = useState<string | null>(null);
   const [confirmDeleteMint, setConfirmDeleteMint] = useState<string | null>(null);
@@ -543,10 +710,28 @@ export function PythonSniperView() {
     }
   };
 
+  const isPyOptEnabled = (key: string) => draftSettings.option_enabled?.[key] !== false;
+  const togglePyOpt = (key: string, enabled: boolean) => {
+    setDraftSettings((prev) => ({
+      ...prev,
+      option_enabled: {
+        ...(prev.option_enabled || {}),
+        [key]: enabled,
+      },
+    }));
+    markSettingsDirty(true);
+  };
+
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
       const payload: Record<string, any> = {};
+      const nextOptionEnabled: Record<string, boolean> = {
+        min_age_minutes: false,
+        ...(draftSettings.option_enabled && typeof draftSettings.option_enabled === 'object'
+          ? draftSettings.option_enabled
+          : {}),
+      };
       for (const [key, _, kind] of PYTHON_SETTINGS_METADATA) {
         const raw = draftSettings[key];
         if (kind === 'bool') {
@@ -565,12 +750,28 @@ export function PythonSniperView() {
         const raw = draftSettings[mod.key];
         payload[mod.key] = raw === undefined ? mod.defaultValue : raw === true || raw === 'true';
       }
-      const nextOptionEnabled: Record<string, boolean> = {
-        min_age_minutes: false,
-        ...(draftSettings.option_enabled && typeof draftSettings.option_enabled === 'object'
-          ? draftSettings.option_enabled
-          : {}),
-      };
+      for (const [key, kind] of PYTHON_PRO_DESK_KEYS) {
+        const raw = draftSettings[key];
+        if (kind === 'bool') {
+          payload[key] = raw === true || raw === 'true';
+        } else if (kind === 'int') {
+          const parsed = parseInt(String(raw ?? 0), 10);
+          payload[key] = isNaN(parsed) ? 0 : parsed;
+        } else if (kind === 'float') {
+          const parsed = parseFloat(String(raw ?? 0));
+          payload[key] = isNaN(parsed) ? 0.0 : parsed;
+        } else if (kind === 'list') {
+          payload[key] = Array.isArray(raw) ? raw : [];
+        } else {
+          payload[key] = String(raw ?? '');
+        }
+        if (kind === 'bool') {
+          if (typeof nextOptionEnabled[key] !== 'boolean') {
+            nextOptionEnabled[key] = true;
+          }
+          nextOptionEnabled[key] = payload[key] === true && nextOptionEnabled[key] !== false;
+        }
+      }
       for (const [key, _, kind] of PYTHON_SETTINGS_METADATA) {
         const defOn = key === 'min_age_minutes' ? false : true;
         if (typeof nextOptionEnabled[key] !== 'boolean') {
@@ -2368,6 +2569,1024 @@ export function PythonSniperView() {
               </form>
             </div>
           )}
+
+      {/* Tab Content: Pro Desk */}
+      {activeTab === 'pro_desk' && (
+        <div className="space-y-6 pb-12 max-w-[1400px] mx-auto">
+          {/* Header Banner */}
+          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-teal-500/15 border border-teal-500/30 flex items-center justify-center text-teal-600 dark:text-teal-400">
+                  <ShieldCheck className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="font-display font-bold text-lg text-slate-900 dark:text-slate-100">
+                    Python Sniper Pro Trader Intelligence &amp; Execution Desk
+                  </h2>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Advanced anti-Sybil bundling protection, smart-money tracking, zero-lag WS exits, Jito dontfront MEV shield, ATA rent reclaim &amp; What-If backtester.
+                  </p>
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={handleSaveSettings}
+                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-teal-600 hover:bg-teal-500 text-white font-semibold text-xs transition-colors shadow-lg shadow-teal-600/20"
+              >
+                <Save className="w-4 h-4" />
+                Save Pro Desk Settings
+              </button>
+            </div>
+          </div>
+
+          {/* GROUP 1: Deeper Wallet & Scam Intelligence */}
+          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800/80">
+              <div className="flex items-center gap-2.5">
+                <Users className="w-5 h-5 text-teal-500" />
+                <h3 className="font-display font-bold text-base text-slate-900 dark:text-slate-100">
+                  Group 1 — Deeper Wallet &amp; Scam Intelligence (Anti-Sybil &amp; Smart Money)
+                </h3>
+              </div>
+              <span className="font-mono text-xs text-slate-400">3 Advanced Modules</span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              {/* 1.1 Anti-Sybil */}
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('anti_sybil_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Anti-Sybil Shared-Funder Cluster</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('anti_sybil_enabled')}
+                      onChange={(e) => togglePyOpt('anti_sybil_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Detects if top early buyers were freshly created and funded from the same CEX/distributor hot wallet minutes before launch.</p>
+                <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Fresh Wallet Window (Minutes)</label>
+                    <input
+                      type="number"
+                      value={draftSettings.fresh_wallet_minutes ?? 30}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, fresh_wallet_minutes: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('anti_sybil_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Max Shared Funder Count</label>
+                    <input
+                      type="number"
+                      value={draftSettings.max_shared_funder_count ?? 3}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, max_shared_funder_count: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('anti_sybil_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* 1.2 Smart Money */}
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('smart_money_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Smart Money / Whale Watchlist</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('smart_money_enabled')}
+                      onChange={(e) => togglePyOpt('smart_money_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Prioritizes coins bought by tracked profitable KOL wallets and auto-exits instantly if they sell.</p>
+                <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[10px] text-slate-500 mb-1">Min Confluence</label>
+                      <input
+                        type="number"
+                        value={draftSettings.smart_money_min_confluence ?? 1}
+                        onChange={(e) => {
+                          setDraftSettings({ ...draftSettings, smart_money_min_confluence: Number(e.target.value) });
+                          markSettingsDirty(true);
+                        }}
+                        disabled={!isPyOptEnabled('smart_money_enabled')}
+                        className="w-full px-2 py-1.5 rounded-lg font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-slate-500 mb-1">Size Boost %</label>
+                      <input
+                        type="number"
+                        value={draftSettings.smart_money_size_boost_pct ?? 35}
+                        onChange={(e) => {
+                          setDraftSettings({ ...draftSettings, smart_money_size_boost_pct: Number(e.target.value) });
+                          markSettingsDirty(true);
+                        }}
+                        disabled={!isPyOptEnabled('smart_money_enabled')}
+                        className="w-full px-2 py-1.5 rounded-lg font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                      />
+                    </div>
+                  </div>
+                  <label className="flex items-center gap-2 pt-1 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={draftSettings.smart_money_auto_exit_on_sell !== false}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, smart_money_auto_exit_on_sell: e.target.checked });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('smart_money_enabled')}
+                      className="rounded text-teal-600 disabled:opacity-50"
+                    />
+                    <span className="text-[11px] text-slate-700 dark:text-slate-300">Auto-exit immediately if tracked wallet dumps</span>
+                  </label>
+                </div>
+              </div>
+
+              {/* 1.3 Reused Socials */}
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('reused_socials_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Reused Socials Detection</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('reused_socials_enabled')}
+                      onChange={(e) => togglePyOpt('reused_socials_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Blocks serial ruggers recycling the same Telegram group, X profile, or Website URL across tokens.</p>
+                <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <label className="block text-[11px] font-medium text-slate-500 mb-1">Max Allowed Social Reuse Count</label>
+                  <input
+                    type="number"
+                    value={draftSettings.max_social_reuse_count ?? 2}
+                    onChange={(e) => {
+                      setDraftSettings({ ...draftSettings, max_social_reuse_count: Number(e.target.value) });
+                      markSettingsDirty(true);
+                    }}
+                    disabled={!isPyOptEnabled('reused_socials_enabled')}
+                    className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* GROUP 2: Zero-Lag Exits & MEV */}
+          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800/80">
+              <div className="flex items-center gap-2.5">
+                <Zap className="w-5 h-5 text-amber-500" />
+                <h3 className="font-display font-bold text-base text-slate-900 dark:text-slate-100">
+                  Group 2 — Zero-Lag Exits &amp; MEV / Wallet Protection (WS Streaming &amp; Jito Shield)
+                </h3>
+              </div>
+              <span className="font-mono text-xs text-slate-400">3 Execution Modules</span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('ws_exit_stream_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Live WebSocket Exit Streaming</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('ws_exit_stream_enabled')}
+                      onChange={(e) => togglePyOpt('ws_exit_stream_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Subscribes directly to bought mint trades (&lt;200ms) to catch dump spikes &amp; TP wicks instantly.</p>
+              </div>
+
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('jito_dont_front_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Jito Sandwich Protection (dontfront)</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('jito_dont_front_enabled')}
+                      onChange={(e) => togglePyOpt('jito_dont_front_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Injects Jito anti-sandwich markers and block-engine tips to prevent MEV front-running.</p>
+                <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <label className="block text-[11px] font-medium text-slate-500 mb-1">Jito Tip Amount (SOL)</label>
+                  <input
+                    type="number"
+                    step="0.00001"
+                    value={draftSettings.jito_tip_sol ?? 0.0002}
+                    onChange={(e) => {
+                      setDraftSettings({ ...draftSettings, jito_tip_sol: Number(e.target.value) });
+                      markSettingsDirty(true);
+                    }}
+                    disabled={!isPyOptEnabled('jito_dont_front_enabled')}
+                    className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                  />
+                </div>
+              </div>
+
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('orphan_sweep_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Orphan Token Auto-Adopter</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('orphan_sweep_enabled')}
+                      onChange={(e) => togglePyOpt('orphan_sweep_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Scans wallet accounts periodically so buys that timed out on RPC confirmation are adopted into monitoring.</p>
+                <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <button
+                    type="button"
+                    onClick={handlePyRunOrphanSweep}
+                    disabled={pySweepLoading || !isPyOptEnabled('orphan_sweep_enabled')}
+                    className="w-full py-2 px-3 rounded-xl bg-amber-600/20 border border-amber-500/40 hover:bg-amber-600/30 text-amber-300 font-semibold text-xs transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${pySweepLoading ? 'animate-spin' : ''}`} />
+                    {pySweepLoading ? 'Sweeping Wallet…' : 'Run Manual Orphan Sweep'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* GROUP 3: Market Structure & Entry Timing */}
+          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800/80">
+              <div className="flex items-center gap-2.5">
+                <TrendingDown className="w-5 h-5 text-indigo-500" />
+                <h3 className="font-display font-bold text-base text-slate-900 dark:text-slate-100">
+                  Group 3 — Market Structure &amp; Entry Timing (Migrations, Wash-Trading &amp; SOL Regimes)
+                </h3>
+              </div>
+              <span className="font-mono text-xs text-slate-400">5 Timing Filters</span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('post_migration_pullback_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Post-Migration Pullback Reclaim</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('post_migration_pullback_enabled')}
+                      onChange={(e) => togglePyOpt('post_migration_pullback_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Waits for post-migration dump after graduation and buys the first higher-low bounce.</p>
+                <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Min Dip %</label>
+                    <input
+                      type="number"
+                      value={draftSettings.migration_min_dip_pct ?? 15}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, migration_min_dip_pct: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('post_migration_pullback_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Wait Secs</label>
+                    <input
+                      type="number"
+                      value={draftSettings.migration_wait_sec ?? 45}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, migration_wait_sec: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('post_migration_pullback_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('pre_migration_curve_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Pre-Migration Curve Surge</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('pre_migration_curve_enabled')}
+                      onChange={(e) => togglePyOpt('pre_migration_curve_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Snipes bonding curves approaching graduation within specified completion bounds.</p>
+                <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Min Curve %</label>
+                    <input
+                      type="number"
+                      value={draftSettings.pre_migration_curve_min_pct ?? 75}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, pre_migration_curve_min_pct: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('pre_migration_curve_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Max Curve %</label>
+                    <input
+                      type="number"
+                      value={draftSettings.pre_migration_curve_max_pct ?? 92}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, pre_migration_curve_max_pct: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('pre_migration_curve_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('wash_trade_filter_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Wash-Trading / Fake Volume Filter</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('wash_trade_filter_enabled')}
+                      onChange={(e) => togglePyOpt('wash_trade_filter_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Checks unique buyer wallets vs total txns to filter out synthetic green candles.</p>
+                <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Min Unique Makers Ratio</label>
+                    <input
+                      type="number"
+                      step="0.05"
+                      value={draftSettings.min_unique_makers_ratio ?? 0.25}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, min_unique_makers_ratio: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('wash_trade_filter_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Min Unique Traders (5m)</label>
+                    <input
+                      type="number"
+                      value={draftSettings.min_unique_traders_5m ?? 6}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, min_unique_traders_5m: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('wash_trade_filter_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('sol_regime_filter_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">SOL Market Regime ("Red Market Pause")</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('sol_regime_filter_enabled')}
+                      onChange={(e) => togglePyOpt('sol_regime_filter_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Automatically pauses entries or halves position size when SOL drops fast in 15 minutes.</p>
+                <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">SOL 15m Drop Threshold %</label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={draftSettings.sol_regime_max_drop_pct ?? 2.0}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, sol_regime_max_drop_pct: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('sol_regime_filter_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Action</label>
+                    <select
+                      value={draftSettings.sol_regime_action ?? 'pause'}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, sol_regime_action: e.target.value });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('sol_regime_filter_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    >
+                      <option value="pause">Pause New Entries</option>
+                      <option value="half_size">Half Position Size</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('anti_top_wick_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Anti-Top-Wick Guard</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('anti_top_wick_enabled')}
+                      onChange={(e) => togglePyOpt('anti_top_wick_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Waits for a brief pause or micro-dip if a coin pumped heavily in the last 15s.</p>
+                <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <label className="block text-[11px] font-medium text-slate-500 mb-1">Max Short Spike %</label>
+                  <input
+                    type="number"
+                    value={draftSettings.max_short_spike_pct ?? 70}
+                    onChange={(e) => {
+                      setDraftSettings({ ...draftSettings, max_short_spike_pct: Number(e.target.value) });
+                      markSettingsDirty(true);
+                    }}
+                    disabled={!isPyOptEnabled('anti_top_wick_enabled')}
+                    className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* GROUP 4: Dynamic Sizing & Capital Efficiency */}
+          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800/80">
+              <div className="flex items-center gap-2.5">
+                <Coins className="w-5 h-5 text-emerald-500" />
+                <h3 className="font-display font-bold text-base text-slate-900 dark:text-slate-100">
+                  Group 4 — Dynamic Sizing &amp; Capital Efficiency (Conviction, Streaks &amp; Meta Caps)
+                </h3>
+              </div>
+              <span className="font-mono text-xs text-slate-400">3 Capital Modules</span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('conviction_sizing_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Conviction-Based Sizing</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('conviction_sizing_enabled')}
+                      onChange={(e) => togglePyOpt('conviction_sizing_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Risks 0.5x on unproven micro-launches and 1.5x–2x on A+ setups.</p>
+                <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Min Multiplier</label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={draftSettings.conviction_min_mult ?? 0.5}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, conviction_min_mult: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('conviction_sizing_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Max Multiplier</label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={draftSettings.conviction_max_mult ?? 1.5}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, conviction_max_mult: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('conviction_sizing_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('streak_throttle_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Drawdown / Losing-Streak Throttle</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('streak_throttle_enabled')}
+                      onChange={(e) => togglePyOpt('streak_throttle_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Automatically halves position size or pauses after taking N consecutive stop-losses.</p>
+                <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Streak Loss Limit</label>
+                    <input
+                      type="number"
+                      value={draftSettings.streak_loss_limit ?? 3}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, streak_loss_limit: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('streak_throttle_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-500 mb-1">Cooldown (Mins)</label>
+                    <input
+                      type="number"
+                      value={draftSettings.streak_cooldown_minutes ?? 20}
+                      onChange={(e) => {
+                        setDraftSettings({ ...draftSettings, streak_cooldown_minutes: Number(e.target.value) });
+                        markSettingsDirty(true);
+                      }}
+                      disabled={!isPyOptEnabled('streak_throttle_enabled')}
+                      className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div
+                className={`rounded-xl border p-4 space-y-4 transition-colors ${
+                  isPyOptEnabled('narrative_cap_enabled')
+                    ? 'border-teal-500/40 bg-teal-500/[0.03]'
+                    : 'border-slate-200 dark:border-slate-800 opacity-60'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">Meta / Narrative Duplicate Cap</span>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isPyOptEnabled('narrative_cap_enabled')}
+                      onChange={(e) => togglePyOpt('narrative_cap_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+                  </label>
+                </div>
+                <p className="text-xs text-slate-500">Limits concurrent open positions sharing the same keyword or ticker stem.</p>
+                <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <label className="block text-[11px] font-medium text-slate-500 mb-1">Max Same Narrative Positions</label>
+                  <input
+                    type="number"
+                    value={draftSettings.max_same_narrative_positions ?? 1}
+                    onChange={(e) => {
+                      setDraftSettings({ ...draftSettings, max_same_narrative_positions: Number(e.target.value) });
+                      markSettingsDirty(true);
+                    }}
+                    disabled={!isPyOptEnabled('narrative_cap_enabled')}
+                    className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* GROUP 5: Hidden Profit Leaks (ATA Rent & Scorecard) */}
+          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800/80">
+              <div className="flex items-center gap-2.5">
+                <Activity className="w-5 h-5 text-teal-500" />
+                <h3 className="font-display font-bold text-base text-slate-900 dark:text-slate-100">
+                  Group 5 — Hidden Profit Leaks (ATA Rent Reclaim &amp; DEX Slippage Scorecard)
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadPyRentAudit()}
+                className="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-semibold flex items-center gap-1.5 transition-colors"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${pyRentLoading ? 'animate-spin' : ''}`} />
+                Refresh ATA Audit
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="lg:col-span-1 rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-4">
+                <span className="font-semibold text-sm text-slate-900 dark:text-slate-100 block">
+                  Empty ATA Rent Reclaim (~0.002 SOL/acc)
+                </span>
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  Every token traded locks SOL in Associated Token Accounts. Reclaiming empty accounts puts that SOL straight back to work.
+                </p>
+                {pyRentReport ? (
+                  <div className="space-y-3 font-mono text-xs">
+                    <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-900 space-y-1">
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Empty ATAs:</span>
+                        <span className="font-bold">{pyRentReport.emptyCount}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Dust Accounts:</span>
+                        <span className="font-bold">{pyRentReport.dustCount}</span>
+                      </div>
+                      <div className="flex justify-between text-teal-600 dark:text-teal-400 font-bold pt-1 border-t border-slate-200 dark:border-slate-800">
+                        <span>Reclaimable SOL:</span>
+                        <span>
+                          {(pyRentReport.emptyReclaimableSol + pyRentReport.dustReclaimableSol).toFixed(4)} SOL
+                        </span>
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="flex items-center gap-2 text-xs">
+                        <input
+                          type="checkbox"
+                          checked={pyBurnDust}
+                          onChange={(e) => setPyBurnDust(e.target.checked)}
+                          className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                        />
+                        <span className="text-slate-700 dark:text-slate-300">Include dust accounts (&lt; $0.05 value)</span>
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => handlePyReclaimRent(pyBurnDust)}
+                        disabled={pyRentLoading}
+                        className="w-full py-2.5 px-4 rounded-xl bg-teal-600 hover:bg-teal-500 text-white font-bold text-xs transition-colors disabled:opacity-50 shadow-md shadow-teal-600/20"
+                      >
+                        {pyRentLoading ? 'Processing…' : 'Reclaim All ATA Rent'}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-xs text-slate-400 italic">Audit report loading…</div>
+                )}
+              </div>
+
+              <div className="lg:col-span-2 rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-4">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">
+                    DEX Slippage &amp; Latency Scorecard
+                  </span>
+                  <span className="text-xs text-slate-400 font-mono">Real vs Quoted Execution</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs font-mono">
+                    <thead>
+                      <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-400">
+                        <th className="pb-2 font-medium">DEX / Platform</th>
+                        <th className="pb-2 font-medium">Trades</th>
+                        <th className="pb-2 font-medium">Avg Slippage</th>
+                        <th className="pb-2 font-medium">Max Slippage</th>
+                        <th className="pb-2 font-medium">Avg Latency</th>
+                        <th className="pb-2 font-medium">Win Rate</th>
+                        <th className="pb-2 font-medium">Net P&amp;L</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
+                      {pyScorecardRows.map((row) => (
+                        <tr key={`${row.dex}-${row.platform}`} className="hover:bg-slate-50 dark:hover:bg-slate-900/40">
+                          <td className="py-2.5 font-bold text-slate-900 dark:text-slate-100 uppercase">
+                            {row.dex} <span className="text-[10px] text-slate-400">({row.platform})</span>
+                          </td>
+                          <td className="py-2.5 tabular-nums">{row.tradeCount}</td>
+                          <td className="py-2.5 tabular-nums text-amber-600 dark:text-amber-400">
+                            {row.avgSlippagePct.toFixed(2)}%
+                          </td>
+                          <td className="py-2.5 tabular-nums text-rose-600 dark:text-rose-400">
+                            {row.maxSlippagePct.toFixed(2)}%
+                          </td>
+                          <td className="py-2.5 tabular-nums">{row.avgLatencyMs.toFixed(0)}ms</td>
+                          <td className="py-2.5 tabular-nums font-semibold text-teal-600 dark:text-teal-400">
+                            {row.winRatePct.toFixed(1)}%
+                          </td>
+                          <td
+                            className={`py-2.5 tabular-nums font-bold ${
+                              row.netPnlSol >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                            }`}
+                          >
+                            {row.netPnlSol >= 0 ? '+' : ''}
+                            {row.netPnlSol.toFixed(3)} SOL
+                          </td>
+                        </tr>
+                      ))}
+                      {pyScorecardRows.length === 0 && (
+                        <tr>
+                          <td colSpan={7} className="py-6 text-center text-slate-400 italic">
+                            No execution telemetry recorded yet.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* GROUP 6: Local What-If Strategy Backtester */}
+          <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800/80">
+              <div className="flex items-center gap-2.5">
+                <BarChart3 className="w-5 h-5 text-purple-500" />
+                <h3 className="font-display font-bold text-base text-slate-900 dark:text-slate-100">
+                  Group 6 — Local Strategy What-If Backtester
+                </h3>
+              </div>
+              <span className="font-mono text-xs text-slate-400">Historical Replay Simulator</span>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <form onSubmit={handlePyRunBacktest} className="lg:col-span-1 space-y-4 rounded-xl border border-slate-200 dark:border-slate-800 p-4">
+                <span className="font-semibold text-sm text-slate-900 dark:text-slate-100 block">Simulation Parameters</span>
+                <div className="space-y-3 font-mono text-xs">
+                  <div>
+                    <label className="block text-[11px] text-slate-500 mb-1">Lookback Hours</label>
+                    <input
+                      type="number"
+                      value={pyBacktestReq.lookbackHours}
+                      onChange={(e) => setPyBacktestReq({ ...pyBacktestReq, lookbackHours: Number(e.target.value) })}
+                      className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] text-slate-500 mb-1">Take Profit %</label>
+                      <input
+                        type="number"
+                        value={pyBacktestReq.takeProfitPct}
+                        onChange={(e) => setPyBacktestReq({ ...pyBacktestReq, takeProfitPct: Number(e.target.value) })}
+                        className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-slate-500 mb-1">Stop Loss %</label>
+                      <input
+                        type="number"
+                        value={pyBacktestReq.stopLossPct}
+                        onChange={(e) => setPyBacktestReq({ ...pyBacktestReq, stopLossPct: Number(e.target.value) })}
+                        className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between py-1">
+                    <span className="text-slate-700 dark:text-slate-300">Enable Trailing Stop</span>
+                    <input
+                      type="checkbox"
+                      checked={pyBacktestReq.trailingEnabled}
+                      onChange={(e) => setPyBacktestReq({ ...pyBacktestReq, trailingEnabled: e.target.checked })}
+                      className="rounded border-slate-300 text-purple-600 focus:ring-purple-500"
+                    />
+                  </div>
+                  {pyBacktestReq.trailingEnabled && (
+                    <div>
+                      <label className="block text-[11px] text-slate-500 mb-1">Trailing Drop %</label>
+                      <input
+                        type="number"
+                        value={pyBacktestReq.trailingDropPct}
+                        onChange={(e) => setPyBacktestReq({ ...pyBacktestReq, trailingDropPct: Number(e.target.value) })}
+                        className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                      />
+                    </div>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={pyBacktestLoading}
+                    className="w-full py-2.5 px-4 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs transition-colors flex items-center justify-center gap-2 shadow-md shadow-purple-600/20 disabled:opacity-50"
+                  >
+                    <Play className={`w-3.5 h-3.5 ${pyBacktestLoading ? 'animate-spin' : ''}`} />
+                    {pyBacktestLoading ? 'Running Backtest…' : 'Run Strategy Backtest'}
+                  </button>
+                </div>
+              </form>
+
+              <div className="lg:col-span-2 rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-4">
+                <span className="font-semibold text-sm text-slate-900 dark:text-slate-100 block">Backtest Comparison Results</span>
+                {pyBacktestResult ? (
+                  <div className="space-y-4 font-mono text-xs">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                      <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900 space-y-1">
+                        <span className="text-[10px] text-slate-400 block uppercase">Sample Size</span>
+                        <span className="font-bold text-sm tabular-nums">{pyBacktestResult.sampleSize}</span>
+                      </div>
+                      <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900 space-y-1">
+                        <span className="text-[10px] text-slate-400 block uppercase">Evaluated Trades</span>
+                        <span className="font-bold text-sm tabular-nums">{pyBacktestResult.evaluatedTrades}</span>
+                      </div>
+                      <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900 space-y-1">
+                        <span className="text-[10px] text-slate-400 block uppercase">Filtered Out</span>
+                        <span className="font-bold text-sm tabular-nums text-amber-500">{pyBacktestResult.filteredOutCount}</span>
+                      </div>
+                      <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900 space-y-1">
+                        <span className="text-[10px] text-slate-400 block uppercase">Unit</span>
+                        <span className="font-bold text-sm uppercase text-teal-500">{pyBacktestResult.pnlUnit}</span>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 space-y-2">
+                        <span className="font-bold text-slate-400 block uppercase text-[10px]">Baseline Strategy</span>
+                        <div className="flex justify-between">
+                          <span className="text-slate-500">Win Rate:</span>
+                          <span className="font-bold tabular-nums">{pyBacktestResult.baselineWinRatePct.toFixed(1)}%</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-500">Net P&amp;L:</span>
+                          <span
+                            className={`font-bold tabular-nums ${
+                              pyBacktestResult.baselineNetPnl >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                            }`}
+                          >
+                            {pyBacktestResult.baselineNetPnl >= 0 ? '+' : ''}
+                            {pyBacktestResult.baselineNetPnl.toFixed(3)} {pyBacktestResult.pnlUnit}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-500">Max Drawdown:</span>
+                          <span className="font-bold tabular-nums text-rose-500">
+                            -{pyBacktestResult.baselineMaxDrawdown.toFixed(3)} {pyBacktestResult.pnlUnit}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="p-4 rounded-xl border border-purple-500/30 bg-purple-500/[0.03] space-y-2">
+                        <span className="font-bold text-purple-400 block uppercase text-[10px]">Simulated Strategy</span>
+                        <div className="flex justify-between">
+                          <span className="text-slate-500">Win Rate:</span>
+                          <span className="font-bold tabular-nums text-purple-600 dark:text-purple-300">
+                            {pyBacktestResult.simulatedWinRatePct.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-500">Net P&amp;L:</span>
+                          <span
+                            className={`font-bold tabular-nums ${
+                              pyBacktestResult.simulatedNetPnl >= 0 ? 'text-emerald-500' : 'text-rose-500'
+                            }`}
+                          >
+                            {pyBacktestResult.simulatedNetPnl >= 0 ? '+' : ''}
+                            {pyBacktestResult.simulatedNetPnl.toFixed(3)} {pyBacktestResult.pnlUnit}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-500">Max Drawdown:</span>
+                          <span className="font-bold tabular-nums text-rose-500">
+                            -{pyBacktestResult.simulatedMaxDrawdown.toFixed(3)} {pyBacktestResult.pnlUnit}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {pyBacktestResult.notes.length > 0 && (
+                      <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-900 text-[11px] text-slate-500 space-y-1">
+                        <span className="font-semibold block text-slate-700 dark:text-slate-300">Simulation Notes:</span>
+                        <ul className="list-disc list-inside space-y-0.5">
+                          {pyBacktestResult.notes.map((n, i) => (
+                            <li key={i}>{n}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="py-12 text-center text-slate-400 italic text-xs">
+                    Run a strategy backtest simulation to compare historical trade performance.
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

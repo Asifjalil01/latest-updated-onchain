@@ -2,6 +2,18 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.38.1 — Pro Desk Style & Feature Parity Across Both Bots (`ProDeskView.tsx`, `PythonSniperView.tsx`, `CHANGELOG.md`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **100% Pro Desk Style, Text & Work Parity on Python Sniper Bot (`PythonSniperView.tsx`)**:
+  - Unified the Python Sniper Bot Pro Desk tab layout, card structures, icons, typography, and tool actions to match the Solana Spot Bot Pro Desk (`ProDeskView.tsx`) identically.
+  - Added direct interactive tool actions for the Python bot: **ATA Rent Audit & Reclaim** (`/api/sniper/rent/audit`, `/api/sniper/rent/reclaim`), **Manual Orphan Token Wallet Sweep** (`/api/sniper/sweep-orphans`), **Real Slippage & Latency DEX Telemetry Scorecard** (`/api/sniper/telemetry`), and **Local Strategy What-If Backtester** (`/api/sniper/backtest`).
+  - Every option on both bots features its own distinct enable/disable toggle checkbox (`optionToggles[key]` / `option_enabled[key]`) controlling active runtime enforcement.
+
+---
+
 ## v1.38.0 — Pro Trader Intelligence & Execution Desk (`Pro Desk` Tab on Both Bots, Per-Option Checkboxes, Anti-Sybil, Jito `dontfront`, Live WS Exits, Rent Audit & Backtester)
 
 **Risk Warning: Trading can lose all of your money.**
