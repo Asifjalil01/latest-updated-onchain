@@ -406,3 +406,48 @@ test('exits: disabling Stepped Trailing Ladder follows Take-Profit only and sync
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('v1.37.0: optionToggles false disables takeProfitPct, emergencyLiquidityFloorUsd, and priorityFeePreset', async () => {
+  const { resolvePriorityFeeSol } = await import('../engine/fees');
+  const offSettings = {
+    ...DEFAULT_SETTINGS,
+    takeProfitPct: 18,
+    trailingEnabled: false,
+    stopLossEnabled: false,
+    emergencyLiquidityFloorUsd: 10_000,
+    priorityFeePreset: 'ultra' as const,
+    optionToggles: {
+      takeProfitPct: false,
+      emergencyLiquidityFloorUsd: false,
+      priorityFeePreset: false,
+    },
+  };
+
+  assert.equal(resolvePriorityFeeSol(offSettings, 0.001), 0);
+
+  const snap = snapshotExitParams(offSettings, 1.5);
+  assert.equal(snap.takeProfitEnabled, false);
+  assert.equal(snap.emergencyLiquidityFloorEnabled, false);
+  assert.equal(snap.emergencyLiquidityFloorUsd, 0);
+
+  const pos = makePosition({ entryLiquidityUsd: 3_000, exitParams: snap });
+  const evalTime = pos.openedAtMs + 60_000;
+  // +200% gain does NOT trigger TAKE_PROFIT and $2,500 liquidity (16.7% drop < 40% drain) does NOT trigger EMERGENCY_LIQUIDITY_FLOOR when unchecked
+  const evalRes = evaluatePositionExit(pos, {
+    currentPriceUsd: 3.0,
+    currentLiquidityUsd: 2_500,
+    nowMs: evalTime,
+  });
+  assert.equal(evalRes.shouldExit, false);
+
+  // Confirm that with floor enabled and $10,000 floor, $2,500 liquidity DOES trigger EMERGENCY_LIQUIDITY_FLOOR
+  const floorOnSnap = snapshotExitParams({ ...offSettings, optionToggles: { takeProfitPct: false, emergencyLiquidityFloorUsd: true } }, 1.5);
+  const floorOnRes = evaluatePositionExit(makePosition({ entryLiquidityUsd: 3_000, exitParams: floorOnSnap }), {
+    currentPriceUsd: 1.0,
+    currentLiquidityUsd: 2_500,
+    nowMs: evalTime,
+  });
+  assert.equal(floorOnRes.shouldExit, true);
+  assert.equal(floorOnRes.reason, 'EMERGENCY_LIQUIDITY_FLOOR');
+});
+

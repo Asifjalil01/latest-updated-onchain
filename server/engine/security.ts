@@ -1,7 +1,12 @@
 import type { BotSettings, HolderAccountInfo, SecurityReport } from '../types';
+import { isOptionEnabled } from '../config/defaults';
 import type { OnChainTokenInspection, SolanaRpcPool } from '../providers/rpcPool';
 import type { NormalizedRugCheckResult, RugCheckProvider } from '../providers/rugcheck';
+import type { DexScreenerProvider } from '../providers/dexscreener';
+import type { CreatorHistorySummary } from '../providers/creatorHistory';
+import { inspectCreatorHistory } from '../providers/creatorHistory';
 import type { JupiterProvider } from '../providers/jupiter';
+import type { BotDatabase } from '../store/db';
 import { WSOL_MINT } from '../providers/jupiter';
 
 export interface SecurityEvaluationInputs {
@@ -10,6 +15,7 @@ export interface SecurityEvaluationInputs {
   sellQuoteImpactPct: number | null;
   sellRouteExists: boolean;
   knownBadDeployers?: Set<string>;
+  creatorHistory?: CreatorHistorySummary | null;
   sellTaxPct?: number | null;
   tradingEnabled?: boolean;
 }
@@ -77,13 +83,19 @@ export function evaluateSecurityRules(
       reasons.push('Token marked as RUGGED by RugCheck');
       criticalFlags.push('RUGGED');
     }
-    if (rugCheck.normalizedRiskScore > settings.maxRugCheckRiskScore) {
+    if (
+      isOptionEnabled(settings, 'maxRugCheckRiskScore') &&
+      rugCheck.normalizedRiskScore > settings.maxRugCheckRiskScore
+    ) {
       reasons.push(
         `RugCheck risk score ${rugCheck.normalizedRiskScore} > ${settings.maxRugCheckRiskScore} threshold`
       );
       criticalFlags.push('RUGCHECK_HIGH_RISK');
     }
-    if (rugCheck.lpLockedOrBurnedPct < settings.minLpLockedOrBurnedPct) {
+    if (
+      isOptionEnabled(settings, 'minLpLockedOrBurnedPct') &&
+      rugCheck.lpLockedOrBurnedPct < settings.minLpLockedOrBurnedPct
+    ) {
       reasons.push(
         `LP burned/locked ${rugCheck.lpLockedOrBurnedPct.toFixed(1)}% < ${settings.minLpLockedOrBurnedPct}% minimum`
       );
@@ -136,11 +148,59 @@ export function evaluateSecurityRules(
       );
       criticalFlags.push('TOP10_CONCENTRATION');
     }
-    if (effectiveSingleMaxPct > settings.maxSingleHolderPct) {
+    if (
+      isOptionEnabled(settings, 'maxSingleHolderPct') &&
+      effectiveSingleMaxPct > settings.maxSingleHolderPct
+    ) {
       reasons.push(
         `Largest non-pool holder owns ${effectiveSingleMaxPct.toFixed(1)}% > ${settings.maxSingleHolderPct}% limit`
       );
       criticalFlags.push('SINGLE_HOLDER_CONCENTRATION');
+    }
+  }
+
+  // Owner / Creator wallet prior launches & rugpull speed guard
+  const creatorHist = inputs.creatorHistory ?? null;
+  const maxCreatorLaunches = Math.max(0, settings.maxCreatorLaunches ?? 5);
+  const maxCreatorRuggedCoins = Math.max(0, settings.maxCreatorRuggedCoins ?? 0);
+  const fastRugWindowMin = Math.max(0, settings.creatorFastRugWindowMinutes ?? 60);
+  if (settings.creatorHistoryEnabled !== false && creatorHist) {
+    if (creatorHist.flaggedByRugCheckRisk) {
+      reasons.push('Owner/creator flagged by RugCheck for prior rugged tokens');
+      criticalFlags.push('CREATOR_RUG_HISTORY');
+    }
+    if (
+      isOptionEnabled(settings, 'maxCreatorLaunches') &&
+      creatorHist.launchCount > maxCreatorLaunches
+    ) {
+      reasons.push(
+        `Owner launched ${creatorHist.launchCount} prior coins > ${maxCreatorLaunches} limit`
+      );
+      criticalFlags.push('CREATOR_SERIAL_LAUNCHER');
+    }
+    if (
+      isOptionEnabled(settings, 'maxCreatorRuggedCoins') &&
+      creatorHist.ruggedCount > maxCreatorRuggedCoins
+    ) {
+      const speedNote =
+        creatorHist.fastestRugMinutes !== null
+          ? ` (fastest rugpull in ${creatorHist.fastestRugMinutes.toFixed(1)}m)`
+          : '';
+      reasons.push(
+        `Owner has ${creatorHist.ruggedCount} rugged prior coin(s) > ${maxCreatorRuggedCoins} limit${speedNote}`
+      );
+      criticalFlags.push('CREATOR_RUG_HISTORY');
+    }
+    if (
+      isOptionEnabled(settings, 'creatorFastRugWindowMinutes') &&
+      creatorHist.fastestRugMinutes !== null &&
+      fastRugWindowMin > 0 &&
+      creatorHist.fastestRugMinutes <= fastRugWindowMin
+    ) {
+      reasons.push(
+        `Owner rugged a prior coin in ${creatorHist.fastestRugMinutes.toFixed(1)}m <= ${fastRugWindowMin}m fast-rug window`
+      );
+      criticalFlags.push('CREATOR_FAST_RUGGER');
     }
   }
 
@@ -154,9 +214,10 @@ export function evaluateSecurityRules(
     reasons.push('Sell-route test failed: no Jupiter route back to SOL');
     criticalFlags.push('NO_SELL_ROUTE');
   } else if (
-    sellQuoteImpactPct === null ||
-    !Number.isFinite(sellQuoteImpactPct) ||
-    sellQuoteImpactPct > settings.maxSellRouteImpactPct
+    isOptionEnabled(settings, 'maxSellRouteImpactPct') &&
+    (sellQuoteImpactPct === null ||
+      !Number.isFinite(sellQuoteImpactPct) ||
+      sellQuoteImpactPct > settings.maxSellRouteImpactPct)
   ) {
     const impactStr =
       sellQuoteImpactPct === null ? 'unknown' : `${sellQuoteImpactPct.toFixed(2)}%`;
@@ -193,11 +254,25 @@ export function evaluateSecurityRules(
     top10HoldersPct: effectiveTop10Pct,
     singleMaxHolderPct: effectiveSingleMaxPct,
     holders: effectiveHolders,
-    deployerFlagged: Boolean(rugCheck?.creator && knownBad.has(rugCheck.creator)),
+    deployerFlagged:
+      Boolean(rugCheck?.creator && knownBad.has(rugCheck.creator)) ||
+      Boolean(
+        criticalFlags.some((f) =>
+          f === 'CREATOR_RUG_HISTORY' || f === 'CREATOR_FAST_RUGGER' || f === 'CREATOR_SERIAL_LAUNCHER'
+        )
+      ),
     deployerReason:
       rugCheck?.creator && knownBad.has(rugCheck.creator)
         ? 'Flagged repeat rugger'
-        : undefined,
+        : criticalFlags.includes('CREATOR_FAST_RUGGER')
+          ? `Fast rugger (${creatorHist?.fastestRugMinutes?.toFixed(1) ?? '?'}m)`
+          : criticalFlags.includes('CREATOR_RUG_HISTORY')
+            ? `Prior rugged coins: ${creatorHist?.ruggedCount ?? 1}`
+            : undefined,
+    creatorAddress: creatorHist?.creatorAddress ?? rugCheck?.creator ?? null,
+    creatorLaunchCount: creatorHist?.launchCount ?? 0,
+    creatorRuggedCount: creatorHist?.ruggedCount ?? 0,
+    creatorFastestRugMinutes: creatorHist?.fastestRugMinutes ?? null,
     sellRouteExists,
     sellRouteImpactPct: sellQuoteImpactPct,
     sellTaxPct,
@@ -208,6 +283,8 @@ export function evaluateSecurityRules(
 
 export async function runSecurityChecks(params: {
   mint: string;
+  symbol?: string;
+  poolCreatedAtMs?: number;
   priceUsd: number;
   solPriceUsd: number;
   testSizeSol: number;
@@ -215,6 +292,8 @@ export async function runSecurityChecks(params: {
   rpcPool: SolanaRpcPool;
   rugCheckProvider: RugCheckProvider;
   jupiterProvider: JupiterProvider;
+  dexScreenerProvider?: DexScreenerProvider;
+  db?: BotDatabase;
 }): Promise<SecurityReport> {
   const { mint, priceUsd, solPriceUsd, testSizeSol, settings, rpcPool, rugCheckProvider, jupiterProvider } =
     params;
@@ -230,25 +309,45 @@ export async function runSecurityChecks(params: {
   let sellRouteExists = false;
   let sellQuoteImpactPct: number | null = null;
 
-  if (onChain && priceUsd > 0 && solPriceUsd > 0) {
-    const testTokenUi = (testSizeSol * solPriceUsd) / priceUsd;
-    const rawUnits = Math.max(1, Math.floor(testTokenUi * 10 ** onChain.decimals));
-    const quote = await jupiterProvider.getQuote({
-      inputMint: mint,
-      outputMint: WSOL_MINT,
-      amountRaw: String(rawUnits),
-      slippageBps: settings.slippageBps,
-    });
-    if (quote && Number(quote.outAmount) > 0) {
-      sellRouteExists = true;
-      sellQuoteImpactPct = Math.abs(Number(quote.priceImpactPct || 0)) * 100;
-    }
+  const [quoteRes, creatorHistory] = await Promise.all([
+    onChain && priceUsd > 0 && solPriceUsd > 0
+      ? (() => {
+          const testTokenUi = (testSizeSol * solPriceUsd) / priceUsd;
+          const rawUnits = Math.max(1, Math.floor(testTokenUi * 10 ** onChain.decimals));
+          return jupiterProvider
+            .getQuote({
+              inputMint: mint,
+              outputMint: WSOL_MINT,
+              amountRaw: String(rawUnits),
+              slippageBps: settings.slippageBps,
+            })
+            .catch(() => null);
+        })()
+      : Promise.resolve(null),
+    settings.creatorHistoryEnabled !== false && rugCheck
+      ? inspectCreatorHistory({
+          creatorAddress: rugCheck.creator,
+          currentMint: mint,
+          currentPoolCreatedAtMs: params.poolCreatedAtMs,
+          currentSymbol: params.symbol,
+          rugCheck,
+          dexScreener: params.dexScreenerProvider,
+          rpcPool,
+          db: params.db,
+        }).catch(() => null)
+      : Promise.resolve(null),
+  ]);
+
+  if (quoteRes && Number(quoteRes.outAmount) > 0) {
+    sellRouteExists = true;
+    sellQuoteImpactPct = Math.abs(Number(quoteRes.priceImpactPct || 0)) * 100;
   }
 
   return evaluateSecurityRules(
     {
       onChain,
       rugCheck,
+      creatorHistory,
       sellRouteExists,
       sellQuoteImpactPct,
     },

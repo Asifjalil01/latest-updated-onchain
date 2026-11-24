@@ -1,3 +1,4 @@
+import { isOptionEnabled } from '../config/defaults';
 import type { BotSettings, SizingResult } from '../types';
 
 export function calculatePositionSize(params: {
@@ -43,7 +44,21 @@ export function calculatePositionSize(params: {
     };
   }
 
-  if (dailyRealizedPnlSol <= -Math.abs(settings.dailyLossLimitSol)) {
+  if (!isOptionEnabled(settings, 'tradeSizeSol')) {
+    return {
+      approved: false,
+      reason: 'Trade Size (SOL) is unchecked/disabled — new buys paused',
+      solAmount: 0,
+      usdAmount: 0,
+      tokenClassMultiplier,
+      cappedBy: 'TRADE_SIZE_DISABLED',
+    };
+  }
+
+  if (
+    isOptionEnabled(settings, 'dailyLossLimitSol') &&
+    dailyRealizedPnlSol <= -Math.abs(settings.dailyLossLimitSol)
+  ) {
     return {
       approved: false,
       reason: `Daily loss limit hit (${dailyRealizedPnlSol.toFixed(4)} <= -${settings.dailyLossLimitSol.toFixed(4)} SOL)`,
@@ -54,7 +69,10 @@ export function calculatePositionSize(params: {
     };
   }
 
-  if (openPositionsCount >= settings.maxOpenPositions) {
+  if (
+    isOptionEnabled(settings, 'maxOpenPositions') &&
+    openPositionsCount >= settings.maxOpenPositions
+  ) {
     return {
       approved: false,
       reason: `Max open positions (${settings.maxOpenPositions}) reached`,
@@ -65,7 +83,10 @@ export function calculatePositionSize(params: {
     };
   }
 
-  const remainingExposure = Math.max(0, settings.maxWalletExposureSol - currentExposureSol);
+  const walletExposureEnabled = isOptionEnabled(settings, 'maxWalletExposureSol');
+  const remainingExposure = walletExposureEnabled
+    ? Math.max(0, settings.maxWalletExposureSol - currentExposureSol)
+    : Number.POSITIVE_INFINITY;
   // Gas reserve check removed: evaluate directly against available wallet balance
   const spendableBalance = Math.max(0, availableBalanceSol);
   const twoPctLiquiditySol = (poolLiquidityUsd * 0.02) / solPriceUsd;
@@ -88,10 +109,13 @@ export function calculatePositionSize(params: {
   const candidates: Array<{ label: string; amount: number }> = [
     { label: 'TRADE_SIZE', amount: targetByClass },
     { label: 'MAX_POSITION_SIZE', amount: settings.maxPositionSizeSol },
-    { label: 'MAX_WALLET_EXPOSURE', amount: remainingExposure },
     { label: 'AVAILABLE_SOL', amount: spendableBalance },
   ];
-  if (settings.minLiquidityUsd >= 500 || poolLiquidityUsd >= 2000) {
+  if (walletExposureEnabled) {
+    candidates.push({ label: 'MAX_WALLET_EXPOSURE', amount: remainingExposure });
+  }
+  const effectiveMinLiq = isOptionEnabled(settings, 'minLiquidityUsd') ? settings.minLiquidityUsd : 0;
+  if (effectiveMinLiq >= 500 || poolLiquidityUsd >= 2000) {
     candidates.push({ label: 'TWO_PCT_POOL_LIQUIDITY', amount: twoPctLiquiditySol });
   }
 

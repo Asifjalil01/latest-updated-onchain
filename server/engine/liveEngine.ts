@@ -30,6 +30,7 @@ import {
   resolvePriorityFeeSol,
   snapshotExitParams,
 } from './fees';
+import { isOptionEnabled } from '../config/defaults';
 
 export interface ExecutionProgressEvent {
   mint: string;
@@ -288,9 +289,12 @@ export class LiveExecutionEngine {
     }
 
     // Parallelize on-chain existing-balance check & priority fee estimate for speed
+    const priorityFeeEnabled = isOptionEnabled(settings, 'priorityFeePreset');
     const [preBalance, autoPriority] = await Promise.all([
       this.rpcPool.getAgreedTokenBalanceUi(owner, token.mint),
-      settings.priorityFeePreset === 'auto' && typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
+      priorityFeeEnabled &&
+      settings.priorityFeePreset === 'auto' &&
+      typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
         ? this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
         : Promise.resolve(null),
     ]);
@@ -315,9 +319,9 @@ export class LiveExecutionEngine {
       timestampMs: Date.now(),
     });
 
-    const priorityFeeSol = resolvePriorityFeeSol(settings, autoPriority?.sol);
+    const priorityFeeSol = priorityFeeEnabled ? resolvePriorityFeeSol(settings, autoPriority?.sol) : 0;
     const priorityFeeLamports: number | 'auto' =
-      settings.priorityFeePreset === 'auto'
+      priorityFeeEnabled && settings.priorityFeePreset === 'auto'
         ? 'auto'
         : Math.round(priorityFeeSol * LAMPORTS_PER_SOL);
 
@@ -811,9 +815,10 @@ export class LiveExecutionEngine {
     const attempts = position.sellAttempts + 1;
     const firstFailureAt = position.firstSellFailureAtMs ?? Date.now();
     // Escalate slippage on emergency or retry attempts (capped safely)
+    const baseSlippageBps = isOptionEnabled(settings, 'slippageBps') ? settings.slippageBps : 150;
     const slippageBps = Math.min(
       2500,
-      settings.slippageBps + (isEmergency ? 300 : 0) + (attempts - 1) * 150
+      baseSlippageBps + (isEmergency ? 300 : 0) + (attempts - 1) * 150
     );
 
     const rawUnitsStr =
@@ -898,6 +903,9 @@ export class LiveExecutionEngine {
         const closedPos = { ...updatedPos, status: 'CLOSED' as const };
         this.db.upsertPosition(closedPos);
         this.db.insertTrade(trade);
+        if (typeof this.db.markMintRuggedForCreator === 'function') {
+          this.db.markMintRuggedForCreator(position.mint, 'WRITE_OFF_UNSELLABLE');
+        }
         return { ok: true, trade, position: closedPos };
       }
 
@@ -910,13 +918,18 @@ export class LiveExecutionEngine {
     }
 
     try {
+      const priorityFeeEnabled = isOptionEnabled(settings, 'priorityFeePreset');
       const autoExitPriority =
-        settings.priorityFeePreset === 'auto' && typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
+        priorityFeeEnabled &&
+        settings.priorityFeePreset === 'auto' &&
+        typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
           ? await this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
           : null;
-      const resolvedExitPrioritySol = resolvePriorityFeeSol(settings, autoExitPriority?.sol);
+      const resolvedExitPrioritySol = priorityFeeEnabled
+        ? resolvePriorityFeeSol(settings, autoExitPriority?.sol)
+        : 0;
       const priorityFeeLamports: number | 'auto' =
-        settings.priorityFeePreset === 'auto' && !isEmergency
+        priorityFeeEnabled && settings.priorityFeePreset === 'auto' && !isEmergency
           ? 'auto'
           : Math.round(resolvedExitPrioritySol * (isEmergency ? 2 : 1) * LAMPORTS_PER_SOL);
       const swapResp = await this.jupiter.buildSwapTransaction({
@@ -1058,7 +1071,9 @@ export class LiveExecutionEngine {
       };
       this.db.upsertPosition(closedPos);
       this.db.insertTrade(trade);
-      this.db.setCooldown(position.mint, 'live', settings.cooldownMinutes);
+      if (isOptionEnabled(settings, 'cooldownMinutes')) {
+        this.db.setCooldown(position.mint, 'live', settings.cooldownMinutes);
+      }
 
       return { ok: true, trade, position: closedPos };
     } catch (err) {

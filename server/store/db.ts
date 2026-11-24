@@ -234,6 +234,21 @@ export class BotDatabase {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS creator_history (
+        creator TEXT NOT NULL,
+        mint TEXT NOT NULL,
+        symbol TEXT NOT NULL DEFAULT '',
+        created_at_ms INTEGER,
+        rugged INTEGER NOT NULL DEFAULT 0,
+        rugged_at_ms INTEGER,
+        rug_reason TEXT,
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (creator, mint)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_creator_history_creator ON creator_history(creator);
+      CREATE INDEX IF NOT EXISTS idx_creator_history_mint ON creator_history(mint);
     `);
 
     // Migrate existing databases to include triggered_sl_tiers_json
@@ -905,6 +920,84 @@ export class BotDatabase {
     });
     tx();
     return sessionId;
+  }
+
+  recordCreatorObservation(params: {
+    creator: string;
+    mint: string;
+    symbol?: string;
+    createdAtMs?: number | null;
+    rugged?: boolean;
+    ruggedAtMs?: number | null;
+    rugReason?: string | null;
+    nowMs?: number;
+  }): void {
+    const creator = (params.creator || '').trim();
+    const mint = (params.mint || '').trim();
+    if (!creator || !mint) return;
+    const nowMs = params.nowMs ?? Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO creator_history (creator, mint, symbol, created_at_ms, rugged, rugged_at_ms, rug_reason, updated_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(creator, mint) DO UPDATE SET
+           symbol = CASE WHEN excluded.symbol != '' THEN excluded.symbol ELSE creator_history.symbol END,
+           created_at_ms = COALESCE(creator_history.created_at_ms, excluded.created_at_ms),
+           rugged = CASE WHEN excluded.rugged = 1 THEN 1 ELSE creator_history.rugged END,
+           rugged_at_ms = COALESCE(creator_history.rugged_at_ms, excluded.rugged_at_ms),
+           rug_reason = COALESCE(excluded.rug_reason, creator_history.rug_reason),
+           updated_at_ms = excluded.updated_at_ms`
+      )
+      .run(
+        creator,
+        mint,
+        params.symbol ?? '',
+        params.createdAtMs && params.createdAtMs > 0 ? Math.round(params.createdAtMs) : null,
+        params.rugged ? 1 : 0,
+        params.ruggedAtMs && params.ruggedAtMs > 0 ? Math.round(params.ruggedAtMs) : null,
+        params.rugReason ?? null,
+        nowMs
+      );
+  }
+
+  markMintRuggedForCreator(mint: string, reason: string, ruggedAtMs = Date.now()): void {
+    const cleanMint = (mint || '').trim();
+    if (!cleanMint) return;
+    this.db
+      .prepare(
+        `UPDATE creator_history
+         SET rugged = 1,
+             rugged_at_ms = COALESCE(rugged_at_ms, ?),
+             rug_reason = COALESCE(rug_reason, ?),
+             updated_at_ms = ?
+         WHERE mint = ?`
+      )
+      .run(ruggedAtMs, reason, ruggedAtMs, cleanMint);
+  }
+
+  getCreatorCoins(creator: string): Array<{
+    creator: string;
+    mint: string;
+    symbol: string;
+    createdAtMs: number | null;
+    rugged: boolean;
+    ruggedAtMs: number | null;
+    rugReason: string | null;
+  }> {
+    const clean = (creator || '').trim();
+    if (!clean) return [];
+    const rows = this.db
+      .prepare('SELECT * FROM creator_history WHERE creator = ? ORDER BY updated_at_ms DESC LIMIT 100')
+      .all(clean) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      creator: String(r.creator),
+      mint: String(r.mint),
+      symbol: String(r.symbol || ''),
+      createdAtMs: r.created_at_ms === null ? null : Number(r.created_at_ms),
+      rugged: Number(r.rugged) === 1,
+      ruggedAtMs: r.rugged_at_ms === null ? null : Number(r.rugged_at_ms),
+      rugReason: r.rug_reason ? String(r.rug_reason) : null,
+    }));
   }
 
   close(): void {

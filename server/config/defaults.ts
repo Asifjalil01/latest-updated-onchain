@@ -13,6 +13,13 @@ export const HARD_LIMITS = {
   maxOpenPositionsCeiling: 10,
 } as const;
 
+export function isOptionEnabled(
+  settings: Pick<BotSettings, 'optionToggles'> | null | undefined,
+  key: string
+): boolean {
+  return settings?.optionToggles?.[key] !== false;
+}
+
 export const DEFAULT_SETTINGS: BotSettings = {
   // Sizing & Risk
   tradeSizeSol: 0.05,
@@ -58,6 +65,10 @@ export const DEFAULT_SETTINGS: BotSettings = {
   maxTop10HoldersPct: 35,
   maxSingleHolderPct: 10,
   maxSellRouteImpactPct: 5,
+  creatorHistoryEnabled: true,
+  maxCreatorLaunches: 5,
+  maxCreatorRuggedCoins: 0,
+  creatorFastRugWindowMinutes: 60,
 
   // Scoring
   enforceMinScores: true,
@@ -114,6 +125,9 @@ export const DEFAULT_SETTINGS: BotSettings = {
   // Shadow Compare
   shadowCompareEnabled: false,
   shadowLiveSizeSol: 0.01,
+
+  // Per-option enable/disable toggles (omitted or true = active)
+  optionToggles: {},
 };
 
 export const SETTINGS_PRESETS: Record<'safe' | 'balanced' | 'aggressive' | 'quick_profit', Partial<BotSettings>> = {
@@ -274,9 +288,18 @@ export function validateSettingsUpdate(
   current: BotSettings,
   patch: Partial<BotSettings>
 ): { valid: boolean; errors: string[]; fieldErrors: Record<string, string>; merged: BotSettings } {
-  const merged: BotSettings = { ...current, ...patch };
+  const mergedOptionToggles: Record<string, boolean> = {
+    ...(current.optionToggles ?? {}),
+    ...(patch.optionToggles ?? {}),
+  };
+  const merged: BotSettings = {
+    ...current,
+    ...patch,
+    optionToggles: mergedOptionToggles,
+  };
   const errors: string[] = [];
   const fieldErrors: Record<string, string> = {};
+  const optOn = (key: string) => isOptionEnabled(merged, key);
 
   const pushErr = (fieldKey: string, msg: string) => {
     if (!errors.includes(msg)) errors.push(msg);
@@ -285,8 +308,8 @@ export function validateSettingsUpdate(
 
   if (!Array.isArray(merged.stopLossTiers)) {
     pushErr('stopLossEnabled', 'Stop-loss tiers must be an array.');
-  } else {
-    if (merged.stopLossEnabled && merged.stopLossTiers.length === 0) {
+  } else if (merged.stopLossEnabled) {
+    if (merged.stopLossTiers.length === 0) {
       pushErr('stopLossEnabled', 'At least 1 Stop-Loss tier is required when Stop-Loss is enabled.');
     }
     merged.stopLossTiers.forEach((tier, idx) => {
@@ -314,16 +337,23 @@ export function validateSettingsUpdate(
     }
   }
 
-  if (!Number.isFinite(merged.stopLossPct) || merged.stopLossPct < HARD_LIMITS.minStopLossPct) {
+  if (
+    merged.stopLossEnabled &&
+    (!Number.isFinite(merged.stopLossPct) || merged.stopLossPct < HARD_LIMITS.minStopLossPct)
+  ) {
     pushErr('stopLossEnabled', `Stop-loss must be at least ${HARD_LIMITS.minStopLossPct}%.`);
   }
-  if (!Number.isFinite(merged.takeProfitPct) || merged.takeProfitPct < HARD_LIMITS.minTakeProfitPct) {
+  if (
+    optOn('takeProfitPct') &&
+    (!Number.isFinite(merged.takeProfitPct) || merged.takeProfitPct < HARD_LIMITS.minTakeProfitPct)
+  ) {
     pushErr(
       'takeProfitPct',
       `Take-Profit (%) must be at least ${HARD_LIMITS.minTakeProfitPct}% (no upper limit).`
     );
   }
   if (
+    optOn('minPoolAgeMinutes') &&
     !merged.customAgeWindowEnabled &&
     !merged.newLaunchOnlyEnabled &&
     (!Number.isFinite(merged.minPoolAgeMinutes) || merged.minPoolAgeMinutes < HARD_LIMITS.minPoolAgeFloorMinutes)
@@ -333,33 +363,37 @@ export function validateSettingsUpdate(
       `Default Min Pool Age must be at least ${HARD_LIMITS.minPoolAgeFloorMinutes} minutes (or enable Custom Pool Age Timeframe above).`
     );
   }
-  if (!Number.isFinite(merged.customMinPoolAgeMinutes) || merged.customMinPoolAgeMinutes < 0) {
-    pushErr('customMinPoolAgeMinutes', 'Min Coin Age must be 0 minutes or greater.');
+  if (merged.customAgeWindowEnabled) {
+    if (!Number.isFinite(merged.customMinPoolAgeMinutes) || merged.customMinPoolAgeMinutes < 0) {
+      pushErr('customMinPoolAgeMinutes', 'Min Coin Age must be 0 minutes or greater.');
+    }
+    if (
+      !Number.isFinite(merged.customMaxPoolAgeMinutes) ||
+      merged.customMaxPoolAgeMinutes <= 0 ||
+      merged.customMaxPoolAgeMinutes < merged.customMinPoolAgeMinutes
+    ) {
+      pushErr(
+        'customMaxPoolAgeMinutes',
+        `Max Coin Age must be > 0 and at least ${Number.isFinite(merged.customMinPoolAgeMinutes) ? merged.customMinPoolAgeMinutes : 0} minutes.`
+      );
+    }
   }
-  if (
-    !Number.isFinite(merged.customMaxPoolAgeMinutes) ||
-    merged.customMaxPoolAgeMinutes <= 0 ||
-    merged.customMaxPoolAgeMinutes < merged.customMinPoolAgeMinutes
-  ) {
-    pushErr(
-      'customMaxPoolAgeMinutes',
-      `Max Coin Age must be > 0 and at least ${Number.isFinite(merged.customMinPoolAgeMinutes) ? merged.customMinPoolAgeMinutes : 0} minutes.`
-    );
+  if (merged.newLaunchOnlyEnabled) {
+    if (!Number.isFinite(merged.newLaunchMinAgeSeconds) || merged.newLaunchMinAgeSeconds < 0) {
+      pushErr('newLaunchMinAgeSeconds', 'Min Launch Age must be 0 seconds or greater.');
+    }
+    if (
+      !Number.isFinite(merged.newLaunchMaxAgeSeconds) ||
+      merged.newLaunchMaxAgeSeconds < 1 ||
+      merged.newLaunchMaxAgeSeconds < merged.newLaunchMinAgeSeconds
+    ) {
+      pushErr(
+        'newLaunchMaxAgeSeconds',
+        `Max Launch Age must be >= 1s and >= ${Number.isFinite(merged.newLaunchMinAgeSeconds) ? merged.newLaunchMinAgeSeconds : 0}s.`
+      );
+    }
   }
-  if (!Number.isFinite(merged.newLaunchMinAgeSeconds) || merged.newLaunchMinAgeSeconds < 0) {
-    pushErr('newLaunchMinAgeSeconds', 'Min Launch Age must be 0 seconds or greater.');
-  }
-  if (
-    !Number.isFinite(merged.newLaunchMaxAgeSeconds) ||
-    merged.newLaunchMaxAgeSeconds < 1 ||
-    merged.newLaunchMaxAgeSeconds < merged.newLaunchMinAgeSeconds
-  ) {
-    pushErr(
-      'newLaunchMaxAgeSeconds',
-      `Max Launch Age must be >= 1s and >= ${Number.isFinite(merged.newLaunchMinAgeSeconds) ? merged.newLaunchMinAgeSeconds : 0}s.`
-    );
-  }
-  if (!Number.isFinite(merged.minLiquidityUsd) || merged.minLiquidityUsd < 0) {
+  if (optOn('minLiquidityUsd') && (!Number.isFinite(merged.minLiquidityUsd) || merged.minLiquidityUsd < 0)) {
     pushErr('minLiquidityUsd', 'Min Liquidity ($) must be $0 or greater (no upper limit).');
   }
   if (
@@ -374,9 +408,10 @@ export function validateSettingsUpdate(
     );
   }
   if (
-    !Number.isFinite(merged.maxSingleHolderPct) ||
-    merged.maxSingleHolderPct < 1 ||
-    merged.maxSingleHolderPct > HARD_LIMITS.maxSingleHolderCeilingPct
+    optOn('maxSingleHolderPct') &&
+    (!Number.isFinite(merged.maxSingleHolderPct) ||
+      merged.maxSingleHolderPct < 1 ||
+      merged.maxSingleHolderPct > HARD_LIMITS.maxSingleHolderCeilingPct)
   ) {
     pushErr(
       'maxSingleHolderPct',
@@ -384,71 +419,123 @@ export function validateSettingsUpdate(
     );
   }
   if (
-    !Number.isFinite(merged.maxOpenPositions) ||
-    !Number.isInteger(merged.maxOpenPositions) ||
-    merged.maxOpenPositions < 1 ||
-    merged.maxOpenPositions > HARD_LIMITS.maxOpenPositionsCeiling
+    optOn('maxOpenPositions') &&
+    (!Number.isFinite(merged.maxOpenPositions) ||
+      !Number.isInteger(merged.maxOpenPositions) ||
+      merged.maxOpenPositions < 1 ||
+      merged.maxOpenPositions > HARD_LIMITS.maxOpenPositionsCeiling)
   ) {
     pushErr(
       'maxOpenPositions',
       `Max Open Positions must be a whole number between 1 and ${HARD_LIMITS.maxOpenPositionsCeiling}.`
     );
   }
-  if (!Number.isFinite(merged.cooldownMinutes) || merged.cooldownMinutes < 0 || merged.cooldownMinutes > 1440) {
+  if (
+    optOn('cooldownMinutes') &&
+    (!Number.isFinite(merged.cooldownMinutes) || merged.cooldownMinutes < 0 || merged.cooldownMinutes > 1440)
+  ) {
     pushErr('cooldownMinutes', 'Re-entry Cooldown must be between 0 and 1440 minutes.');
   }
-  if (!Number.isFinite(merged.tradeSizeSol) || merged.tradeSizeSol <= 0 || merged.tradeSizeSol > merged.maxPositionSizeSol) {
+  if (
+    optOn('tradeSizeSol') &&
+    (!Number.isFinite(merged.tradeSizeSol) || merged.tradeSizeSol <= 0 || merged.tradeSizeSol > merged.maxPositionSizeSol)
+  ) {
     pushErr(
       'tradeSizeSol',
       `Trade Size (SOL) must be > 0 and <= ${merged.maxPositionSizeSol} SOL.`
     );
   }
-  if (!Number.isFinite(merged.maxWalletExposureSol) || merged.maxWalletExposureSol <= 0 || merged.maxPositionSizeSol > merged.maxWalletExposureSol) {
+  if (
+    optOn('maxWalletExposureSol') &&
+    (!Number.isFinite(merged.maxWalletExposureSol) ||
+      merged.maxWalletExposureSol <= 0 ||
+      merged.maxPositionSizeSol > merged.maxWalletExposureSol)
+  ) {
     pushErr(
       'maxWalletExposureSol',
       `Max Wallet Exposure (SOL) must be > 0 and >= ${merged.maxPositionSizeSol} SOL.`
     );
   }
-  if (!Number.isFinite(merged.dailyLossLimitSol) || merged.dailyLossLimitSol <= 0) {
+  if (optOn('dailyLossLimitSol') && (!Number.isFinite(merged.dailyLossLimitSol) || merged.dailyLossLimitSol <= 0)) {
     pushErr('dailyLossLimitSol', 'Daily Loss Limit (SOL) must be greater than 0.');
   }
   if (!Number.isFinite(merged.gasReserveSol) || merged.gasReserveSol < 0) {
     pushErr('gasReserveSol', 'Gas Reserve (SOL) must be 0 or greater.');
   }
-  if (!Number.isFinite(merged.maxHoldMinutes) || merged.maxHoldMinutes < 5 || merged.maxHoldMinutes > 10080) {
+  if (
+    merged.maxHoldStagnationEnabled &&
+    (!Number.isFinite(merged.maxHoldMinutes) || merged.maxHoldMinutes < 5 || merged.maxHoldMinutes > 10080)
+  ) {
     pushErr('maxHoldMinutes', 'Max Hold Time must be between 5 and 10080 minutes.');
   }
-  if (!Number.isFinite(merged.emergencyLiquidityFloorUsd) || merged.emergencyLiquidityFloorUsd < 0) {
+  if (
+    optOn('emergencyLiquidityFloorUsd') &&
+    (!Number.isFinite(merged.emergencyLiquidityFloorUsd) || merged.emergencyLiquidityFloorUsd < 0)
+  ) {
     pushErr('emergencyLiquidityFloorUsd', 'Emergency Liquidity Floor ($) must be $0 or greater.');
   }
-  if (!Number.isFinite(merged.slippageBps) || merged.slippageBps < 10 || merged.slippageBps > HARD_LIMITS.maxSlippageBps) {
+  if (
+    optOn('slippageBps') &&
+    (!Number.isFinite(merged.slippageBps) || merged.slippageBps < 10 || merged.slippageBps > HARD_LIMITS.maxSlippageBps)
+  ) {
     pushErr('slippageBps', `Slippage must be between 10 and ${HARD_LIMITS.maxSlippageBps} bps.`);
   }
   if (!Number.isFinite(merged.maxPriorityFeeSol) || merged.maxPriorityFeeSol > HARD_LIMITS.maxPriorityFeeSolCap) {
     pushErr('maxPriorityFeeSol', `Priority fee cap cannot exceed ${HARD_LIMITS.maxPriorityFeeSolCap} SOL.`);
   }
-  if (!Number.isFinite(merged.paperDelayMinSec) || merged.paperDelayMinSec < 0 || merged.paperDelayMinSec > 30) {
-    pushErr('paperDelayMinSec', 'Min Delay must be between 0 and 30 seconds.');
+  if (optOn('paperDelayWindow')) {
+    if (!Number.isFinite(merged.paperDelayMinSec) || merged.paperDelayMinSec < 0 || merged.paperDelayMinSec > 30) {
+      pushErr('paperDelayMinSec', 'Min Delay must be between 0 and 30 seconds.');
+    }
+    if (
+      !Number.isFinite(merged.paperDelayMaxSec) ||
+      merged.paperDelayMaxSec < 0 ||
+      merged.paperDelayMaxSec > 60 ||
+      merged.paperDelayMaxSec < merged.paperDelayMinSec
+    ) {
+      pushErr(
+        'paperDelayMaxSec',
+        `Max Delay must be between ${Number.isFinite(merged.paperDelayMinSec) ? merged.paperDelayMinSec : 0} and 60 seconds.`
+      );
+    }
+  }
+  if (optOn('paperFailChance')) {
+    if (!Number.isFinite(merged.paperBuyFailChancePct) || merged.paperBuyFailChancePct < 0 || merged.paperBuyFailChancePct > 100) {
+      pushErr('paperBuyFailChancePct', 'Buy Failure Chance (%) must be between 0% and 100%.');
+    }
+    if (!Number.isFinite(merged.paperSellFailChancePct) || merged.paperSellFailChancePct < 0 || merged.paperSellFailChancePct > 100) {
+      pushErr('paperSellFailChancePct', 'Sell Failure Chance (%) must be between 0% and 100%.');
+    }
   }
   if (
-    !Number.isFinite(merged.paperDelayMaxSec) ||
-    merged.paperDelayMaxSec < 0 ||
-    merged.paperDelayMaxSec > 60 ||
-    merged.paperDelayMaxSec < merged.paperDelayMinSec
+    optOn('paperCompetitionPenaltyPct') &&
+    (!Number.isFinite(merged.paperCompetitionPenaltyPct) ||
+      merged.paperCompetitionPenaltyPct < 0 ||
+      merged.paperCompetitionPenaltyPct > 20)
   ) {
-    pushErr(
-      'paperDelayMaxSec',
-      `Max Delay must be between ${Number.isFinite(merged.paperDelayMinSec) ? merged.paperDelayMinSec : 0} and 60 seconds.`
-    );
-  }
-  if (!Number.isFinite(merged.paperBuyFailChancePct) || merged.paperBuyFailChancePct < 0 || merged.paperBuyFailChancePct > 100) {
-    pushErr('paperBuyFailChancePct', 'Buy Failure Chance (%) must be between 0% and 100%.');
-  }
-  if (!Number.isFinite(merged.paperSellFailChancePct) || merged.paperSellFailChancePct < 0 || merged.paperSellFailChancePct > 100) {
-    pushErr('paperSellFailChancePct', 'Sell Failure Chance (%) must be between 0% and 100%.');
-  }
-  if (!Number.isFinite(merged.paperCompetitionPenaltyPct) || merged.paperCompetitionPenaltyPct < 0 || merged.paperCompetitionPenaltyPct > 20) {
     pushErr('paperCompetitionPenaltyPct', '<24h Competition Penalty (%) must be between 0% and 20%.');
+  }
+  if (merged.creatorHistoryEnabled) {
+    if (
+      optOn('maxCreatorLaunches') &&
+      (!Number.isFinite(merged.maxCreatorLaunches) || merged.maxCreatorLaunches < 0 || merged.maxCreatorLaunches > 500)
+    ) {
+      pushErr('maxCreatorLaunches', 'Max Owner Prior Launches must be between 0 and 500.');
+    }
+    if (
+      optOn('maxCreatorRuggedCoins') &&
+      (!Number.isFinite(merged.maxCreatorRuggedCoins) || merged.maxCreatorRuggedCoins < 0 || merged.maxCreatorRuggedCoins > 100)
+    ) {
+      pushErr('maxCreatorRuggedCoins', 'Max Owner Rugged Coins must be between 0 and 100.');
+    }
+    if (
+      optOn('creatorFastRugWindowMinutes') &&
+      (!Number.isFinite(merged.creatorFastRugWindowMinutes) ||
+        merged.creatorFastRugWindowMinutes < 0 ||
+        merged.creatorFastRugWindowMinutes > 10080)
+    ) {
+      pushErr('creatorFastRugWindowMinutes', 'Fast-Rug Speed Block Window must be between 0 and 10080 minutes.');
+    }
   }
   if (
     merged.enforceMinScores &&
@@ -462,24 +549,26 @@ export function validateSettingsUpdate(
   ) {
     pushErr('minTradeScore', 'Min Trade Score must be between 50 and 100.');
   }
-  if (!Array.isArray(merged.trailingLadder) || merged.trailingLadder.length === 0) {
-    pushErr('trailingEnabled', 'Stepped trailing ladder must contain at least one tier.');
-  } else {
-    merged.trailingLadder.forEach((tier, idx) => {
-      if (!Number.isFinite(tier.peakGainPct) || tier.peakGainPct <= 0) {
-        pushErr(`trailingLadder.${idx}.peakGainPct`, 'Peak % must be greater than 0%.');
-      }
-      if (
-        !Number.isFinite(tier.allowedDropPct) ||
-        tier.allowedDropPct <= 0 ||
-        (Number.isFinite(tier.peakGainPct) && tier.allowedDropPct >= tier.peakGainPct)
-      ) {
-        pushErr(
-          `trailingLadder.${idx}.allowedDropPct`,
-          `Allowed Drop % must be > 0 and less than Peak % (${Number.isFinite(tier.peakGainPct) ? tier.peakGainPct : 0}%).`
-        );
-      }
-    });
+  if (merged.trailingEnabled) {
+    if (!Array.isArray(merged.trailingLadder) || merged.trailingLadder.length === 0) {
+      pushErr('trailingEnabled', 'Stepped trailing ladder must contain at least one tier.');
+    } else {
+      merged.trailingLadder.forEach((tier, idx) => {
+        if (!Number.isFinite(tier.peakGainPct) || tier.peakGainPct <= 0) {
+          pushErr(`trailingLadder.${idx}.peakGainPct`, 'Peak % must be greater than 0%.');
+        }
+        if (
+          !Number.isFinite(tier.allowedDropPct) ||
+          tier.allowedDropPct <= 0 ||
+          (Number.isFinite(tier.peakGainPct) && tier.allowedDropPct >= tier.peakGainPct)
+        ) {
+          pushErr(
+            `trailingLadder.${idx}.allowedDropPct`,
+            `Allowed Drop % must be > 0 and less than Peak % (${Number.isFinite(tier.peakGainPct) ? tier.peakGainPct : 0}%).`
+          );
+        }
+      });
+    }
   }
 
   return { valid: errors.length === 0, errors, fieldErrors, merged };

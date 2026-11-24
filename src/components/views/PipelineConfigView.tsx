@@ -7,7 +7,13 @@ export function PipelineConfigView() {
   const { settings, apiFetch, hydrateAll, pushToast } = useBotStore();
 
   const [minLiquidity, setMinLiquidity] = useState(settings?.minLiquidityUsd ?? 25000);
+  const [minLiquidityEnabled, setMinLiquidityEnabled] = useState(
+    settings?.optionToggles?.minLiquidityUsd !== false
+  );
   const [minPoolAge, setMinPoolAge] = useState(settings?.minPoolAgeMinutes ?? 30);
+  const [minPoolAgeEnabled, setMinPoolAgeEnabled] = useState(
+    settings?.optionToggles?.minPoolAgeMinutes !== false
+  );
   const [maxTop10, setMaxTop10] = useState(settings?.maxTop10HoldersPct ?? 35);
   const [enforceTop10, setEnforceTop10] = useState(settings?.enforceMaxTop10Holders ?? true);
   const [minQuality, setMinQuality] = useState(settings?.minQualityScore ?? 60);
@@ -19,7 +25,9 @@ export function PipelineConfigView() {
   useEffect(() => {
     if (!settings) return;
     setMinLiquidity(settings.minLiquidityUsd);
+    setMinLiquidityEnabled(settings.optionToggles?.minLiquidityUsd !== false);
     setMinPoolAge(settings.minPoolAgeMinutes);
+    setMinPoolAgeEnabled(settings.optionToggles?.minPoolAgeMinutes !== false);
     setMaxTop10(settings.maxTop10HoldersPct);
     setEnforceTop10(settings.enforceMaxTop10Holders);
     setMinQuality(settings.minQualityScore);
@@ -43,6 +51,11 @@ export function PipelineConfigView() {
           minTradeScore: Number(minTrade),
           enforceMinScores: enforceScores,
           newLaunchOnlyEnabled: newLaunchOnly,
+          optionToggles: {
+            ...(settings?.optionToggles ?? {}),
+            minLiquidityUsd: minLiquidityEnabled,
+            minPoolAgeMinutes: minPoolAgeEnabled,
+          },
         }),
       });
       await hydrateAll();
@@ -68,7 +81,9 @@ export function PipelineConfigView() {
       const updated = useBotStore.getState().settings;
       if (updated) {
         setMinLiquidity(updated.minLiquidityUsd);
+        setMinLiquidityEnabled(updated.optionToggles?.minLiquidityUsd !== false);
         setMinPoolAge(updated.minPoolAgeMinutes);
+        setMinPoolAgeEnabled(updated.optionToggles?.minPoolAgeMinutes !== false);
         setMaxTop10(updated.maxTop10HoldersPct);
         setEnforceTop10(updated.enforceMaxTop10Holders);
         setMinQuality(updated.minQualityScore);
@@ -218,34 +233,76 @@ export function PipelineConfigView() {
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center">
-              Min Liquidity ($) · Unlimited
-              <InfoTooltip text="Minimum USD liquidity required in a pool before buying. Higher liquidity prevents extreme buy/sell slippage." />
+            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={minLiquidityEnabled}
+                  onChange={(e) => setMinLiquidityEnabled(e.target.checked)}
+                  className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                />
+                <span className={!minLiquidityEnabled ? 'line-through opacity-60' : ''}>
+                  Min Liquidity ($) · Unlimited
+                </span>
+                <InfoTooltip text="Minimum USD liquidity required in a pool before buying. Uncheck to disable minimum liquidity filtering." />
+              </span>
+              {!minLiquidityEnabled && (
+                <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                  OFF
+                </span>
+              )}
             </label>
             <input
               type="number"
               step="any"
               min="0"
+              disabled={!minLiquidityEnabled}
               value={minLiquidity}
               onChange={(e) => setMinLiquidity(Number(e.target.value))}
-              className="w-full px-3.5 py-2 rounded-xl font-mono text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+              className="w-full px-3.5 py-2 rounded-xl font-mono text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 disabled:opacity-40"
             />
-            <p className="text-[11px] text-slate-500">Any amount from $0 upwards.</p>
+            <p className="text-[11px] text-slate-500">
+              {minLiquidityEnabled ? 'Any amount from $0 upwards.' : 'Disabled — minimum liquidity filter ignored.'}
+            </p>
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center">
-              Default Min Pool Age (Minutes)
-              <InfoTooltip text="Minimum minutes a pool must exist before entry (used when Custom Age Window and New Launches Only are unchecked)." />
+            <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={minPoolAgeEnabled}
+                  onChange={(e) => setMinPoolAgeEnabled(e.target.checked)}
+                  className="rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                />
+                <span className={!minPoolAgeEnabled ? 'line-through opacity-60' : ''}>
+                  Default Min Pool Age (Minutes)
+                </span>
+                <InfoTooltip text="Minimum minutes a pool must exist before entry. Uncheck to ignore minimum age checks when Custom Age Window and New Launches Only are unchecked." />
+              </span>
+              {!minPoolAgeEnabled ? (
+                <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                  OFF
+                </span>
+              ) : Number(minPoolAge) >= 60 ? (
+                <span className="font-mono text-[11px] text-teal-600 dark:text-teal-400">
+                  = {(Number(minPoolAge) / 60).toFixed(1)}h
+                </span>
+              ) : null}
             </label>
             <input
               type="number"
               min="0"
+              disabled={!minPoolAgeEnabled}
               value={minPoolAge}
               onChange={(e) => setMinPoolAge(Number(e.target.value))}
-              className="w-full px-3.5 py-2 rounded-xl font-mono text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+              className="w-full px-3.5 py-2 rounded-xl font-mono text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 disabled:opacity-40"
             />
-            <p className="text-[11px] text-slate-500">Default 30m minimum (overridden if new launch mode active).</p>
+            <p className="text-[11px] text-slate-500">
+              {minPoolAgeEnabled
+                ? 'Default 30m minimum (overridden if new launch or custom age mode active).'
+                : 'Disabled — default pool age filter bypassed.'}
+            </p>
           </div>
 
           <div className="space-y-1.5">

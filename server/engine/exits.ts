@@ -126,6 +126,8 @@ export function evaluatePositionExit(
     };
   }
   if (
+    params.emergencyLiquidityFloorEnabled !== false &&
+    params.emergencyLiquidityFloorUsd > 0 &&
     telemetry.currentLiquidityUsd > 0 &&
     telemetry.currentLiquidityUsd < params.emergencyLiquidityFloorUsd
   ) {
@@ -189,7 +191,7 @@ export function evaluatePositionExit(
   }
 
   // 3. Take-profit
-  if (grossPnlPct + PNL_EPSILON >= params.takeProfitPct) {
+  if (params.takeProfitEnabled !== false && grossPnlPct + PNL_EPSILON >= params.takeProfitPct) {
     return {
       ...baseResult,
       shouldExit: true,

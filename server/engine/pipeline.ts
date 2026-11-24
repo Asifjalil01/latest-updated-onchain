@@ -32,6 +32,7 @@ import { calculatePositionSize } from './sizing';
 import { evaluatePositionExit, findSlotRotationCandidate } from './exits';
 import { executeRealisticPaperBuy, executeRealisticPaperSell } from './paperEngine';
 import { LiveExecutionEngine, type ExecutionProgressEvent } from './liveEngine';
+import { isOptionEnabled } from '../config/defaults';
 
 export interface ConnectedBrowserWallet {
   provider: 'phantom' | 'solflare' | 'watch_only' | 'none';
@@ -280,7 +281,9 @@ export class BotOrchestrator {
     const openPositions = this.db.getPositions(this.mode, false);
     const currentExposureSol = openPositions.reduce((sum, p) => sum + p.solIn, 0);
     const dailyRealizedPnlSol = this.db.getDailyRealizedPnlSol(this.mode);
-    const dailyLossLimitHit = dailyRealizedPnlSol <= -Math.abs(settings.dailyLossLimitSol);
+    const dailyLossLimitHit =
+      isOptionEnabled(settings, 'dailyLossLimitSol') &&
+      dailyRealizedPnlSol <= -Math.abs(settings.dailyLossLimitSol);
 
     return {
       mode: this.mode,
@@ -521,14 +524,19 @@ export class BotOrchestrator {
       };
     }
 
+    const probeTradeSizeSol = isOptionEnabled(settings, 'tradeSizeSol')
+      ? settings.tradeSizeSol
+      : Math.min(0.05, settings.maxPositionSizeSol || 0.05);
+    const probeSlippageBps = isOptionEnabled(settings, 'slippageBps') ? settings.slippageBps : 150;
+
     let buyImpactPct: number | null = null;
     if (solPrice && solPrice > 0) {
-      const lamports = String(Math.floor(settings.tradeSizeSol * LAMPORTS_PER_SOL));
+      const lamports = String(Math.floor(probeTradeSizeSol * LAMPORTS_PER_SOL));
       const quote = await this.jupiter.getQuote({
         inputMint: WSOL_MINT,
         outputMint: mint,
         amountRaw: lamports,
-        slippageBps: settings.slippageBps,
+        slippageBps: probeSlippageBps,
       });
       if (quote) {
         buyImpactPct = Math.abs(Number(quote.priceImpactPct || 0)) * 100;
@@ -538,13 +546,17 @@ export class BotOrchestrator {
     const filterResult = evaluateHardFilters(candidate, settings, buyImpactPct);
     const security = await runSecurityChecks({
       mint,
+      symbol: candidate.symbol,
       priceUsd: candidate.priceUsd,
       solPriceUsd: solPrice ?? 0,
-      testSizeSol: settings.tradeSizeSol,
+      testSizeSol: probeTradeSizeSol,
+      poolCreatedAtMs: candidate.poolCreatedAtMs,
       settings,
       rpcPool: this.rpcPool,
       rugCheckProvider: this.rugCheck,
       jupiterProvider: this.jupiter,
+      dexScreenerProvider: this.dexScreener,
+      db: this.db,
     });
 
     const explanation = scoreCandidate({
@@ -585,7 +597,11 @@ export class BotOrchestrator {
     try {
       const settings = this.db.getSettings();
       const openPositions = this.db.getPositions(this.mode, false);
-      if (openPositions.length >= settings.maxOpenPositions && !settings.allowSlotRotation) {
+      if (
+        isOptionEnabled(settings, 'maxOpenPositions') &&
+        openPositions.length >= settings.maxOpenPositions &&
+        !settings.allowSlotRotation
+      ) {
         this.log(
           'INFO',
           'SCAN',
@@ -703,7 +719,9 @@ export class BotOrchestrator {
           }
         } else {
           const ageMin = (nowMs - createdAt) / 60_000;
-          const targetMin = settings.customAgeWindowEnabled ? settings.customMinPoolAgeMinutes : 30;
+          const targetMin = settings.customAgeWindowEnabled
+            ? settings.customMinPoolAgeMinutes
+            : (isOptionEnabled(settings, 'minPoolAgeMinutes') ? settings.minPoolAgeMinutes : 0);
           const targetMax = settings.customAgeWindowEnabled ? settings.customMaxPoolAgeMinutes : 75;
           if (ageMin >= Math.max(0, targetMin - 1) && ageMin <= targetMax + 2) {
             mintsToEnrich.add(mint);
@@ -736,7 +754,7 @@ export class BotOrchestrator {
 
         // Exclude already held, in cooldown, previously attempted, or already traded
         if (this.db.getOpenPositionByMint(this.mode, candidate.mint)) continue;
-        if (this.db.isInCooldown(candidate.mint, this.mode)) continue;
+        if (isOptionEnabled(settings, 'cooldownMinutes') && this.db.isInCooldown(candidate.mint, this.mode)) continue;
         if (this.db.isMintAttempted(candidate.mint, this.mode)) continue;
         if (this.db.hasTradedMint(candidate.mint, this.mode)) continue;
 
@@ -767,12 +785,16 @@ export class BotOrchestrator {
         }
 
         // Planned quote price impact for Hard Filter (fail closed if quote unavailable)
-        const lamports = String(Math.floor(settings.tradeSizeSol * LAMPORTS_PER_SOL));
+        const effectiveTradeSizeSol = isOptionEnabled(settings, 'tradeSizeSol')
+          ? settings.tradeSizeSol
+          : Math.min(0.05, settings.maxPositionSizeSol || 0.05);
+        const effectiveSlippageBps = isOptionEnabled(settings, 'slippageBps') ? settings.slippageBps : 150;
+        const lamports = String(Math.floor(effectiveTradeSizeSol * LAMPORTS_PER_SOL));
         const buyQuote = await this.jupiter.getQuote({
           inputMint: WSOL_MINT,
           outputMint: candidate.mint,
           amountRaw: lamports,
-          slippageBps: settings.slippageBps,
+          slippageBps: effectiveSlippageBps,
         });
         const plannedImpactPct = buyQuote
           ? Math.abs(Number(buyQuote.priceImpactPct || 0)) * 100
@@ -796,13 +818,17 @@ export class BotOrchestrator {
         // Stage 4 & 5: SECURITY & SELL-ROUTE TEST
         const securityReport = await runSecurityChecks({
           mint: candidate.mint,
+          symbol: candidate.symbol,
           priceUsd: candidate.priceUsd,
           solPriceUsd,
-          testSizeSol: settings.tradeSizeSol,
+          testSizeSol: effectiveTradeSizeSol,
+          poolCreatedAtMs: candidate.poolCreatedAtMs,
           settings,
           rpcPool: this.rpcPool,
           rugCheckProvider: this.rugCheck,
           jupiterProvider: this.jupiter,
+          dexScreenerProvider: this.dexScreener,
+          db: this.db,
         });
 
         if (!securityReport.passed) {
@@ -866,7 +892,11 @@ export class BotOrchestrator {
         const dailyPnl = this.db.getDailyRealizedPnlSol(this.mode);
 
         // Optional slot rotation if at max positions
-        if (openPositions.length >= settings.maxOpenPositions && settings.allowSlotRotation) {
+        if (
+          isOptionEnabled(settings, 'maxOpenPositions') &&
+          openPositions.length >= settings.maxOpenPositions &&
+          settings.allowSlotRotation
+        ) {
           const rotTarget = findSlotRotationCandidate(
             openPositions,
             explanation.combinedScore,
@@ -943,7 +973,11 @@ export class BotOrchestrator {
             this.funnel.bought += 1;
             this.broadcast({ type: 'trade_event', data: { kind: 'BUY', position: res.position } });
             const latestOpenCount = this.db.getPositions(this.mode, false).length;
-            if (latestOpenCount >= settings.maxOpenPositions && !settings.allowSlotRotation) {
+            if (
+              isOptionEnabled(settings, 'maxOpenPositions') &&
+              latestOpenCount >= settings.maxOpenPositions &&
+              !settings.allowSlotRotation
+            ) {
               this.log(
                 'INFO',
                 'SCAN',
@@ -975,10 +1009,12 @@ export class BotOrchestrator {
             tokenDecimals: resolvedDecimals,
           };
           const autoPriority =
+            isOptionEnabled(settings, 'priorityFeePreset') &&
             settings.priorityFeePreset === 'auto' &&
             typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
               ? await this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
               : null;
+          const paperSlippageBps = isOptionEnabled(settings, 'slippageBps') ? settings.slippageBps : 150;
           const paperBuy = await executeRealisticPaperBuy({
             mode: this.mode,
             token: paperCandidate,
@@ -999,7 +1035,7 @@ export class BotOrchestrator {
                   inputMint: WSOL_MINT,
                   outputMint: candidate.mint,
                   amountRaw: String(Math.floor(sizing.solAmount * LAMPORTS_PER_SOL)),
-                  slippageBps: settings.slippageBps,
+                  slippageBps: paperSlippageBps,
                 });
                 return {
                   priceUsd: f?.priceUsd ?? candidate.priceUsd,
@@ -1037,7 +1073,7 @@ export class BotOrchestrator {
                 inputMint: WSOL_MINT,
                 outputMint: candidate.mint,
                 amountRaw: String(Math.floor(shadowSol * LAMPORTS_PER_SOL)),
-                slippageBps: settings.slippageBps,
+                slippageBps: paperSlippageBps,
               });
               if (shadowQuote) {
                 const inspection = await this.rpcPool.inspectTokenOnChain(candidate.mint);
@@ -1054,7 +1090,11 @@ export class BotOrchestrator {
             }
 
             const latestOpenCount = this.db.getPositions(this.mode, false).length;
-            if (latestOpenCount >= settings.maxOpenPositions && !settings.allowSlotRotation) {
+            if (
+              isOptionEnabled(settings, 'maxOpenPositions') &&
+              latestOpenCount >= settings.maxOpenPositions &&
+              !settings.allowSlotRotation
+            ) {
               this.log(
                 'INFO',
                 'SCAN',
@@ -1277,12 +1317,13 @@ export class BotOrchestrator {
           pos.quantity > 0
         ) {
           const rawUnits = Math.max(1, Math.floor(pos.quantity * 10 ** pos.decimals));
+          const verifySlippageBps = isOptionEnabled(settings, 'slippageBps') ? settings.slippageBps : 150;
           const sellQuote = await this.jupiter
             .getQuote({
               inputMint: pos.mint,
               outputMint: WSOL_MINT,
               amountRaw: String(rawUnits),
-              slippageBps: settings.slippageBps,
+              slippageBps: verifySlippageBps,
             })
             .catch(() => null);
           if (sellQuote && Number(sellQuote.outAmount) > 0) {
@@ -1406,6 +1447,14 @@ export class BotOrchestrator {
           liquiditySource2Usd: pos.currentLiquidityUsd,
         });
         if (res.ok && res.trade) {
+          if (
+            typeof this.db.markMintRuggedForCreator === 'function' &&
+            (reason === 'EMERGENCY_LIQUIDITY_DRAIN' ||
+              reason === 'EMERGENCY_LIQUIDITY_FLOOR' ||
+              reason === 'WRITE_OFF_UNSELLABLE')
+          ) {
+            this.db.markMintRuggedForCreator(pos.mint, reason);
+          }
           this.lastLiveBalanceSyncByPos.delete(positionId);
           this.broadcast({ type: 'trade_event', data: { kind: 'SELL', trade: res.trade } });
           this.broadcastStatus();
@@ -1424,10 +1473,12 @@ export class BotOrchestrator {
         : pos;
 
       const autoExitPriority =
+        isOptionEnabled(settings, 'priorityFeePreset') &&
         settings.priorityFeePreset === 'auto' &&
         typeof this.jupiter.estimateLivePriorityFeeSol === 'function'
           ? await this.jupiter.estimateLivePriorityFeeSol(this.rpcPool, settings.maxPriorityFeeSol)
           : null;
+      const exitSlippageBps = isOptionEnabled(settings, 'slippageBps') ? settings.slippageBps : 150;
 
       // Paper or Testnet simulated realistic exit
       const res = await executeRealisticPaperSell({
@@ -1449,7 +1500,7 @@ export class BotOrchestrator {
               inputMint: p.mint,
               outputMint: WSOL_MINT,
               amountRaw: String(rawUnits),
-              slippageBps: settings.slippageBps,
+              slippageBps: exitSlippageBps,
             });
             return {
               priceUsd: f?.priceUsd ?? p.currentPriceUsd,
@@ -1521,7 +1572,15 @@ export class BotOrchestrator {
       };
       this.db.upsertPosition(closedPos);
       this.db.insertTrade(res.trade);
-      this.db.setCooldown(pos.mint, pos.mode, settings.cooldownMinutes);
+      if (isOptionEnabled(settings, 'cooldownMinutes')) {
+        this.db.setCooldown(pos.mint, pos.mode, settings.cooldownMinutes);
+      }
+      if (
+        typeof this.db.markMintRuggedForCreator === 'function' &&
+        (reason === 'EMERGENCY_LIQUIDITY_DRAIN' || reason === 'EMERGENCY_LIQUIDITY_FLOOR')
+      ) {
+        this.db.markMintRuggedForCreator(pos.mint, reason);
+      }
 
       const curBal = this.db.getModeBalanceSol(pos.mode);
       this.db.setModeBalanceSol(pos.mode, curBal + res.solReturnedNet);

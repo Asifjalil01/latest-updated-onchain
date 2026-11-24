@@ -1,3 +1,4 @@
+import { isOptionEnabled } from '../config/defaults';
 import type {
   AnalyticsSummary,
   BotSettings,
@@ -15,6 +16,9 @@ export function resolvePriorityFeeSol(
   settings: BotSettings,
   liveAutoPriorityFeeSol?: number | null
 ): number {
+  if (!isOptionEnabled(settings, 'priorityFeePreset')) {
+    return 0;
+  }
   let raw = settings.customPriorityFeeSol;
   if (settings.priorityFeePreset === 'auto') {
     raw =
@@ -203,15 +207,20 @@ export function computeBreakEvenPrices(params: {
 
 export function snapshotExitParams(settings: BotSettings, roundTripCostPct: number): PositionExitSnapshot {
   const clampedSl = Math.max(0.5, settings.stopLossPct);
-  const clampedTp = Math.max(1.5, settings.takeProfitPct);
-  const effectiveEmergencyLiquidityFloorUsd =
-    settings.minLiquidityUsd < settings.emergencyLiquidityFloorUsd
+  const takeProfitEnabled = isOptionEnabled(settings, 'takeProfitPct');
+  const clampedTp = takeProfitEnabled ? Math.max(1.5, settings.takeProfitPct) : 0;
+  const emergencyLiquidityFloorEnabled = isOptionEnabled(settings, 'emergencyLiquidityFloorUsd');
+  const minLiqEnabled = isOptionEnabled(settings, 'minLiquidityUsd');
+  const effectiveEmergencyLiquidityFloorUsd = !emergencyLiquidityFloorEnabled
+    ? 0
+    : minLiqEnabled && settings.minLiquidityUsd < settings.emergencyLiquidityFloorUsd
       ? Math.min(settings.emergencyLiquidityFloorUsd, Math.max(0, settings.minLiquidityUsd * 0.5))
       : settings.emergencyLiquidityFloorUsd;
   return {
     stopLossEnabled: settings.stopLossEnabled,
     stopLossPct: clampedSl,
     stopLossTiers: (settings.stopLossTiers || []).map((t) => ({ ...t })),
+    takeProfitEnabled,
     takeProfitPct: clampedTp,
     trailingEnabled: settings.trailingEnabled,
     trailingLadder: settings.trailingLadder.map((t) => ({ ...t })),
@@ -219,6 +228,7 @@ export function snapshotExitParams(settings: BotSettings, roundTripCostPct: numb
     maxHoldMinutes: settings.maxHoldMinutes,
     maxHoldStagnationEnabled: settings.maxHoldStagnationEnabled,
     stagnationMinGainPct: settings.stagnationMinGainPct,
+    emergencyLiquidityFloorEnabled,
     emergencyLiquidityFloorUsd: effectiveEmergencyLiquidityFloorUsd,
     emergencyLiquidityDrainPct: settings.emergencyLiquidityDrainPct,
     emergencyMaxSellTaxPct: settings.emergencyMaxSellTaxPct,

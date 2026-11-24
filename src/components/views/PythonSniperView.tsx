@@ -34,6 +34,7 @@ import {
   orderLogsNewestFirst,
   formatBotUptime,
   formatTrailingModeHint,
+  isPyOptionEnabled,
   validatePythonSniperSettings,
   type EnrichedSniperTrade,
 } from '../../utils/sniperFormat';
@@ -107,6 +108,7 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['use_real_swap_quotes', 'Exit monitor: real Jupiter reverse swap quotes', 'bool'],
 
   // Entry Momentum & Liquidity Filters (Important)
+  ['min_age_minutes', 'Sniper window: min coin age (minutes)', 'float'],
   ['max_age_minutes', 'Sniper window: max coin age (minutes)', 'float'],
   ['min_liquidity_usd', 'Min liquidity $', 'float'],
   ['min_volume_m5_usd', 'Min 5-min volume $ (0 = off)', 'float'],
@@ -118,6 +120,10 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['use_rugcheck', 'Hard RugCheck (score + risks)', 'bool'],
   ['strict_rugcheck', 'Strict: reject ANY danger & missing reports', 'bool'],
   ['block_insider_bundles', 'Block bundled / insider RugCheck wallets', 'bool'],
+  ['check_creator_history', 'Owner / Creator History & Fast-Rug Check', 'bool'],
+  ['max_creator_launches', 'Max owner prior coins launched', 'int'],
+  ['max_creator_rugged_coins', 'Max owner prior rugged coins', 'int'],
+  ['creator_fast_rug_window_min', 'Fast rugpull block window (minutes)', 'int'],
   ['max_dev_hold_pct', 'Max creator/dev wallet holdings %', 'float'],
   ['rugcheck_max_score', 'Max RugCheck risk score (0-100)', 'float'],
   ['max_top10_holder_pct', 'Max top-10 non-pool holders %', 'float'],
@@ -126,34 +132,6 @@ const PYTHON_SETTINGS_METADATA: Array<[string, string, 'float' | 'int' | 'bool' 
   ['priority_fee_tier', 'Priority fee speed tier (live swaps)', 'tier'],
   ['jito_tip_sol', 'Optional Jito tip (SOL, 0 = off, e.g. 0.0001)', 'float'],
   ['custom_rpc_url', 'Private RPC URL (optional, Helius / QuickNode)', 'string'],
-
-  // --- Optional / Commented Settings (uncomment any line if needed later) ---
-  // ['auto_rug_exit', 'Auto emergency sell on LP drain (rug exit)', 'bool'],
-  // ['rug_liq_drop_pct', 'LP drain emergency sell trigger % (e.g. 50)', 'float'],
-  // ['require_lp_locked', 'Require LP burned/locked >= 80% (AMM pools)', 'bool'],
-  // ['start_balance_usd', 'Start balance $ (paper reset only)', 'float'],
-  // ['min_recent_buys_60s', 'Min buys in last 60s (PumpPortal stream)', 'int'],
-  // ['recover_principal_enabled', 'Recover investment at TP (sell % + trailing ladder)', 'bool'],
-  // ['recover_principal_sell_pct', 'Step 1: Sell % at TP to recover money (default 50)', 'float'],
-  // ['scale_out_sell_pct', 'Step 2: Sell % of remaining on extra pumps (0 = off)', 'float'],
-  // ['scale_out_step_gain_pct', 'Step 2: Extra pump step +% (e.g. 100 = every +100%)', 'float'],
-  // ['max_hold_minutes', 'Max hold (minutes)', 'int'],
-  // ['ultra_early_grace_sec', 'Ultra-early rug-filter bypass window (sec, 0 = strict)', 'int'],
-  // ['scan_interval_sec', 'Scan for new coins every (sec)', 'int'],
-  // ['rescan_delay_after_sell_sec', 'Delay before rescan after sell (sec)', 'int'],
-  // ['monitor_interval_sec', 'Price check every (sec)', 'float'],
-  // ['min_holders', 'Min buys in last 1h (0 = off, optional)', 'int'],
-  // ['rug_recheck_minutes', 'Recheck rug score every (min, optional)', 'int'],
-  // ['use_gecko', 'Source: GeckoTerminal new pools (all DEXes)', 'bool'],
-  // ['use_jupiter_recent', 'Source: Jupiter recent tokens', 'bool'],
-  // ['use_jupiter_price', 'Use Jupiter live prices', 'bool'],
-  // ['use_dex_profiles', 'Source: DexScreener token profiles', 'bool'],
-  // ['use_pumpportal', 'Source: PumpPortal new launches', 'bool'],
-  // ['use_promoted_feeds', 'Source: DexScreener boosted (not recommended)', 'bool'],
-  // ['fee_pct', 'Simulated fee % (paper only)', 'float'],
-  // ['log_rejects', 'Log filtered-out coins (debug, optional)', 'bool'],
-  // ['jupiter_api_key', 'Jupiter API Key (optional)', 'string'],
-  // ['python_binary_path', 'Python executable / path (auto, py, python, or full path to python.exe)', 'string'],
 ];
 
 const PYTHON_SETTING_NOTES: Record<string, string> = {
@@ -161,9 +139,12 @@ const PYTHON_SETTING_NOTES: Record<string, string> = {
   max_open_positions: 'Max coins held at the same time; scanning pauses when all slots are full.',
   daily_loss_limit_usd: 'Stops opening new buys for the day if realized daily loss reaches this $ cap.',
   take_profit_pct: 'Profit target %: sells directly if Trailing Stop is 0, or arms Trailing Stop when > 0.',
+  trailing_stop_pct: 'Trailing drawdown % below peak PnL after Take Profit arms trailing.',
+  stop_loss_pct: 'Max allowed loss % from entry before force-selling.',
   slippage_pct: 'Max swap price tolerance % for fills and sells; higher speeds up fills on volatile launches.',
   use_real_swap_quotes: 'Prices exits from live Jupiter token→SOL swap quotes instead of cached chart prices.',
-  max_age_minutes: 'Only buys brand-new coins launched within this many minutes; skips older tokens.',
+  min_age_minutes: 'Minimum coin age in minutes (e.g. 5m, 300m = 5h). Pair with Max coin age to trade a specific age gap.',
+  max_age_minutes: 'Maximum coin age in minutes (e.g. 2m for launches, 300m = 5h, 600m = 10h); skips older coins.',
   min_liquidity_usd: 'Minimum pool liquidity $ required before entry to avoid shallow illiquid traps.',
   min_volume_m5_usd: 'Minimum 5-minute trading volume $ to verify real active trader demand (0 = off).',
   min_buys_m5: 'Minimum number of buy swaps in the last 5 minutes required to enter.',
@@ -172,6 +153,10 @@ const PYTHON_SETTING_NOTES: Record<string, string> = {
   use_rugcheck: 'Runs on-chain RPC + RugCheck audit to block mintable, freezable, and Token-2022 scams.',
   strict_rugcheck: 'Fail-closed guard: rejects tokens with missing RugCheck/RPC reports or critical risk flags.',
   block_insider_bundles: 'Blocks bundled insider wallet clusters and tokens where the dev dumped during launch.',
+  check_creator_history: 'Inspects the owner/creator wallet before buying: total prior launches, rugged coins, and minutes-to-rug speed.',
+  max_creator_launches: 'Rejects coins whose creator wallet has launched more than this many prior tokens.',
+  max_creator_rugged_coins: 'Rejects coins whose creator wallet has more than this many prior rugged tokens.',
+  creator_fast_rug_window_min: 'Blocks creators who previously rugged a coin within this many minutes of its launch (0 = block any prior rug).',
   max_dev_hold_pct: 'Rejects launches where the creator wallet still holds more than this % of total supply.',
   rugcheck_max_score: 'Maximum allowed RugCheck risk score 0–100 (brand-new Solana launches baseline ~52).',
   max_top10_holder_pct: 'Caps combined % held by top-10 private wallets (excludes DEX pool and burn addresses).',
@@ -580,6 +565,22 @@ export function PythonSniperView() {
         const raw = draftSettings[mod.key];
         payload[mod.key] = raw === undefined ? mod.defaultValue : raw === true || raw === 'true';
       }
+      const nextOptionEnabled: Record<string, boolean> = {
+        min_age_minutes: false,
+        ...(draftSettings.option_enabled && typeof draftSettings.option_enabled === 'object'
+          ? draftSettings.option_enabled
+          : {}),
+      };
+      for (const [key, _, kind] of PYTHON_SETTINGS_METADATA) {
+        const defOn = key === 'min_age_minutes' ? false : true;
+        if (typeof nextOptionEnabled[key] !== 'boolean') {
+          nextOptionEnabled[key] = defOn;
+        }
+        if (kind === 'bool') {
+          nextOptionEnabled[key] = payload[key] === true && nextOptionEnabled[key] !== false;
+        }
+      }
+      payload.option_enabled = nextOptionEnabled;
       payload.enabled_platforms = Array.isArray(draftSettings.enabled_platforms)
         ? Array.from(
             new Set(
@@ -594,8 +595,8 @@ export function PythonSniperView() {
       if (!clientCheck.valid) {
         pushToast({
           kind: 'error',
-          title: 'Take Profit too low to recover investment',
-          body: clientCheck.error || 'Adjust Take profit % before saving.',
+          title: 'Invalid Python Sniper settings',
+          body: clientCheck.error || 'Adjust highlighted setting before saving.',
         });
         return;
       }
@@ -758,8 +759,10 @@ export function PythonSniperView() {
   const closedCount = state.closed || 0;
   const winsCount = state.wins || 0;
   const winRateText = closedCount > 0 ? `${((winsCount / closedCount) * 100).toFixed(0)}% (${winsCount}/${closedCount})` : 'no closed trades';
-  const maxSlots = Math.max(1, Number(serverSettings.max_open_positions || draftSettings.max_open_positions || 3));
-  const slotsFull = positionsList.length >= maxSlots || scanPaused;
+  const maxSlots = isPyOptionEnabled(serverSettings, 'max_open_positions', true)
+    ? Math.max(1, Number(serverSettings.max_open_positions || draftSettings.max_open_positions || 3))
+    : 0;
+  const slotsFull = (maxSlots > 0 && positionsList.length >= maxSlots) || scanPaused;
   const cooldownRemainingSec = Number(cooldownSec || state.cooldown_remaining_sec || 0);
 
   const isLiveMode = mode === 'live';
@@ -790,7 +793,8 @@ export function PythonSniperView() {
   const newestFirstLogs = orderLogsNewestFirst(logs);
   const draftValidation = validatePythonSniperSettings({ ...draftSettings, mode }, solPriceUsd);
   const recoverPrincipalOn =
-    draftSettings.recover_principal_enabled === true || draftSettings.recover_principal_enabled === 'true';
+    isPyOptionEnabled(draftSettings, 'recover_principal_enabled', true) &&
+    (draftSettings.recover_principal_enabled === true || draftSettings.recover_principal_enabled === 'true');
 
   let statusText = 'STOPPED';
   let statusBadgeClass = 'bg-slate-500/20 text-slate-500 dark:text-slate-400';
@@ -806,7 +810,9 @@ export function PythonSniperView() {
         priceAgeSec !== null && priceAgeSec <= 15
           ? `prices ${priceAgeSec.toFixed(1)}s ago`
           : 'updating prices';
-      statusText = `RUNNING · Slots Full (${positionsList.length}/${maxSlots}) · Scan Paused · ${priceHint}`;
+      statusText = maxSlots > 0
+        ? `RUNNING · Slots Full (${positionsList.length}/${maxSlots}) · Scan Paused · ${priceHint}`
+        : `RUNNING · Scan Paused · ${priceHint}`;
       statusBadgeClass = 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30';
       dotClass = 'bg-amber-500 animate-pulse';
     } else if (positionsList.length > 0) {
@@ -1311,7 +1317,7 @@ export function PythonSniperView() {
               </button>
             </div>
             <span className="text-slate-500 dark:text-slate-400 font-mono">
-              {positionsList.length} of {maxSlots} slots in use
+              {maxSlots > 0 ? `${positionsList.length} of ${maxSlots} slots in use` : `${positionsList.length} open (Slot limit OFF)`}
             </span>
           </div>
         </div>
@@ -1659,6 +1665,7 @@ export function PythonSniperView() {
                     rug_liq_drop_pct: 50,
                     slippage_pct: 3,
                     use_real_swap_quotes: true,
+                    min_age_minutes: 0,
                     max_age_minutes: 2,
                     ultra_early_grace_sec: 0,
                     min_liquidity_usd: 5000,
@@ -1671,6 +1678,10 @@ export function PythonSniperView() {
                     strict_rugcheck: true,
                     require_lp_locked: false,
                     block_insider_bundles: true,
+                    check_creator_history: true,
+                    max_creator_launches: 5,
+                    max_creator_rugged_coins: 0,
+                    creator_fast_rug_window_min: 60,
                     max_dev_hold_pct: 5,
                     rugcheck_max_score: 55,
                     max_top10_holder_pct: 35,
@@ -1685,6 +1696,9 @@ export function PythonSniperView() {
                     anti_rug_pool_depth_check_enabled: true,
                     anti_rug_sell_sim_enabled: false,
                     anti_rug_copycat_cooldown_enabled: true,
+                    option_enabled: {
+                      min_age_minutes: false,
+                    },
                     enabled_platforms: Array.isArray(draftSettings.enabled_platforms)
                       ? draftSettings.enabled_platforms
                       : [],
@@ -1755,134 +1769,220 @@ export function PythonSniperView() {
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 text-xs">
               {PYTHON_SETTINGS_METADATA.map(([key, label, kind]) => {
                 const val = draftSettings[key];
+                const defaultOptOn = key === 'min_age_minutes' ? false : true;
+                const rawOptToggle = isPyOptionEnabled(draftSettings, key, defaultOptOn);
+                const optEnabled =
+                  kind === 'bool'
+                    ? rawOptToggle && (val === undefined ? true : val === true || val === 'true')
+                    : rawOptToggle;
+                const toggleOption = (checked: boolean) => {
+                  const nextToggles = {
+                    ...(draftSettings.option_enabled && typeof draftSettings.option_enabled === 'object'
+                      ? draftSettings.option_enabled
+                      : {}),
+                    [key]: checked,
+                  };
+                  if (kind === 'bool') {
+                    setDraftSettings({
+                      ...draftSettings,
+                      [key]: checked,
+                      option_enabled: nextToggles,
+                    });
+                  } else {
+                    setDraftSettings({
+                      ...draftSettings,
+                      option_enabled: nextToggles,
+                    });
+                  }
+                  markSettingsDirty(true);
+                };
+
                 const isUsdField = USD_SETTING_KEYS.has(key);
                 const numericVal = parseFloat(String(val ?? ''));
                 const solEquivalent =
-                  isUsdField && !isNaN(numericVal) && solPriceUsd
+                  optEnabled && isUsdField && !isNaN(numericVal) && solPriceUsd
                     ? fmtSolAmount(usdToSol(numericVal, solPriceUsd))
                     : null;
+                const ageHoursHelper =
+                  optEnabled &&
+                  (key === 'min_age_minutes' || key === 'max_age_minutes' || key === 'creator_fast_rug_window_min') &&
+                  !isNaN(numericVal) &&
+                  numericVal >= 60
+                    ? `= ${(numericVal / 60).toFixed(1)}h`
+                    : null;
                 const timeHelper =
-                  key === 'rescan_delay_after_sell_sec'
+                  optEnabled && key === 'rescan_delay_after_sell_sec'
                     ? !isNaN(numericVal) && numericVal > 0
                       ? `≈ ${(numericVal / 60).toFixed(1)} min (${numericVal}s)`
                       : '0s (immediate)'
-                    : null;
+                    : ageHoursHelper;
                 const trailHelper =
                   key === 'trailing_stop_pct'
-                    ? formatTrailingModeHint(
-                        parseFloat(String(draftSettings.take_profit_pct ?? 0)) || 0,
-                        !isNaN(numericVal) ? numericVal : 0
-                      )
+                    ? optEnabled
+                      ? formatTrailingModeHint(
+                          isPyOptionEnabled(draftSettings, 'take_profit_pct', true)
+                            ? parseFloat(String(draftSettings.take_profit_pct ?? 0)) || 0
+                            : 0,
+                          !isNaN(numericVal) ? numericVal : 0
+                        )
+                      : 'Disabled — trailing stop rule ignored.'
                     : null;
                 const stopLossHelper =
                   key === 'stop_loss_pct'
-                    ? !isNaN(numericVal) && numericVal > 0
+                    ? optEnabled && !isNaN(numericVal) && numericVal > 0
                       ? `Force-sells if PnL drops to -${numericVal}% to cap downside loss.`
                       : 'Disabled — holds through dips (exits only on Take Profit / Trailing).'
                     : null;
-                const purposeNote = trailHelper || stopLossHelper || PYTHON_SETTING_NOTES[key] || null;
-                const isDynamicHint = Boolean(trailHelper || stopLossHelper);
+                const purposeNote = optEnabled
+                  ? trailHelper || stopLossHelper || PYTHON_SETTING_NOTES[key] || null
+                  : 'Disabled — bot ignores and skips this setting.';
+                const isDynamicHint = optEnabled && Boolean(trailHelper || stopLossHelper);
 
-                    const hasTpRecoveryError =
-                      key === 'take_profit_pct' && recoverPrincipalOn && !draftValidation.valid;
+                const hasTpRecoveryError =
+                  key === 'take_profit_pct' && recoverPrincipalOn && !draftValidation.valid;
 
-                    return (
-                      <div key={key} className="space-y-1">
-                        <div className="flex items-center justify-between gap-2">
-                          <label htmlFor={`py-set-${key}`} className="font-sans font-medium text-slate-700 dark:text-slate-300">
-                            {label}
-                          </label>
-                          {solEquivalent && (
-                            <span className="font-mono text-[11px] font-semibold text-teal-600 dark:text-teal-400 whitespace-nowrap">
-                              ≈ {solEquivalent}
-                            </span>
-                          )}
-                          {timeHelper && (
-                            <span className="font-mono text-[11px] font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap">
-                              {timeHelper}
-                            </span>
-                          )}
-                        </div>
-                        {kind === 'bool' ? (
-                          <select
-                            id={`py-set-${key}`}
-                            value={val === true || val === 'true' ? 'true' : 'false'}
-                            onChange={(e) => {
-                              setDraftSettings({ ...draftSettings, [key]: e.target.value === 'true' });
-                              markSettingsDirty(true);
-                            }}
-                            className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100"
-                          >
-                            <option value="true">True (Enabled)</option>
-                            <option value="false">False (Disabled)</option>
-                          </select>
-                        ) : kind === 'tier' ? (
-                          <select
-                            id={`py-set-${key}`}
-                            value={String(val || 'fast')}
-                            onChange={(e) => {
-                              setDraftSettings({ ...draftSettings, [key]: e.target.value });
-                              markSettingsDirty(true);
-                            }}
-                            className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100"
-                          >
-                            <option value="standard">Standard (auto)</option>
-                            <option value="fast">Fast (high priority)</option>
-                            <option value="turbo">Turbo (veryHigh + urgent exits)</option>
-                          </select>
-                        ) : (
-                          <input
-                            id={`py-set-${key}`}
-                            type={kind === 'int' || kind === 'float' ? 'number' : 'text'}
-                            step={kind === 'float' ? 'any' : '1'}
-                            value={val ?? ''}
-                            placeholder={key === 'custom_rpc_url' ? 'https://mainnet.helius-rpc.com/?api-key=...' : undefined}
-                            onChange={(e) => {
-                              setDraftSettings({ ...draftSettings, [key]: e.target.value });
-                              markSettingsDirty(true);
-                            }}
-                            className={`w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 ${
-                              hasTpRecoveryError
-                                ? 'border-rose-500 focus:ring-rose-500'
-                                : 'border-slate-200 dark:border-slate-800 focus:ring-teal-500'
-                            }`}
-                          />
+                return (
+                  <div
+                    key={key}
+                    className={`space-y-1.5 rounded-xl border p-2.5 transition-colors ${
+                      optEnabled
+                        ? 'border-slate-200/80 dark:border-slate-800/80 bg-white/40 dark:bg-slate-900/30'
+                        : 'border-slate-200/40 dark:border-slate-800/40 bg-slate-100/50 dark:bg-slate-900/15 opacity-75'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <input
+                          id={`py-opt-${key}`}
+                          type="checkbox"
+                          checked={optEnabled}
+                          onChange={(e) => toggleOption(e.target.checked)}
+                          aria-label={`Enable ${label}`}
+                          className="h-3.5 w-3.5 rounded border-slate-300 dark:border-slate-700 text-teal-600 focus:ring-teal-500 cursor-pointer shrink-0"
+                        />
+                        <label
+                          htmlFor={`py-set-${key}`}
+                          className={`font-sans font-medium text-slate-700 dark:text-slate-300 cursor-pointer truncate ${
+                            !optEnabled ? 'line-through opacity-60' : ''
+                          }`}
+                          title={label}
+                        >
+                          {label}
+                        </label>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {!optEnabled && (
+                          <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-mono font-bold text-slate-500">
+                            OFF
+                          </span>
                         )}
-                        {purposeNote && (
-                          <p
-                            className={`text-[11px] leading-snug ${
-                              isDynamicHint
-                                ? 'font-mono font-medium text-teal-600 dark:text-teal-400'
-                                : 'font-sans text-slate-500 dark:text-slate-400'
-                            }`}
-                          >
-                            {purposeNote}
-                          </p>
+                        {solEquivalent && (
+                          <span className="font-mono text-[11px] font-semibold text-teal-600 dark:text-teal-400 whitespace-nowrap">
+                            ≈ {solEquivalent}
+                          </span>
                         )}
-                        {hasTpRecoveryError && draftValidation.error && (
-                          <div className="p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-600 dark:text-rose-400 text-[11px] space-y-1.5">
-                            <p className="font-semibold leading-snug">{draftValidation.error}</p>
-                            {draftValidation.recovery && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setDraftSettings({
-                                    ...draftSettings,
-                                    take_profit_pct: draftValidation.recovery!.minTpPct,
-                                  });
-                                  markSettingsDirty(true);
-                                }}
-                                className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-mono font-bold text-[10px] transition-colors"
-                              >
-                                Set Take profit to +{draftValidation.recovery.minTpPct.toFixed(1)}%
-                              </button>
-                            )}
-                          </div>
+                        {timeHelper && (
+                          <span className="font-mono text-[11px] font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap">
+                            {timeHelper}
+                          </span>
                         )}
                       </div>
-                    );
-                  })}
-                </div>
+                    </div>
+                    {kind === 'bool' ? (
+                      <select
+                        id={`py-set-${key}`}
+                        disabled={!optEnabled}
+                        value={val === true || val === 'true' ? 'true' : 'false'}
+                        onChange={(e) => {
+                          const boolVal = e.target.value === 'true';
+                          setDraftSettings({
+                            ...draftSettings,
+                            [key]: boolVal,
+                            option_enabled: {
+                              ...(draftSettings.option_enabled && typeof draftSettings.option_enabled === 'object'
+                                ? draftSettings.option_enabled
+                                : {}),
+                              [key]: boolVal,
+                            },
+                          });
+                          markSettingsDirty(true);
+                        }}
+                        className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100 disabled:opacity-40"
+                      >
+                        <option value="true">True (Enabled)</option>
+                        <option value="false">False (Disabled)</option>
+                      </select>
+                    ) : kind === 'tier' ? (
+                      <select
+                        id={`py-set-${key}`}
+                        disabled={!optEnabled}
+                        value={String(val || 'fast')}
+                        onChange={(e) => {
+                          setDraftSettings({ ...draftSettings, [key]: e.target.value });
+                          markSettingsDirty(true);
+                        }}
+                        className="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 font-mono text-slate-900 dark:text-slate-100 disabled:opacity-40"
+                      >
+                        <option value="standard">Standard (auto)</option>
+                        <option value="fast">Fast (high priority)</option>
+                        <option value="turbo">Turbo (veryHigh + urgent exits)</option>
+                      </select>
+                    ) : (
+                      <input
+                        id={`py-set-${key}`}
+                        type={kind === 'int' || kind === 'float' ? 'number' : 'text'}
+                        step={kind === 'float' ? 'any' : '1'}
+                        disabled={!optEnabled}
+                        value={val ?? ''}
+                        placeholder={key === 'custom_rpc_url' ? 'https://mainnet.helius-rpc.com/?api-key=...' : undefined}
+                        onChange={(e) => {
+                          setDraftSettings({ ...draftSettings, [key]: e.target.value });
+                          markSettingsDirty(true);
+                        }}
+                        className={`w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-900 border font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 disabled:opacity-40 ${
+                          hasTpRecoveryError
+                            ? 'border-rose-500 focus:ring-rose-500'
+                            : 'border-slate-200 dark:border-slate-800 focus:ring-teal-500'
+                        }`}
+                      />
+                    )}
+                    {purposeNote && (
+                      <p
+                        className={`text-[11px] leading-snug ${
+                          !optEnabled
+                            ? 'font-sans text-slate-400 italic'
+                            : isDynamicHint
+                              ? 'font-mono font-medium text-teal-600 dark:text-teal-400'
+                              : 'font-sans text-slate-500 dark:text-slate-400'
+                        }`}
+                      >
+                        {purposeNote}
+                      </p>
+                    )}
+                    {hasTpRecoveryError && draftValidation.error && (
+                      <div className="p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-600 dark:text-rose-400 text-[11px] space-y-1.5">
+                        <p className="font-semibold leading-snug">{draftValidation.error}</p>
+                        {draftValidation.recovery && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDraftSettings({
+                                ...draftSettings,
+                                take_profit_pct: draftValidation.recovery!.minTpPct,
+                              });
+                              markSettingsDirty(true);
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-mono font-bold text-[10px] transition-colors"
+                          >
+                            Set Take profit to +{draftValidation.recovery.minTpPct.toFixed(1)}%
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
 
                 {(() => {
                   const selectedWebsites: string[] = Array.isArray(draftSettings.enabled_platforms)
@@ -2242,17 +2342,23 @@ export function PythonSniperView() {
                   </div>
                 )}
 
+                {!draftValidation.valid && !recoverPrincipalOn && draftValidation.error && (
+                  <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-xs text-rose-600 dark:text-rose-400 font-semibold">
+                    {draftValidation.error}
+                  </div>
+                )}
+
                 <div className="pt-4 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
-                  <span className={`text-xs ${recoverPrincipalOn && !draftValidation.valid ? 'text-rose-500 font-semibold' : 'text-slate-500'}`}>
-                    {recoverPrincipalOn && !draftValidation.valid
-                      ? 'Fix Take profit % above to recover your invested money before saving or starting.'
+                  <span className={`text-xs ${!draftValidation.valid ? 'text-rose-500 font-semibold' : 'text-slate-500'}`}>
+                    {!draftValidation.valid
+                      ? draftValidation.error || 'Fix highlighted settings before saving.'
                       : isSettingsDirty
                         ? 'You have unsaved changes. Click Apply to save.'
                         : 'Settings are synced with settings.json.'}
                   </span>
                   <button
                     type="submit"
-                    disabled={recoverPrincipalOn && !draftValidation.valid}
+                    disabled={!draftValidation.valid}
                     className="px-6 py-2.5 rounded-xl text-xs font-semibold bg-teal-600 hover:bg-teal-500 disabled:bg-slate-400 disabled:cursor-not-allowed text-white transition-colors shadow-sm"
                   >
                     Apply and Save Python Settings

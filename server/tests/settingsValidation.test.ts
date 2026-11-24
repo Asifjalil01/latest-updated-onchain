@@ -85,3 +85,43 @@ test('settingsValidation: accepts 90% SL with 25% TP and highlights specific inv
   assert.match(invalidCase.fieldErrors['trailingLadder.0.allowedDropPct'], /less than Peak %/);
   assert.match(invalidCase.fieldErrors.customMaxPoolAgeMinutes, />= Min Coin Age/);
 });
+
+test('v1.37.0: optionToggles skip validation for unchecked rules and validate creator history bounds when enabled', () => {
+  const skippedWhenUnchecked = validateSettingsDraft({
+    ...DEFAULT_SETTINGS,
+    tradeSizeSol: 0,
+    takeProfitPct: 0,
+    maxOpenPositions: 0,
+    dailyLossLimitSol: 0,
+    minLiquidityUsd: -50,
+    minPoolAgeMinutes: 0,
+    maxCreatorLaunches: -5,
+    optionToggles: {
+      tradeSizeSol: false,
+      takeProfitPct: false,
+      maxOpenPositions: false,
+      dailyLossLimitSol: false,
+      minLiquidityUsd: false,
+      minPoolAgeMinutes: false,
+      maxCreatorLaunches: false,
+    },
+  });
+  assert.equal(
+    skippedWhenUnchecked.valid,
+    true,
+    `Expected disabled fields to skip validation, got: ${skippedWhenUnchecked.errors.join('; ')}`
+  );
+
+  const invalidCreatorBounds = validateSettingsDraft({
+    ...DEFAULT_SETTINGS,
+    creatorHistoryEnabled: true,
+    maxCreatorLaunches: -1,
+    maxCreatorRuggedCoins: 150,
+    creatorFastRugWindowMinutes: -10,
+  });
+  assert.equal(invalidCreatorBounds.valid, false);
+  assert.ok(invalidCreatorBounds.fieldErrors.maxCreatorLaunches);
+  assert.ok(invalidCreatorBounds.fieldErrors.maxCreatorRuggedCoins);
+  assert.ok(invalidCreatorBounds.fieldErrors.creatorFastRugWindowMinutes);
+});
+

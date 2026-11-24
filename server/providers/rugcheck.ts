@@ -30,11 +30,25 @@ export interface RugCheckApiReport {
   }>;
   knownAccounts?: Record<string, { name?: string; type?: string }>;
   creator?: string;
+  creatorTokens?: Array<{
+    mint?: string;
+    createdAt?: string | number;
+    marketCap?: number;
+    rugged?: boolean;
+  }>;
+  detectedAt?: string | number;
   tokenMeta?: {
     mutable?: boolean;
   };
   freezeAuthority?: string | null;
   mintAuthority?: string | null;
+}
+
+export interface RugCheckCreatorTokenInfo {
+  mint: string;
+  createdAtMs: number | null;
+  marketCap: number | null;
+  rugged: boolean;
 }
 
 export interface NormalizedRugCheckResult {
@@ -45,6 +59,8 @@ export interface NormalizedRugCheckResult {
   riskNames: string[];
   criticalRisks: string[];
   creator: string | null;
+  creatorTokens?: RugCheckCreatorTokenInfo[];
+  detectedAtMs?: number | null;
   holders?: HolderAccountInfo[];
   top10HoldersPct?: number | null;
   singleMaxHolderPct?: number | null;
@@ -138,6 +154,32 @@ export class RugCheckProvider {
         .filter((r) => (r.level || '').toLowerCase() === 'danger' || (r.level || '').toLowerCase() === 'critical')
         .map((r) => r.name || r.description || 'Critical risk');
 
+      const creatorTokens: RugCheckCreatorTokenInfo[] = [];
+      for (const ct of data.creatorTokens ?? []) {
+        if (!ct?.mint) continue;
+        let createdAtMs: number | null = null;
+        if (typeof ct.createdAt === 'number' && Number.isFinite(ct.createdAt)) {
+          createdAtMs = ct.createdAt > 1e12 ? ct.createdAt : ct.createdAt * 1000;
+        } else if (typeof ct.createdAt === 'string' && ct.createdAt.trim()) {
+          const parsedTs = Date.parse(ct.createdAt);
+          if (Number.isFinite(parsedTs)) createdAtMs = parsedTs;
+        }
+        creatorTokens.push({
+          mint: String(ct.mint),
+          createdAtMs,
+          marketCap: typeof ct.marketCap === 'number' ? ct.marketCap : null,
+          rugged: Boolean(ct.rugged),
+        });
+      }
+
+      let detectedAtMs: number | null = null;
+      if (typeof data.detectedAt === 'number' && Number.isFinite(data.detectedAt)) {
+        detectedAtMs = data.detectedAt > 1e12 ? data.detectedAt : data.detectedAt * 1000;
+      } else if (typeof data.detectedAt === 'string' && data.detectedAt.trim()) {
+        const parsedTs = Date.parse(data.detectedAt);
+        if (Number.isFinite(parsedTs)) detectedAtMs = parsedTs;
+      }
+
       this.http.recordItems(1);
       return {
         available: true,
@@ -147,6 +189,8 @@ export class RugCheckProvider {
         riskNames,
         criticalRisks,
         creator: data.creator ?? null,
+        creatorTokens,
+        detectedAtMs,
         holders,
         top10HoldersPct,
         singleMaxHolderPct,

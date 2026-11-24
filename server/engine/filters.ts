@@ -1,4 +1,4 @@
-import { DEFAULT_SETTINGS } from '../config/defaults';
+import { DEFAULT_SETTINGS, isOptionEnabled } from '../config/defaults';
 import type { BotSettings, CandidateToken, HardFilterResult } from '../types';
 
 export function validateCandidateData(
@@ -11,7 +11,8 @@ export function validateCandidateData(
   if (!Number.isFinite(token.priceUsd) || token.priceUsd <= 0) {
     return { valid: false, reason: 'Missing or non-positive USD price' };
   }
-  const allowZeroLiquidity = settings.minLiquidityUsd <= 0;
+  const minLiqEnabled = isOptionEnabled(settings, 'minLiquidityUsd');
+  const allowZeroLiquidity = !minLiqEnabled || settings.minLiquidityUsd <= 0;
   if (
     !Number.isFinite(token.liquidityUsd) ||
     (allowZeroLiquidity ? token.liquidityUsd < 0 : token.liquidityUsd <= 0)
@@ -26,7 +27,8 @@ export function validateCandidateData(
   }
   const allowMissingPriceChange =
     settings.newLaunchOnlyEnabled ||
-    (settings.customAgeWindowEnabled && settings.customMaxPoolAgeMinutes <= 30);
+    (settings.customAgeWindowEnabled && settings.customMaxPoolAgeMinutes <= 30) ||
+    (!settings.customAgeWindowEnabled && !isOptionEnabled(settings, 'minPoolAgeMinutes'));
   if (
     !allowMissingPriceChange &&
     (!Number.isFinite(token.priceChange1hPct) || !Number.isFinite(token.priceChange24hPct))
@@ -79,11 +81,13 @@ export function evaluateHardFilters(
       );
     }
   } else {
-    const effectiveMinAge = Math.max(30, settings.minPoolAgeMinutes);
-    if (!Number.isFinite(poolAgeMinutes) || poolAgeMinutes < effectiveMinAge) {
-      reasons.push(
-        `Pool age ${Math.max(0, poolAgeMinutes).toFixed(1)}m is below ${effectiveMinAge}m minimum`
-      );
+    if (isOptionEnabled(settings, 'minPoolAgeMinutes')) {
+      const effectiveMinAge = Math.max(30, settings.minPoolAgeMinutes);
+      if (!Number.isFinite(poolAgeMinutes) || poolAgeMinutes < effectiveMinAge) {
+        reasons.push(
+          `Pool age ${Math.max(0, poolAgeMinutes).toFixed(1)}m is below ${effectiveMinAge}m minimum`
+        );
+      }
     }
     if (poolAgeDays > settings.maxPoolAgeDays) {
       reasons.push(`Pool age ${poolAgeDays.toFixed(1)}d exceeds ${settings.maxPoolAgeDays}d maximum`);
@@ -91,17 +95,20 @@ export function evaluateHardFilters(
   }
 
   // 2. Liquidity, volume, tx count, unique traders
+  const minLiqEnabled = isOptionEnabled(settings, 'minLiquidityUsd');
+  const effectiveMinLiquidityUsd = minLiqEnabled ? settings.minLiquidityUsd : 0;
   const isNewLaunchMode = settings.newLaunchOnlyEnabled;
   const isCustomMicroWindow =
     isNewLaunchMode ||
+    !isOptionEnabled(settings, 'minPoolAgeMinutes') ||
     (settings.customAgeWindowEnabled &&
-      (settings.customMaxPoolAgeMinutes <= 60 || settings.minLiquidityUsd < 10_000));
-  const isMicroLiquidityOverride = !isCustomMicroWindow && settings.minLiquidityUsd < 10_000;
+      (settings.customMaxPoolAgeMinutes <= 60 || effectiveMinLiquidityUsd < 10_000));
+  const isMicroLiquidityOverride = !isCustomMicroWindow && effectiveMinLiquidityUsd < 10_000;
 
   const effectiveMinVolume24hUsd = isNewLaunchMode
     ? 0
     : isCustomMicroWindow || isMicroLiquidityOverride
-      ? Math.min(settings.minVolume24hUsd, Math.max(0, settings.minLiquidityUsd))
+      ? Math.min(settings.minVolume24hUsd, Math.max(0, effectiveMinLiquidityUsd))
       : settings.minVolume24hUsd;
   const effectiveMinTx24h = isNewLaunchMode
     ? 0
@@ -114,9 +121,9 @@ export function evaluateHardFilters(
       ? Math.min(settings.minUniqueTraders24h, 3)
       : settings.minUniqueTraders24h;
 
-  if (token.liquidityUsd < settings.minLiquidityUsd) {
+  if (minLiqEnabled && token.liquidityUsd < effectiveMinLiquidityUsd) {
     reasons.push(
-      `Liquidity $${token.liquidityUsd.toLocaleString()} < $${settings.minLiquidityUsd.toLocaleString()} floor`
+      `Liquidity $${token.liquidityUsd.toLocaleString()} < $${effectiveMinLiquidityUsd.toLocaleString()} floor`
     );
   }
   if (token.volume24hUsd < effectiveMinVolume24hUsd) {
@@ -161,7 +168,7 @@ export function evaluateHardFilters(
   const effectiveMaxPlannedPriceImpactPct = isNewLaunchMode
     ? Math.max(settings.maxPlannedPriceImpactPct, 12.0)
     : isCustomMicroWindow || isMicroLiquidityOverride
-      ? settings.minLiquidityUsd < 2_500
+      ? effectiveMinLiquidityUsd < 2_500
         ? Math.max(settings.maxPlannedPriceImpactPct, 8.0)
         : Math.max(settings.maxPlannedPriceImpactPct, 4.0)
       : settings.maxPlannedPriceImpactPct;

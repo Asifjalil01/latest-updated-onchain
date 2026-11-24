@@ -2,6 +2,27 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.37.0 — Per-Option Enable/Disable Checkboxes (Both Bots), Owner/Creator Rugpull Speed History & Python Sniper Min–Max Coin Age Gap (`SettingsView.tsx`, `PipelineConfigView.tsx`, `PythonSniperView.tsx`, `bot.py`, `creatorHistory.ts`, `security.ts`, `pipeline.ts`, `db.ts`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Per-Option Enable/Disable Checkboxes on BOTH Bots (`SettingsView.tsx`, `PipelineConfigView.tsx`, `PythonSniperView.tsx`, `defaults.ts`, `sniperManager.ts`, `bot.py`)**:
+  - Every configurable setting on both the **Solana Spot Bot** (`optionToggles` across Sizing, Hard Filters, Creator History, Exit Rules, Paper Simulation Realism, Priority Fees, and Pipeline Rules) and **Python New-Launch Sniper Bot** (`option_enabled` across Sizing, Exits, Age Windows, Entry Filters, Anti-Rug, Creator History, Priority/Jito/RPC) now has an explicit enable/disable checkbox.
+  - **Checked**: The setting is active, validated, and enforced during scanning, filtering, sizing, buying, and selling.
+  - **Unchecked**: The input dims with an `OFF` badge, validation skips disabled bounds, and both bots completely ignore and bypass that rule.
+- **Owner / Creator Launch Count & Rugpull Speed Check on BOTH Bots (`creatorHistory.ts`, `security.ts`, `db.ts`, `pipeline.ts`, `liveEngine.ts`, `bot.py`, `sniperManager.ts`)**:
+  - Added real on-chain + RugCheck creator resolution and persistent deployer tracking (`creator_history` SQLite table for Spot Bot; `creator_history.json` for Python Sniper Bot):
+    - **Check Toggle (`creatorHistoryEnabled` / `check_creator_history`)**: Enable or disable creator history inspection.
+    - **Max Owner Prior Coins Launched (`maxCreatorLaunches` / `max_creator_launches`)**: Rejects tokens from serial deployer wallets above your cap.
+    - **Max Owner Prior Rugged Coins (`maxCreatorRuggedCoins` / `max_creator_rugged_coins`)**: Rejects creators with prior rugged or LP-drained launches above your limit.
+    - **Fast Rugpull Block Window (`creatorFastRugWindowMinutes` / `creator_fast_rug_window_min`)**: Tracks how many minutes after launch a creator pulled the rug and blocks repeat fast-ruggers automatically. Both bots also automatically flag creators when positions are written off (`rugpull_writeoff`) or drained (`EMERGENCY_LIQUIDITY_DRAIN` / `rug_liquidity_drop`).
+- **Python Sniper Bot Min–Max Coin Age Gap (`min_age_minutes` + `max_age_minutes` & Hours Helper) (`bot.py`, `settings.json`, `sniperFormat.ts`, `PythonSniperView.tsx`)**:
+  - Added **Sniper window: min coin age (minutes)** (`min_age_minutes`, unchecked by default) right alongside **max coin age (minutes)** so you can specify an exact coin age window (e.g., `5m` to `300m` / `600m` [5h–10h]), complete with `= X.Xh` hours helper badges in the UI and client/server validation ensuring `min_age_minutes <= max_age_minutes`.
+  - Updated `bot.py` scanner discovery to also fetch multi-hour pools (`trending_pools`, paginated `pools`, and age-gap DexScreener queries) when targeting older windows, and ensured `"too young"` coins are never blacklisted in `_too_old_mints` so they remain eligible once they mature into your age gap.
+
+---
+
 ## v1.36.0 — Axiom.trade Pulse Migrated Coins Exclusive Filter (`PythonSniperView.tsx`, `bot.py`, `settings.json`, `sniperManager.ts`)
 
 **Risk Warning: Trading can lose all of your money.**

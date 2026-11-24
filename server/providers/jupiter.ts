@@ -381,7 +381,8 @@ export class JupiterProvider {
         jitoTipLamports: Math.max(1000, Math.round(params.jitoTipLamports)),
       };
     } else if (typeof params.priorityFeeLamports === 'number') {
-      prioritizationFeeLamports = Math.max(1000, Math.round(params.priorityFeeLamports));
+      prioritizationFeeLamports =
+        params.priorityFeeLamports <= 0 ? 0 : Math.max(1000, Math.round(params.priorityFeeLamports));
     } else if (params.priorityLevel) {
       prioritizationFeeLamports = {
         priorityLevelWithMaxLamports: {

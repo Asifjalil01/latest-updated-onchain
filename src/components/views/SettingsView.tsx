@@ -97,6 +97,23 @@ export function SettingsView() {
     }, 30);
   };
 
+  const isOptEnabled = (key: string) => draft.optionToggles?.[key] !== false;
+
+  const setOptEnabled = (key: string, enabled: boolean, ...errorKeysToClear: string[]) => {
+    setDraft((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        optionToggles: {
+          ...(prev.optionToggles ?? {}),
+          [key]: enabled,
+        },
+      };
+    });
+    setValidationError(null);
+    clearFieldError(key, ...errorKeysToClear);
+  };
+
   const updateField = <K extends keyof BotSettings>(key: K, value: BotSettings[K]) => {
     setDraft((prev) => {
       if (!prev) return prev;
@@ -321,7 +338,10 @@ export function SettingsView() {
     'minLiquidityUsd',
     'maxTop10HoldersPct',
     'minQualityScore',
-    'minTradeScore'
+    'minTradeScore',
+    'maxCreatorLaunches',
+    'maxCreatorRuggedCoins',
+    'creatorFastRugWindowMinutes'
   );
   const exitsHasError = hasErrorPrefix(
     'takeProfitPct',
@@ -465,141 +485,198 @@ export function SettingsView() {
               </div>
             )}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-              <label className="space-y-1">
-                <span className="text-slate-500 flex items-center justify-between">
-                  <HoverTip text="Base SOL amount allocated per buy (scaled by token class: bluechip 1.0x, mid-cap 0.9x, early-stage 0.7x, meme 0.4x).">
-                    <span className="cursor-help">Trade Size (SOL)</span>
-                  </HoverTip>
-                  <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
-                    ≈ ${safeFixed((Number.isFinite(draft.tradeSizeSol) ? draft.tradeSizeSol : 0) * solUsd)} USD
-                  </span>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('tradeSizeSol')}
+                      onChange={(e) => setOptEnabled('tradeSizeSol', e.target.checked, 'tradeSizeSol')}
+                    />
+                    <HoverTip text="Base SOL amount allocated per buy (scaled by token class). Uncheck to ignore custom trade size and use default safe minimum.">
+                      <span className={`cursor-help ${!isOptEnabled('tradeSizeSol') ? 'line-through opacity-60' : ''}`}>
+                        Trade Size (SOL)
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('tradeSizeSol') ? (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  ) : (
+                    <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
+                      ≈ ${safeFixed((Number.isFinite(draft.tradeSizeSol) ? draft.tradeSizeSol : 0) * solUsd)} USD
+                    </span>
+                  )}
                 </span>
                 <input
                   type="number"
                   step="0.005"
+                  disabled={!isOptEnabled('tradeSizeSol')}
                   data-field-key="tradeSizeSol"
+                  aria-label="Trade Size (SOL)"
                   value={inputValue(draft.tradeSizeSol)}
                   onChange={(e) => updateField('tradeSizeSol', parseNumInput(e.target.value))}
-                  className={inputClass('tradeSizeSol')}
+                  className={inputClass('tradeSizeSol', 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40')}
                 />
                 <FieldErrorPopup
                   message={fieldErrors.tradeSizeSol}
                   onDismiss={() => clearFieldError('tradeSizeSol')}
                 />
-              </label>
+              </div>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 flex items-center justify-between">
-                  <HoverTip text="Maximum total SOL allowed across all open positions combined. New buys are blocked once exposure reaches this cap.">
-                    <span className="cursor-help">Max Wallet Exposure (SOL)</span>
-                  </HoverTip>
-                  <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
-                    ≈ ${safeFixed((Number.isFinite(draft.maxWalletExposureSol) ? draft.maxWalletExposureSol : 0) * solUsd)} USD
-                  </span>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('maxWalletExposureSol')}
+                      onChange={(e) => setOptEnabled('maxWalletExposureSol', e.target.checked, 'maxWalletExposureSol', 'tradeSizeSol')}
+                    />
+                    <HoverTip text="Maximum total SOL allowed across all open positions combined. Uncheck to disable this cap.">
+                      <span className={`cursor-help ${!isOptEnabled('maxWalletExposureSol') ? 'line-through opacity-60' : ''}`}>
+                        Max Wallet Exposure (SOL)
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('maxWalletExposureSol') ? (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  ) : (
+                    <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
+                      ≈ ${safeFixed((Number.isFinite(draft.maxWalletExposureSol) ? draft.maxWalletExposureSol : 0) * solUsd)} USD
+                    </span>
+                  )}
                 </span>
                 <input
                   type="number"
                   step="0.01"
+                  disabled={!isOptEnabled('maxWalletExposureSol')}
                   data-field-key="maxWalletExposureSol"
+                  aria-label="Max Wallet Exposure (SOL)"
                   value={inputValue(draft.maxWalletExposureSol)}
                   onChange={(e) => updateField('maxWalletExposureSol', parseNumInput(e.target.value))}
-                  className={inputClass('maxWalletExposureSol')}
+                  className={inputClass('maxWalletExposureSol', 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40')}
                 />
                 <FieldErrorPopup
                   message={fieldErrors.maxWalletExposureSol}
                   onDismiss={() => clearFieldError('maxWalletExposureSol')}
                 />
-              </label>
+              </div>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 flex items-center justify-between">
-                  <HoverTip text="Circuit-breaker cap: if net realized losses today reach this SOL amount, the bot halts all new buys until the next UTC day.">
-                    <span className="cursor-help">Daily Loss Limit (SOL)</span>
-                  </HoverTip>
-                  <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
-                    ≈ ${safeFixed((Number.isFinite(draft.dailyLossLimitSol) ? draft.dailyLossLimitSol : 0) * solUsd)} USD
-                  </span>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('dailyLossLimitSol')}
+                      onChange={(e) => setOptEnabled('dailyLossLimitSol', e.target.checked, 'dailyLossLimitSol')}
+                    />
+                    <HoverTip text="Circuit-breaker cap: if net realized losses today reach this SOL amount, the bot halts all new buys until tomorrow. Uncheck to disable.">
+                      <span className={`cursor-help ${!isOptEnabled('dailyLossLimitSol') ? 'line-through opacity-60' : ''}`}>
+                        Daily Loss Limit (SOL)
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('dailyLossLimitSol') ? (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  ) : (
+                    <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
+                      ≈ ${safeFixed((Number.isFinite(draft.dailyLossLimitSol) ? draft.dailyLossLimitSol : 0) * solUsd)} USD
+                    </span>
+                  )}
                 </span>
                 <input
                   type="number"
                   step="0.01"
+                  disabled={!isOptEnabled('dailyLossLimitSol')}
                   data-field-key="dailyLossLimitSol"
+                  aria-label="Daily Loss Limit (SOL)"
                   value={inputValue(draft.dailyLossLimitSol)}
                   onChange={(e) => updateField('dailyLossLimitSol', parseNumInput(e.target.value))}
-                  className={inputClass('dailyLossLimitSol')}
+                  className={inputClass('dailyLossLimitSol', 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40')}
                 />
                 <FieldErrorPopup
                   message={fieldErrors.dailyLossLimitSol}
                   onDismiss={() => clearFieldError('dailyLossLimitSol')}
                 />
-              </label>
+              </div>
 
-              {/* Gas Reserve (SOL) field commented out per user request:
-              <label className="space-y-1">
-                <span className="text-slate-500 flex items-center justify-between">
-                  <HoverTip text="Minimum SOL always left untouched in your wallet so stop-losses and emergency exits always have enough gas to execute.">
-                    <span className="cursor-help">Gas Reserve (SOL)</span>
-                  </HoverTip>
-                  <span className="font-mono text-teal-600 dark:text-teal-400 font-semibold">
-                    ≈ ${safeFixed((Number.isFinite(draft.gasReserveSol) ? draft.gasReserveSol : 0) * solUsd)} USD
-                  </span>
-                </span>
-                <input
-                  type="number"
-                  step="0.005"
-                  min="0.01"
-                  data-field-key="gasReserveSol"
-                  value={inputValue(draft.gasReserveSol)}
-                  onChange={(e) => updateField('gasReserveSol', parseNumInput(e.target.value))}
-                  className={inputClass('gasReserveSol')}
-                />
-                <FieldErrorPopup
-                  message={fieldErrors.gasReserveSol}
-                  onDismiss={() => clearFieldError('gasReserveSol')}
-                />
-              </label>
-              */}
-
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="Maximum number of different tokens held open at the same time (1–10).">
-                    <span className="cursor-help">Max Open Positions</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('maxOpenPositions')}
+                      onChange={(e) => setOptEnabled('maxOpenPositions', e.target.checked, 'maxOpenPositions')}
+                    />
+                    <HoverTip text="Maximum number of different tokens held open at the same time (1–10). Uncheck to remove the max-slot cap.">
+                      <span className={`cursor-help ${!isOptEnabled('maxOpenPositions') ? 'line-through opacity-60' : ''}`}>
+                        Max Open Positions
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('maxOpenPositions') && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  )}
                 </span>
                 <input
                   type="number"
                   min="1"
                   max="10"
+                  disabled={!isOptEnabled('maxOpenPositions')}
                   data-field-key="maxOpenPositions"
+                  aria-label="Max Open Positions"
                   value={inputValue(draft.maxOpenPositions)}
                   onChange={(e) => updateField('maxOpenPositions', parseNumInput(e.target.value))}
-                  className={inputClass('maxOpenPositions')}
+                  className={inputClass('maxOpenPositions', 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40')}
                 />
                 <FieldErrorPopup
                   message={fieldErrors.maxOpenPositions}
                   onDismiss={() => clearFieldError('maxOpenPositions')}
                 />
-              </label>
+              </div>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="Waiting period (in minutes) before the bot is allowed to buy the same token mint again after closing it.">
-                    <span className="cursor-help">Re-entry Cooldown (min)</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('cooldownMinutes')}
+                      onChange={(e) => setOptEnabled('cooldownMinutes', e.target.checked, 'cooldownMinutes')}
+                    />
+                    <HoverTip text="Waiting period (in minutes) before the bot is allowed to buy the same token mint again after closing it. Uncheck to disable cooldown.">
+                      <span className={`cursor-help ${!isOptEnabled('cooldownMinutes') ? 'line-through opacity-60' : ''}`}>
+                        Re-entry Cooldown (min)
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('cooldownMinutes') && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  )}
                 </span>
                 <input
                   type="number"
                   min="0"
+                  disabled={!isOptEnabled('cooldownMinutes')}
                   data-field-key="cooldownMinutes"
+                  aria-label="Re-entry Cooldown (min)"
                   value={inputValue(draft.cooldownMinutes)}
                   onChange={(e) => updateField('cooldownMinutes', parseNumInput(e.target.value))}
-                  className={inputClass('cooldownMinutes')}
+                  className={inputClass('cooldownMinutes', 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40')}
                 />
                 <FieldErrorPopup
                   message={fieldErrors.cooldownMinutes}
                   onDismiss={() => clearFieldError('cooldownMinutes')}
                 />
-              </label>
+              </div>
             </div>
           </section>
 
@@ -868,7 +945,14 @@ export function SettingsView() {
               </p>
               <div className="grid grid-cols-2 gap-3">
                 <label className="space-y-1">
-                  <span className="text-slate-500 block">Min Coin Age (minutes)</span>
+                  <span className="text-slate-500 flex items-center justify-between">
+                    <span>Min Coin Age (minutes)</span>
+                    {Number.isFinite(draft.customMinPoolAgeMinutes) && draft.customMinPoolAgeMinutes >= 60 && (
+                      <span className="font-mono text-[11px] text-teal-600 dark:text-teal-400">
+                        = {safeFixed(draft.customMinPoolAgeMinutes / 60, 1)}h
+                      </span>
+                    )}
+                  </span>
                   <input
                     type="number"
                     min="0"
@@ -889,7 +973,14 @@ export function SettingsView() {
                   />
                 </label>
                 <label className="space-y-1">
-                  <span className="text-slate-500 block">Max Coin Age (minutes)</span>
+                  <span className="text-slate-500 flex items-center justify-between">
+                    <span>Max Coin Age (minutes)</span>
+                    {Number.isFinite(draft.customMaxPoolAgeMinutes) && draft.customMaxPoolAgeMinutes >= 60 && (
+                      <span className="font-mono text-[11px] text-teal-600 dark:text-teal-400">
+                        = {safeFixed(draft.customMaxPoolAgeMinutes / 60, 1)}h
+                      </span>
+                    )}
+                  </span>
                   <input
                     type="number"
                     min="1"
@@ -913,53 +1004,93 @@ export function SettingsView() {
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="Minimum age of a liquidity pool (at least 30 minutes) required when Custom Age Window and New Launches Only are unchecked.">
-                    <span className="cursor-help">Default Min Pool Age (min, &ge; 30m)</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('minPoolAgeMinutes')}
+                      onChange={(e) => setOptEnabled('minPoolAgeMinutes', e.target.checked, 'minPoolAgeMinutes')}
+                    />
+                    <HoverTip text="Minimum age of a liquidity pool (at least 30 minutes) required when Custom Age Window and New Launches Only are unchecked. Uncheck to ignore min pool age.">
+                      <span className={`cursor-help ${!isOptEnabled('minPoolAgeMinutes') ? 'line-through opacity-60' : ''}`}>
+                        Default Min Pool Age (min, &ge; 30m)
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('minPoolAgeMinutes') ? (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  ) : Number.isFinite(draft.minPoolAgeMinutes) && draft.minPoolAgeMinutes >= 60 ? (
+                    <span className="font-mono text-[11px] text-teal-600 dark:text-teal-400">
+                      = {safeFixed(draft.minPoolAgeMinutes / 60, 1)}h
+                    </span>
+                  ) : null}
                 </span>
                 <input
                   type="number"
                   min="30"
-                  disabled={draft.customAgeWindowEnabled || draft.newLaunchOnlyEnabled}
+                  disabled={!isOptEnabled('minPoolAgeMinutes') || draft.customAgeWindowEnabled || draft.newLaunchOnlyEnabled}
                   data-field-key="minPoolAgeMinutes"
+                  aria-label="Default Min Pool Age (min)"
                   value={inputValue(draft.minPoolAgeMinutes)}
                   onChange={(e) => updateField('minPoolAgeMinutes', parseNumInput(e.target.value))}
                   className={inputClass(
                     'minPoolAgeMinutes',
-                    'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-50'
+                    'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40'
                   )}
                 />
                 <FieldErrorPopup
                   message={fieldErrors.minPoolAgeMinutes}
                   onDismiss={() => clearFieldError('minPoolAgeMinutes')}
                 />
-              </label>
+              </div>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="Minimum USD liquidity required in the token's DEX pool. Higher liquidity lowers slippage and rug risk.">
-                    <span className="cursor-help">Min Liquidity ($) · Unlimited</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('minLiquidityUsd')}
+                      onChange={(e) => setOptEnabled('minLiquidityUsd', e.target.checked, 'minLiquidityUsd')}
+                    />
+                    <HoverTip text="Minimum USD liquidity required in the token's DEX pool. Uncheck to disable minimum liquidity filtering.">
+                      <span className={`cursor-help ${!isOptEnabled('minLiquidityUsd') ? 'line-through opacity-60' : ''}`}>
+                        Min Liquidity ($) · Unlimited
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('minLiquidityUsd') && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  )}
                 </span>
                 <input
                   type="number"
                   min="0"
                   step="any"
+                  disabled={!isOptEnabled('minLiquidityUsd')}
                   data-field-key="minLiquidityUsd"
+                  aria-label="Min Liquidity ($)"
                   value={inputValue(draft.minLiquidityUsd)}
                   onChange={(e) => updateField('minLiquidityUsd', parseNumInput(e.target.value))}
-                  className={inputClass('minLiquidityUsd')}
+                  className={inputClass(
+                    'minLiquidityUsd',
+                    'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40'
+                  )}
                 />
                 <span className="text-[11px] text-slate-400 block">
-                  Any amount from $0 (e.g. $0, $1, $300, $1,000,000); emergency floor auto-scales.
+                  {isOptEnabled('minLiquidityUsd')
+                    ? 'Any amount from $0 (e.g. $0, $1, $300, $1,000,000); emergency floor auto-scales.'
+                    : 'Unchecked: Minimum liquidity threshold is disabled.'}
                 </span>
                 <FieldErrorPopup
                   message={fieldErrors.minLiquidityUsd}
                   onDismiss={() => clearFieldError('minLiquidityUsd')}
                 />
-              </label>
+              </div>
 
               <div className="space-y-1.5">
                 <label className="inline-flex items-center gap-2 text-slate-600 dark:text-slate-300 font-medium cursor-pointer">
@@ -1059,6 +1190,145 @@ export function SettingsView() {
                 />
               </div>
             </div>
+
+            {/* Owner / Creator History & Fast-Rug Speed Check */}
+            <div
+              className={`rounded-xl border p-3.5 space-y-3 text-xs ${
+                hasErrorPrefix('maxCreatorLaunches', 'maxCreatorRuggedCoins', 'creatorFastRugWindowMinutes')
+                  ? 'border-rose-500/70 bg-rose-500/5'
+                  : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60'
+              }`}
+            >
+              <HoverTip text="Inspects the coin creator/deployer wallet before buying: checks how many coins they previously launched, how many rugged, and how fast (minutes) they pulled liquidity so serial fast-ruggers are blocked.">
+                <label className="inline-flex items-center gap-2 font-semibold text-slate-800 dark:text-slate-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={draft.creatorHistoryEnabled ?? true}
+                    onChange={(e) => {
+                      updateField('creatorHistoryEnabled', e.target.checked);
+                      clearFieldError('maxCreatorLaunches', 'maxCreatorRuggedCoins', 'creatorFastRugWindowMinutes');
+                    }}
+                  />
+                  <span>Owner / Creator Launch &amp; Rugpull Speed Check</span>
+                </label>
+              </HoverTip>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                {(draft.creatorHistoryEnabled ?? true)
+                  ? 'Active: Inspects deployer wallet launch count, prior rugged coins, and minutes-to-rug speed before buying.'
+                  : 'Unchecked: Creator launch history & fast-rug checks are bypassed.'}
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="space-y-1">
+                  <span className="text-slate-500 flex items-center justify-between gap-1">
+                    <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        disabled={draft.creatorHistoryEnabled === false}
+                        checked={isOptEnabled('maxCreatorLaunches')}
+                        onChange={(e) => setOptEnabled('maxCreatorLaunches', e.target.checked, 'maxCreatorLaunches')}
+                      />
+                      <span className={!isOptEnabled('maxCreatorLaunches') ? 'line-through opacity-60' : ''}>
+                        Max Prior Coins
+                      </span>
+                    </label>
+                  </span>
+                  <input
+                    type="number"
+                    min="0"
+                    max="500"
+                    step="1"
+                    disabled={draft.creatorHistoryEnabled === false || !isOptEnabled('maxCreatorLaunches')}
+                    data-field-key="maxCreatorLaunches"
+                    aria-label="Max owner prior coins launched"
+                    value={inputValue(draft.maxCreatorLaunches ?? 5)}
+                    onChange={(e) => updateField('maxCreatorLaunches', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'maxCreatorLaunches',
+                      'w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 disabled:opacity-40'
+                    )}
+                  />
+                  <FieldErrorPopup
+                    message={fieldErrors.maxCreatorLaunches}
+                    onDismiss={() => clearFieldError('maxCreatorLaunches')}
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <span className="text-slate-500 flex items-center justify-between gap-1">
+                    <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        disabled={draft.creatorHistoryEnabled === false}
+                        checked={isOptEnabled('maxCreatorRuggedCoins')}
+                        onChange={(e) => setOptEnabled('maxCreatorRuggedCoins', e.target.checked, 'maxCreatorRuggedCoins')}
+                      />
+                      <span className={!isOptEnabled('maxCreatorRuggedCoins') ? 'line-through opacity-60' : ''}>
+                        Max Rugged Coins
+                      </span>
+                    </label>
+                  </span>
+                  <input
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="1"
+                    disabled={draft.creatorHistoryEnabled === false || !isOptEnabled('maxCreatorRuggedCoins')}
+                    data-field-key="maxCreatorRuggedCoins"
+                    aria-label="Max owner prior rugged coins"
+                    value={inputValue(draft.maxCreatorRuggedCoins ?? 0)}
+                    onChange={(e) => updateField('maxCreatorRuggedCoins', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'maxCreatorRuggedCoins',
+                      'w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 disabled:opacity-40'
+                    )}
+                  />
+                  <FieldErrorPopup
+                    message={fieldErrors.maxCreatorRuggedCoins}
+                    onDismiss={() => clearFieldError('maxCreatorRuggedCoins')}
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <span className="text-slate-500 flex items-center justify-between gap-1">
+                    <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        disabled={draft.creatorHistoryEnabled === false}
+                        checked={isOptEnabled('creatorFastRugWindowMinutes')}
+                        onChange={(e) => setOptEnabled('creatorFastRugWindowMinutes', e.target.checked, 'creatorFastRugWindowMinutes')}
+                      />
+                      <span className={!isOptEnabled('creatorFastRugWindowMinutes') ? 'line-through opacity-60' : ''}>
+                        Fast-Rug Window (m)
+                      </span>
+                    </label>
+                    {Number.isFinite(draft.creatorFastRugWindowMinutes) && draft.creatorFastRugWindowMinutes >= 60 && (
+                      <span className="font-mono text-[10px] text-teal-600 dark:text-teal-400">
+                        = {safeFixed(draft.creatorFastRugWindowMinutes / 60, 1)}h
+                      </span>
+                    )}
+                  </span>
+                  <input
+                    type="number"
+                    min="0"
+                    max="10080"
+                    step="1"
+                    disabled={draft.creatorHistoryEnabled === false || !isOptEnabled('creatorFastRugWindowMinutes')}
+                    data-field-key="creatorFastRugWindowMinutes"
+                    aria-label="Creator fast rugpull window minutes"
+                    value={inputValue(draft.creatorFastRugWindowMinutes ?? 60)}
+                    onChange={(e) => updateField('creatorFastRugWindowMinutes', parseNumInput(e.target.value))}
+                    className={inputClass(
+                      'creatorFastRugWindowMinutes',
+                      'w-full px-3 py-2 rounded-xl font-mono bg-white dark:bg-slate-900 disabled:opacity-40'
+                    )}
+                  />
+                  <FieldErrorPopup
+                    message={fieldErrors.creatorFastRugWindowMinutes}
+                    onDismiss={() => clearFieldError('creatorFastRugWindowMinutes')}
+                  />
+                </div>
+              </div>
+            </div>
           </section>
         </div>
 
@@ -1071,72 +1341,130 @@ export function SettingsView() {
               <InfoTooltip text="Defines Take-Profit target, max stagnation hold duration, emergency rug-pull floor, and optional stepped trailing profit lock." />
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="Target gross gain % where the bot automatically takes profit (verified against an executable Jupiter sell quote).">
-                    <span className="cursor-help">Take-Profit (%) · Unlimited</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-1">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('takeProfitPct')}
+                      onChange={(e) => setOptEnabled('takeProfitPct', e.target.checked, 'takeProfitPct')}
+                    />
+                    <HoverTip text="Target gross gain % where the bot automatically takes profit. Uncheck to disable fixed Take-Profit target.">
+                      <span className={`cursor-help ${!isOptEnabled('takeProfitPct') ? 'line-through opacity-60' : ''}`}>
+                        Take-Profit (%) · Unlimited
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('takeProfitPct') && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  )}
                 </span>
                 <input
                   type="number"
                   min="1.5"
                   step="0.5"
+                  disabled={!isOptEnabled('takeProfitPct')}
                   data-field-key="takeProfitPct"
+                  aria-label="Take-Profit (%)"
                   value={inputValue(draft.takeProfitPct)}
                   onChange={(e) => updateField('takeProfitPct', parseNumInput(e.target.value))}
-                  className={inputClass('takeProfitPct')}
+                  className={inputClass('takeProfitPct', 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40')}
                 />
                 <span className="text-[11px] text-slate-400 block">
-                  {draft.trailingEnabled
-                    ? 'Waits here if price clears all trailing tiers.'
-                    : 'Trailing ladder disabled — exits directly at this Take-Profit %.'}
+                  {!isOptEnabled('takeProfitPct')
+                    ? 'Take-Profit target disabled — trailing/SL/manual exits only.'
+                    : draft.trailingEnabled
+                      ? 'Waits here if price clears all trailing tiers.'
+                      : 'Trailing ladder disabled — exits directly at this Take-Profit %.'}
                 </span>
                 <FieldErrorPopup
                   message={fieldErrors.takeProfitPct}
                   onDismiss={() => clearFieldError('takeProfitPct')}
                 />
-              </label>
+              </div>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="Maximum minutes to hold a stagnant trade that has not gained at least +2% before automatically exiting to free the slot.">
-                    <span className="cursor-help">Max Hold Time (minutes)</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-1">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={draft.maxHoldStagnationEnabled !== false && isOptEnabled('maxHoldMinutes')}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        updateField('maxHoldStagnationEnabled', checked);
+                        setOptEnabled('maxHoldMinutes', checked, 'maxHoldMinutes');
+                      }}
+                    />
+                    <HoverTip text="Maximum minutes to hold a stagnant trade before auto-exiting. Uncheck to hold indefinitely until TP/SL.">
+                      <span className={`cursor-help ${draft.maxHoldStagnationEnabled === false || !isOptEnabled('maxHoldMinutes') ? 'line-through opacity-60' : ''}`}>
+                        Max Hold Time (min)
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {draft.maxHoldStagnationEnabled === false || !isOptEnabled('maxHoldMinutes') ? (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  ) : Number.isFinite(draft.maxHoldMinutes) && draft.maxHoldMinutes >= 60 ? (
+                    <span className="font-mono text-[10px] text-teal-600 dark:text-teal-400">
+                      = {safeFixed(draft.maxHoldMinutes / 60, 1)}h
+                    </span>
+                  ) : null}
                 </span>
                 <input
                   type="number"
                   min="5"
+                  disabled={draft.maxHoldStagnationEnabled === false || !isOptEnabled('maxHoldMinutes')}
                   data-field-key="maxHoldMinutes"
+                  aria-label="Max Hold Time (minutes)"
                   value={inputValue(draft.maxHoldMinutes)}
                   onChange={(e) => updateField('maxHoldMinutes', parseNumInput(e.target.value))}
-                  className={inputClass('maxHoldMinutes')}
+                  className={inputClass('maxHoldMinutes', 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40')}
                 />
                 <FieldErrorPopup
                   message={fieldErrors.maxHoldMinutes}
                   onDismiss={() => clearFieldError('maxHoldMinutes')}
                 />
-              </label>
+              </div>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="If pool USD liquidity plunges below this floor while you hold the token, the bot immediately triggers an emergency exit.">
-                    <span className="cursor-help">Emergency Liquidity Floor ($)</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-1">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('emergencyLiquidityFloorUsd')}
+                      onChange={(e) => setOptEnabled('emergencyLiquidityFloorUsd', e.target.checked, 'emergencyLiquidityFloorUsd')}
+                    />
+                    <HoverTip text="If pool USD liquidity plunges below this floor while you hold the token, the bot immediately triggers an emergency exit. Uncheck to disable.">
+                      <span className={`cursor-help ${!isOptEnabled('emergencyLiquidityFloorUsd') ? 'line-through opacity-60' : ''}`}>
+                        Emergency Liq Floor ($)
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('emergencyLiquidityFloorUsd') && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  )}
                 </span>
                 <input
                   type="number"
                   min="0"
                   step="100"
+                  disabled={!isOptEnabled('emergencyLiquidityFloorUsd')}
                   data-field-key="emergencyLiquidityFloorUsd"
+                  aria-label="Emergency Liquidity Floor ($)"
                   value={inputValue(draft.emergencyLiquidityFloorUsd)}
                   onChange={(e) => updateField('emergencyLiquidityFloorUsd', parseNumInput(e.target.value))}
-                  className={inputClass('emergencyLiquidityFloorUsd')}
+                  className={inputClass('emergencyLiquidityFloorUsd', 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40')}
                 />
                 <FieldErrorPopup
                   message={fieldErrors.emergencyLiquidityFloorUsd}
                   onDismiss={() => clearFieldError('emergencyLiquidityFloorUsd')}
                 />
-              </label>
+              </div>
             </div>
 
             <div className="flex flex-wrap gap-4 pt-1 text-xs">
@@ -1326,37 +1654,55 @@ export function SettingsView() {
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="Simulated confirmation wait window (in seconds) between signal and fill. The simulator samples prices across this window and fills at the worst price seen (set 0/0 for instant quote fill).">
-                    <span className="cursor-help">Delay Window Min / Max (sec)</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('paperDelayWindow')}
+                      onChange={(e) =>
+                        setOptEnabled('paperDelayWindow', e.target.checked, 'paperDelayMinSec', 'paperDelayMaxSec')
+                      }
+                    />
+                    <HoverTip text="Simulated confirmation wait window (seconds) between signal and fill. Uncheck to disable Paper confirmation latency simulation.">
+                      <span className={`cursor-help ${!isOptEnabled('paperDelayWindow') ? 'line-through opacity-60' : ''}`}>
+                        Delay Window Min / Max (sec)
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('paperDelayWindow') && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  )}
                 </span>
                 <div className="flex gap-2">
                   <input
                     type="number"
                     min="0"
                     step="0.5"
+                    disabled={!isOptEnabled('paperDelayWindow')}
                     data-field-key="paperDelayMinSec"
                     aria-label="Paper delay min seconds"
                     value={inputValue(draft.paperDelayMinSec)}
                     onChange={(e) => updateField('paperDelayMinSec', parseNumInput(e.target.value))}
                     className={inputClass(
                       'paperDelayMinSec',
-                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40'
                     )}
                   />
                   <input
                     type="number"
                     min="0"
                     step="0.5"
+                    disabled={!isOptEnabled('paperDelayWindow')}
                     data-field-key="paperDelayMaxSec"
                     aria-label="Paper delay max seconds"
                     value={inputValue(draft.paperDelayMaxSec)}
                     onChange={(e) => updateField('paperDelayMaxSec', parseNumInput(e.target.value))}
                     className={inputClass(
                       'paperDelayMaxSec',
-                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40'
                     )}
                   />
                 </div>
@@ -1368,39 +1714,57 @@ export function SettingsView() {
                   message={fieldErrors.paperDelayMaxSec}
                   onDismiss={() => clearFieldError('paperDelayMaxSec')}
                 />
-              </label>
+              </div>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="Probability (%) that a simulated Paper buy or sell transaction misses a block or fails route execution (set 0/0 to disable simulated failures).">
-                    <span className="cursor-help">Buy / Sell Failure Chance (%)</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('paperFailChance')}
+                      onChange={(e) =>
+                        setOptEnabled('paperFailChance', e.target.checked, 'paperBuyFailChancePct', 'paperSellFailChancePct')
+                      }
+                    />
+                    <HoverTip text="Probability (%) that a simulated Paper buy or sell transaction misses a block. Uncheck to disable simulated failures.">
+                      <span className={`cursor-help ${!isOptEnabled('paperFailChance') ? 'line-through opacity-60' : ''}`}>
+                        Buy / Sell Failure Chance (%)
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('paperFailChance') && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  )}
                 </span>
                 <div className="flex gap-2">
                   <input
                     type="number"
                     min="0"
                     max="100"
+                    disabled={!isOptEnabled('paperFailChance')}
                     data-field-key="paperBuyFailChancePct"
                     aria-label="Paper buy failure chance percent"
                     value={inputValue(draft.paperBuyFailChancePct)}
                     onChange={(e) => updateField('paperBuyFailChancePct', parseNumInput(e.target.value))}
                     className={inputClass(
                       'paperBuyFailChancePct',
-                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40'
                     )}
                   />
                   <input
                     type="number"
                     min="0"
                     max="100"
+                    disabled={!isOptEnabled('paperFailChance')}
                     data-field-key="paperSellFailChancePct"
                     aria-label="Paper sell failure chance percent"
                     value={inputValue(draft.paperSellFailChancePct)}
                     onChange={(e) => updateField('paperSellFailChancePct', parseNumInput(e.target.value))}
                     className={inputClass(
                       'paperSellFailChancePct',
-                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900'
+                      'w-1/2 px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40'
                     )}
                   />
                 </div>
@@ -1412,41 +1776,75 @@ export function SettingsView() {
                   message={fieldErrors.paperSellFailChancePct}
                   onDismiss={() => clearFieldError('paperSellFailChancePct')}
                 />
-              </label>
+              </div>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="Extra buy fill penalty (%) added for coins younger than 24 hours to mimic competing sniper bots / front-running (set 0% for exact quoted fill).">
-                    <span className="cursor-help">&lt;24h Competition Penalty (%)</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('paperCompetitionPenaltyPct')}
+                      onChange={(e) =>
+                        setOptEnabled('paperCompetitionPenaltyPct', e.target.checked, 'paperCompetitionPenaltyPct')
+                      }
+                    />
+                    <HoverTip text="Extra buy fill penalty (%) added for coins younger than 24 hours to mimic competing sniper bots. Uncheck to disable.">
+                      <span className={`cursor-help ${!isOptEnabled('paperCompetitionPenaltyPct') ? 'line-through opacity-60' : ''}`}>
+                        &lt;24h Competition Penalty (%)
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('paperCompetitionPenaltyPct') && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  )}
                 </span>
                 <input
                   type="number"
                   min="0"
                   step="0.25"
+                  disabled={!isOptEnabled('paperCompetitionPenaltyPct')}
                   data-field-key="paperCompetitionPenaltyPct"
+                  aria-label="<24h Competition Penalty (%)"
                   value={inputValue(draft.paperCompetitionPenaltyPct)}
                   onChange={(e) => updateField('paperCompetitionPenaltyPct', parseNumInput(e.target.value))}
-                  className={inputClass('paperCompetitionPenaltyPct')}
+                  className={inputClass('paperCompetitionPenaltyPct', 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900 disabled:opacity-40')}
                 />
                 <FieldErrorPopup
                   message={fieldErrors.paperCompetitionPenaltyPct}
                   onDismiss={() => clearFieldError('paperCompetitionPenaltyPct')}
                 />
-              </label>
+              </div>
 
-              <label className="space-y-1">
-                <span className="text-slate-500 block">
-                  <HoverTip text="Solana priority fee speed tier used to compute transaction fees. Auto queries live Solana network fee percentiles and caps at Max Priority Fee.">
-                    <span className="cursor-help">Priority Fee Preset</span>
-                  </HoverTip>
+              <div className="space-y-1">
+                <span className="text-slate-500 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={isOptEnabled('priorityFeePreset')}
+                      onChange={(e) => setOptEnabled('priorityFeePreset', e.target.checked)}
+                    />
+                    <HoverTip text="Solana priority fee speed tier used to compute transaction fees. Uncheck to use minimal baseline fees.">
+                      <span className={`cursor-help ${!isOptEnabled('priorityFeePreset') ? 'line-through opacity-60' : ''}`}>
+                        Priority Fee Preset
+                      </span>
+                    </HoverTip>
+                  </label>
+                  {!isOptEnabled('priorityFeePreset') && (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-[10px] font-bold text-slate-500">
+                      OFF
+                    </span>
+                  )}
                 </span>
                 <select
+                  disabled={!isOptEnabled('priorityFeePreset')}
+                  aria-label="Priority Fee Preset"
                   value={draft.priorityFeePreset}
                   onChange={(e) =>
                     updateField('priorityFeePreset', e.target.value as BotSettings['priorityFeePreset'])
                   }
-                  className="w-full px-3 py-2 rounded-xl text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                  className="w-full px-3 py-2 rounded-xl text-xs bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 disabled:opacity-40"
                 >
                   <option value="auto">Auto · Live Jupiter / Network (Adaptive)</option>
                   <option value="standard">Standard (0.0001 SOL)</option>
@@ -1454,7 +1852,7 @@ export function SettingsView() {
                   <option value="ultra">Ultra (0.0015 SOL)</option>
                   <option value="custom">Custom</option>
                 </select>
-              </label>
+              </div>
             </div>
           </section>
         </div>

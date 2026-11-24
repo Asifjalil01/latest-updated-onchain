@@ -1,3 +1,4 @@
+import { isOptionEnabled } from '../config/defaults';
 import type {
   BotSettings,
   CandidateToken,
@@ -49,8 +50,10 @@ export function scoreCandidate(params: {
     settings.newLaunchOnlyEnabled &&
     poolAgeSeconds >= settings.newLaunchMinAgeSeconds &&
     poolAgeSeconds <= settings.newLaunchMaxAgeSeconds;
+  const effectiveMinLiq = isOptionEnabled(settings, 'minLiquidityUsd') ? settings.minLiquidityUsd : 0;
   const allowCustomYoungAge =
     allowNewLaunchAge ||
+    (!settings.customAgeWindowEnabled && !isOptionEnabled(settings, 'minPoolAgeMinutes')) ||
     (settings.customAgeWindowEnabled &&
       poolAgeMinutes >= settings.customMinPoolAgeMinutes &&
       poolAgeMinutes <= settings.customMaxPoolAgeMinutes);
@@ -58,16 +61,16 @@ export function scoreCandidate(params: {
     token,
     poolAgeMinutes,
     allowCustomYoungAge,
-    settings.minLiquidityUsd
+    effectiveMinLiq
   );
 
   // Quality score components (max 100)
   const safetyPts = securityReport.passed
     ? Math.max(0, 30 - (securityReport.rugCheckScore ?? 30) * 0.5)
     : 0;
-  const isMicroCustomWindow = (allowCustomYoungAge || settings.minLiquidityUsd < 10_000) && settings.minLiquidityUsd < 10_000;
+  const isMicroCustomWindow = (allowCustomYoungAge || effectiveMinLiq < 10_000) && effectiveMinLiq < 10_000;
   const baseLiqLog = Math.log10(
-    Math.max(1, allowCustomYoungAge || settings.minLiquidityUsd < 10_000 ? Math.min(10_000, settings.minLiquidityUsd) : 10_000)
+    Math.max(1, allowCustomYoungAge || effectiveMinLiq < 10_000 ? Math.min(10_000, effectiveMinLiq) : 10_000)
   );
   const targetLiqLog = isMicroCustomWindow ? Math.max(baseLiqLog + 1.5, 4.5) : 6;
   const liqSpan = Math.max(1, targetLiqLog - baseLiqLog);

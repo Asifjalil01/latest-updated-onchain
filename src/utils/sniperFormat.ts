@@ -238,6 +238,18 @@ export function calcMinRecoveryTakeProfitPct(params: {
   };
 }
 
+export function isPyOptionEnabled(
+  settings: Record<string, any> | undefined | null,
+  key: string,
+  defaultVal = true
+): boolean {
+  const toggles = settings?.option_enabled;
+  if (toggles && typeof toggles === 'object' && typeof toggles[key] === 'boolean') {
+    return toggles[key];
+  }
+  return defaultVal;
+}
+
 export interface SniperSettingsValidation {
   valid: boolean;
   error: string | null;
@@ -248,13 +260,82 @@ export function validatePythonSniperSettings(
   settings: Record<string, any>,
   solPriceUsd?: number | null
 ): SniperSettingsValidation {
+  if (isPyOptionEnabled(settings, 'min_age_minutes', false)) {
+    const minAge = parseFloat(String(settings.min_age_minutes ?? 0));
+    if (!Number.isFinite(minAge) || minAge < 0) {
+      return {
+        valid: false,
+        error: 'Minimum coin age (minutes) must be 0 or greater.',
+        recovery: null,
+      };
+    }
+    if (isPyOptionEnabled(settings, 'max_age_minutes', true)) {
+      const maxAge = parseFloat(String(settings.max_age_minutes ?? 0));
+      if (Number.isFinite(maxAge) && maxAge > 0 && minAge > maxAge) {
+        return {
+          valid: false,
+          error: `Minimum coin age (${minAge}m) cannot exceed Maximum coin age (${maxAge}m).`,
+          recovery: null,
+        };
+      }
+    }
+  }
+
+  const creatorHistoryActive =
+    isPyOptionEnabled(settings, 'check_creator_history', true) &&
+    settings.check_creator_history !== false &&
+    settings.check_creator_history !== 'false';
+  if (creatorHistoryActive) {
+    if (isPyOptionEnabled(settings, 'max_creator_launches', true)) {
+      const maxLaunches = parseFloat(String(settings.max_creator_launches ?? 5));
+      if (!Number.isFinite(maxLaunches) || maxLaunches < 0) {
+        return {
+          valid: false,
+          error: 'Max owner prior coins launched must be 0 or greater.',
+          recovery: null,
+        };
+      }
+    }
+    if (isPyOptionEnabled(settings, 'max_creator_rugged_coins', true)) {
+      const maxRugs = parseFloat(String(settings.max_creator_rugged_coins ?? 0));
+      if (!Number.isFinite(maxRugs) || maxRugs < 0) {
+        return {
+          valid: false,
+          error: 'Max owner prior rugged coins must be 0 or greater.',
+          recovery: null,
+        };
+      }
+    }
+    if (isPyOptionEnabled(settings, 'creator_fast_rug_window_min', true)) {
+      const fastWindow = parseFloat(String(settings.creator_fast_rug_window_min ?? 60));
+      if (!Number.isFinite(fastWindow) || fastWindow < 0) {
+        return {
+          valid: false,
+          error: 'Fast rugpull window (minutes) must be 0 or greater.',
+          recovery: null,
+        };
+      }
+    }
+  }
+
   const recoverEnabled =
-    settings.recover_principal_enabled === true || settings.recover_principal_enabled === 'true';
+    isPyOptionEnabled(settings, 'recover_principal_enabled', true) &&
+    (settings.recover_principal_enabled === true || settings.recover_principal_enabled === 'true');
   if (!recoverEnabled) {
     return { valid: true, error: null, recovery: null };
   }
 
-  const tradeSizeUsd = parseFloat(String(settings.trade_size_usd ?? 0));
+  if (!isPyOptionEnabled(settings, 'take_profit_pct', true)) {
+    return {
+      valid: false,
+      error: 'Enable Take profit % (check its option box) or turn off Recover 100% Principal before saving.',
+      recovery: null,
+    };
+  }
+
+  const tradeSizeUsd = isPyOptionEnabled(settings, 'trade_size_usd', true)
+    ? parseFloat(String(settings.trade_size_usd ?? 0))
+    : 5.0;
   if (!Number.isFinite(tradeSizeUsd) || tradeSizeUsd <= 0) {
     return {
       valid: false,
@@ -263,7 +344,9 @@ export function validatePythonSniperSettings(
     };
   }
 
-  const recoverSellPct = parseFloat(String(settings.recover_principal_sell_pct ?? 50));
+  const recoverSellPct = isPyOptionEnabled(settings, 'recover_principal_sell_pct', true)
+    ? parseFloat(String(settings.recover_principal_sell_pct ?? 50))
+    : 50;
   if (!Number.isFinite(recoverSellPct) || recoverSellPct < 5 || recoverSellPct > 95) {
     return {
       valid: false,
@@ -275,8 +358,10 @@ export function validatePythonSniperSettings(
   const recovery = calcMinRecoveryTakeProfitPct({
     tradeSizeUsd,
     recoverSellPct,
-    feePct: parseFloat(String(settings.fee_pct ?? 1)),
-    slippagePct: parseFloat(String(settings.slippage_pct ?? 2)),
+    feePct: isPyOptionEnabled(settings, 'fee_pct', true) ? parseFloat(String(settings.fee_pct ?? 1)) : 0,
+    slippagePct: isPyOptionEnabled(settings, 'slippage_pct', true)
+      ? parseFloat(String(settings.slippage_pct ?? 2))
+      : 0,
     mode: settings.mode,
     solPriceUsd,
   });
@@ -293,5 +378,6 @@ export function validatePythonSniperSettings(
 
   return { valid: true, error: null, recovery };
 }
+
 
 

@@ -4,6 +4,7 @@ import path from 'path';
 import readline from 'readline';
 import { LAMPORTS_PER_SOL, VersionedTransaction } from '@solana/web3.js';
 import {
+  isPyOptionEnabled,
   pairTradesWithEntryAndExit,
   validatePythonSniperSettings,
   type RawSniperCsvRow,
@@ -276,11 +277,13 @@ export class SniperManager {
     this.orchestrator = orchestrator;
     this.txAdapter = customTxAdapter ?? new DefaultLiveTxAdapter(orchestrator.rpcPool);
     const settings = this.readSettings();
-    if (typeof settings.custom_rpc_url === 'string' && settings.custom_rpc_url.trim()) {
-      (orchestrator.rpcPool as any)?.setPrimaryCustomRpc?.(settings.custom_rpc_url);
+    const customRpc = isPyOptionEnabled(settings, 'custom_rpc_url', true) ? settings.custom_rpc_url : '';
+    if (typeof customRpc === 'string' && customRpc.trim()) {
+      (orchestrator.rpcPool as any)?.setPrimaryCustomRpc?.(customRpc);
     }
-    if (typeof settings.jupiter_api_key === 'string' && settings.jupiter_api_key.trim()) {
-      (orchestrator.jupiter as any)?.setApiKey?.(settings.jupiter_api_key);
+    const jupKey = isPyOptionEnabled(settings, 'jupiter_api_key', true) ? settings.jupiter_api_key : '';
+    if (typeof jupKey === 'string' && jupKey.trim()) {
+      (orchestrator.jupiter as any)?.setApiKey?.(jupKey);
     }
     if (this.getMode(settings) === 'live') {
       void this.refreshLiveWalletInfo(true);
@@ -504,14 +507,20 @@ export class SniperManager {
       const settings = this.readSettings();
       const prices: Record<string, number> = customFetcher ? await customFetcher(mints) : {};
       if (!customFetcher) {
-        if (settings.use_jupiter_price !== false) {
-          const jupUrl = settings.jupiter_api_key
+        const useJupPrice =
+          isPyOptionEnabled(settings, 'use_jupiter_price', true) && settings.use_jupiter_price !== false;
+        const jupApiKey =
+          isPyOptionEnabled(settings, 'jupiter_api_key', true) && typeof settings.jupiter_api_key === 'string'
+            ? settings.jupiter_api_key.trim()
+            : '';
+        if (useJupPrice) {
+          const jupUrl = jupApiKey
             ? `https://api.jup.ag/price/v3?ids=${encodeURIComponent(mints.join(','))}`
             : `https://lite-api.jup.ag/price/v3?ids=${encodeURIComponent(mints.join(','))}`;
           const jup = await this.fetchJsonWithTimeout(
             jupUrl,
             3500,
-            settings.jupiter_api_key ? { 'x-api-key': settings.jupiter_api_key } : undefined
+            jupApiKey ? { 'x-api-key': jupApiKey } : undefined
           );
           if (jup && typeof jup === 'object') {
             const map = jup.data && typeof jup.data === 'object' ? jup.data : jup;
@@ -556,8 +565,12 @@ export class SniperManager {
 
       const nowSec = Date.now() / 1000;
       freshState.last_price_time = nowSec;
-      const slippage = (settings.slippage_pct ?? 2.0) / 100;
-      const fee = (settings.fee_pct ?? 1.0) / 100;
+      const slippage = isPyOptionEnabled(settings, 'slippage_pct', true)
+        ? Number(settings.slippage_pct ?? 2.0) / 100
+        : 0;
+      const fee = isPyOptionEnabled(settings, 'fee_pct', true)
+        ? Number(settings.fee_pct ?? 1.0) / 100
+        : 0;
       let anyUpdated = false;
       for (const mint of Object.keys(freshPositions)) {
         const deletedAt = this.recentlyDeletedMints.get(mint);
@@ -613,6 +626,7 @@ export class SniperManager {
       auto_rug_exit: false,
       rug_liq_drop_pct: 50.0,
       max_hold_minutes: 120,
+      min_age_minutes: 0,
       max_age_minutes: 2.0,
       ultra_early_grace_sec: 0,
       scan_interval_sec: 1,
@@ -628,6 +642,11 @@ export class SniperManager {
       strict_rugcheck: true,
       require_lp_locked: false,
       block_insider_bundles: true,
+      block_creator_dump: true,
+      check_creator_history: true,
+      max_creator_launches: 5,
+      max_creator_rugged_coins: 0,
+      creator_fast_rug_window_min: 60,
       max_dev_hold_pct: 5.0,
       rugcheck_max_score: 55.0,
       max_top10_holder_pct: 35.0,
@@ -639,6 +658,7 @@ export class SniperManager {
       use_dex_profiles: true,
       use_pumpportal: true,
       use_promoted_feeds: false,
+      axiom_pulse_migrated_only_enabled: false,
       enabled_platforms: [],
       slippage_pct: 3.0,
       fee_pct: 1.0,
@@ -657,6 +677,9 @@ export class SniperManager {
       anti_rug_copycat_cooldown_enabled: true,
       python_binary_path: 'auto',
       rescan_delay_after_sell_sec: 0,
+      option_enabled: {
+        min_age_minutes: false,
+      },
     };
     fs.writeFileSync(this.settingsFile, JSON.stringify(defaults, null, 2), 'utf-8');
   }
@@ -719,8 +742,12 @@ export class SniperManager {
             pos.pnl_pct = Number(((pos.current_price / pos.entry_price - 1) * 100).toFixed(2));
           }
           if (pos.pnl_usd === undefined || pos.pnl_usd === null) {
-            const slippage = (settings.slippage_pct ?? 2.0) / 100;
-            const fee = (settings.fee_pct ?? 1.0) / 100;
+            const slippage = isPyOptionEnabled(settings, 'slippage_pct', true)
+              ? Number(settings.slippage_pct ?? 2.0) / 100
+              : 0;
+            const fee = isPyOptionEnabled(settings, 'fee_pct', true)
+              ? Number(settings.fee_pct ?? 1.0) / 100
+              : 0;
             const fill = pos.current_price * (1 - slippage);
             const proceeds = (pos.qty || 0) * fill * (1 - fee);
             pos.pnl_usd = Number((proceeds - (pos.cost || 0)).toFixed(4));
@@ -784,7 +811,9 @@ export class SniperManager {
     const lastPriceSec = typeof state.last_price_time === 'number' ? state.last_price_time : 0;
     const priceAgeSec = lastPriceSec > 0 ? Math.max(0, Date.now() / 1000 - lastPriceSec) : null;
 
-    const rescanDelaySec = Math.max(0, Number(settings.rescan_delay_after_sell_sec || 0));
+    const rescanDelaySec = isPyOptionEnabled(settings, 'rescan_delay_after_sell_sec', true)
+      ? Math.max(0, Number(settings.rescan_delay_after_sell_sec || 0))
+      : 0;
     const lastSellTimeSec = typeof state.last_sell_time === 'number' ? state.last_sell_time : 0;
     const elapsedSinceSell = lastSellTimeSec > 0 ? Date.now() / 1000 - lastSellTimeSec : 9999999;
     const cooldownRemainingSec =
@@ -928,7 +957,11 @@ export class SniperManager {
 
     this.running = true;
     this.startedAtMs = Date.now();
-    if (settings.use_pumpportal !== false && this.orchestrator?.pumpPortal) {
+    if (
+      isPyOptionEnabled(settings, 'use_pumpportal', true) &&
+      settings.use_pumpportal !== false &&
+      this.orchestrator?.pumpPortal
+    ) {
       this.orchestrator.pumpPortal.start();
     }
 
@@ -997,7 +1030,7 @@ export class SniperManager {
   public getPumpPortalMints(maxAgeMs = 180_000): string[] {
     if (!this.orchestrator?.pumpPortal) return [];
     const settings = this.readSettings();
-    if (settings.use_pumpportal === false) return [];
+    if (!isPyOptionEnabled(settings, 'use_pumpportal', true) || settings.use_pumpportal === false) return [];
     this.orchestrator.pumpPortal.start();
     return this.orchestrator.pumpPortal.drainRecentMints(maxAgeMs);
   }
@@ -1011,7 +1044,7 @@ export class SniperManager {
       return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd };
     }
     const settings = this.readSettings();
-    if (settings.use_pumpportal === false) {
+    if (!isPyOptionEnabled(settings, 'use_pumpportal', true) || settings.use_pumpportal === false) {
       return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd };
     }
     this.orchestrator.pumpPortal.start();
@@ -1029,8 +1062,11 @@ export class SniperManager {
     solPriceOverride?: number | null
   ): Promise<{ ok: boolean; prices: Record<string, number>; solPriceUsd: number | null; pausedForQuota?: boolean }> {
     const settings = this.readSettings();
+    const quotaGuardOn =
+      isPyOptionEnabled(settings, 'jupiter_quota_guard_enabled', true) &&
+      settings.jupiter_quota_guard_enabled !== false;
     if (
-      settings.jupiter_quota_guard_enabled !== false &&
+      quotaGuardOn &&
       (this.liveSwapActiveCount > 0 || (this.lastLiveSwapAtMs > 0 && Date.now() - this.lastLiveSwapAtMs < 10_000))
     ) {
       return { ok: true, prices: {}, solPriceUsd: this.solPriceUsd, pausedForQuota: true };
@@ -1063,10 +1099,14 @@ export class SniperManager {
     maxPriorityFeeLamports: number;
     jitoTipLamports: number;
   } {
-    const rawTier = String(overrides?.priorityFeeTier ?? settings.priority_fee_tier ?? 'fast').toLowerCase();
+    const priorityOn = isPyOptionEnabled(settings, 'priority_fee_tier', true);
+    const rawTier = priorityOn
+      ? String(overrides?.priorityFeeTier ?? settings.priority_fee_tier ?? 'fast').toLowerCase()
+      : 'standard';
     const tier: 'standard' | 'fast' | 'turbo' =
       rawTier === 'turbo' ? 'turbo' : rawTier === 'standard' ? 'standard' : 'fast';
-    const rawJitoSol = Number(overrides?.jitoTipSol ?? settings.jito_tip_sol ?? 0);
+    const jitoOn = isPyOptionEnabled(settings, 'jito_tip_sol', true);
+    const rawJitoSol = jitoOn ? Number(overrides?.jitoTipSol ?? settings.jito_tip_sol ?? 0) : 0;
     const safeJitoSol = Number.isFinite(rawJitoSol) && rawJitoSol > 0 ? Math.min(0.01, rawJitoSol) : 0;
     const jitoTipLamports = safeJitoSol > 0 ? Math.max(10_000, Math.round(safeJitoSol * LAMPORTS_PER_SOL)) : 0;
 
@@ -1117,9 +1157,19 @@ export class SniperManager {
   public updateSettings(newSettings: Record<string, any>) {
     try {
       const current = this.readSettings();
+      const mergedOptionEnabled: Record<string, boolean> = {
+        min_age_minutes: false,
+        ...(current.option_enabled && typeof current.option_enabled === 'object' ? current.option_enabled : {}),
+      };
+      if (newSettings.option_enabled && typeof newSettings.option_enabled === 'object') {
+        for (const [k, v] of Object.entries(newSettings.option_enabled)) {
+          if (typeof v === 'boolean') mergedOptionEnabled[k] = v;
+        }
+      }
       const updated: Record<string, any> = {
         ...current,
         ...newSettings,
+        option_enabled: mergedOptionEnabled,
         mode: newSettings.mode === 'live' || current.mode === 'live'
           ? newSettings.mode === 'paper'
             ? 'paper'
@@ -1146,8 +1196,10 @@ export class SniperManager {
       }
       fs.writeFileSync(this.settingsFile, JSON.stringify(updated, null, 2), 'utf-8');
       if (this.orchestrator) {
-        (this.orchestrator.rpcPool as any)?.setPrimaryCustomRpc?.(updated.custom_rpc_url);
-        (this.orchestrator.jupiter as any)?.setApiKey?.(updated.jupiter_api_key);
+        const rpcUrl = isPyOptionEnabled(updated, 'custom_rpc_url', true) ? updated.custom_rpc_url : '';
+        const jupKey = isPyOptionEnabled(updated, 'jupiter_api_key', true) ? updated.jupiter_api_key : '';
+        (this.orchestrator.rpcPool as any)?.setPrimaryCustomRpc?.(rpcUrl || '');
+        (this.orchestrator.jupiter as any)?.setApiKey?.(jupKey || '');
       }
       this.appendLog('INFO', 'Python bot settings updated and saved.');
       return { ok: true, settings: updated };
@@ -1252,12 +1304,19 @@ export class SniperManager {
     const solAmount = tradeSizeUsd / solPriceUsd;
     const minRequiredSol = solAmount + 0.001;
 
-    const amountRaw = String(Math.max(10_000, Math.round(solAmount * LAMPORTS_PER_SOL)));
-    const slippageBps = Math.min(2500, Math.max(50, Math.round((params.slippagePct ?? 2.0) * 100)));
-
     const savedSettings = this.readSettings();
-    const fastBuyEnabled = savedSettings.fast_live_buy_enabled !== false;
-    const directDexFallbackEnabled = savedSettings.direct_dex_fallback_enabled !== false;
+    const amountRaw = String(Math.max(10_000, Math.round(solAmount * LAMPORTS_PER_SOL)));
+    const effectiveSlipPct = isPyOptionEnabled(savedSettings, 'slippage_pct', true)
+      ? (params.slippagePct ?? 2.0)
+      : 2.0;
+    const slippageBps = Math.min(2500, Math.max(50, Math.round(effectiveSlipPct * 100)));
+
+    const fastBuyEnabled =
+      isPyOptionEnabled(savedSettings, 'fast_live_buy_enabled', true) &&
+      savedSettings.fast_live_buy_enabled !== false;
+    const directDexFallbackEnabled =
+      isPyOptionEnabled(savedSettings, 'direct_dex_fallback_enabled', true) &&
+      savedSettings.direct_dex_fallback_enabled !== false;
     const preDecimals =
       typeof params.decimals === 'number' && Number.isFinite(params.decimals) && params.decimals >= 0 && params.decimals <= 18
         ? params.decimals
@@ -1763,7 +1822,11 @@ export class SniperManager {
     const soldQty = Number(rawToSellBig) / 10 ** effectiveDecimals;
     const amountRaw = rawToSellBig.toString();
 
-    const baseSlippageBps = Math.min(2500, Math.max(100, Math.round((params.slippagePct ?? 2.0) * 100)));
+    const savedSellInitSettings = this.readSettings();
+    const effectiveSellSlipPct = isPyOptionEnabled(savedSellInitSettings, 'slippage_pct', true)
+      ? (params.slippagePct ?? 2.0)
+      : 2.0;
+    const baseSlippageBps = Math.min(2500, Math.max(100, Math.round(effectiveSellSlipPct * 100)));
     const reasonStr = String(params.reason || '');
     const isUrgentExit =
       reasonStr.startsWith('trailing_stop') ||
@@ -1896,7 +1959,10 @@ export class SniperManager {
 
     // Emergency PumpPortal + Raydium Trade API sell fallback when Jupiter is rate-limited or has no route
     const savedSellSettings = this.readSettings();
-    if (!sig && savedSellSettings.direct_dex_fallback_enabled !== false) {
+    const sellDirectFallbackOn =
+      isPyOptionEnabled(savedSellSettings, 'direct_dex_fallback_enabled', true) &&
+      savedSellSettings.direct_dex_fallback_enabled !== false;
+    if (!sig && sellDirectFallbackOn) {
       const sellExecFees = this.resolveSwapExecutionFees(savedSellSettings, true);
       const ppFeeSol =
         typeof sellExecFees.priorityFeeLamports === 'number'
@@ -2081,7 +2147,9 @@ export class SniperManager {
         return { ok: true, message: `Closing ${pos.symbol} at live price...` };
       }
 
-      const maxSlots = Math.max(1, Number(settings.max_open_positions || 3));
+      const maxSlots = isPyOptionEnabled(settings, 'max_open_positions', true)
+        ? Math.max(1, Number(settings.max_open_positions || 3))
+        : Number.MAX_SAFE_INTEGER;
       const nowIso = new Date().toISOString();
       let fill = pos.current_price || pos.entry_price;
       let proceeds = 0;
@@ -2098,7 +2166,9 @@ export class SniperManager {
           decimals: pos.decimals,
           costUsd: Number(pos.cost || 0),
           costSol: pos.cost_sol,
-          slippagePct: settings.slippage_pct ?? 2.0,
+          slippagePct: isPyOptionEnabled(settings, 'slippage_pct', true)
+            ? (settings.slippage_pct ?? 2.0)
+            : 2.0,
           solPriceUsd: this.solPriceUsd,
           reason: 'manual_exit',
         });
@@ -2117,8 +2187,12 @@ export class SniperManager {
         }
       } else {
         const currentPrice = pos.current_price || pos.entry_price;
-        const slippage = (settings.slippage_pct ?? 2.0) / 100;
-        const fee = (settings.fee_pct ?? 1.0) / 100;
+        const slippage = isPyOptionEnabled(settings, 'slippage_pct', true)
+          ? Number(settings.slippage_pct ?? 2.0) / 100
+          : 0;
+        const fee = isPyOptionEnabled(settings, 'fee_pct', true)
+          ? Number(settings.fee_pct ?? 1.0) / 100
+          : 0;
         fill = currentPrice * (1 - slippage);
         proceeds = pos.qty * fill * (1 - fee);
         pnlUsd = proceeds - pos.cost;
@@ -2208,12 +2282,40 @@ export class SniperManager {
       }
 
       const pos = state.positions[mint];
-      const maxSlots = Math.max(1, Number(settings.max_open_positions || 3));
+      const maxSlots = isPyOptionEnabled(settings, 'max_open_positions', true)
+        ? Math.max(1, Number(settings.max_open_positions || 3))
+        : Number.MAX_SAFE_INTEGER;
       const nowIso = new Date().toISOString();
       const costUsd = Number(pos.cost || 0);
       const pnlUsd = -costUsd;
       const pnlPct = -100.0;
       const cleanReason = reason === 'manual_delete' ? 'manual_delete' : 'rugpull_writeoff';
+
+      if (cleanReason === 'rugpull_writeoff' && typeof pos.creator === 'string' && pos.creator.trim()) {
+        try {
+          const histFile = path.join(this.baseDir, 'creator_history.json');
+          const hist = fs.existsSync(histFile) ? JSON.parse(fs.readFileSync(histFile, 'utf-8')) : {};
+          if (hist && typeof hist === 'object') {
+            const creatorKey = pos.creator.trim();
+            const bucket = hist[creatorKey] && typeof hist[creatorKey] === 'object' ? hist[creatorKey] : {};
+            const prev = bucket[mint] && typeof bucket[mint] === 'object' ? bucket[mint] : {};
+            const nowSec = Math.floor(Date.now() / 1000);
+            const launchSec = Number(prev.launch_ts || pos.created_at_sec || pos.opened || nowSec);
+            const rugMinutes = Math.max(0, Math.round(((nowSec - launchSec) / 60) * 100) / 100);
+            bucket[mint] = {
+              ...prev,
+              symbol: prev.symbol || pos.symbol || '',
+              launch_ts: launchSec,
+              rugged: true,
+              rug_ts: nowSec,
+              rug_minutes: rugMinutes,
+              reason: 'rugpull_writeoff',
+            };
+            hist[creatorKey] = bucket;
+            this.writeStateAtomic(histFile, hist);
+          }
+        } catch {}
+      }
 
       state.last_sell_time = Date.now() / 1000;
       delete state.positions[mint];

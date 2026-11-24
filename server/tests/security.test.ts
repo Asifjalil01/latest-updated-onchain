@@ -146,4 +146,130 @@ test('security: skips top-10 non-pool holder limit when enforceMaxTop10Holders i
   assert.equal(bypassed.passed, true, `Unexpected rejection when top-10 rule disabled: ${bypassed.reasons.join('; ')}`);
 });
 
+test('v1.37.0: creator history blocks serial launchers, prior ruggers & fast-ruggers, and bypasses when unchecked', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { BotDatabase } = await import('../store/db');
+  const { inspectCreatorHistory } = await import('../providers/creatorHistory');
+
+  // 1. evaluateSecurityRules enforcement vs bypass
+  const fastRugReport = evaluateSecurityRules(
+    {
+      onChain: makeCleanOnChain(),
+      rugCheck: makeCleanRugCheck(),
+      sellRouteExists: true,
+      sellQuoteImpactPct: 0.8,
+      creatorHistory: {
+        creatorAddress: 'CreatorSerial111111111111111111111111111111',
+        launchCount: 8,
+        ruggedCount: 2,
+        fastestRugMinutes: 14.5,
+        flaggedByRugCheckRisk: false,
+        ruggedMints: ['RugMintA', 'RugMintB'],
+      },
+    },
+    {
+      ...DEFAULT_SETTINGS,
+      creatorHistoryEnabled: true,
+      maxCreatorLaunches: 5,
+      maxCreatorRuggedCoins: 0,
+      creatorFastRugWindowMinutes: 60,
+    }
+  );
+  assert.equal(fastRugReport.passed, false);
+  assert.ok(fastRugReport.criticalFlags.includes('CREATOR_SERIAL_LAUNCHER'));
+  assert.ok(fastRugReport.criticalFlags.includes('CREATOR_RUG_HISTORY'));
+  assert.ok(fastRugReport.criticalFlags.includes('CREATOR_FAST_RUGGER'));
+  assert.equal(fastRugReport.deployerFlagged, true);
+
+  // Unchecking creatorHistoryEnabled bypasses all creator checks
+  const creatorDisabled = evaluateSecurityRules(
+    {
+      onChain: makeCleanOnChain(),
+      rugCheck: makeCleanRugCheck(),
+      sellRouteExists: true,
+      sellQuoteImpactPct: 0.8,
+      creatorHistory: {
+        creatorAddress: 'CreatorSerial111111111111111111111111111111',
+        launchCount: 8,
+        ruggedCount: 2,
+        fastestRugMinutes: 14.5,
+        flaggedByRugCheckRisk: true,
+        ruggedMints: ['RugMintA'],
+      },
+    },
+    {
+      ...DEFAULT_SETTINGS,
+      creatorHistoryEnabled: false,
+    }
+  );
+  assert.equal(creatorDisabled.passed, true, `Unexpected rejection: ${creatorDisabled.reasons.join('; ')}`);
+
+  // Unchecking individual optionToggles bypasses only those specific creator checks
+  const individualDisabled = evaluateSecurityRules(
+    {
+      onChain: makeCleanOnChain(),
+      rugCheck: makeCleanRugCheck(),
+      sellRouteExists: true,
+      sellQuoteImpactPct: 0.8,
+      creatorHistory: {
+        creatorAddress: 'CreatorSerial111111111111111111111111111111',
+        launchCount: 8,
+        ruggedCount: 2,
+        fastestRugMinutes: 14.5,
+        flaggedByRugCheckRisk: false,
+        ruggedMints: ['RugMintA'],
+      },
+    },
+    {
+      ...DEFAULT_SETTINGS,
+      creatorHistoryEnabled: true,
+      optionToggles: {
+        maxCreatorLaunches: false,
+        maxCreatorRuggedCoins: false,
+        creatorFastRugWindowMinutes: false,
+      },
+    }
+  );
+  assert.equal(individualDisabled.passed, true);
+
+  // 2. Database + inspectCreatorHistory end-to-end rug speed tracking
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssb-creator-db-'));
+  const db = new BotDatabase(path.join(tmpDir, 'test.db'));
+  try {
+    const now = 1_760_000_000_000;
+    const creator = 'DevWallet1111111111111111111111111111111111';
+    db.recordCreatorObservation({
+      creator,
+      mint: 'OldRuggedMint111111111111111111111111111111',
+      symbol: 'OLDRUG',
+      createdAtMs: now - 30 * 60_000,
+      rugged: false,
+      nowMs: now - 30 * 60_000,
+    });
+    // Drain happens 12 minutes after launch
+    db.markMintRuggedForCreator('OldRuggedMint111111111111111111111111111111', 'EMERGENCY_LIQUIDITY_DRAIN', now - 18 * 60_000);
+
+    const summary = await inspectCreatorHistory({
+      creatorAddress: creator,
+      currentMint: 'NewMint22222222222222222222222222222222222',
+      currentPoolCreatedAtMs: now,
+      currentSymbol: 'NEW2',
+      rugCheck: makeCleanRugCheck(),
+      db,
+      nowMs: now,
+      bypassCache: true,
+    });
+    assert.equal(summary.launchCount, 1);
+    assert.equal(summary.ruggedCount, 1);
+    assert.equal(summary.fastestRugMinutes, 12);
+    assert.deepEqual(summary.ruggedMints, ['OldRuggedMint111111111111111111111111111111']);
+  } finally {
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+
 

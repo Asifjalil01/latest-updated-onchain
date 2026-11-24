@@ -571,3 +571,69 @@ test('filters: rejects active 5m dump, parabolic 5m blow-off spike, and 5m/1h se
   const healthyRes = evaluateHardFilters(healthy5m, DEFAULT_SETTINGS, 0.3, now);
   assert.equal(healthyRes.passed, true, `Unexpected rejection: ${healthyRes.reasons.join('; ')}`);
 });
+
+test('v1.37.0: optionToggles false disables minLiquidityUsd, minPoolAgeMinutes, and sizing caps', async () => {
+  const { calculatePositionSize } = await import('../engine/sizing');
+  const now = 1_760_000_000_000;
+  const youngZeroLiq: CandidateToken = {
+    ...makeMatureCleanToken(now),
+    poolCreatedAtMs: now - 4 * 60_000, // 4m old (< 30m default)
+    liquidityUsd: 0, // $0 (< $25k default)
+    priceChange1hPct: Number.NaN,
+    priceChange24hPct: Number.NaN,
+    volume24hUsd: 100,
+    txCount24h: 10,
+    uniqueTraders24h: 5,
+  };
+
+  // Enabled -> rejects
+  assert.equal(validateCandidateData(youngZeroLiq, DEFAULT_SETTINGS).valid, false);
+
+  // Unchecked minLiquidityUsd & minPoolAgeMinutes -> bot ignores both rules completely
+  const togglesOffSettings = {
+    ...DEFAULT_SETTINGS,
+    minLiquidityUsd: 50_000,
+    minPoolAgeMinutes: 120,
+    optionToggles: {
+      minLiquidityUsd: false,
+      minPoolAgeMinutes: false,
+      maxOpenPositions: false,
+      dailyLossLimitSol: false,
+      maxWalletExposureSol: false,
+    },
+  };
+  assert.equal(validateCandidateData(youngZeroLiq, togglesOffSettings).valid, true);
+  const res = evaluateHardFilters(youngZeroLiq, togglesOffSettings, 0.5, now);
+  assert.equal(res.passed, true, `Expected disabled liq/age rules to pass, got: ${res.reasons.join('; ')}`);
+
+  // Sizing ignores maxOpenPositions, dailyLossLimitSol, and maxWalletExposureSol when unchecked
+  const sizingBypassed = calculatePositionSize({
+    settings: togglesOffSettings,
+    availableBalanceSol: 2,
+    currentExposureSol: 10, // > 0.1 maxWalletExposureSol
+    openPositionsCount: 10, // > 3 maxOpenPositions
+    dailyRealizedPnlSol: -5, // worse than -0.15 dailyLossLimitSol
+    poolLiquidityUsd: 50_000,
+    solPriceUsd: 100,
+    tokenClassMultiplier: 1,
+  });
+  assert.equal(sizingBypassed.approved, true, `Unexpected sizing block: ${sizingBypassed.reason}`);
+
+  // Unchecking tradeSizeSol pauses new buys explicitly
+  const sizingPaused = calculatePositionSize({
+    settings: {
+      ...togglesOffSettings,
+      optionToggles: { ...togglesOffSettings.optionToggles, tradeSizeSol: false },
+    },
+    availableBalanceSol: 2,
+    currentExposureSol: 0,
+    openPositionsCount: 0,
+    dailyRealizedPnlSol: 0,
+    poolLiquidityUsd: 50_000,
+    solPriceUsd: 100,
+    tokenClassMultiplier: 1,
+  });
+  assert.equal(sizingPaused.approved, false);
+  assert.equal(sizingPaused.cappedBy, 'TRADE_SIZE_DISABLED');
+});
+

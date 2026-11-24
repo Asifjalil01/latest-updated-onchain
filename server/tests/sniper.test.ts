@@ -16,6 +16,7 @@ import {
   formatBotUptime,
   formatTrailingModeHint,
   calcMinRecoveryTakeProfitPct,
+  isPyOptionEnabled,
   validatePythonSniperSettings,
 } from '../../src/utils/sniperFormat.ts';
 import {
@@ -1624,26 +1625,26 @@ test('v1.33.0: bot.py blocks bundled insider RugCheck reports, creator holds/dum
     'out["good_vel"] = list(bot.passes_filters(good_pair, cfg, now_ms))',
     'bot._rpc_mint_account_info = lambda m, c=None: {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": []}',
     'bot._check_sell_route = lambda *a, **k: (True, "ok")',
-    'bot.get_json = lambda u, **k: {"score_normalised": 15, "insiderNetworks": [{"id": "net1", "size": 12}], "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
-    'out["insider_net"] = list(bot.hard_rug_check("MintIns1", cfg, age_s=20, pair=good_pair))',
-    'bot.get_json = lambda u, **k: {"score_normalised": 15, "creator": "Dev1", "creatorBalance": 90000, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
-    'out["dev_hold"] = list(bot.hard_rug_check("MintDev1", cfg, age_s=20, pair=good_pair))',
-    'bot.get_json = lambda u, **k: {"score_normalised": 15, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
-    'dump_pair = dict(good_pair); dump_pair["_pumpportal"] = {"has_trade_stream": True, "buys_60s": 6, "sells_60s": 2, "creator_sold": True}',
-    'out["creator_sold"] = list(bot.hard_rug_check("MintDump1", cfg, age_s=20, pair=dump_pair))',
-    'mint_weak = "MintWeakAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"',
-    'mint_strong = "MintStrongBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"',
-    'weak_pair = {"baseToken": {"address": mint_weak, "symbol": "WEAK"}, "dexId": "pumpfun", "pairCreatedAt": now_ms - 50000, "priceUsd": "0.0001", "liquidity": {"usd": 6000}, "txns": {"m5": {"buys": 10, "sells": 6}}, "volume": {"m5": 2200}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 3, "sells_60s": 2, "sol_vol_60s": 0.8}}',
-    'strong_pair = {"baseToken": {"address": mint_strong, "symbol": "STRG"}, "dexId": "pumpfun", "pairCreatedAt": now_ms - 12000, "priceUsd": "0.0002", "liquidity": {"usd": 8000}, "txns": {"m5": {"buys": 35, "sells": 5}}, "volume": {"m5": 14000}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 14, "sells_60s": 1, "sol_vol_60s": 8.0}}',
-    'bot._pumpportal_pairs.clear()',
-    'bot._pumpportal_pairs[mint_weak] = weak_pair',
-    'bot._pumpportal_pairs[mint_strong] = strong_pair',
-    'bot.fetch_candidate_mints = lambda c, force=False: [mint_weak, mint_strong]',
-    'bot.get_json = lambda u, **k: {"score_normalised": 10, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
     'tmp_dir = tempfile.mkdtemp()',
     'orig_base = bot._base_dir',
     'bot._base_dir = lambda: tmp_dir',
     'try:',
+    '    bot.get_json = lambda u, **k: {"score_normalised": 15, "insiderNetworks": [{"id": "net1", "size": 12}], "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
+    '    out["insider_net"] = list(bot.hard_rug_check("MintIns1", cfg, age_s=20, pair=good_pair))',
+    '    bot.get_json = lambda u, **k: {"score_normalised": 15, "creator": "Dev1", "creatorBalance": 90000, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
+    '    out["dev_hold"] = list(bot.hard_rug_check("MintDev1", cfg, age_s=20, pair=good_pair))',
+    '    bot.get_json = lambda u, **k: {"score_normalised": 15, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
+    '    dump_pair = dict(good_pair); dump_pair["_pumpportal"] = {"has_trade_stream": True, "buys_60s": 6, "sells_60s": 2, "creator_sold": True}',
+    '    out["creator_sold"] = list(bot.hard_rug_check("MintDump1", cfg, age_s=20, pair=dump_pair))',
+    '    mint_weak = "MintWeakAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"',
+    '    mint_strong = "MintStrongBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"',
+    '    weak_pair = {"baseToken": {"address": mint_weak, "symbol": "WEAK"}, "dexId": "pumpfun", "pairCreatedAt": now_ms - 50000, "priceUsd": "0.0001", "liquidity": {"usd": 6000}, "txns": {"m5": {"buys": 10, "sells": 6}}, "volume": {"m5": 2200}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 3, "sells_60s": 2, "sol_vol_60s": 0.8}}',
+    '    strong_pair = {"baseToken": {"address": mint_strong, "symbol": "STRG"}, "dexId": "pumpfun", "pairCreatedAt": now_ms - 12000, "priceUsd": "0.0002", "liquidity": {"usd": 8000}, "txns": {"m5": {"buys": 35, "sells": 5}}, "volume": {"m5": 14000}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 14, "sells_60s": 1, "sol_vol_60s": 8.0}}',
+    '    bot._pumpportal_pairs.clear()',
+    '    bot._pumpportal_pairs[mint_weak] = weak_pair',
+    '    bot._pumpportal_pairs[mint_strong] = strong_pair',
+    '    bot.fetch_candidate_mints = lambda c, force=False: [mint_weak, mint_strong]',
+    '    bot.get_json = lambda u, **k: {"score_normalised": 10, "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 3.0}]} if "rugcheck" in u else None',
     '    rcfg = dict(cfg, max_open_positions=1, max_age_minutes=3)',
     '    acct = bot.TradingAccount(rcfg, mode="paper")',
     '    bot.scan_and_buy(acct, rcfg)',
@@ -2338,6 +2339,12 @@ test('v1.35.0: Speed & Anti-Rug checkboxes (checked applies rule, unchecked igno
 test('v1.36.0: axiom_pulse_migrated_only_enabled blocks unmigrated pumpfun bonding curve coins and passes migrated pumpswap/raydium coins', async () => {
   const pyScript = [
     'import sys, types, json',
+    'req = types.ModuleType("requests")',
+    'class DummySess:',
+    '    def get(self, *a, **k): raise RuntimeError("no net")',
+    '    def post(self, *a, **k): raise RuntimeError("no net")',
+    'req.Session = lambda: DummySess()',
+    'sys.modules["requests"] = req',
     'sys.path.insert(0, "sniper")',
     'import bot',
     'cfg = {**bot.CONFIG, "axiom_pulse_migrated_only_enabled": True}',
@@ -2352,6 +2359,183 @@ test('v1.36.0: axiom_pulse_migrated_only_enabled blocks unmigrated pumpfun bondi
   assert.equal(pyOut.ok_unmigrated, false);
   assert.equal(pyOut.ok_migrated, true);
 });
+
+test('v1.37.0: Python sniper option_enabled checkboxes, creator launch/rug speed history, and min-max coin age gap', () => {
+  // 1. isPyOptionEnabled & validatePythonSniperSettings
+  assert.equal(isPyOptionEnabled({ option_enabled: { min_age_minutes: false } }, 'min_age_minutes', false), false);
+  assert.equal(isPyOptionEnabled({}, 'min_age_minutes', false), false);
+  assert.equal(isPyOptionEnabled({}, 'max_age_minutes', true), true);
+
+  // Min age > Max age rejected when min_age_minutes checkbox is ON
+  const badAgeGap = validatePythonSniperSettings({
+    min_age_minutes: 300,
+    max_age_minutes: 120,
+    option_enabled: { min_age_minutes: true, max_age_minutes: true },
+  });
+  assert.equal(badAgeGap.valid, false);
+  assert.match(badAgeGap.error || '', /cannot exceed Maximum coin age/i);
+
+  // Valid age gap (5m to 300m) and disabled min_age_minutes skip validation cleanly
+  const goodAgeGap = validatePythonSniperSettings({
+    min_age_minutes: 5,
+    max_age_minutes: 300,
+    option_enabled: { min_age_minutes: true, max_age_minutes: true },
+  });
+  assert.equal(goodAgeGap.valid, true);
+
+  const disabledMinAge = validatePythonSniperSettings({
+    min_age_minutes: 999,
+    max_age_minutes: 2,
+    option_enabled: { min_age_minutes: false, max_age_minutes: true },
+  });
+  assert.equal(disabledMinAge.valid, true);
+
+  // Creator history invalid negative bounds fail when enabled, pass when unchecked
+  const badCreatorBounds = validatePythonSniperSettings({
+    check_creator_history: true,
+    max_creator_launches: -2,
+    option_enabled: { check_creator_history: true, max_creator_launches: true },
+  });
+  assert.equal(badCreatorBounds.valid, false);
+  assert.match(badCreatorBounds.error || '', /Max owner prior coins launched/i);
+
+  const skippedCreatorBounds = validatePythonSniperSettings({
+    check_creator_history: true,
+    max_creator_launches: -2,
+    option_enabled: { check_creator_history: true, max_creator_launches: false },
+  });
+  assert.equal(skippedCreatorBounds.valid, true);
+
+  // Recover principal blocked if take_profit_pct checkbox is unchecked
+  const recWithoutTp = validatePythonSniperSettings({
+    recover_principal_enabled: true,
+    trade_size_usd: 5,
+    recover_principal_sell_pct: 50,
+    take_profit_pct: 120,
+    option_enabled: { take_profit_pct: false },
+  });
+  assert.equal(recWithoutTp.valid, false);
+  assert.match(recWithoutTp.error || '', /Enable Take profit %/i);
+
+  // 2. SniperManager option_enabled persistence & rugpull_writeoff updates creator_history.json
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1370-mgr-'));
+  try {
+    const manager = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const defaults = manager.getStatus().settings as Record<string, any>;
+    assert.equal(defaults.option_enabled?.min_age_minutes, false);
+    assert.equal(defaults.check_creator_history, true);
+    assert.equal(defaults.max_creator_launches, 5);
+    assert.equal(defaults.max_creator_rugged_coins, 0);
+    assert.equal(defaults.creator_fast_rug_window_min, 60);
+
+    const upd = manager.updateSettings({
+      min_age_minutes: 5,
+      max_age_minutes: 300,
+      option_enabled: {
+        min_age_minutes: true,
+        slippage_pct: false,
+        fee_pct: false,
+      },
+    });
+    assert.equal(upd.ok, true);
+    assert.equal(upd.settings?.option_enabled?.min_age_minutes, true);
+    assert.equal(upd.settings?.option_enabled?.slippage_pct, false);
+
+    // Seed paper state position with creator + launch timestamp 15 minutes ago
+    const { stateFile } = getSniperFilePaths('paper', tmpDir);
+    const nowSec = Math.floor(Date.now() / 1000);
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({
+        mode: 'paper',
+        cash: 45,
+        positions: {
+          RugMint111111111111111111111111111111111111: {
+            symbol: 'RUGX',
+            mint: 'RugMint111111111111111111111111111111111111',
+            creator: 'SerialOwner1111111111111111111111111111111',
+            created_at_sec: nowSec - 900,
+            entry_price: 0.001,
+            current_price: 0.001,
+            qty: 5000,
+            cost: 5,
+            opened: nowSec - 600,
+          },
+        },
+        closed: 0,
+        total_pnl: 0,
+        day_pnl: 0,
+      }),
+      'utf-8'
+    );
+
+    const delRes = manager.forceDeletePosition('RugMint111111111111111111111111111111111111', 'rugpull_writeoff');
+    assert.equal(delRes.ok, true);
+
+    const histPath = path.join(tmpDir, 'creator_history.json');
+    assert.equal(fs.existsSync(histPath), true);
+    const hist = JSON.parse(fs.readFileSync(histPath, 'utf-8'));
+    const entry = hist['SerialOwner1111111111111111111111111111111']?.['RugMint111111111111111111111111111111111111'];
+    assert.ok(entry);
+    assert.equal(entry.rugged, true);
+    assert.equal(entry.reason, 'rugpull_writeoff');
+    assert.ok(entry.rug_minutes >= 14.5 && entry.rug_minutes <= 16.0);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // 3. Isolated Python bot.py test for min-max age gap, opt_on bypasses, and creator history speed/launch checks
+  const pyTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1370-py-'));
+  try {
+    const pyScript = [
+      'import sys, types, json, time, os',
+      'req = types.ModuleType("requests")',
+      'class DummySess:',
+      '    def get(self, *a, **k): raise RuntimeError("no net")',
+      '    def post(self, *a, **k): raise RuntimeError("no net")',
+      'req.Session = lambda: DummySess()',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      `TMP_DIR = ${JSON.stringify(pyTmpDir)}`,
+      'bot._base_dir = lambda: TMP_DIR',
+      'now_ms = int(time.time() * 1000)',
+      'def make_pair(mint, age_min, liq=8000, buys=12, sells=3):',
+      '    return {"baseToken": {"address": mint, "symbol": "GAP"}, "dexId": "pumpswap", "pairCreatedAt": now_ms - int(age_min * 60000), "priceUsd": "0.001", "liquidity": {"usd": liq}, "fdv": 20000, "volume": {"m5": 5000}, "txns": {"m5": {"buys": buys, "sells": sells}}}',
+      'cfg_gap = {**bot.CONFIG, "min_age_minutes": 5.0, "max_age_minutes": 300.0, "option_enabled": {"min_age_minutes": True, "max_age_minutes": True}}',
+      'ok_young, code_young, _ = bot.passes_filters(make_pair("YoungMint11", 2.0), cfg_gap, now_ms)',
+      'ok_in_gap, _, _ = bot.passes_filters(make_pair("InGapMint11", 60.0), cfg_gap, now_ms)',
+      'ok_old, code_old, _ = bot.passes_filters(make_pair("OldMint1111", 400.0), cfg_gap, now_ms)',
+      'cfg_bypass = {**bot.CONFIG, "min_liquidity_usd": 999999.0, "min_buys_m5": 500, "max_age_minutes": 1.0, "option_enabled": {"min_liquidity_usd": False, "min_buys_m5": False, "max_age_minutes": False, "min_age_minutes": False}}',
+      'ok_bypass, code_bypass, _ = bot.passes_filters(make_pair("BypassMint1", 120.0, liq=4000, buys=4, sells=1), cfg_bypass, now_ms)',
+      'bot.get_json = lambda *a, **k: None',
+      'bot._rpc_earliest_tx_ms = lambda *a, **k: 0',
+      'fast_rep = {"creator": "FastRugDev11", "creatorTokens": [{"mint": "PriorRug1", "createdAt": int((now_ms - 3600000)/1000), "rugged": True, "ruggedAt": int((now_ms - 3600000 + 900000)/1000)}]}',
+      'res_fast = bot._evaluate_creator_history("NewToken1", "FastRugDev11", fast_rep, {**bot.CONFIG, "check_creator_history": True, "max_creator_launches": 5, "max_creator_rugged_coins": 0, "creator_fast_rug_window_min": 60})',
+      'serial_rep = {"creator": "SerialDev11", "creatorTokens": [{"mint": f"P{i}", "createdAt": int((now_ms - (i+2)*3600000)/1000), "rugged": False} for i in range(6)]}',
+      'res_serial = bot._evaluate_creator_history("NewToken2", "SerialDev11", serial_rep, {**bot.CONFIG, "check_creator_history": True, "max_creator_launches": 5, "max_creator_rugged_coins": 0, "creator_fast_rug_window_min": 60})',
+      'res_off = bot._evaluate_creator_history("NewToken3", "FastRugDev11", fast_rep, {**bot.CONFIG, "check_creator_history": False})',
+      'print(json.dumps({"ok_young": ok_young, "code_young": code_young, "ok_in_gap": ok_in_gap, "ok_old": ok_old, "code_old": code_old, "ok_bypass": ok_bypass, "code_bypass": code_bypass, "fast_ok": res_fast["ok"], "fast_reason": res_fast["reason"], "fast_min": res_fast["fast_rug_min"], "serial_ok": res_serial["ok"], "serial_reason": res_serial["reason"], "off_ok": res_off["ok"]}))',
+    ].join('\n');
+    const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyOut.ok_young, false);
+    assert.equal(pyOut.code_young, 'too young');
+    assert.equal(pyOut.ok_in_gap, true);
+    assert.equal(pyOut.ok_old, false);
+    assert.equal(pyOut.code_old, 'too old');
+    assert.equal(pyOut.ok_bypass, true, `Unexpected rejection when filters unchecked: ${pyOut.code_bypass}`);
+    assert.equal(pyOut.fast_ok, false);
+    assert.match(pyOut.fast_reason, /rugged 1 coin|15\.0m/i);
+    assert.ok(pyOut.fast_min >= 14.9 && pyOut.fast_min <= 15.1);
+    assert.equal(pyOut.serial_ok, false);
+    assert.match(pyOut.serial_reason, /launched 6 prior coins > 5 limit/i);
+    assert.equal(pyOut.off_ok, true);
+  } finally {
+    fs.rmSync(pyTmpDir, { recursive: true, force: true });
+  }
+});
+
 
 
 

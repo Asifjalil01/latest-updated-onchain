@@ -23,12 +23,12 @@ const APP_VERSION = readPackageVersion();
 
 const settingsPatchSchema = z
   .object({
-    tradeSizeSol: z.number().positive().optional(),
+    tradeSizeSol: z.number().min(0).optional(),
     maxPositionSizeSol: z.number().positive().optional(),
-    maxWalletExposureSol: z.number().positive().optional(),
+    maxWalletExposureSol: z.number().min(0).optional(),
     gasReserveSol: z.number().min(0).optional(),
-    dailyLossLimitSol: z.number().positive().optional(),
-    maxOpenPositions: z.number().int().min(1).max(10).optional(),
+    dailyLossLimitSol: z.number().min(0).optional(),
+    maxOpenPositions: z.number().int().min(0).max(10).optional(),
     cooldownMinutes: z.number().int().min(0).max(1440).optional(),
     allowSlotRotation: z.boolean().optional(),
     slotRotationMinScoreDelta: z.number().min(5).max(50).optional(),
@@ -36,15 +36,15 @@ const settingsPatchSchema = z
     priorityFeePreset: z.enum(['auto', 'standard', 'high', 'ultra', 'custom']).optional(),
     customPriorityFeeSol: z.number().min(0).max(0.05).optional(),
     maxPriorityFeeSol: z.number().min(0.0001).max(0.05).optional(),
-    slippageBps: z.number().int().min(10).max(1000).optional(),
-    minPoolAgeMinutes: z.number().min(30).optional(),
+    slippageBps: z.number().int().min(0).max(1000).optional(),
+    minPoolAgeMinutes: z.number().min(0).optional(),
     maxPoolAgeDays: z.number().min(1).max(3650).optional(),
     customAgeWindowEnabled: z.boolean().optional(),
     customMinPoolAgeMinutes: z.number().min(0).optional(),
-    customMaxPoolAgeMinutes: z.number().positive().optional(),
+    customMaxPoolAgeMinutes: z.number().min(0).optional(),
     newLaunchOnlyEnabled: z.boolean().optional(),
     newLaunchMinAgeSeconds: z.number().min(0).optional(),
-    newLaunchMaxAgeSeconds: z.number().min(1).optional(),
+    newLaunchMaxAgeSeconds: z.number().min(0).optional(),
     minLiquidityUsd: z.number().min(0).optional(),
     minVolume24hUsd: z.number().min(0).optional(),
     minTx24h: z.number().int().min(0).optional(),
@@ -59,9 +59,13 @@ const settingsPatchSchema = z
     maxRugCheckRiskScore: z.number().min(0).max(100).optional(),
     minLpLockedOrBurnedPct: z.number().min(0).max(100).optional(),
     enforceMaxTop10Holders: z.boolean().optional(),
-    maxTop10HoldersPct: z.number().min(1).max(50).optional(),
-    maxSingleHolderPct: z.number().min(1).max(20).optional(),
+    maxTop10HoldersPct: z.number().min(0).max(100).optional(),
+    maxSingleHolderPct: z.number().min(0).max(100).optional(),
     maxSellRouteImpactPct: z.number().min(0.1).max(25).optional(),
+    creatorHistoryEnabled: z.boolean().optional(),
+    maxCreatorLaunches: z.number().int().min(0).max(500).optional(),
+    maxCreatorRuggedCoins: z.number().int().min(0).max(100).optional(),
+    creatorFastRugWindowMinutes: z.number().min(0).max(10080).optional(),
     enforceMinScores: z.boolean().optional(),
     minQualityScore: z.number().min(0).max(100).optional(),
     minTradeScore: z.number().min(0).max(100).optional(),
@@ -69,7 +73,7 @@ const settingsPatchSchema = z
     enablePumpPortalWs: z.boolean().optional(),
     scanIntervalSeconds: z.number().int().min(10).max(600).optional(),
     stopLossEnabled: z.boolean().optional(),
-    stopLossPct: z.number().min(0.5).optional(),
+    stopLossPct: z.number().min(0).optional(),
     stopLossTiers: z
       .array(
         z.object({
@@ -78,13 +82,13 @@ const settingsPatchSchema = z
         })
       )
       .optional(),
-    takeProfitPct: z.number().min(1.5).optional(),
+    takeProfitPct: z.number().min(0).optional(),
     trailingEnabled: z.boolean().optional(),
     trailingLadder: z
       .array(z.object({ peakGainPct: z.number().positive(), allowedDropPct: z.number().positive() }))
       .optional(),
     breakEvenRecoveryEnabled: z.boolean().optional(),
-    maxHoldMinutes: z.number().int().min(5).max(10080).optional(),
+    maxHoldMinutes: z.number().int().min(0).max(10080).optional(),
     maxHoldStagnationEnabled: z.boolean().optional(),
     stagnationMinGainPct: z.number().optional(),
     emergencyLiquidityFloorUsd: z.number().min(0).optional(),
@@ -100,6 +104,7 @@ const settingsPatchSchema = z
     paperInitialBalanceSol: z.number().min(0.1).max(10000).optional(),
     shadowCompareEnabled: z.boolean().optional(),
     shadowLiveSizeSol: z.number().min(0.005).max(0.5).optional(),
+    optionToggles: z.record(z.string(), z.boolean()).optional(),
     applyToOpenPositions: z.boolean().optional(),
   })
   .strict();

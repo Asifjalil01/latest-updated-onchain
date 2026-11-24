@@ -14,6 +14,7 @@ export interface SettingsValidationResult {
 export function validateSettingsDraft(draft: BotSettings): SettingsValidationResult {
   const fieldErrors: Record<string, string> = {};
   const errors: string[] = [];
+  const optOn = (key: string) => draft.optionToggles?.[key] !== false;
 
   const addError = (fieldKey: string, message: string) => {
     if (!fieldErrors[fieldKey]) {
@@ -25,41 +26,53 @@ export function validateSettingsDraft(draft: BotSettings): SettingsValidationRes
   };
 
   // Position Sizing & Risk Caps
-  if (!Number.isFinite(draft.maxWalletExposureSol) || draft.maxWalletExposureSol <= 0) {
+  if (
+    optOn('maxWalletExposureSol') &&
+    (!Number.isFinite(draft.maxWalletExposureSol) || draft.maxWalletExposureSol <= 0)
+  ) {
     addError('maxWalletExposureSol', 'Must be greater than 0 SOL.');
   }
   if (
-    !Number.isFinite(draft.tradeSizeSol) ||
-    draft.tradeSizeSol <= 0 ||
-    (Number.isFinite(draft.maxWalletExposureSol) &&
-      draft.maxWalletExposureSol > 0 &&
-      draft.tradeSizeSol > draft.maxWalletExposureSol)
+    optOn('tradeSizeSol') &&
+    (!Number.isFinite(draft.tradeSizeSol) ||
+      draft.tradeSizeSol <= 0 ||
+      (optOn('maxWalletExposureSol') &&
+        Number.isFinite(draft.maxWalletExposureSol) &&
+        draft.maxWalletExposureSol > 0 &&
+        draft.tradeSizeSol > draft.maxWalletExposureSol))
   ) {
     const cap = Number.isFinite(draft.maxWalletExposureSol) ? draft.maxWalletExposureSol : 0.1;
     addError(
       'tradeSizeSol',
-      `Must be greater than 0 and <= Max Wallet Exposure (${cap} SOL).`
+      optOn('maxWalletExposureSol')
+        ? `Must be greater than 0 and <= Max Wallet Exposure (${cap} SOL).`
+        : 'Must be greater than 0 SOL.'
     );
   }
-  if (!Number.isFinite(draft.dailyLossLimitSol) || draft.dailyLossLimitSol <= 0) {
+  if (
+    optOn('dailyLossLimitSol') &&
+    (!Number.isFinite(draft.dailyLossLimitSol) || draft.dailyLossLimitSol <= 0)
+  ) {
     addError('dailyLossLimitSol', 'Must be greater than 0 SOL.');
   }
   if (!Number.isFinite(draft.gasReserveSol) || draft.gasReserveSol < 0) {
     addError('gasReserveSol', 'Must be 0 or greater.');
   }
   if (
-    !Number.isFinite(draft.maxOpenPositions) ||
-    !Number.isInteger(draft.maxOpenPositions) ||
-    draft.maxOpenPositions < 1 ||
-    draft.maxOpenPositions > 10
+    optOn('maxOpenPositions') &&
+    (!Number.isFinite(draft.maxOpenPositions) ||
+      !Number.isInteger(draft.maxOpenPositions) ||
+      draft.maxOpenPositions < 1 ||
+      draft.maxOpenPositions > 10)
   ) {
     addError('maxOpenPositions', 'Must be a whole number between 1 and 10.');
   }
   if (
-    !Number.isFinite(draft.cooldownMinutes) ||
-    !Number.isInteger(draft.cooldownMinutes) ||
-    draft.cooldownMinutes < 0 ||
-    draft.cooldownMinutes > 1440
+    optOn('cooldownMinutes') &&
+    (!Number.isFinite(draft.cooldownMinutes) ||
+      !Number.isInteger(draft.cooldownMinutes) ||
+      draft.cooldownMinutes < 0 ||
+      draft.cooldownMinutes > 1440)
   ) {
     addError('cooldownMinutes', 'Must be a whole number between 0 and 1440 minutes.');
   }
@@ -124,16 +137,16 @@ export function validateSettingsDraft(draft: BotSettings): SettingsValidationRes
         `Must be greater than 0 and >= Min Coin Age (${minAge} min).`
       );
     }
-  } else {
+  } else if (optOn('minPoolAgeMinutes')) {
     if (!Number.isFinite(draft.minPoolAgeMinutes) || draft.minPoolAgeMinutes < 30) {
       addError(
         'minPoolAgeMinutes',
-        'Must be at least 30 minutes (or enable New Launches Only / Custom Pool Age Timeframe above).'
+        'Must be at least 30 minutes (or enable New Launches Only / Custom Pool Age Timeframe above, or uncheck to disable).'
       );
     }
   }
 
-  if (!Number.isFinite(draft.minLiquidityUsd) || draft.minLiquidityUsd < 0) {
+  if (optOn('minLiquidityUsd') && (!Number.isFinite(draft.minLiquidityUsd) || draft.minLiquidityUsd < 0)) {
     addError('minLiquidityUsd', 'Must be $0 or greater (no upper limit).');
   }
   if (
@@ -161,21 +174,52 @@ export function validateSettingsDraft(draft: BotSettings): SettingsValidationRes
     addError('minTradeScore', 'Trade Score must be between 50 and 100.');
   }
 
+  // Owner / Creator History & Fast-Rug Check
+  if (draft.creatorHistoryEnabled) {
+    if (
+      optOn('maxCreatorLaunches') &&
+      (!Number.isFinite(draft.maxCreatorLaunches) ||
+        draft.maxCreatorLaunches < 0 ||
+        draft.maxCreatorLaunches > 500)
+    ) {
+      addError('maxCreatorLaunches', 'Must be between 0 and 500 prior coins.');
+    }
+    if (
+      optOn('maxCreatorRuggedCoins') &&
+      (!Number.isFinite(draft.maxCreatorRuggedCoins) ||
+        draft.maxCreatorRuggedCoins < 0 ||
+        draft.maxCreatorRuggedCoins > 100)
+    ) {
+      addError('maxCreatorRuggedCoins', 'Must be between 0 and 100 rugged coins.');
+    }
+    if (
+      optOn('creatorFastRugWindowMinutes') &&
+      (!Number.isFinite(draft.creatorFastRugWindowMinutes) ||
+        draft.creatorFastRugWindowMinutes < 0 ||
+        draft.creatorFastRugWindowMinutes > 10080)
+    ) {
+      addError('creatorFastRugWindowMinutes', 'Must be between 0 and 10080 minutes.');
+    }
+  }
+
   // Exit Rules
-  if (!Number.isFinite(draft.takeProfitPct) || draft.takeProfitPct < 1.5) {
+  if (optOn('takeProfitPct') && (!Number.isFinite(draft.takeProfitPct) || draft.takeProfitPct < 1.5)) {
     addError('takeProfitPct', 'Must be at least 1.5% (no upper limit).');
   }
   if (
-    !Number.isFinite(draft.maxHoldMinutes) ||
-    !Number.isInteger(draft.maxHoldMinutes) ||
-    draft.maxHoldMinutes < 5 ||
-    draft.maxHoldMinutes > 10080
+    draft.maxHoldStagnationEnabled !== false &&
+    optOn('maxHoldMinutes') &&
+    (!Number.isFinite(draft.maxHoldMinutes) ||
+      !Number.isInteger(draft.maxHoldMinutes) ||
+      draft.maxHoldMinutes < 5 ||
+      draft.maxHoldMinutes > 10080)
   ) {
     addError('maxHoldMinutes', 'Must be a whole number between 5 and 10080 minutes.');
   }
   if (
-    !Number.isFinite(draft.emergencyLiquidityFloorUsd) ||
-    draft.emergencyLiquidityFloorUsd < 0
+    optOn('emergencyLiquidityFloorUsd') &&
+    (!Number.isFinite(draft.emergencyLiquidityFloorUsd) ||
+      draft.emergencyLiquidityFloorUsd < 0)
   ) {
     addError('emergencyLiquidityFloorUsd', 'Must be $0 or greater.');
   }
@@ -211,43 +255,48 @@ export function validateSettingsDraft(draft: BotSettings): SettingsValidationRes
   }
 
   // Paper Shadow Simulation Realism
-  if (
-    !Number.isFinite(draft.paperDelayMinSec) ||
-    draft.paperDelayMinSec < 0 ||
-    draft.paperDelayMinSec > 30
-  ) {
-    addError('paperDelayMinSec', 'Min Delay must be between 0 and 30 seconds.');
+  if (optOn('paperDelayWindow')) {
+    if (
+      !Number.isFinite(draft.paperDelayMinSec) ||
+      draft.paperDelayMinSec < 0 ||
+      draft.paperDelayMinSec > 30
+    ) {
+      addError('paperDelayMinSec', 'Min Delay must be between 0 and 30 seconds.');
+    }
+    const minDelay = Number.isFinite(draft.paperDelayMinSec) ? draft.paperDelayMinSec : 0;
+    if (
+      !Number.isFinite(draft.paperDelayMaxSec) ||
+      draft.paperDelayMaxSec < 0 ||
+      draft.paperDelayMaxSec > 60 ||
+      draft.paperDelayMaxSec < minDelay
+    ) {
+      addError(
+        'paperDelayMaxSec',
+        `Max Delay must be between ${minDelay} and 60 seconds.`
+      );
+    }
   }
-  const minDelay = Number.isFinite(draft.paperDelayMinSec) ? draft.paperDelayMinSec : 0;
-  if (
-    !Number.isFinite(draft.paperDelayMaxSec) ||
-    draft.paperDelayMaxSec < 0 ||
-    draft.paperDelayMaxSec > 60 ||
-    draft.paperDelayMaxSec < minDelay
-  ) {
-    addError(
-      'paperDelayMaxSec',
-      `Max Delay must be between ${minDelay} and 60 seconds.`
-    );
+  if (optOn('paperFailChance')) {
+    if (
+      !Number.isFinite(draft.paperBuyFailChancePct) ||
+      draft.paperBuyFailChancePct < 0 ||
+      draft.paperBuyFailChancePct > 100
+    ) {
+      addError('paperBuyFailChancePct', 'Buy Failure % must be between 0% and 100%.');
+    }
+    if (
+      !Number.isFinite(draft.paperSellFailChancePct) ||
+      draft.paperSellFailChancePct < 0 ||
+      draft.paperSellFailChancePct > 100
+    ) {
+      addError('paperSellFailChancePct', 'Sell Failure % must be between 0% and 100%.');
+    }
   }
   if (
-    !Number.isFinite(draft.paperBuyFailChancePct) ||
-    draft.paperBuyFailChancePct < 0 ||
-    draft.paperBuyFailChancePct > 100
-  ) {
-    addError('paperBuyFailChancePct', 'Buy Failure % must be between 0% and 100%.');
-  }
-  if (
-    !Number.isFinite(draft.paperSellFailChancePct) ||
-    draft.paperSellFailChancePct < 0 ||
-    draft.paperSellFailChancePct > 100
-  ) {
-    addError('paperSellFailChancePct', 'Sell Failure % must be between 0% and 100%.');
-  }
-  if (
-    !Number.isFinite(draft.paperCompetitionPenaltyPct) ||
-    draft.paperCompetitionPenaltyPct < 0 ||
-    draft.paperCompetitionPenaltyPct > 20
+    optOn('paperCompetitionPenaltyPct') &&
+    (!Number.isFinite(draft.paperCompetitionPenaltyPct) ||
+      draft.paperCompetitionPenaltyPct < 0 ||
+      draft.paperCompetitionPenaltyPct > 20)
   ) {
     addError('paperCompetitionPenaltyPct', 'Must be between 0% and 20%.');
   }

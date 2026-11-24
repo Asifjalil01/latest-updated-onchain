@@ -1,3 +1,4 @@
+import { isOptionEnabled } from '../config/defaults';
 import type {
   BotSettings,
   CandidateToken,
@@ -108,7 +109,7 @@ export async function executeRealisticPaperBuy(params: {
   const quotedPriceUsd = quotedPriceSol * solPriceUsd;
 
   // Simulated failure check (buy failed / missed block)
-  if (rng() * 100 < settings.paperBuyFailChancePct) {
+  if (isOptionEnabled(settings, 'paperFailChance') && rng() * 100 < settings.paperBuyFailChancePct) {
     return {
       executed: false,
       cancelledReason: 'Simulated paper buy execution failure (block miss / slippage exceed)',
@@ -120,9 +121,10 @@ export async function executeRealisticPaperBuy(params: {
   }
 
   // Decision-to-fill delay window: sample multiple times and take WORST (highest) price
-  const minSec = Math.max(0, settings.paperDelayMinSec);
-  const maxSec = Math.max(minSec, settings.paperDelayMaxSec);
-  const delaySec = minSec + rng() * (maxSec - minSec);
+  const delayWindowEnabled = isOptionEnabled(settings, 'paperDelayWindow');
+  const minSec = delayWindowEnabled ? Math.max(0, settings.paperDelayMinSec) : 0;
+  const maxSec = delayWindowEnabled ? Math.max(minSec, settings.paperDelayMaxSec) : 0;
+  const delaySec = delayWindowEnabled ? minSec + rng() * (maxSec - minSec) : 0;
   const steps = delaySec <= 0 ? 0 : Math.max(1, Math.min(4, Math.ceil(delaySec)));
   const stepMs = steps > 0 ? (delaySec * 1000) / steps : 0;
 
@@ -166,7 +168,7 @@ export async function executeRealisticPaperBuy(params: {
   }
 
   // Re-check liquidity at fill time: cancel if liquidity fell below floor during delay
-  if (latestLiquidityUsd < settings.minLiquidityUsd) {
+  if (isOptionEnabled(settings, 'minLiquidityUsd') && latestLiquidityUsd < settings.minLiquidityUsd) {
     return {
       executed: false,
       cancelledReason: `Paper buy cancelled at fill time: liquidity dropped to $${latestLiquidityUsd.toFixed(0)} < $${settings.minLiquidityUsd} floor during ${delaySec.toFixed(1)}s delay`,
@@ -180,7 +182,9 @@ export async function executeRealisticPaperBuy(params: {
   // Competition penalty on coins < 24h old
   const poolAgeMinutes = (nowMs - token.poolCreatedAtMs) / 60_000;
   const competitionPenaltyPct =
-    poolAgeMinutes < 24 * 60 ? settings.paperCompetitionPenaltyPct : 0;
+    isOptionEnabled(settings, 'paperCompetitionPenaltyPct') && poolAgeMinutes < 24 * 60
+      ? settings.paperCompetitionPenaltyPct
+      : 0;
 
   // Optional measured Live vs Paper reality gap
   const measuredGapPenaltyPct =
@@ -191,6 +195,7 @@ export async function executeRealisticPaperBuy(params: {
   const effectiveFillPriceSol = effectiveFillPriceUsd / solPriceUsd;
 
   const resolvedAutoPriority =
+    isOptionEnabled(settings, 'priorityFeePreset') &&
     params.liveAutoPriorityFeeSol === undefined &&
     jupiterProvider &&
     settings.priorityFeePreset === 'auto' &&
@@ -313,7 +318,11 @@ export async function executeRealisticPaperSell(params: {
   const nowMs = params.nowMs ?? Date.now();
 
   // Simulate "no route" or failed sell — leaves position OPEN and exposed!
-  if (exitReason !== 'KILL_SWITCH' && rng() * 100 < settings.paperSellFailChancePct) {
+  if (
+    isOptionEnabled(settings, 'paperFailChance') &&
+    exitReason !== 'KILL_SWITCH' &&
+    rng() * 100 < settings.paperSellFailChancePct
+  ) {
     return {
       executed: false,
       failureReason: 'Simulated paper sell failure: no route / transaction dropped',
@@ -352,9 +361,10 @@ export async function executeRealisticPaperSell(params: {
   }
 
   // Delay window for sell: track WORST (lowest) price between signal and fill
-  const minSec = Math.max(0, settings.paperDelayMinSec);
-  const maxSec = Math.max(minSec, settings.paperDelayMaxSec);
-  const delaySec = minSec + rng() * (maxSec - minSec);
+  const sellDelayEnabled = isOptionEnabled(settings, 'paperDelayWindow');
+  const minSec = sellDelayEnabled ? Math.max(0, settings.paperDelayMinSec) : 0;
+  const maxSec = sellDelayEnabled ? Math.max(minSec, settings.paperDelayMaxSec) : 0;
+  const delaySec = sellDelayEnabled ? minSec + rng() * (maxSec - minSec) : 0;
   const steps = delaySec <= 0 ? 0 : Math.max(1, Math.min(4, Math.ceil(delaySec)));
   const stepMs = steps > 0 ? (delaySec * 1000) / steps : 0;
 
@@ -401,6 +411,7 @@ export async function executeRealisticPaperSell(params: {
   const grossSolOut = (position.quantity * effectiveExitPriceUsd) / solPriceUsd;
 
   const resolvedAutoPriority =
+    isOptionEnabled(settings, 'priorityFeePreset') &&
     params.liveAutoPriorityFeeSol === undefined &&
     jupiterProvider &&
     settings.priorityFeePreset === 'auto' &&

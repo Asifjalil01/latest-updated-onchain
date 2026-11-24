@@ -41,7 +41,8 @@ CONFIG = {
     "scale_out_step_gain_pct": 100.0,
     "auto_rug_exit": False,
     "rug_liq_drop_pct": 50.0,
-    # sniper window: buy ONLY coins younger than this
+    # sniper window: buy ONLY coins inside [min_age_minutes, max_age_minutes]
+    "min_age_minutes": 0.0,
     "max_age_minutes": 2.0,
     # coins younger than this skip liquidity/volume floors (0 = strict anti-rug from second 0)
     "ultra_early_grace_sec": 0,
@@ -53,10 +54,12 @@ CONFIG = {
     "min_recent_buys_60s": 3,
     "max_price_change_m5_pct": 250.0,
     "min_holders": 0,
-    # hard rug screen
+    # hard rug screen & owner/creator history
     "use_rugcheck": True, "strict_rugcheck": True, "require_lp_locked": False,
     "block_insider_bundles": True, "block_creator_dump": True, "max_dev_hold_pct": 5.0,
     "rugcheck_max_score": 55.0, "max_top10_holder_pct": 35.0, "rug_recheck_minutes": 15,
+    "check_creator_history": True, "max_creator_launches": 5,
+    "max_creator_rugged_coins": 0, "creator_fast_rug_window_min": 60.0,
     # candidate sources & website filters (empty = all websites)
     "use_gecko": True, "use_jupiter_recent": True, "use_dex_profiles": True,
     "use_pumpportal": True, "use_promoted_feeds": False,
@@ -73,15 +76,41 @@ CONFIG = {
     "anti_rug_pool_depth_check_enabled": True,
     "anti_rug_sell_sim_enabled": False,
     "anti_rug_copycat_cooldown_enabled": True,
+    "axiom_pulse_migrated_only_enabled": False,
     "state_file": "state.json", "trades_csv": "trades.csv",
     "log_rejects": False, "jupiter_api_key": "",
+    # per-option enable/disable toggles (true = enforce, false = ignore)
+    "option_enabled": {"min_age_minutes": False},
     # compatibility keys kept so old settings files still load
-    "cooldown_minutes": 60, "min_volume_h1_usd": 0.0, "min_age_minutes": 0,
+    "cooldown_minutes": 60, "min_volume_h1_usd": 0.0,
     "max_age_hours": 24, "min_buys_h1": 0, "min_buy_sell_ratio_h1": 0.0,
     "use_jupiter_price": True, "use_real_swap_quotes": True,
     "pool_keep_hours": 1, "pool_max_size": 500,
     "rescan_delay_after_sell_sec": 0,
 }
+
+_BOOL_OPTION_KEYS = {
+    "use_real_swap_quotes", "use_rugcheck", "strict_rugcheck", "require_lp_locked",
+    "block_insider_bundles", "block_creator_dump", "check_creator_history",
+    "auto_rug_exit", "recover_principal_enabled", "use_gecko", "use_jupiter_recent",
+    "use_dex_profiles", "use_pumpportal", "use_promoted_feeds", "use_jupiter_price",
+    "fast_live_buy_enabled", "parallel_rug_screen_enabled", "jupiter_quota_guard_enabled",
+    "direct_dex_fallback_enabled", "anti_rug_tight_score_enabled",
+    "anti_rug_pool_depth_check_enabled", "anti_rug_sell_sim_enabled",
+    "anti_rug_copycat_cooldown_enabled", "axiom_pulse_migrated_only_enabled", "log_rejects",
+}
+
+def opt_on(cfg, key, default=True):
+    """Return True if option `key` is checked/active in option_enabled (or bool field)."""
+    c = cfg or CONFIG
+    oe = c.get("option_enabled")
+    has_oe = isinstance(oe, dict) and (key in oe)
+    if key in _BOOL_OPTION_KEYS:
+        base = bool(c.get(key, default))
+        return (bool(oe[key]) and base) if has_oe else base
+    if has_oe:
+        return bool(oe[key])
+    return bool(default)
 
 _settings_mtime = 0.0
 _settings_lock = threading.Lock()
@@ -202,7 +231,7 @@ RPC_URLS = [
 
 def _get_rpc_urls(cfg=None):
     c = cfg or CONFIG
-    custom = str(c.get("custom_rpc_url") or "").strip()
+    custom = str(c.get("custom_rpc_url") or "").strip() if opt_on(c, "custom_rpc_url", True) else ""
     if custom.startswith("http://") or custom.startswith("https://"):
         return [custom] + [u for u in RPC_URLS if u != custom]
     return list(RPC_URLS)
@@ -314,7 +343,7 @@ def get_sol_price_usd(cfg=None, force=False):
 
     cfg = cfg or CONFIG
     price = None
-    has_key = bool(cfg.get("jupiter_api_key"))
+    has_key = bool(cfg.get("jupiter_api_key")) and opt_on(cfg, "jupiter_api_key", True)
     jup_url = JUP_PRICE if has_key else JUP_PRICE_LITE
     hdrs = {"x-api-key": cfg["jupiter_api_key"]} if has_key else None
     jdata = get_json(jup_url, params={"ids": WSOL_MINT}, timeout=4, headers=hdrs)
@@ -414,25 +443,17 @@ def _update_pending_dex_mints(fresh_mints, found_pairs):
                 if len(_pending_dex_retry) < 120:
                     _pending_dex_retry[m] = (t, t)
 
-def _src_gecko(cfg):
-    global _gecko_backoff_until
-    if not cfg.get("use_gecko", True):
-        return []
-    now_ts = time.time()
-    if now_ts < _gecko_backoff_until:
-        return []
-    out = []
-    try:
-        r = _session.get(GECKO, params={"page": 1}, headers=HEADERS, timeout=6)
-        if r.status_code == 429:
-            _gecko_backoff_until = time.time() + 45.0
-            return []
-        r.raise_for_status()
-        data = r.json()
-    except Exception:
-        return []
+def _needs_older_age_discovery(cfg):
+    c = cfg or CONFIG
+    if not opt_on(c, "max_age_minutes", True):
+        return True
+    max_m = float(c.get("max_age_minutes", 2.0) or 0.0)
+    min_m = float(c.get("min_age_minutes", 0.0) or 0.0) if opt_on(c, "min_age_minutes", False) else 0.0
+    return max_m > 10.0 or min_m >= 3.0
+
+def _extract_gecko_pools(data, out):
     if not (isinstance(data, dict) and isinstance(data.get("data"), list)):
-        return []
+        return
     for pool in data["data"]:
         try:
             rel = pool.get("relationships") or {}
@@ -442,7 +463,8 @@ def _src_gecko(cfg):
             mint = tid[len("solana_"):]
             if not mint or len(mint) <= 20:
                 continue
-            out.append(mint)
+            if mint not in out:
+                out.append(mint)
             attrs = pool.get("attributes") or {}
             created_ms = _parse_iso_ms(attrs.get("pool_created_at"))
             px = attrs.get("base_token_price_usd")
@@ -472,14 +494,78 @@ def _src_gecko(cfg):
                 }
         except Exception:
             continue
+
+_gecko_age_page_idx = [0]
+
+def _src_gecko(cfg):
+    global _gecko_backoff_until
+    if not opt_on(cfg, "use_gecko", True):
+        return []
+    now_ts = time.time()
+    if now_ts < _gecko_backoff_until:
+        return []
+    endpoints = [GECKO]
+    if _needs_older_age_discovery(cfg):
+        extra = [
+            "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools",
+            "https://api.geckoterminal.com/api/v2/networks/solana/pools",
+        ]
+        pick = extra[_gecko_age_page_idx[0] % len(extra)]
+        _gecko_age_page_idx[0] += 1
+        endpoints.append(pick)
+    out = []
+    for url in endpoints:
+        try:
+            r = _session.get(url, params={"page": 1}, headers=HEADERS, timeout=6)
+            if r.status_code == 429:
+                _gecko_backoff_until = time.time() + 45.0
+                break
+            r.raise_for_status()
+            _extract_gecko_pools(r.json(), out)
+        except Exception:
+            continue
     if len(_gecko_pairs) > 500:
         for k in list(_gecko_pairs.keys())[:250]:
             _gecko_pairs.pop(k, None)
     return out
 
+_dex_age_search_idx = [0]
+
+def _src_dex_age_gap(cfg):
+    """Extra multi-hour discovery via DexScreener search when age window exceeds fresh launches."""
+    if not _needs_older_age_discovery(cfg):
+        return []
+    queries = ("SOL", "pump", "raydium", "meteora")
+    q = queries[_dex_age_search_idx[0] % len(queries)]
+    _dex_age_search_idx[0] += 1
+    data = get_json(f"{DEX}/latest/dex/search", params={"q": q}, timeout=5)
+    if not isinstance(data, dict) or not isinstance(data.get("pairs"), list):
+        return []
+    now_ms = int(time.time() * 1000)
+    min_s = (max(0.0, float(cfg.get("min_age_minutes", 0.0) or 0.0)) * 60.0) if opt_on(cfg, "min_age_minutes", False) else 0.0
+    max_s = (float(cfg.get("max_age_minutes", 2.0) or 0.0) * 60.0) if opt_on(cfg, "max_age_minutes", True) else 0.0
+    out = []
+    for p in data["pairs"]:
+        if not isinstance(p, dict) or p.get("chainId") != "solana":
+            continue
+        mint = (p.get("baseToken") or {}).get("address")
+        if not mint or len(mint) <= 20:
+            continue
+        created = int(p.get("pairCreatedAt") or 0)
+        if created > 0:
+            age_s = (now_ms - created) / 1000.0
+            if min_s > 0 and age_s < min_s * 0.8:
+                continue
+            if max_s > 0 and age_s > max_s * 1.1:
+                continue
+        if mint not in out:
+            out.append(mint)
+    return out
+
 def _src_jup(cfg):
-    if not cfg.get("use_jupiter_recent", True): return []
-    hdrs = {"x-api-key": cfg["jupiter_api_key"]} if cfg.get("jupiter_api_key") else None
+    if not opt_on(cfg, "use_jupiter_recent", True): return []
+    has_key = bool(cfg.get("jupiter_api_key")) and opt_on(cfg, "jupiter_api_key", True)
+    hdrs = {"x-api-key": cfg["jupiter_api_key"]} if has_key else None
     data = get_json(f"{JUP}/recent", headers=hdrs)
     if isinstance(data, list): items = data
     elif isinstance(data, dict): items = data.get("tokens") or data.get("data") or []
@@ -487,21 +573,21 @@ def _src_jup(cfg):
     return [t.get("id") for t in items if isinstance(t, dict) and t.get("id")]
 
 def _src_profiles(cfg):
-    if not cfg.get("use_dex_profiles", True): return []
+    if not opt_on(cfg, "use_dex_profiles", True): return []
     data = get_json(f"{DEX}/token-profiles/latest/v1")
     if not isinstance(data, list): return []
     return [d.get("tokenAddress") for d in data
             if isinstance(d, dict) and d.get("chainId") == "solana" and d.get("tokenAddress")]
 
 def _src_boosts(cfg):
-    if not cfg.get("use_promoted_feeds", False): return []
+    if not opt_on(cfg, "use_promoted_feeds", False): return []
     data = get_json(f"{DEX}/token-boosts/latest/v1")
     if not isinstance(data, list): return []
     return [d.get("tokenAddress") for d in data
             if isinstance(d, dict) and d.get("chainId") == "solana" and d.get("tokenAddress")]
 
 def _src_pumpportal(cfg):
-    if not cfg.get("use_pumpportal", True): return []
+    if not opt_on(cfg, "use_pumpportal", True): return []
     if _bridge_base_url():
         resp = bridge_get("/api/sniper/pumpportal-mints", timeout=4)
         if isinstance(resp, dict) and resp.get("ok"):
@@ -524,6 +610,7 @@ def _src_pumpportal(cfg):
 SOURCES = [
     ("pumpportal", 2.0, _src_pumpportal),
     ("gecko", 10.0, _src_gecko),
+    ("dex_age_gap", 12.0, _src_dex_age_gap),
     ("jup", 6.0, _src_jup),
     ("profiles", 4.0, _src_profiles),
     ("boosts", 10.0, _src_boosts),
@@ -557,7 +644,7 @@ def fetch_candidate_mints(cfg, force=False):
     # Prioritize real-time launch streams (pumpportal, gecko) ahead of older profile/jupiter lists
     ordered_mints = []
     seen_batch = set()
-    for src_name in ("pumpportal", "gecko", "profiles", "jup", "boosts"):
+    for src_name in ("pumpportal", "gecko", "dex_age_gap", "profiles", "jup", "boosts"):
         for m in by_src.get(src_name, []):
             if m not in seen_batch:
                 seen_batch.add(m)
@@ -589,7 +676,7 @@ def _extract_pair_websites(pair):
 
 def matches_enabled_platforms(pair, mint="", source="", cfg=None):
     """Check whether pair/mint/source matches user-checked websites in enabled_platforms ([] = all allowed)."""
-    if bool((cfg or {}).get("axiom_pulse_migrated_only_enabled", False)):
+    if opt_on(cfg, "axiom_pulse_migrated_only_enabled", False):
         mint_str = str(mint or (pair.get("baseToken") or {}).get("address") or "").strip()
         mint_low = mint_str.lower()
         dex_raw = str((pair or {}).get("dexId") or "").strip().lower()
@@ -600,9 +687,11 @@ def matches_enabled_platforms(pair, mint="", source="", cfg=None):
         is_meteora = "meteora" in dex_norm or "dlmm" in dex_norm
         is_migrated = (is_pumpswap or is_raydium or is_meteora) or (dex_norm not in ("pumpfun", "pump") and not mint_low.endswith("pump") and liq_pre >= 2000.0)
         if not is_migrated:
-            return False, "axiom pulse migrated only", f"dex={dex_raw or '?'} not migrated AMM pool"
+            return False, f"dex={dex_raw or '?'} not migrated AMM pool"
         return True, "axiom_pulse_migrated"
 
+    if not opt_on(cfg, "enabled_platforms", True):
+        return True, "all"
     selected_raw = (cfg or {}).get("enabled_platforms") if isinstance(cfg, dict) else None
     if not isinstance(selected_raw, list) or not selected_raw:
         return True, "all"
@@ -679,7 +768,7 @@ def _note_symbol_cooldown(symbol, cfg=None):
     sym = str(symbol or "").strip().upper()
     if not sym or sym in ("?", "UNKNOWN"):
         return
-    if cfg is not None and not bool(cfg.get("anti_rug_copycat_cooldown_enabled", True)):
+    if cfg is not None and not opt_on(cfg, "anti_rug_copycat_cooldown_enabled", True):
         return
     with _symbol_cd_lock:
         if len(_rejected_symbol_cooldown) > 500:
@@ -689,7 +778,7 @@ def _note_symbol_cooldown(symbol, cfg=None):
         _rejected_symbol_cooldown[sym] = time.time() + 600.0
 
 def _is_symbol_on_cooldown(symbol, liq, cfg):
-    if not bool((cfg or {}).get("anti_rug_copycat_cooldown_enabled", True)):
+    if not opt_on(cfg, "anti_rug_copycat_cooldown_enabled", True):
         return False
     sym = str(symbol or "").strip().upper()
     if not sym or sym in ("?", "UNKNOWN"):
@@ -716,53 +805,64 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
     created = int(pair.get("pairCreatedAt") or 0)
     if created <= 0: return False, "missing data", "no pairCreatedAt"
     age_s = (now_ms - created) / 1000.0
-    if age_s > cfg.get("max_age_minutes", 2) * 60: return False, "too old", f"{age_s / 60:.1f}m > window"
     if age_s < -10: return False, "clock skew", "sync your PC clock"
+    if opt_on(cfg, "min_age_minutes", False):
+        min_age_m = max(0.0, float(cfg.get("min_age_minutes", 0.0) or 0.0))
+        if min_age_m > 0.0 and age_s < min_age_m * 60.0:
+            return False, "too young", f"{age_s / 60:.1f}m < {min_age_m:g}m min"
+    if opt_on(cfg, "max_age_minutes", True):
+        max_age_m = float(cfg.get("max_age_minutes", 2.0) or 0.0)
+        if max_age_m > 0.0 and age_s > max_age_m * 60.0:
+            return False, "too old", f"{age_s / 60:.1f}m > {max_age_m:g}m window"
     px = _f(pair.get("priceUsd"))
     if px is None or px <= 0: return False, "no price", "no price on DexScreener/curve yet"
 
     m5 = (pair.get("txns") or {}).get("m5") or {}
     buys, sells = int(m5.get("buys") or 0), int(m5.get("sells") or 0)
-    ratio = float(cfg.get("min_buy_sell_ratio_m5", 1.5) or 0)
+    ratio = float(cfg.get("min_buy_sell_ratio_m5", 1.5) or 0) if opt_on(cfg, "min_buy_sell_ratio_m5", True) else 0.0
     if ratio > 0 and buys < sells * ratio:
         return False, "selling pressure", f"{buys}b/{sells}s in last 5m"
     if age_s >= 30 and buys >= 12 and sells == 0:
         return False, "honeypot pattern", f"{buys} buys / 0 sells in 5m"
 
+    grace_sec = max(0.0, float(cfg.get("ultra_early_grace_sec", 0) or 0)) if opt_on(cfg, "ultra_early_grace_sec", True) else 0.0
     pp = pair.get("_pumpportal") if isinstance(pair.get("_pumpportal"), dict) else None
     if pp and pp.get("has_trade_stream"):
         buys_60s = int(pp.get("buys_60s") or 0)
         sells_60s = int(pp.get("sells_60s") or 0)
         if buys_60s < sells_60s:
             return False, "selling pressure (60s)", f"{buys_60s}b/{sells_60s}s last 60s"
-        min_60s = int(cfg.get("min_recent_buys_60s", 3) or 0)
-        grace_sec_pp = max(0, float(cfg.get("ultra_early_grace_sec", 0) or 0))
-        if age_s > grace_sec_pp and min_60s > 0 and buys_60s < min_60s:
-            return False, "low 60s velocity", f"{buys_60s} buys < {min_60s} in 60s"
+        if opt_on(cfg, "min_recent_buys_60s", True):
+            min_60s = int(cfg.get("min_recent_buys_60s", 3) or 0)
+            if age_s > grace_sec and min_60s > 0 and buys_60s < min_60s:
+                return False, "low 60s velocity", f"{buys_60s} buys < {min_60s} in 60s"
 
-    m5c = _f((pair.get("priceChange") or {}).get("m5"))
-    if m5c is not None and m5c > cfg.get("max_price_change_m5_pct", 300):
-        return False, "already pumped", f"+{m5c:.0f}% in 5m"
+    if opt_on(cfg, "max_price_change_m5_pct", True):
+        m5c = _f((pair.get("priceChange") or {}).get("m5"))
+        max_m5c = float(cfg.get("max_price_change_m5_pct", 300) or 0)
+        if m5c is not None and max_m5c > 0 and m5c > max_m5c:
+            return False, "already pumped", f"+{m5c:.0f}% in 5m"
 
     liq = liq_pre
     fdv = _f(pair.get("fdv")) or _f(pair.get("marketCap")) or 0.0
-    pool_depth_on = bool(cfg.get("anti_rug_pool_depth_check_enabled", True))
+    pool_depth_on = opt_on(cfg, "anti_rug_pool_depth_check_enabled", True)
     max_fdv_mult = 80.0 if pool_depth_on else 150.0
     if liq > 0 and fdv > 0 and fdv > liq * max_fdv_mult:
         return False, "inflated mcap/liq", f"MCap ${fdv:.0f} vs LP ${liq:.0f}"
 
-    grace_sec = max(0, float(cfg.get("ultra_early_grace_sec", 0) or 0))
     if age_s > grace_sec:
-        min_liq = float(cfg.get("min_liquidity_usd", 5000) or 0)
-        eff_min_liq = max(min_liq, 2500.0) if (pool_depth_on and min_liq > 0) else min_liq
-        if liq < eff_min_liq:
+        min_liq = float(cfg.get("min_liquidity_usd", 5000) or 0) if opt_on(cfg, "min_liquidity_usd", True) else 0.0
+        eff_min_liq = max(min_liq, 2500.0) if (pool_depth_on and min_liq > 0) else (2500.0 if pool_depth_on else min_liq)
+        if eff_min_liq > 0 and liq < eff_min_liq:
             return False, "low liquidity", f"${liq:.0f} < ${eff_min_liq:.0f}"
-        if buys < cfg.get("min_buys_m5", 8):
-            return False, "few buys", f"{buys} buys in last 5m"
-        if cfg.get("min_volume_m5_usd", 0) > 0:
+        if opt_on(cfg, "min_buys_m5", True):
+            min_bm5 = int(cfg.get("min_buys_m5", 8) or 0)
+            if min_bm5 > 0 and buys < min_bm5:
+                return False, "few buys", f"{buys} buys in last 5m"
+        if opt_on(cfg, "min_volume_m5_usd", True) and float(cfg.get("min_volume_m5_usd", 0) or 0) > 0:
             mv5 = _f((pair.get("volume") or {}).get("m5")) or 0.0
             if mv5 < cfg["min_volume_m5_usd"]: return False, "low m5 volume", f"${mv5:.0f}"
-        if cfg.get("min_holders", 0) > 0:
+        if opt_on(cfg, "min_holders", True) and int(cfg.get("min_holders", 0) or 0) > 0:
             h1b = int(((pair.get("txns") or {}).get("h1") or {}).get("buys") or 0)
             if h1b < cfg["min_holders"]: return False, "too few h1 buys", f"{h1b}"
     return True, "ok", ""
@@ -772,7 +872,8 @@ def score_candidate(pair, cfg, now_ms=None):
     now_ms = now_ms or int(time.time() * 1000)
     created = int(pair.get("pairCreatedAt") or 0)
     age_s = max(0.0, (now_ms - created) / 1000.0) if created > 0 else 120.0
-    max_age_s = max(10.0, float(cfg.get("max_age_minutes", 2) or 2) * 60.0)
+    max_age_m = float(cfg.get("max_age_minutes", 2) or 2) if opt_on(cfg, "max_age_minutes", True) else 60.0
+    max_age_s = max(10.0, max_age_m * 60.0)
 
     m5 = (pair.get("txns") or {}).get("m5") or {}
     buys = int(m5.get("buys") or 0)
@@ -903,7 +1004,7 @@ def _check_sell_route(mint, decimals, price_usd, cfg, max_impact_pct=15.0):
     if not mint or not price_usd or price_usd <= 0:
         return True, "skip"
     now_ts = time.time()
-    has_key = bool(cfg.get("jupiter_api_key"))
+    has_key = bool(cfg.get("jupiter_api_key")) and opt_on(cfg, "jupiter_api_key", True)
     impact_cap = float(max_impact_pct or 15.0)
     cache_key = f"{mint}:{impact_cap:g}"
     with _jup_quote_lock:
@@ -916,7 +1017,7 @@ def _check_sell_route(mint, decimals, price_usd, cfg, max_impact_pct=15.0):
             return True, "jup_paced_skip"
         _last_jup_quote_ts = now_ts
 
-    trade_usd = max(0.5, float(cfg.get("trade_size_usd", 5.0) or 5.0))
+    trade_usd = max(0.5, float(cfg.get("trade_size_usd", 5.0) or 5.0) if opt_on(cfg, "trade_size_usd", True) else 5.0)
     qty_ui = trade_usd / float(price_usd)
     dec = max(0, int(decimals if decimals is not None else 6))
     raw_units = max(1, int(qty_ui * (10 ** dec)))
@@ -974,20 +1075,327 @@ def _fetch_rugcheck_report(mint):
         rep = get_json(f"{RUGC}/{mint}/report/summary", timeout=5)
     return rep
 
+# ---------------------------------------------------------------- owner / creator history & rugpull speed check
+_creator_hist_lock = threading.Lock()
+_creator_rpc_cache = {}
+
+def _creator_history_path():
+    return os.path.join(_base_dir(), "creator_history.json")
+
+def _load_creator_history():
+    p = _creator_history_path()
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_creator_history(hist):
+    p = _creator_history_path()
+    tmp = p + f".tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(hist, f, indent=2, ensure_ascii=False)
+        try:
+            os.replace(tmp, p)
+        except Exception:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(hist, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def _parse_ts_ms(val):
+    if val is None or val == "":
+        return 0
+    if isinstance(val, (int, float)):
+        num = float(val)
+        if num <= 0:
+            return 0
+        return int(num * 1000) if num < 1e12 else int(num)
+    if isinstance(val, str):
+        s = val.strip()
+        try:
+            num = float(s)
+            return int(num * 1000) if num < 1e12 else int(num)
+        except Exception:
+            return _parse_iso_ms(s)
+    return 0
+
+def _record_creator_coin(creator, mint, symbol="", created_ms=0, rugged=False, rugged_at_ms=0, rug_reason=""):
+    if not creator or not mint:
+        return
+    now_ms = int(time.time() * 1000)
+    with _creator_hist_lock:
+        hist = _load_creator_history()
+        coins = hist.get(creator)
+        if not isinstance(coins, dict):
+            coins = {}
+        entry = coins.get(mint) if isinstance(coins.get(mint), dict) else {}
+        if not entry.get("first_seen_ms"):
+            entry["first_seen_ms"] = now_ms
+        if symbol and symbol != "?":
+            entry["symbol"] = symbol
+        if created_ms and created_ms > 0:
+            prev_c = int(entry.get("pool_created_at_ms") or 0)
+            entry["pool_created_at_ms"] = min(prev_c, int(created_ms)) if prev_c > 0 else int(created_ms)
+        if rugged:
+            entry["rugged"] = True
+            if rugged_at_ms and rugged_at_ms > 0:
+                entry["rugged_at_ms"] = int(entry.get("rugged_at_ms") or rugged_at_ms)
+            elif not entry.get("rugged_at_ms"):
+                entry["rugged_at_ms"] = now_ms
+            if rug_reason:
+                entry["rug_reason"] = str(rug_reason)[:180]
+        entry.setdefault("rugged", False)
+        coins[mint] = entry
+        # Cap total tracked creators so disk footprint remains bounded
+        if len(hist) > 2500:
+            oldest_keys = list(hist.keys())[:len(hist) - 2500]
+            for k in oldest_keys:
+                hist.pop(k, None)
+        hist[creator] = coins
+        _save_creator_history(hist)
+
+def _mark_creator_coin_rugged(mint, rug_reason="", rugged_at_ms=None, creator=None):
+    if not mint:
+        return
+    now_ms = int(rugged_at_ms or time.time() * 1000)
+    with _creator_hist_lock:
+        hist = _load_creator_history()
+        changed = False
+        for c_addr, coins in hist.items():
+            if isinstance(coins, dict) and mint in coins and isinstance(coins[mint], dict):
+                coins[mint]["rugged"] = True
+                if not coins[mint].get("rugged_at_ms"):
+                    coins[mint]["rugged_at_ms"] = now_ms
+                if rug_reason:
+                    coins[mint]["rug_reason"] = str(rug_reason)[:180]
+                changed = True
+        if creator and (creator not in hist or mint not in (hist.get(creator) or {})):
+            coins = hist.get(creator) if isinstance(hist.get(creator), dict) else {}
+            coins[mint] = {
+                "first_seen_ms": now_ms,
+                "pool_created_at_ms": 0,
+                "rugged": True,
+                "rugged_at_ms": now_ms,
+                "rug_reason": str(rug_reason or "rugged")[:180],
+            }
+            hist[creator] = coins
+            changed = True
+        if changed:
+            _save_creator_history(hist)
+
+def _rpc_earliest_tx_ms(address, cfg=None):
+    if not address:
+        return 0
+    now_ts = time.time()
+    cached = _creator_rpc_cache.get(address)
+    if cached and now_ts - cached[0] < 180.0:
+        return cached[1]
+    body = {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress", "params": [address, {"limit": 100}]}
+    for url in _get_rpc_urls(cfg):
+        try:
+            r = _session.post(url, json=body, timeout=4, headers={**HEADERS, "Content-Type": "application/json"})
+            if r.status_code != 200:
+                continue
+            sigs = (r.json().get("result") or [])
+            times = [int(s["blockTime"]) * 1000 for s in sigs if isinstance(s, dict) and s.get("blockTime")]
+            if times:
+                earliest = min(times)
+                _creator_rpc_cache[address] = (now_ts, earliest)
+                if len(_creator_rpc_cache) > 1000:
+                    _creator_rpc_cache.clear()
+                return earliest
+        except Exception:
+            continue
+    return 0
+
+def _evaluate_creator_history(mint, creator_addr, rep, cfg, pair=None):
+    """Inspect coin owner's prior launches, rugged coins, and rugpull speed (minutes after launch)."""
+    now_ms = int(time.time() * 1000)
+    cur_created = int((pair or {}).get("pairCreatedAt") or 0)
+    cur_sym = str(((pair or {}).get("baseToken") or {}).get("symbol") or "?")
+
+    prior_map = {}  # prior_mint -> {created_ms, rugged, rugged_at_ms}
+    if creator_addr:
+        with _creator_hist_lock:
+            hist = _load_creator_history()
+            local_coins = hist.get(creator_addr)
+            if isinstance(local_coins, dict):
+                for pmint, info in local_coins.items():
+                    if not pmint or pmint == mint or not isinstance(info, dict):
+                        continue
+                    c_ms = int(info.get("pool_created_at_ms") or info.get("first_seen_ms") or 0)
+                    prior_map[pmint] = {
+                        "created_ms": c_ms,
+                        "rugged": bool(info.get("rugged")),
+                        "rugged_at_ms": int(info.get("rugged_at_ms") or 0),
+                    }
+
+    if isinstance(rep, dict):
+        ct = rep.get("creatorTokens")
+        if isinstance(ct, list):
+            for item in ct:
+                if not isinstance(item, dict):
+                    continue
+                pmint = str(item.get("mint") or item.get("address") or item.get("id") or "").strip()
+                if not pmint or pmint == mint:
+                    continue
+                c_ms = _parse_ts_ms(item.get("createdAt") or item.get("created_at") or item.get("timestamp"))
+                r_flag = bool(item.get("rugged") or item.get("isRugged") or item.get("rug"))
+                r_ms = _parse_ts_ms(item.get("ruggedAt") or item.get("rugged_at"))
+                if r_flag and r_ms <= 0 and c_ms > 0:
+                    r_ms = c_ms
+                cur = prior_map.get(pmint, {"created_ms": 0, "rugged": False, "rugged_at_ms": 0})
+                if c_ms > 0 and (cur["created_ms"] <= 0 or c_ms < cur["created_ms"]):
+                    cur["created_ms"] = c_ms
+                if r_flag:
+                    cur["rugged"] = True
+                if r_ms > 0 and (cur["rugged_at_ms"] <= 0 or r_ms < cur["rugged_at_ms"]):
+                    cur["rugged_at_ms"] = r_ms
+                prior_map[pmint] = cur
+
+    # Enrich unknown/unmarked prior mints via DexScreener batch lookup to detect LP drains on earlier launches
+    unchecked_mints = [pm for pm, pinfo in list(prior_map.items())[:30] if not pinfo["rugged"]]
+    if unchecked_mints:
+        ds_list = get_json(f"{DEX}/tokens/v1/solana/{','.join(unchecked_mints)}", timeout=4)
+        if isinstance(ds_list, list):
+            by_pm = {}
+            for dp in ds_list:
+                if not isinstance(dp, dict):
+                    continue
+                dmint = (dp.get("baseToken") or {}).get("address")
+                if not dmint or dmint not in prior_map:
+                    continue
+                liq = _f((dp.get("liquidity") or {}).get("usd")) or 0.0
+                prev = by_pm.get(dmint)
+                if prev is None or liq > (_f((prev.get("liquidity") or {}).get("usd")) or 0.0):
+                    by_pm[dmint] = dp
+            for dmint, dp in by_pm.items():
+                pinfo = prior_map[dmint]
+                pc_ms = int(dp.get("pairCreatedAt") or 0)
+                if pc_ms > 0 and (pinfo["created_ms"] <= 0 or pc_ms < pinfo["created_ms"]):
+                    pinfo["created_ms"] = pc_ms
+                liq = _f((dp.get("liquidity") or {}).get("usd")) or 0.0
+                h24 = _f((dp.get("priceChange") or {}).get("h24")) or 0.0
+                if liq < 500.0 or (liq < 2000.0 and h24 <= -90.0):
+                    pinfo["rugged"] = True
+                    if pinfo["rugged_at_ms"] <= 0:
+                        pinfo["rugged_at_ms"] = now_ms
+
+    # Compute rugpull speed (minutes after launch) for rugged coins, checking RPC earliest tx if launch timestamp missing
+    fast_rug_min = None
+    rugged_count = 0
+    for pm, pinfo in list(prior_map.items()):
+        if pinfo["rugged"]:
+            rugged_count += 1
+            if pinfo["created_ms"] <= 0:
+                pinfo["created_ms"] = _rpc_earliest_tx_ms(pm, cfg=cfg)
+            if pinfo["created_ms"] > 0 and pinfo["rugged_at_ms"] >= pinfo["created_ms"]:
+                delay_m = max(0.0, (pinfo["rugged_at_ms"] - pinfo["created_ms"]) / 60000.0)
+                if fast_rug_min is None or delay_m < fast_rug_min:
+                    fast_rug_min = delay_m
+            if creator_addr:
+                _record_creator_coin(creator_addr, pm, created_ms=pinfo["created_ms"], rugged=True, rugged_at_ms=pinfo["rugged_at_ms"])
+
+    # Also detect ultra-rapid serial launches by same creator (re-launching within fast window)
+    serial_launch_min = None
+    if cur_created > 0 and prior_map:
+        for pm, pinfo in prior_map.items():
+            if pinfo["created_ms"] > 0 and pinfo["created_ms"] < cur_created:
+                gap_m = (cur_created - pinfo["created_ms"]) / 60000.0
+                if serial_launch_min is None or gap_m < serial_launch_min:
+                    serial_launch_min = gap_m
+
+    # Persist current coin observation for future creator checks
+    if creator_addr:
+        _record_creator_coin(creator_addr, mint, symbol=cur_sym, created_ms=cur_created)
+
+    # Check RugCheck creator risks
+    rc_creator_flag = False
+    rc_creator_msg = ""
+    if isinstance(rep, dict) and isinstance(rep.get("risks"), list):
+        for rsk in rep["risks"]:
+            if not isinstance(rsk, dict):
+                continue
+            rname = str(rsk.get("name") or "")
+            if re.search(r"creator.*rug|rugged.*token|serial.*rug", rname, re.I):
+                rc_creator_flag = True
+                rc_creator_msg = rname
+                break
+
+    prior_launches = len(prior_map)
+    if not opt_on(cfg, "check_creator_history", True):
+        return {
+            "ok": True, "reason": "disabled", "creator": creator_addr,
+            "prior_launches": prior_launches, "rugged_count": rugged_count, "fast_rug_min": fast_rug_min,
+        }
+
+    if rc_creator_flag:
+        return {
+            "ok": False, "reason": f"owner flagged in RugCheck ({rc_creator_msg})",
+            "creator": creator_addr, "prior_launches": prior_launches, "rugged_count": rugged_count, "fast_rug_min": fast_rug_min,
+        }
+
+    if opt_on(cfg, "max_creator_rugged_coins", True):
+        max_rugs = max(0, int(cfg.get("max_creator_rugged_coins", 0) or 0))
+        if rugged_count > max_rugs:
+            speed_note = f" (fastest rug {fast_rug_min:.1f}m after launch)" if fast_rug_min is not None else ""
+            return {
+                "ok": False,
+                "reason": f"owner rugged {rugged_count} prior coin(s) > {max_rugs} limit{speed_note}",
+                "creator": creator_addr, "prior_launches": prior_launches, "rugged_count": rugged_count, "fast_rug_min": fast_rug_min,
+            }
+
+    if opt_on(cfg, "creator_fast_rug_window_min", True):
+        fast_win = max(0.0, float(cfg.get("creator_fast_rug_window_min", 60.0) or 0.0))
+        if fast_win > 0.0 and fast_rug_min is not None and fast_rug_min <= fast_win:
+            return {
+                "ok": False,
+                "reason": f"owner rugged prior coin in {fast_rug_min:.1f}m <= {fast_win:g}m fast-rug window",
+                "creator": creator_addr, "prior_launches": prior_launches, "rugged_count": rugged_count, "fast_rug_min": fast_rug_min,
+            }
+
+    if opt_on(cfg, "max_creator_launches", True):
+        max_launches = max(0, int(cfg.get("max_creator_launches", 5) or 0))
+        if prior_launches > max_launches:
+            return {
+                "ok": False,
+                "reason": f"owner launched {prior_launches} prior coins > {max_launches} limit",
+                "creator": creator_addr, "prior_launches": prior_launches, "rugged_count": rugged_count, "fast_rug_min": fast_rug_min,
+            }
+
+    return {
+        "ok": True, "reason": "ok", "creator": creator_addr,
+        "prior_launches": prior_launches, "rugged_count": rugged_count,
+        "fast_rug_min": fast_rug_min, "serial_launch_min": serial_launch_min,
+    }
+
 def hard_rug_check(mint, cfg, age_s, pair=None):
-    """Return (ok, reason). Fail-closed parallel RPC SPL/Token-2022 + RugCheck report + holder concentration + sell-route test."""
-    tight_score_on = bool(cfg.get("anti_rug_tight_score_enabled", False))
-    pool_depth_on = bool(cfg.get("anti_rug_pool_depth_check_enabled", True))
-    sell_sim_on = bool(cfg.get("anti_rug_sell_sim_enabled", False))
-    lp_req_on = bool(cfg.get("require_lp_locked", False))
-    cache_key = f"{mint}:{int(tight_score_on)}:{int(pool_depth_on)}:{int(sell_sim_on)}:{int(lp_req_on)}"
-    ttl = max(60, cfg.get("rug_recheck_minutes", 15) * 60)
+    """Return (ok, reason). Fail-closed parallel RPC SPL/Token-2022 + RugCheck + creator history + holder concentration + sell-route test."""
+    tight_score_on = opt_on(cfg, "anti_rug_tight_score_enabled", False)
+    pool_depth_on = opt_on(cfg, "anti_rug_pool_depth_check_enabled", True)
+    sell_sim_on = opt_on(cfg, "anti_rug_sell_sim_enabled", False)
+    lp_req_on = opt_on(cfg, "require_lp_locked", False)
+    creator_chk_on = opt_on(cfg, "check_creator_history", True)
+    cache_key = (
+        f"{mint}:{int(tight_score_on)}:{int(pool_depth_on)}:{int(sell_sim_on)}:{int(lp_req_on)}:"
+        f"{int(creator_chk_on)}:{int(opt_on(cfg, 'use_rugcheck', True))}:{int(opt_on(cfg, 'strict_rugcheck', True))}:"
+        f"{int(cfg.get('max_creator_launches', 5))}:{int(cfg.get('max_creator_rugged_coins', 0))}:"
+        f"{float(cfg.get('creator_fast_rug_window_min', 60) or 0):g}"
+    )
+    ttl = max(60, int(cfg.get("rug_recheck_minutes", 15) or 15) * 60) if opt_on(cfg, "rug_recheck_minutes", True) else 60
     with _rug_lock:
         hit = _rug_cache.get(cache_key)
         if hit and time.time() - hit[0] < ttl: return hit[1]
 
-    strict = bool(cfg.get("strict_rugcheck", True))
-    use_rc = bool(cfg.get("use_rugcheck", True))
+    strict = opt_on(cfg, "strict_rugcheck", True)
+    use_rc = opt_on(cfg, "use_rugcheck", True)
+    block_bundles = opt_on(cfg, "block_insider_bundles", True)
+    block_dev_dump = opt_on(cfg, "block_creator_dump", True)
     px_usd = _f(pair.get("priceUsd")) if pair is not None else None
     tx_m5 = (pair.get("txns") or {}).get("m5") if isinstance(pair, dict) else None
     pp_info = pair.get("_pumpportal") if isinstance(pair, dict) else None
@@ -1004,7 +1412,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
     except Exception:
         _rpc_params = 1
     rpc_fut = pool.submit(_rpc_mint_account_info, mint, cfg) if _rpc_params >= 2 else pool.submit(_rpc_mint_account_info, mint)
-    rc_fut = pool.submit(_fetch_rugcheck_report, mint) if use_rc else None
+    rc_fut = pool.submit(_fetch_rugcheck_report, mint) if (use_rc or creator_chk_on) else None
     if need_sell_probe:
         try:
             _sell_params = len(inspect.signature(_check_sell_route).parameters)
@@ -1018,6 +1426,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
     else:
         sell_fut = None
 
+    creator_addr = str((pp_info or {}).get("creator") or "")
     try:
         verdict = (True, "ok")
         mint_info = rpc_fut.result()
@@ -1038,7 +1447,8 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                 exts = ", ".join(mint_info["disallowed_extensions"])
                 verdict = (False, f"disallowed Token-2022 extensions: {exts}")
         else:
-            hdrs = {"x-api-key": cfg["jupiter_api_key"]} if cfg.get("jupiter_api_key") else None
+            has_k = bool(cfg.get("jupiter_api_key")) and opt_on(cfg, "jupiter_api_key", True)
+            hdrs = {"x-api-key": cfg["jupiter_api_key"]} if has_k else None
             jt = get_json(f"{JUP}/search", params={"query": mint}, headers=hdrs)
             if isinstance(jt, dict): jt = jt.get("tokens") or jt.get("data") or []
             if isinstance(jt, list) and jt:
@@ -1057,16 +1467,26 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
         pair_addr = str((pair or {}).get("pairAddress") or "")
         raw_pair_liq = ((pair or {}).get("liquidity") or {}).get("usd") if isinstance(pair, dict) else None
         pair_liq = _f(raw_pair_liq) or 0.0
-        min_liq_cfg = float(cfg.get("min_liquidity_usd", 3000) or 0)
-        grace_sec = max(0.0, float(cfg.get("ultra_early_grace_sec", 0) or 0))
+        min_liq_cfg = float(cfg.get("min_liquidity_usd", 3000) or 0) if opt_on(cfg, "min_liquidity_usd", True) else 0.0
+        grace_sec = max(0.0, float(cfg.get("ultra_early_grace_sec", 0) or 0)) if opt_on(cfg, "ultra_early_grace_sec", True) else 0.0
 
         if verdict[0] and pool_depth_on and isinstance(pair, dict) and raw_pair_liq is not None and age_s > grace_sec:
             if pair_liq < 2500.0:
                 verdict = (False, f"pool depth too shallow (${pair_liq:.0f} < $2,500)")
 
-        if verdict[0] and rc_fut is not None:
-            rep = rc_fut.result()
+        rep = rc_fut.result() if rc_fut is not None else None
+        if isinstance(rep, dict) and rep.get("creator"):
+            creator_addr = str(rep.get("creator") or creator_addr)
+        if creator_addr and isinstance(pair, dict):
+            pair["_creator"] = creator_addr
 
+        # Owner / creator prior launch count & fast-rug speed check
+        if verdict[0] and (creator_addr or (isinstance(rep, dict) and rep.get("creatorTokens"))):
+            c_res = _evaluate_creator_history(mint, creator_addr, rep, cfg, pair=pair)
+            if not c_res.get("ok"):
+                verdict = (False, c_res.get("reason") or "creator failed rug history check")
+
+        if verdict[0] and use_rc:
             if not isinstance(rep, dict) or (not isinstance(rep.get("risks"), list) and rep.get("score") is None):
                 if strict:
                     verdict = (False, "no rugcheck report yet (fail closed)")
@@ -1082,34 +1502,34 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
 
                 # Block creator dump detected on PumpPortal stream on fresh launches
                 pp_meta = (pair or {}).get("_pumpportal") if isinstance((pair or {}).get("_pumpportal"), dict) else None
-                if verdict[0] and pp_meta and pp_meta.get("creator_sold") and cfg.get("block_creator_dump", True) and young:
+                if verdict[0] and pp_meta and pp_meta.get("creator_sold") and block_dev_dump and young:
                     verdict = (False, "creator/dev already sold during launch curve")
 
                 # Enforce RugCheck risk score at EVERY age (never skip young tokens)
-                if verdict[0]:
+                if verdict[0] and (opt_on(cfg, "rugcheck_max_score", True) or tight_score_on):
                     sn = _f(rep.get("score_normalised"))
                     if sn is None and _f(rep.get("score")) is not None:
                         raw_s = _f(rep.get("score")) or 0.0
                         sn = min(100.0, raw_s / 100.0) if raw_s > 100.0 else raw_s
                     if sn is not None:
                         if sn > 100: sn /= 1000.0
-                        max_rc_score = float(cfg.get("rugcheck_max_score", 55) or 55)
+                        max_rc_score = float(cfg.get("rugcheck_max_score", 55) or 55) if opt_on(cfg, "rugcheck_max_score", True) else 100.0
                         if tight_score_on:
                             max_rc_score = min(max_rc_score, 45.0)
                         if sn >= max_rc_score:
                             verdict = (False, f"rugcheck risk score {sn:.0f}/100 >= {max_rc_score:.0f}")
 
                 # Catch bundled / insider wallet networks & excessive dev holdings before buying
-                if verdict[0] and cfg.get("block_insider_bundles", True):
+                if verdict[0] and block_bundles:
                     insiders = rep.get("insiderNetworks")
                     insiders_cnt = int(rep.get("insidersDetected") or 0)
                     if (isinstance(insiders, list) and len(insiders) > 0) or insiders_cnt > 0:
                         verdict = (False, f"bundled insider wallets detected ({max(insiders_cnt, len(insiders or []))} clusters)")
 
-                if verdict[0]:
+                if verdict[0] and opt_on(cfg, "max_dev_hold_pct", True):
                     max_dev_pct = float(cfg.get("max_dev_hold_pct", 5.0) or 0.0)
                     if max_dev_pct > 0:
-                        creator_addr = str(rep.get("creator") or (pp_meta or {}).get("creator") or "")
+                        c_addr_chk = str(rep.get("creator") or (pp_meta or {}).get("creator") or "")
                         creator_bal = _f(rep.get("creatorBalance"))
                         token_meta = rep.get("token") if isinstance(rep.get("token"), dict) else {}
                         raw_sup = _f(token_meta.get("supply"))
@@ -1121,9 +1541,9 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                             dev_pct = (dev_ui / eff_sup) * 100.0
                             if dev_pct > max_dev_pct:
                                 verdict = (False, f"creator/dev holds {dev_pct:.1f}% > {max_dev_pct:.0f}% limit")
-                        if verdict[0] and creator_addr and isinstance(rep.get("topHolders"), list):
+                        if verdict[0] and c_addr_chk and isinstance(rep.get("topHolders"), list):
                             for th in rep["topHolders"][:20]:
-                                if isinstance(th, dict) and (th.get("owner") == creator_addr or th.get("address") == creator_addr):
+                                if isinstance(th, dict) and (th.get("owner") == c_addr_chk or th.get("address") == c_addr_chk):
                                     c_pct = _f(th.get("pct")) or 0.0
                                     if c_pct > max_dev_pct:
                                         verdict = (False, f"creator wallet holds {c_pct:.1f}% > {max_dev_pct:.0f}% limit")
@@ -1164,7 +1584,8 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                         if max_lp_pct < 80.0:
                             verdict = (False, f"LP burned/locked {max_lp_pct:.0f}% < 80% minimum (rug risk)")
 
-                max_top10 = float(cfg.get("max_top10_holder_pct", 35) or 35)
+                top10_enabled = opt_on(cfg, "max_top10_holder_pct", True) or tight_score_on
+                max_top10 = float(cfg.get("max_top10_holder_pct", 35) or 35) if opt_on(cfg, "max_top10_holder_pct", True) else 100.0
                 if tight_score_on:
                     max_top10 = min(max_top10, 30.0)
                 max_single = min(25.0, max(10.0, max_top10 * 0.65))
@@ -1189,7 +1610,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                     top10_pct = sum(non_pool_pcts[:10])
                     single_max_pct = max(non_pool_pcts) if non_pool_pcts else 0.0
 
-                if top10_pct is None and supply_ui > 0:
+                if top10_pct is None and supply_ui > 0 and top10_enabled:
                     top10_pct, single_max_pct = _rpc_top_holders(mint, supply_ui, known_pools, cfg=cfg)
 
                 risks = rep.get("risks") if isinstance(rep.get("risks"), list) else []
@@ -1199,7 +1620,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                         level = str(risk.get("level") or "").lower()
                         name = str(risk.get("name") or ""); low = name.lower()
                         desc = str(risk.get("description") or "")
-                        if "holder" in low:
+                        if top10_enabled and "holder" in low:
                             m = re.search(r"([\d.]+)\s*%", desc + " " + name)
                             if m and float(m.group(1)) > max_top10:
                                 verdict = (False, f"{name} ({m.group(1)}% > {max_top10:.0f}% limit)")
@@ -1209,7 +1630,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                                 verdict = (False, f"LP risk: {name}")
                                 break
                             continue
-                        if cfg.get("block_insider_bundles", True) and any(k in low for k in ("bundle", "bundled", "insider", "sniper")):
+                        if block_bundles and any(k in low for k in ("bundle", "bundled", "insider", "sniper")):
                             verdict = (False, f"bundle/insider risk: {name}")
                             break
                         if level not in ("danger", "critical"):
@@ -1226,7 +1647,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                         verdict = (False, f"rugcheck danger: {name or 'unknown risk'}")
                         break
 
-                if verdict[0]:
+                if verdict[0] and top10_enabled:
                     if top10_pct is None:
                         if strict:
                             verdict = (False, "top holder concentration unavailable (fail closed)")
@@ -1254,6 +1675,9 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                 verdict = (False, route_reason)
     finally:
         pool.shutdown(wait=False)
+
+    if not verdict[0] and creator_addr and any(w in verdict[1].lower() for w in ("rug", "honeypot", "authority", "freeze", "lp burned")):
+        _mark_creator_coin_rugged(mint, verdict[1], creator=creator_addr)
 
     with _rug_lock:
         if len(_rug_cache) > 5000: _rug_cache.clear()
@@ -1379,6 +1803,8 @@ class TradingAccount:
             self.state["day_pnl"] = 0.0
 
     def is_slots_full(self):
+        if not opt_on(self.cfg, "max_open_positions", True):
+            return False, len(self.state["positions"]), 0
         max_pos = max(1, int(self.cfg.get("max_open_positions", 3)))
         used = len(self.state["positions"]) + int(getattr(self, "_in_flight_buys", 0))
         return used >= max_pos, used, max_pos
@@ -1408,18 +1834,22 @@ class TradingAccount:
     def can_open(self):
         self._roll_day()
         c = self.cfg
-        max_pos = max(1, int(c.get("max_open_positions", 3)))
-        if len(self.state["positions"]) >= max_pos: return False, "max positions"
-        if self.state["day_pnl"] <= -c["daily_loss_limit_usd"]: return False, "daily loss limit"
+        if opt_on(c, "max_open_positions", True):
+            max_pos = max(1, int(c.get("max_open_positions", 3)))
+            if len(self.state["positions"]) >= max_pos: return False, "max positions"
+        if opt_on(c, "daily_loss_limit_usd", True):
+            dll = float(c.get("daily_loss_limit_usd", 0) or 0)
+            if dll > 0 and self.state["day_pnl"] <= -dll: return False, "daily loss limit"
+        req_size = float(c.get("trade_size_usd", 5.0) or 5.0) if opt_on(c, "trade_size_usd", True) else 5.0
         if self.mode == "live":
             sol_px = self.state.get("sol_price_usd") or 0.0
             bal_sol = self.state.get("wallet_sol")
             if bal_sol is not None:
                 avail_usd = float(bal_sol) * float(sol_px or 0.0)
-                if float(bal_sol) <= 0.001 or (sol_px > 0 and avail_usd < c["trade_size_usd"]):
+                if float(bal_sol) <= 0.001 or (sol_px > 0 and avail_usd < req_size):
                     return False, f"no SOL/USD in wallet ({float(bal_sol):.4f} SOL / ${avail_usd:.2f})"
         else:
-            if self.state["cash"] < c["trade_size_usd"]:
+            if self.state["cash"] < req_size:
                 return False, f"no cash (${self.state['cash']:.2f})"
         return True, "ok"
 
@@ -1459,12 +1889,14 @@ class TradingAccount:
         meta = meta or {}
         c = self.cfg
         url = url or f"https://dexscreener.com/solana/{mint}"
-        fast_lock = self.mode == "live" and bool(c.get("fast_live_buy_enabled", True))
+        fast_lock = self.mode == "live" and opt_on(c, "fast_live_buy_enabled", True)
+        eff_slip_pct = float(c.get("slippage_pct", 2.0) or 0.0) if opt_on(c, "slippage_pct", True) else 0.0
+        eff_fee_pct = float(c.get("fee_pct", 1.0) or 0.0) if opt_on(c, "fee_pct", True) else 0.0
         with self.lock:
             ok, _why = self.can_open()
             if not ok or mint in self.state["positions"] or self.is_slots_full()[0]:
                 return False
-            size = c["trade_size_usd"]
+            size = float(c.get("trade_size_usd", 5.0) or 5.0) if opt_on(c, "trade_size_usd", True) else 5.0
             sol_px = self.state.get("sol_price_usd")
             tx_buy = ""
             cost_sol = (size / sol_px) if sol_px and sol_px > 0 else 0.0
@@ -1479,7 +1911,7 @@ class TradingAccount:
                     "mint": mint,
                     "symbol": symbol,
                     "tradeSizeUsd": size,
-                    "slippagePct": c.get("slippage_pct", 2.0),
+                    "slippagePct": eff_slip_pct if opt_on(c, "slippage_pct", True) else 1.5,
                     "solPriceUsd": sol_px,
                     "dex": meta.get("dex", "?"),
                     "source": meta.get("source", "?"),
@@ -1536,8 +1968,8 @@ class TradingAccount:
                         self._in_flight_buys = max(0, self._in_flight_buys - 1)
         else:
             with self.lock:
-                fill = price * (1 + c["slippage_pct"] / 100)
-                qty = (size * (1 - c["fee_pct"] / 100)) / fill
+                fill = price * (1 + eff_slip_pct / 100.0)
+                qty = (size * (1 - eff_fee_pct / 100.0)) / fill
 
         with self.lock:
             if self.mode == "live":
@@ -1579,6 +2011,7 @@ class TradingAccount:
                 "scale_out_count": 0,
                 "dex": meta.get("dex", "?"),
                 "source": meta.get("source", "?"),
+                "creator": meta.get("creator", ""),
                 "age_at_entry": round(meta.get("age_s", 0), 1),
                 "entry_liquidity_usd": meta.get("liquidity_usd"),
                 "current_liquidity_usd": meta.get("liquidity_usd"),
@@ -1620,7 +2053,9 @@ class TradingAccount:
         if _should_stop():
             return False
         c = self.cfg
-        fast_lock = self.mode == "live" and bool(c.get("fast_live_buy_enabled", True))
+        fast_lock = self.mode == "live" and opt_on(c, "fast_live_buy_enabled", True)
+        eff_slip_pct = float(c.get("slippage_pct", 2.0) or 0.0) if opt_on(c, "slippage_pct", True) else 0.0
+        eff_fee_pct = float(c.get("fee_pct", 1.0) or 0.0) if opt_on(c, "fee_pct", True) else 0.0
         with self.lock:
             pos = self.state["positions"].get(mint)
             if not pos:
@@ -1640,7 +2075,7 @@ class TradingAccount:
 
             # Avoid leaving microscopic unswappable dust on partial sells
             if is_partial:
-                est_rem_usd = (prev_qty * (1.0 - req_frac)) * float(price or 0.0) * (1.0 - float(c.get("fee_pct", 1.0)) / 100.0)
+                est_rem_usd = (prev_qty * (1.0 - req_frac)) * float(price or 0.0) * (1.0 - eff_fee_pct / 100.0)
                 if est_rem_usd < 0.15:
                     req_frac = 1.0
                     is_partial = False
@@ -1656,7 +2091,7 @@ class TradingAccount:
                 "decimals": pos_decimals,
                 "costUsd": prev_cost,
                 "costSol": prev_cost_sol,
-                "slippagePct": c.get("slippage_pct", 2.0),
+                "slippagePct": eff_slip_pct if opt_on(c, "slippage_pct", True) else 1.5,
                 "solPriceUsd": sol_px,
                 "reason": reason,
                 "sellFraction": req_frac if is_partial else 1.0,
@@ -1723,12 +2158,12 @@ class TradingAccount:
                 pos = self.state["positions"].get(mint)
                 if not pos:
                     return False
-                fill = price * (1 - c["slippage_pct"] / 100)
+                fill = price * (1 - eff_slip_pct / 100.0)
                 if is_partial:
                     sold_qty = prev_qty * req_frac
                     rem_qty = max(0.0, prev_qty - sold_qty)
                     allocated_cost = prev_cost * req_frac
-                    proceeds = sold_qty * fill * (1 - c["fee_pct"] / 100)
+                    proceeds = sold_qty * fill * (1 - eff_fee_pct / 100.0)
                     pnl = proceeds - allocated_cost
                     pnl_pct = (pnl / allocated_cost * 100) if allocated_cost > 0 else 0.0
                     self.state["cash"] += proceeds
@@ -1739,10 +2174,13 @@ class TradingAccount:
                 else:
                     allocated_cost = prev_cost
                     self.state["positions"].pop(mint, None)
-                    proceeds = prev_qty * fill * (1 - c["fee_pct"] / 100)
+                    proceeds = prev_qty * fill * (1 - eff_fee_pct / 100.0)
                     pnl = proceeds - allocated_cost
                     pnl_pct = (pnl / allocated_cost * 100) if allocated_cost > 0 else 0.0
                     self.state["cash"] += proceeds
+
+        if str(reason) == "rug_liquidity_drop":
+            _mark_creator_coin_rugged(mint, str(reason), creator=(pos or {}).get("creator"))
 
         with self.lock:
             self._roll_day()
@@ -1806,7 +2244,11 @@ class TradingAccount:
                 self.state["last_sell_time"] = now_ts
                 mode_tag = "LIVE SELL" if self.mode == "live" else "SELL"
                 log(f"✗ {mode_tag} {pos['symbol']} entry ${fmt_price(pos['entry_price'])} -> exit ${fmt_price(fill)} pnl ${pnl:.2f}{sol_hint} ({pnl_pct:.1f}%) [{reason}]{tx_hint}")
-                rescan_delay = max(0, int(self.cfg.get("rescan_delay_after_sell_sec", 0)))
+                rescan_delay = (
+                    max(0, int(self.cfg.get("rescan_delay_after_sell_sec", 0) or 0))
+                    if opt_on(self.cfg, "rescan_delay_after_sell_sec", True)
+                    else 0
+                )
                 full, cnt, max_pos = self.is_slots_full()
                 if rescan_delay > 0:
                     self.state["cooldown_remaining_sec"] = rescan_delay
@@ -1823,10 +2265,10 @@ class TradingAccount:
     @staticmethod
     def calc_min_recovery_tp_pct(cfg, sol_price_usd=None):
         """Mirror of calcMinRecoveryTakeProfitPct in sniperFormat.ts."""
-        trade_size = max(0.01, float(cfg.get("trade_size_usd", 5.0) or 5.0))
+        trade_size = max(0.01, float(cfg.get("trade_size_usd", 5.0) or 5.0) if opt_on(cfg, "trade_size_usd", True) else 5.0)
         sell_pct = min(95.0, max(5.0, float(cfg.get("recover_principal_sell_pct", 50.0) or 50.0)))
-        fee = min(0.45, max(0.0, float(cfg.get("fee_pct", 1.0) or 0.0) / 100.0))
-        slip = min(0.45, max(0.0, float(cfg.get("slippage_pct", 2.0) or 0.0) / 100.0))
+        fee = min(0.45, max(0.0, (float(cfg.get("fee_pct", 1.0) or 0.0) if opt_on(cfg, "fee_pct", True) else 0.0) / 100.0))
+        slip = min(0.45, max(0.0, (float(cfg.get("slippage_pct", 2.0) or 0.0) if opt_on(cfg, "slippage_pct", True) else 0.0) / 100.0))
         sell_frac = sell_pct / 100.0
         is_live = str(cfg.get("mode") or "paper").strip().lower() == "live"
         sol_px = float(sol_price_usd or 0.0)
@@ -1948,16 +2390,18 @@ class TradingAccount:
         healthy_rev_quotes = healthy_rev_quotes or set()
         dex_updates = dex_updates or {}
         exits = 0
-        tp = float(self.cfg.get("take_profit_pct", 50) or 0.0)
-        sl = float(self.cfg.get("stop_loss_pct", 0) or 0.0)
-        trail = float(self.cfg.get("trailing_stop_pct", 0) or 0.0)
-        max_hold = float(self.cfg.get("max_hold_minutes", 120) or 0.0)
-        recover_enabled = bool(self.cfg.get("recover_principal_enabled", False))
-        recover_sell_pct = float(self.cfg.get("recover_principal_sell_pct", 50.0) or 50.0)
-        scale_sell_pct = float(self.cfg.get("scale_out_sell_pct", 25.0) or 25.0)
-        scale_step = float(self.cfg.get("scale_out_step_gain_pct", 100.0) or 0.0)
-        auto_rug = bool(self.cfg.get("auto_rug_exit", False))
-        rug_drop = float(self.cfg.get("rug_liq_drop_pct", 60.0) or 60.0)
+        tp = float(self.cfg.get("take_profit_pct", 50) or 0.0) if opt_on(self.cfg, "take_profit_pct", True) else 0.0
+        sl = float(self.cfg.get("stop_loss_pct", 0) or 0.0) if opt_on(self.cfg, "stop_loss_pct", True) else 0.0
+        trail = float(self.cfg.get("trailing_stop_pct", 0) or 0.0) if opt_on(self.cfg, "trailing_stop_pct", True) else 0.0
+        max_hold = float(self.cfg.get("max_hold_minutes", 120) or 0.0) if opt_on(self.cfg, "max_hold_minutes", True) else 0.0
+        recover_enabled = opt_on(self.cfg, "recover_principal_enabled", False)
+        recover_sell_pct = float(self.cfg.get("recover_principal_sell_pct", 50.0) or 50.0) if opt_on(self.cfg, "recover_principal_sell_pct", True) else 50.0
+        scale_sell_pct = float(self.cfg.get("scale_out_sell_pct", 25.0) or 25.0) if opt_on(self.cfg, "scale_out_sell_pct", True) else 0.0
+        scale_step = float(self.cfg.get("scale_out_step_gain_pct", 100.0) or 0.0) if opt_on(self.cfg, "scale_out_step_gain_pct", True) else 0.0
+        auto_rug = opt_on(self.cfg, "auto_rug_exit", False)
+        rug_drop = float(self.cfg.get("rug_liq_drop_pct", 60.0) or 60.0) if opt_on(self.cfg, "rug_liq_drop_pct", True) else 60.0
+        eff_slip_pct = float(self.cfg.get("slippage_pct", 2.0) or 0.0) if opt_on(self.cfg, "slippage_pct", True) else 0.0
+        eff_fee_pct = float(self.cfg.get("fee_pct", 1.0) or 0.0) if opt_on(self.cfg, "fee_pct", True) else 0.0
         now_ts = time.time()
         self.state["last_price_time"] = now_ts
         for mint, pos in list(self.state["positions"].items()):
@@ -1992,8 +2436,8 @@ class TradingAccount:
             pos["low_price"] = min(pos.get("low_price", entry), price)
             change = (price / entry - 1) * 100
             pos["pnl_pct"] = round(change, 2)
-            fill = price * (1 - self.cfg.get("slippage_pct", 2.0) / 100)
-            proceeds = pos["qty"] * fill * (1 - self.cfg.get("fee_pct", 1.0) / 100)
+            fill = price * (1 - eff_slip_pct / 100.0)
+            proceeds = pos["qty"] * fill * (1 - eff_fee_pct / 100.0)
             pos["pnl_usd"] = round(proceeds - pos["cost"], 4)
             pos["peak_pct"] = round((pos["peak_price"] / entry - 1) * 100, 2)
             pos["low_pct"] = round((pos["low_price"] / entry - 1) * 100, 2)
@@ -2121,7 +2565,11 @@ def scan_and_buy(acct, cfg):
         return
 
     # Check post-sell rescan delay
-    rescan_delay = max(0, int(cfg.get("rescan_delay_after_sell_sec", 0)))
+    rescan_delay = (
+        max(0, int(cfg.get("rescan_delay_after_sell_sec", 0) or 0))
+        if opt_on(cfg, "rescan_delay_after_sell_sec", True)
+        else 0
+    )
     last_sell = float(acct.state.get("last_sell_time") or 0.0)
     if rescan_delay > 0 and last_sell > 0:
         elapsed = time.time() - last_sell
@@ -2216,7 +2664,7 @@ def scan_and_buy(acct, cfg):
                 with _seen_lock:
                     _too_old_mints[mint] = time.time()
             with _stats_lock: _stats["rejects"][code] = _stats["rejects"].get(code, 0) + 1
-            if cfg.get("log_rejects"): log(f"– {symbol} filtered: {code} ({detail})")
+            if opt_on(cfg, "log_rejects", False): log(f"– {symbol} filtered: {code} ({detail})")
             continue
         passing.append((mint, pair))
 
@@ -2231,7 +2679,7 @@ def scan_and_buy(acct, cfg):
 
     # 2. Run parallel or sequential hard_rug_check and enter in highest-momentum order until slots fill
     pre_screened = {}
-    if bool(cfg.get("parallel_rug_screen_enabled", True)) and len(ranked) > 1:
+    if opt_on(cfg, "parallel_rug_screen_enabled", True) and len(ranked) > 1:
         top_batch = ranked[:3]
         scr_pool = ThreadPoolExecutor(max_workers=len(top_batch))
         try:
@@ -2283,6 +2731,7 @@ def scan_and_buy(acct, cfg):
         meta = {
             "dex": pair.get("dexId") or "?",
             "source": _src_of.get(mint, "?"),
+            "creator": pair.get("_creator") or ((pair.get("_pumpportal") or {}).get("creator") if isinstance(pair.get("_pumpportal"), dict) else "") or "",
             "age_s": age_s,
             "liquidity_usd": liq_usd,
             "liq_source": "pumpportal" if pair.get("_synthetic") else "dexscreener",
@@ -2294,22 +2743,23 @@ def scan_and_buy(acct, cfg):
                 break
         elif acct.mode == "live" and not _should_stop():
             # Brief spacing after a failed live buy prevents back-to-back Jupiter 429 collisions on the next ranked candidate
-            time.sleep(0.5 if bool(cfg.get("fast_live_buy_enabled", True)) else 0.9)
+            time.sleep(0.5 if opt_on(cfg, "fast_live_buy_enabled", True) else 0.9)
 
 _last_rev_quote_ts = [0.0]
 
 def _reverse_quote_prices(pos_dict, cfg, sol_px, acct=None):
     """Fetch true executable exit prices (mint -> WSOL quote) without overloading Jupiter keyless limits."""
-    if not cfg.get("use_real_swap_quotes", True) or not pos_dict:
+    if not opt_on(cfg, "use_real_swap_quotes", True) or not pos_dict:
         return {}
-    if bool(cfg.get("jupiter_quota_guard_enabled", True)) and acct is not None and acct.mode == "live":
+    if opt_on(cfg, "jupiter_quota_guard_enabled", True) and acct is not None and acct.mode == "live":
         if time.time() - float(getattr(acct, "_last_live_swap_ts", 0.0) or 0.0) < 10.0:
             return {}
-        if not cfg.get("jupiter_api_key") and not acct.is_slots_full()[0]:
+        has_key = bool(cfg.get("jupiter_api_key")) and opt_on(cfg, "jupiter_api_key", True)
+        if not has_key and not acct.is_slots_full()[0]:
             return {}
     now_ts = time.time()
-    tp = float(cfg.get("take_profit_pct") or 0.0)
-    sl = float(cfg.get("stop_loss_pct") or 0.0)
+    tp = float(cfg.get("take_profit_pct") or 0.0) if opt_on(cfg, "take_profit_pct", True) else 0.0
+    sl = float(cfg.get("stop_loss_pct") or 0.0) if opt_on(cfg, "stop_loss_pct", True) else 0.0
     near_exit = False
     for _m, p in pos_dict.items():
         pnl = float(p.get("pnl_pct") or 0.0)
@@ -2353,9 +2803,9 @@ def _reverse_quote_prices(pos_dict, cfg, sol_px, acct=None):
     return {}
 
 def _jupiter_prices(mints, cfg):
-    if not cfg.get("use_jupiter_price", True) or not mints:
+    if not opt_on(cfg, "use_jupiter_price", True) or not mints:
         return {}
-    has_key = bool(cfg.get("jupiter_api_key"))
+    has_key = bool(cfg.get("jupiter_api_key")) and opt_on(cfg, "jupiter_api_key", True)
     url = JUP_PRICE if has_key else JUP_PRICE_LITE
     headers = {"x-api-key": cfg["jupiter_api_key"]} if has_key else None
     data = get_json(url, params={"ids": ",".join(mints)}, timeout=4, headers=headers)
@@ -2584,21 +3034,23 @@ def run(once=False):
         bal_sol = acct.state.get("wallet_sol")
         bal_usd = acct.state.get("cash") or 0.0
         if bal_sol is not None:
-            log(f"Wallet balance: {float(bal_sol):.4f} SOL (${float(bal_usd):.2f}) | trade size ${CONFIG['trade_size_usd']:.2f}")
-    log(f"Sources: gecko={CONFIG['use_gecko']} jupiter={CONFIG['use_jupiter_recent']} profiles={CONFIG['use_dex_profiles']} pumpportal={CONFIG['use_pumpportal']} boosts={CONFIG['use_promoted_feeds']}{sol_banner}")
-    plats = CONFIG.get("enabled_platforms") if isinstance(CONFIG.get("enabled_platforms"), list) else []
+            t_sz = float(CONFIG.get("trade_size_usd", 5.0) or 5.0) if opt_on(CONFIG, "trade_size_usd", True) else 5.0
+            log(f"Wallet balance: {float(bal_sol):.4f} SOL (${float(bal_usd):.2f}) | trade size ${t_sz:.2f}")
+    log(f"Sources: gecko={opt_on(CONFIG, 'use_gecko', True)} jupiter={opt_on(CONFIG, 'use_jupiter_recent', True)} profiles={opt_on(CONFIG, 'use_dex_profiles', True)} pumpportal={opt_on(CONFIG, 'use_pumpportal', True)} boosts={opt_on(CONFIG, 'use_promoted_feeds', False)}{sol_banner}")
+    plats = CONFIG.get("enabled_platforms") if (opt_on(CONFIG, "enabled_platforms", True) and isinstance(CONFIG.get("enabled_platforms"), list)) else []
     log(f"Websites: {', '.join(str(x) for x in plats) if plats else 'ALL (no restriction)'}")
-    tp_cfg = float(CONFIG.get("take_profit_pct", 50) or 0.0)
-    tr_cfg = float(CONFIG.get("trailing_stop_pct", 0) or 0.0)
-    rec_enabled = bool(CONFIG.get("recover_principal_enabled", False))
-    rec_sell_pct = float(CONFIG.get("recover_principal_sell_pct", 50.0) or 50.0)
-    scale_sell_pct = float(CONFIG.get("scale_out_sell_pct", 25.0) or 25.0)
-    scale_step_pct = float(CONFIG.get("scale_out_step_gain_pct", 100.0) or 0.0)
+    tp_cfg = float(CONFIG.get("take_profit_pct", 50) or 0.0) if opt_on(CONFIG, "take_profit_pct", True) else 0.0
+    tr_cfg = float(CONFIG.get("trailing_stop_pct", 0) or 0.0) if opt_on(CONFIG, "trailing_stop_pct", True) else 0.0
+    rec_enabled = opt_on(CONFIG, "recover_principal_enabled", False)
+    rec_sell_pct = float(CONFIG.get("recover_principal_sell_pct", 50.0) or 50.0) if opt_on(CONFIG, "recover_principal_sell_pct", True) else 50.0
+    scale_sell_pct = float(CONFIG.get("scale_out_sell_pct", 25.0) or 25.0) if opt_on(CONFIG, "scale_out_sell_pct", True) else 0.0
+    scale_step_pct = float(CONFIG.get("scale_out_step_gain_pct", 100.0) or 0.0) if opt_on(CONFIG, "scale_out_step_gain_pct", True) else 0.0
 
     if rec_enabled:
         min_tp, target_usd = TradingAccount.calc_min_recovery_tp_pct({**CONFIG, "mode": mode}, sol_px)
+        t_sz = float(CONFIG.get("trade_size_usd", 5.0) or 5.0) if opt_on(CONFIG, "trade_size_usd", True) else 5.0
         if tp_cfg <= 0 or tp_cfg + 1e-9 < min_tp:
-            log(f"✗ INVALID SETTINGS: Investment is ${float(CONFIG.get('trade_size_usd', 0)):.2f} (requires ~${target_usd:.2f} back incl. fees). Selling {rec_sell_pct:g}% requires Take Profit >= +{min_tp:.1f}% (got +{tp_cfg:g}%). Exiting.")
+            log(f"✗ INVALID SETTINGS: Investment is ${t_sz:.2f} (requires ~${target_usd:.2f} back incl. fees). Selling {rec_sell_pct:g}% requires Take Profit >= +{min_tp:.1f}% (got +{tp_cfg:g}%). Exiting.")
             _cleanup_pid_file()
             return
         scale_note = f" + {scale_sell_pct:g}% scale-out every +{scale_step_pct:g}%" if (scale_step_pct > 0 and scale_sell_pct > 0) else ""
@@ -2612,7 +3064,13 @@ def run(once=False):
         exit_banner = f"Profit-only Trail {tr_cfg:g}% (arms +{TradingAccount.trailing_stop_arm_pct(0, tr_cfg):.0f}%)"
     else:
         exit_banner = "TP/Trail OFF"
-    log(f"Window: coins < {CONFIG['max_age_minutes'] * 60:.0f}s old (grace <{CONFIG['ultra_early_grace_sec']}s skips liquidity/buy floors) | {exit_banner} | liq>=${CONFIG['min_liquidity_usd']:.0f} after grace | buys>=sells(5m) | pump cap +{CONFIG['max_price_change_m5_pct']:.0f}% | rug check {'ON' if CONFIG['use_rugcheck'] else 'OFF'}")
+    min_age_banner = f"{float(CONFIG.get('min_age_minutes', 0) or 0):g}m" if opt_on(CONFIG, "min_age_minutes", False) else "0m"
+    max_age_banner = f"{float(CONFIG.get('max_age_minutes', 2) or 2):g}m" if opt_on(CONFIG, "max_age_minutes", True) else "any"
+    grace_banner = float(CONFIG.get("ultra_early_grace_sec", 0) or 0) if opt_on(CONFIG, "ultra_early_grace_sec", True) else 0
+    liq_banner = float(CONFIG.get("min_liquidity_usd", 5000) or 0) if opt_on(CONFIG, "min_liquidity_usd", True) else 0
+    pump_banner = f"+{float(CONFIG.get('max_price_change_m5_pct', 250) or 0):.0f}%" if opt_on(CONFIG, "max_price_change_m5_pct", True) else "OFF"
+    creator_banner = f"owner-chk={'ON' if opt_on(CONFIG, 'check_creator_history', True) else 'OFF'}"
+    log(f"Window: coins {min_age_banner}–{max_age_banner} old (grace <{grace_banner:g}s skips liquidity/buy floors) | {exit_banner} | liq>=${liq_banner:.0f} after grace | pump cap {pump_banner} | rug={'ON' if opt_on(CONFIG, 'use_rugcheck', True) else 'OFF'} | {creator_banner}")
     if once:
         try:
             scan_and_buy(acct, CONFIG)
@@ -2629,7 +3087,8 @@ def run(once=False):
             except Exception as e:
                 if not _should_stop():
                     log(f"scan error: {e}")
-            wait_sec = max(0.1, float(CONFIG.get("scan_interval_sec", 1)) - (time.time() - started))
+            scan_iv = float(CONFIG.get("scan_interval_sec", 1) or 1) if opt_on(CONFIG, "scan_interval_sec", True) else 1.0
+            wait_sec = max(0.1, scan_iv - (time.time() - started))
             _interruptible_wait(wait_sec, _scan_wake)
 
     threading.Thread(target=scan_loop, daemon=True).start()
@@ -2645,7 +3104,8 @@ def run(once=False):
             except Exception as e:
                 if not _should_stop():
                     log(f"monitor error: {e}")
-            wait_sec = max(0.1, float(CONFIG.get("monitor_interval_sec", 1.0)) - (time.time() - started))
+            mon_iv = float(CONFIG.get("monitor_interval_sec", 1.0) or 1.0) if opt_on(CONFIG, "monitor_interval_sec", True) else 1.0
+            wait_sec = max(0.1, mon_iv - (time.time() - started))
             _interruptible_wait(wait_sec)
     finally:
         _stop_event.set()

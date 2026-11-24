@@ -77,6 +77,10 @@ export interface BotSettings {
   maxTop10HoldersPct: number;
   maxSingleHolderPct: number;
   maxSellRouteImpactPct: number;
+  creatorHistoryEnabled: boolean;
+  maxCreatorLaunches: number;
+  maxCreatorRuggedCoins: number;
+  creatorFastRugWindowMinutes: number;
 
   // Scoring
   enforceMinScores: boolean;
@@ -116,12 +120,16 @@ export interface BotSettings {
   // Shadow Compare
   shadowCompareEnabled: boolean;
   shadowLiveSizeSol: number;
+
+  // Per-option enable/disable toggles (omitted or true = active)
+  optionToggles?: Record<string, boolean>;
 }
 
 export interface PositionExitSnapshot {
   stopLossEnabled: boolean;
   stopLossPct: number;
   stopLossTiers: StopLossTier[];
+  takeProfitEnabled?: boolean;
   takeProfitPct: number;
   trailingEnabled: boolean;
   trailingLadder: TrailingTier[];
@@ -129,6 +137,7 @@ export interface PositionExitSnapshot {
   maxHoldMinutes: number;
   maxHoldStagnationEnabled: boolean;
   stagnationMinGainPct: number;
+  emergencyLiquidityFloorEnabled?: boolean;
   emergencyLiquidityFloorUsd: number;
   emergencyLiquidityDrainPct: number;
   emergencyMaxSellTaxPct: number;
@@ -201,6 +210,10 @@ export interface SecurityReport {
   holders: HolderAccountInfo[];
   deployerFlagged: boolean;
   deployerReason?: string;
+  creatorAddress?: string | null;
+  creatorLaunchCount?: number;
+  creatorRuggedCount?: number;
+  creatorFastestRugMinutes?: number | null;
   sellRouteExists: boolean;
   sellRouteImpactPct: number | null;
   sellTaxPct: number | null;
