@@ -2,6 +2,18 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.38.2 — Fix Python Sniper Scan Exception (`size_mult` KeyError in `_evaluate_sol_regime`)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed
+- **Python Sniper Bot Scan Exception (`KeyError: 'size_mult'`)**:
+  - Fixed an unhandled dictionary key access in `sniper/bot.py` during candidate buy order sizing (`total_size_mult = round(max(0.1, min(3.0, conv_mult * regime["size_mult"] * streak["size_mult"])), 3)`).
+  - Updated `_evaluate_sol_regime` to explicitly provide `size_mult` in all return payloads (`1.0` for allow, `0.5` for half size, `0.0` for pause).
+  - Hardened dictionary lookups with fallback `.get("size_mult", 1.0)` and defensive `get("action")` checks so buy orders proceed smoothly when launches pass filters.
+
+---
+
 ## v1.38.1 — Pro Desk Style & Feature Parity Across Both Bots (`ProDeskView.tsx`, `PythonSniperView.tsx`, `CHANGELOG.md`)
 
 **Risk Warning: Trading can lose all of your money.**

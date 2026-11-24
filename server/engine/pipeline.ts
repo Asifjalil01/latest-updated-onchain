@@ -454,7 +454,9 @@ export class BotOrchestrator {
       this.pumpTradeUnsub();
       this.pumpTradeUnsub = null;
     }
-    this.pumpPortal.setPinnedOpenMints([]);
+    if (typeof this.pumpPortal?.setPinnedOpenMints === 'function') {
+      this.pumpPortal.setPinnedOpenMints([]);
+    }
     this.pumpPortal.stop();
     this.runState = 'stopped';
     this.log('INFO', 'ENGINE', 'Bot stopped.');
@@ -483,7 +485,9 @@ export class BotOrchestrator {
       this.pumpTradeUnsub();
       this.pumpTradeUnsub = null;
     }
-    this.pumpPortal.setPinnedOpenMints([]);
+    if (typeof this.pumpPortal?.setPinnedOpenMints === 'function') {
+      this.pumpPortal.setPinnedOpenMints([]);
+    }
     this.pumpPortal.stop();
     this.log('CRITICAL', 'KILL_SWITCH', 'KILL SWITCH ACTIVATED: stopping bot and exiting all open positions.');
     this.broadcastStatus();

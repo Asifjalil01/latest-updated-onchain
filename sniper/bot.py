@@ -414,7 +414,7 @@ def _record_sol_regime_sample(price, ts_sec=None):
             del _sol_regime_samples[:len(_sol_regime_samples) - 400]
 
 def _evaluate_sol_regime(cfg, now_ts=None):
-    """Evaluate 15-minute SOL drop % and return {action, drop_pct, peak, current}."""
+    """Evaluate 15-minute SOL drop % and return {action, size_mult, drop_pct, peak, current}."""
     t = now_ts if now_ts is not None else time.time()
     cutoff = t - 900.0
     with _sol_lock:
@@ -428,17 +428,19 @@ def _evaluate_sol_regime(cfg, now_ts=None):
         if peak > 0:
             drop_pct = max(0.0, ((peak - cur) / peak) * 100.0)
     if not opt_on(cfg, "sol_regime_filter_enabled", True):
-        return {"action": "allow", "drop_pct": round(drop_pct, 3), "peak": peak, "current": cur}
+        return {"action": "allow", "size_mult": 1.0, "drop_pct": round(drop_pct, 3), "peak": peak, "current": cur}
     max_drop = max(0.1, float((cfg or {}).get("sol_regime_max_drop_pct", 2.0) or 2.0))
     if drop_pct >= max_drop:
         raw_act = str((cfg or {}).get("sol_regime_action") or "pause").strip().lower()
+        is_half = (raw_act == "half_size")
         return {
-            "action": "half_size" if raw_act == "half_size" else "pause",
+            "action": "half_size" if is_half else "pause",
+            "size_mult": 0.5 if is_half else 0.0,
             "drop_pct": round(drop_pct, 3),
             "peak": peak,
             "current": cur,
         }
-    return {"action": "allow", "drop_pct": round(drop_pct, 3), "peak": peak, "current": cur}
+    return {"action": "allow", "size_mult": 1.0, "drop_pct": round(drop_pct, 3), "peak": peak, "current": cur}
 
 def get_sol_price_usd(cfg=None, force=False):
     """Fetch and cache live SOL/USD price every 12s via Jupiter / DexScreener."""
@@ -1040,12 +1042,17 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
         min_ratio = max(0.05, min(1.0, float(cfg.get("min_unique_makers_ratio", 0.25) or 0.25)))
         min_uniq = max(1, int(cfg.get("min_unique_traders_5m", 6) or 6))
         total_m5 = buys + sells
-        uniq_5m = int(
-            ((pp or {}).get("unique_traders_5m") or 0)
-            or (m5.get("makers") or 0)
-            or (pair.get("_unique_traders_5m") or 0)
+        has_uniq_data = (
+            (isinstance(pp, dict) and pp.get("unique_traders_5m") is not None)
+            or (isinstance(m5, dict) and m5.get("makers") is not None)
+            or (pair.get("_unique_traders_5m") is not None)
         )
-        if total_m5 >= 6 and (uniq_5m > 0 or (pp and pp.get("has_trade_stream"))):
+        if total_m5 >= 6 and has_uniq_data:
+            uniq_5m = int(
+                ((pp or {}).get("unique_traders_5m") or 0)
+                or (m5.get("makers") or 0)
+                or (pair.get("_unique_traders_5m") or 0)
+            )
             ratio_5m = uniq_5m / max(1, total_m5)
             if uniq_5m < min_uniq:
                 return False, "wash trading", f"{uniq_5m} unique 5m traders < {min_uniq}"
@@ -3233,17 +3240,17 @@ def scan_and_buy(acct, cfg):
 
     _maybe_summary()
     regime = _evaluate_sol_regime(cfg)
-    if regime["action"] == "pause":
+    if (regime or {}).get("action") == "pause":
         if time.time() - _last_block_log[0] > 30:
             _last_block_log[0] = time.time()
-            log(f"⏸ SOL 15m Red Market Pause active (-{regime['drop_pct']:.2f}% drop in 15m) — skipping fresh entries.")
+            log(f"⏸ SOL 15m Red Market Pause active (-{float((regime or {}).get('drop_pct', 0.0)):.2f}% drop in 15m) — skipping fresh entries.")
         return
 
     streak = _evaluate_streak_throttle(acct, cfg)
-    if streak["action"] == "pause":
+    if (streak or {}).get("action") == "pause":
         if time.time() - _last_block_log[0] > 30:
             _last_block_log[0] = time.time()
-            log(f"⏸ Losing-Streak Throttle Pause active ({streak['losses']} consecutive losses) — cooling down.")
+            log(f"⏸ Losing-Streak Throttle Pause active ({int((streak or {}).get('losses', 0))} consecutive losses) — cooling down.")
         return
 
     ok, why = acct.can_open()
@@ -3392,7 +3399,9 @@ def scan_and_buy(acct, cfg):
         liq_usd = _f((pair.get("liquidity") or {}).get("usd"))
         smart_buyers = pair.get("_smart_buyers") if isinstance(pair.get("_smart_buyers"), list) else []
         conv_mult = _evaluate_conviction_mult(pair, cfg, len(smart_buyers))
-        total_size_mult = round(max(0.1, min(3.0, conv_mult * regime["size_mult"] * streak["size_mult"])), 3)
+        regime_mult = float((regime or {}).get("size_mult", 1.0) or 1.0)
+        streak_mult = float((streak or {}).get("size_mult", 1.0) or 1.0)
+        total_size_mult = round(max(0.1, min(3.0, conv_mult * regime_mult * streak_mult)), 3)
         meta = {
             "dex": pair.get("dexId") or "?",
             "source": _src_of.get(mint, "?"),
