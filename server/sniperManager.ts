@@ -591,8 +591,12 @@ export class SniperManager {
           continue;
         }
         const pos = freshPositions[mint];
-        const px = prices[mint];
-        if (!pos || !px) continue;
+        let px = prices[mint];
+        if (!pos || !px || px <= 0) continue;
+        const prevCur = Number(pos.current_price || pos.entry_price || px);
+        if (prevCur > 0 && px < prevCur * 0.30 && !pos.liq_drop_streak) {
+          px = prevCur;
+        }
         anyUpdated = true;
         const entry = Number(pos.entry_price || px);
         pos.current_price = px;

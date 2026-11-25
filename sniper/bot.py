@@ -3284,6 +3284,9 @@ class TradingAccount:
             if price is None or price <= 0:
                 continue
             entry = pos["entry_price"]
+            prev_cur = float(pos.get("current_price") or entry)
+            if prev_cur > 0 and price < prev_cur * 0.30 and int(pos.get("liq_drop_streak", 0) or 0) < 2:
+                price = prev_cur
             pos["current_price"] = price
             pos["last_updated"] = now_ts
             pos["peak_price"] = max(pos.get("peak_price", entry), price)

@@ -2,6 +2,16 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.41.2 — Anti-Glitch Price Stabilization (Eliminates Transient -99% Flash Drops)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed & Improved
+- **Anti-Glitch Single-Poll Price Drop Filter (`sniper/bot.py`, `server/sniperManager.ts`)**:
+  - Implemented robust outlier and transient price protection in `check_exits()` and `refreshStoppedOpenPositions()`: momentary zero/low price glitches or unindexed price API hiccups that drop a position's reported price by >70% in a single poll are automatically filtered out and stabilized (retaining the last known valid price) unless a confirmed liquidity collapse or dev dump exit is active. This eliminates erratic `-99%` red flashes during active trades.
+
+---
+
 ## v1.41.0 — Best Quick-Profit Defaults + Dedicated Reset-to-Default Buttons for Settings & Pro Desk
 
 **Risk Warning: Trading can lose all of your money.**
