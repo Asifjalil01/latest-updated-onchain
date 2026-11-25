@@ -166,6 +166,53 @@ test('API: requests without x-api-token return 401 and paper reset keeps live ro
     const modeJson = (await modeRes.json()) as { status: { mode: string; runState: string } };
     assert.equal(modeJson.status.mode, 'testnet');
     assert.equal(modeJson.status.runState, 'stopped');
+
+    // 7. POST /settings/reset resets Settings and Pro Desk scopes cleanly to Quick-Profit defaults
+    const customSave = await fetch(`${base}/settings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': token,
+      },
+      body: JSON.stringify({
+        stopLossPct: 25,
+        takeProfitPct: 60,
+        antiSybilEnabled: false,
+        streakLossLimit: 7,
+      }),
+    });
+    assert.equal(customSave.status, 200);
+
+    const resetSettingsRes = await fetch(`${base}/settings/reset`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': token,
+      },
+      body: JSON.stringify({ scope: 'settings' }),
+    });
+    assert.equal(resetSettingsRes.status, 200);
+    const resetSettingsJson = (await resetSettingsRes.json()) as { settings: Record<string, any> };
+    assert.equal(resetSettingsJson.settings.stopLossPct, 4);
+    assert.equal(resetSettingsJson.settings.takeProfitPct, 12);
+    assert.equal(resetSettingsJson.settings.antiSybilEnabled, false);
+    assert.equal(resetSettingsJson.settings.streakLossLimit, 7);
+
+    const resetProRes = await fetch(`${base}/settings/reset`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': token,
+      },
+      body: JSON.stringify({ scope: 'pro_desk' }),
+    });
+    assert.equal(resetProRes.status, 200);
+    const resetProJson = (await resetProRes.json()) as { settings: Record<string, any> };
+    assert.equal(resetProJson.settings.antiSybilEnabled, true);
+    assert.equal(resetProJson.settings.wsExitStreamEnabled, true);
+    assert.equal(resetProJson.settings.jitoDontFrontEnabled, true);
+    assert.equal(resetProJson.settings.streakLossLimit, 2);
+    assert.equal(resetProJson.settings.stopLossPct, 4);
   } finally {
     orch.stop();
     db.close();

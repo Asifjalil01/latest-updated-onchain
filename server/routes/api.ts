@@ -2,7 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express, { type Request, type Response } from 'express';
 import { z } from 'zod';
-import { SETTINGS_PRESETS, WALLET_FEE_PROFILES } from '../config/defaults';
+import {
+  SETTINGS_PRESETS,
+  SPOT_PRO_DESK_DEFAULT_SETTINGS,
+  SPOT_QUICK_PROFIT_DEFAULT_SETTINGS,
+  WALLET_FEE_PROFILES,
+} from '../config/defaults';
 import { createApiTokenMiddleware, constantTimeTokenEqual } from '../auth/middleware';
 import { computeAnalyticsSummary } from '../engine/fees';
 import type { BotOrchestrator } from '../engine/pipeline';
@@ -512,6 +517,81 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     });
   });
 
+  router.post('/settings/reset', (req: Request, res: Response) => {
+    const scopeRaw = String(req.body?.scope || 'all').trim().toLowerCase();
+    const scope = scopeRaw === 'settings' || scopeRaw === 'pro_desk' ? scopeRaw : 'all';
+    const current = orchestrator.db.getSettings();
+    const currentToggles = { ...(current.optionToggles || {}) };
+    const proDeskToggleKeys = [
+      'antiSybilEnabled',
+      'smartMoneyEnabled',
+      'reusedSocialsEnabled',
+      'wsExitStreamEnabled',
+      'jitoDontFrontEnabled',
+      'orphanSweepEnabled',
+      'postMigrationPullbackEnabled',
+      'preMigrationCurveEnabled',
+      'washTradeFilterEnabled',
+      'solRegimeFilterEnabled',
+      'antiTopWickEnabled',
+      'convictionSizingEnabled',
+      'streakThrottleEnabled',
+      'narrativeCapEnabled',
+      'autoReclaimRent',
+    ];
+    let patch: Partial<BotSettings>;
+    if (scope === 'pro_desk') {
+      for (const k of proDeskToggleKeys) {
+        delete currentToggles[k];
+      }
+      patch = {
+        ...SPOT_PRO_DESK_DEFAULT_SETTINGS,
+        optionToggles: currentToggles,
+      };
+    } else if (scope === 'settings') {
+      const nextToggles: Record<string, boolean> = {};
+      for (const k of proDeskToggleKeys) {
+        if (k in currentToggles) {
+          nextToggles[k] = currentToggles[k];
+        }
+      }
+      patch = {
+        ...SPOT_QUICK_PROFIT_DEFAULT_SETTINGS,
+        optionToggles: nextToggles,
+      };
+    } else {
+      patch = {
+        ...SPOT_QUICK_PROFIT_DEFAULT_SETTINGS,
+        ...SPOT_PRO_DESK_DEFAULT_SETTINGS,
+        optionToggles: {},
+      };
+    }
+    const result = orchestrator.db.updateSettings(patch);
+    if (!result.valid) {
+      res.status(400).json({ error: 'Reset validation failed', errors: result.errors });
+      return;
+    }
+    orchestrator.invalidateLiveConfirmationIfCriticalChanged(result.settings);
+    if (req.body?.applyToOpenPositions === true) {
+      const mode = orchestrator.getStatusSnapshot().mode;
+      orchestrator.db.syncOpenPositionsExitParams(mode, result.settings);
+    }
+    orchestrator.log(
+      'INFO',
+      'SETTINGS',
+      scope === 'pro_desk'
+        ? 'Reset Pro Desk settings to Quick-Profit defaults.'
+        : scope === 'settings'
+          ? 'Reset Bot & Risk settings to Quick-Profit defaults.'
+          : 'Reset all Bot & Pro Desk settings to Quick-Profit defaults.'
+    );
+    res.json({
+      scope,
+      settings: result.settings,
+      history: orchestrator.db.getSettingsHistory(100),
+    });
+  });
+
   router.get('/wallets', async (_req: Request, res: Response) => {
     const diagnostics = await orchestrator.refreshWalletDiagnostics();
     res.json({
@@ -933,6 +1013,12 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       return;
     }
     res.json(sniperManager.updateSettings(settings));
+  });
+
+  router.post('/sniper/settings/reset', (req: Request, res: Response) => {
+    const scopeRaw = String(req.body?.scope || 'all').trim().toLowerCase();
+    const scope = scopeRaw === 'settings' || scopeRaw === 'pro_desk' ? scopeRaw : 'all';
+    res.json(sniperManager.resetSettingsToDefault(scope));
   });
 
   router.post('/sniper/reset', (_req: Request, res: Response) => {

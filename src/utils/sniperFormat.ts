@@ -23,6 +23,25 @@ export interface EnrichedSniperTrade extends RawSniperCsvRow {
   solPriceUsd?: string;
   txBuy?: string;
   txSell?: string;
+  tradeStatus?: 'OPEN' | 'PARTIAL' | 'CLOSED';
+  entryTime?: string;
+  exitTime?: string;
+  buyAmountUsd?: string;
+  exitAmountUsd?: string;
+  diffUsd?: string;
+  exitCount?: number;
+  partialReasons?: string[];
+}
+
+export interface ConsolidatedSniperTrade extends EnrichedSniperTrade {
+  tradeStatus: 'OPEN' | 'PARTIAL' | 'CLOSED';
+  entryTime: string;
+  exitTime: string;
+  buyAmountUsd: string;
+  exitAmountUsd: string;
+  diffUsd: string;
+  exitCount: number;
+  partialReasons?: string[];
 }
 
 export function usdToSol(usd: number, solPriceUsd: number | null | undefined): number | null {
@@ -153,6 +172,186 @@ export function pairTradesWithEntryAndExit(
   }
 
   return enriched.slice(-limit).reverse();
+}
+
+/**
+ * Merges BUY and subsequent partial/final SELL CSV events into a single
+ * consolidated trade record per coin position lifecycle, updating the BUY row
+ * in-place when exited so history counts unique coin trades rather than raw events.
+ * Returns up to `limit` trades sorted newest-activity-first.
+ */
+export function consolidateSniperTrades(
+  chronologicalRows: RawSniperCsvRow[],
+  limit = 200
+): ConsolidatedSniperTrade[] {
+  interface InternalTrade {
+    trade: ConsolidatedSniperTrade;
+    buyCostNum: number;
+    exitAmountNum: number;
+    accPnlUsd: number;
+    hasPnl: boolean;
+    lastSeq: number;
+  }
+
+  const records: InternalTrade[] = [];
+  const activeIdxByMint = new Map<string, number>();
+
+  for (let seq = 0; seq < chronologicalRows.length; seq++) {
+    const row = chronologicalRows[seq];
+    const action = (row.action || '').toUpperCase();
+    const mint = (row.mint || '').trim();
+    const rowTx = (row.txSig || '').trim();
+
+    if (action === 'BUY') {
+      const buyCost = parseFloat(row.amount || '0');
+      const safeBuyCost = Number.isFinite(buyCost) ? buyCost : 0;
+      const rec: InternalTrade = {
+        trade: {
+          ...row,
+          action: 'BUY',
+          tradeStatus: 'OPEN',
+          entryTime: row.time || '',
+          exitTime: '',
+          entryPrice: row.entryPrice || row.price || '',
+          exitPrice: '',
+          buyAmountUsd: row.amount || safeBuyCost.toFixed(4),
+          exitAmountUsd: '',
+          diffUsd: '',
+          exitCount: 0,
+          txBuy: rowTx || undefined,
+          partialReasons: [],
+        },
+        buyCostNum: safeBuyCost,
+        exitAmountNum: 0,
+        accPnlUsd: 0,
+        hasPnl: false,
+        lastSeq: seq,
+      };
+      const idx = records.push(rec) - 1;
+      if (mint) {
+        activeIdxByMint.set(mint, idx);
+      }
+      continue;
+    }
+
+    if (action === 'SELL') {
+      const reason = row.reason || '';
+      const isPartialSell =
+        reason.startsWith('principal_recovery') || reason.startsWith('scale_out');
+      const sellProceeds = parseFloat(row.amount || '0');
+      const safeProceeds = Number.isFinite(sellProceeds) ? sellProceeds : 0;
+      const sellPnl = parseFloat(row.pnlUsd || '');
+      const hasSellPnl = Number.isFinite(sellPnl);
+
+      const activeIdx = mint ? activeIdxByMint.get(mint) : undefined;
+      if (activeIdx !== undefined && records[activeIdx]) {
+        const rec = records[activeIdx];
+        const t = rec.trade;
+        rec.exitAmountNum += safeProceeds;
+        if (hasSellPnl) {
+          rec.accPnlUsd += sellPnl;
+          rec.hasPnl = true;
+        }
+        rec.lastSeq = seq;
+
+        t.exitCount += 1;
+        t.time = row.time || t.time;
+        t.exitTime = row.time || '';
+        t.entryPrice = t.entryPrice || row.entryPrice || '';
+        t.exitPrice = row.price || '';
+        t.txSell = rowTx || t.txSell;
+        t.solPriceUsd = row.solPriceUsd || t.solPriceUsd;
+        t.reason = reason || t.reason;
+        if (isPartialSell && reason) {
+          t.partialReasons = [...(t.partialReasons || []), reason];
+        }
+
+        const effectiveBuy = rec.buyCostNum;
+        const effectiveExit = rec.exitAmountNum;
+        const diffVal = effectiveExit - effectiveBuy;
+
+        t.amount = effectiveExit.toFixed(4);
+        t.buyAmountUsd = effectiveBuy.toFixed(4);
+        t.exitAmountUsd = effectiveExit.toFixed(4);
+        t.diffUsd = diffVal.toFixed(4);
+        t.pnlUsd = rec.hasPnl ? rec.accPnlUsd.toFixed(4) : diffVal.toFixed(4);
+
+        if (t.exitCount === 1 && !isPartialSell && row.pnlPct && Number.isFinite(parseFloat(row.pnlPct))) {
+          t.pnlPct = row.pnlPct;
+        } else if (effectiveBuy > 0) {
+          const pnlForPct = rec.hasPnl ? rec.accPnlUsd : diffVal;
+          t.pnlPct = ((pnlForPct / effectiveBuy) * 100).toFixed(2);
+        } else {
+          t.pnlPct = row.pnlPct || '0.00';
+        }
+
+        if (isPartialSell) {
+          t.tradeStatus = 'PARTIAL';
+          t.action = 'PARTIAL';
+        } else {
+          t.tradeStatus = 'CLOSED';
+          t.action = 'CLOSED';
+          if (mint) activeIdxByMint.delete(mint);
+        }
+        continue;
+      }
+
+      // Orphaned SELL without an earlier BUY row in this CSV
+      const inferredBuy = hasSellPnl ? Math.max(0, safeProceeds - sellPnl) : 0;
+      const diffVal = safeProceeds - inferredBuy;
+      const rec: InternalTrade = {
+        trade: {
+          ...row,
+          action: isPartialSell ? 'PARTIAL' : 'CLOSED',
+          tradeStatus: isPartialSell ? 'PARTIAL' : 'CLOSED',
+          entryTime: row.time || '',
+          exitTime: row.time || '',
+          entryPrice: row.entryPrice || '',
+          exitPrice: row.price || '',
+          buyAmountUsd: inferredBuy.toFixed(4),
+          exitAmountUsd: safeProceeds.toFixed(4),
+          diffUsd: (hasSellPnl ? sellPnl : diffVal).toFixed(4),
+          exitCount: 1,
+          txSell: rowTx || undefined,
+          partialReasons: isPartialSell && reason ? [reason] : [],
+        },
+        buyCostNum: inferredBuy,
+        exitAmountNum: safeProceeds,
+        accPnlUsd: hasSellPnl ? sellPnl : diffVal,
+        hasPnl: hasSellPnl,
+        lastSeq: seq,
+      };
+      records.push(rec);
+      continue;
+    }
+
+    const fallbackCost = parseFloat(row.amount || '0');
+    records.push({
+      trade: {
+        ...row,
+        tradeStatus: 'OPEN',
+        entryTime: row.time || '',
+        exitTime: '',
+        entryPrice: row.entryPrice || row.price || '',
+        exitPrice: '',
+        buyAmountUsd: Number.isFinite(fallbackCost) ? fallbackCost.toFixed(4) : '0',
+        exitAmountUsd: '',
+        diffUsd: '',
+        exitCount: 0,
+        txBuy: rowTx || undefined,
+      },
+      buyCostNum: Number.isFinite(fallbackCost) ? fallbackCost : 0,
+      exitAmountNum: 0,
+      accPnlUsd: 0,
+      hasPnl: false,
+      lastSeq: seq,
+    });
+  }
+
+  return records
+    .sort((a, b) => b.lastSeq - a.lastSeq)
+    .slice(0, limit)
+    .map((r) => r.trade);
 }
 
 export function orderLogsNewestFirst<T>(logs: readonly T[]): T[] {

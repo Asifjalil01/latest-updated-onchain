@@ -75,6 +75,11 @@ interface SniperPosition {
   trailing_floor_pct?: number | null;
   dex?: string;
   source?: string;
+  creator?: string;
+  creator_launches?: number;
+  creator_prior_launches?: number;
+  creator_rugged?: number;
+  creator_fast_rug_min?: number | null;
   age_at_entry?: number;
   last_updated?: number;
   last_sell_error?: string;
@@ -117,7 +122,7 @@ const PYTHON_PRO_DESK_KEYS: Array<[string, 'bool' | 'int' | 'float' | 'string' |
   ['reused_socials_enabled', 'bool'],
   ['max_social_reuse_count', 'int'],
   ['ws_exit_stream_enabled', 'bool'],
-  ['jito_dont_front_enabled', 'bool'],
+  ['jito_dontfront_enabled', 'bool'],
   ['jito_tip_sol', 'float'],
   ['orphan_sweep_enabled', 'bool'],
   ['post_migration_pullback_enabled', 'bool'],
@@ -282,6 +287,15 @@ const SNIPER_PROTECTION_MODULES: SniperProtectionModuleOption[] = [
     description:
       'Checked: When Jupiter returns HTTP 429 or has no route on a brand-new coin or urgent exit, immediately builds and signs the swap via PumpPortal trade-local (pool=auto) or Raydium Trade API. Unchecked: Uses Jupiter swap routes only.',
     linkedTo: 'Slippage % · Priority fee speed tier',
+  },
+  {
+    key: 'early_rug_shield_enabled',
+    group: 'safety',
+    label: 'Early-Launch Rugpull Shield (0m–3m Pre-Buy + Live Dev-Dump Auto-Exit)',
+    defaultValue: true,
+    description:
+      'Checked: Blocks dev sniper bundles (>8 SOL block-0 buy), thin curve spoofs, >18% single whales, >34% top-3 splits, shared-funder dev/Pump.fun sybil clusters, and hidden >30% sell taxes; triggers instant creator_dump_exit & catastrophic LP collapse auto-exits.',
+    linkedTo: 'Hard RugCheck · Anti-Sybil · Block creator/dev sell dumps · Auto Emergency Sell on LP Drain',
   },
   {
     key: 'anti_rug_tight_score_enabled',
@@ -552,6 +566,7 @@ export function PythonSniperView() {
   const [confirmDeleteMint, setConfirmDeleteMint] = useState<string | null>(null);
   const [deletingMint, setDeletingMint] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [resettingDefaults, setResettingDefaults] = useState<'settings' | 'pro_desk' | null>(null);
 
   const fetchStatus = async () => {
     try {
@@ -707,6 +722,36 @@ export function PythonSniperView() {
       }
     } catch (err) {
       pushToast({ kind: 'error', title: 'Reset failed', body: err instanceof Error ? err.message : 'Error' });
+    }
+  };
+
+  const handleResetDefaults = async (scope: 'settings' | 'pro_desk') => {
+    setResettingDefaults(scope);
+    try {
+      const data = await apiFetch<any>('/api/sniper/settings/reset', {
+        method: 'POST',
+        body: JSON.stringify({ scope }),
+      });
+      if (data.ok && data.settings) {
+        setServerSettings(data.settings);
+        setDraftSettings(data.settings);
+        markSettingsDirty(false);
+        pushToast({
+          kind: 'success',
+          title: scope === 'pro_desk' ? 'Pro Desk Reset to Default' : 'Settings Reset to Default',
+          body:
+            scope === 'pro_desk'
+              ? 'All Pro Desk modules and thresholds have been restored to best Quick-Profit defaults and saved.'
+              : 'All Settings filters, exits, and Rug Shield options have been restored to best Quick-Profit defaults and saved.',
+        });
+        void fetchStatus();
+      } else {
+        pushToast({ kind: 'error', title: 'Reset failed', body: data.message || 'Unable to reset defaults' });
+      }
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Reset failed', body: err instanceof Error ? err.message : 'Error' });
+    } finally {
+      setResettingDefaults(null);
     }
   };
 
@@ -987,7 +1032,9 @@ export function PythonSniperView() {
       t.symbol.toLowerCase().includes(q) ||
       t.mint.toLowerCase().includes(q) ||
       t.action.toLowerCase().includes(q) ||
-      t.reason.toLowerCase().includes(q)
+      (t.tradeStatus || '').toLowerCase().includes(q) ||
+      t.reason.toLowerCase().includes(q) ||
+      (t.partialReasons || []).some((r) => r.toLowerCase().includes(q))
     );
   });
 
@@ -1322,6 +1369,7 @@ export function PythonSniperView() {
                     <th className="py-2 px-2 font-semibold text-right">Peak / Low</th>
                     <th className="py-2 px-2 font-semibold text-right">Held</th>
                     <th className="py-2 px-2 font-semibold">Coin key</th>
+                    <th className="py-2 px-2 font-semibold">Dev wallet</th>
                     <th className="py-2 px-2 font-semibold text-right">Actions</th>
                   </tr>
                 </thead>
@@ -1443,6 +1491,57 @@ export function PythonSniperView() {
                           </div>
                         </td>
 
+                        {/* Dev wallet (launches & rug pulls) */}
+                        <td className="py-2.5 px-2 whitespace-nowrap">
+                          {p.creator ? (
+                            (() => {
+                              const launches = Math.max(1, Number(p.creator_launches ?? (typeof p.creator_prior_launches === 'number' ? p.creator_prior_launches + 1 : 1)));
+                              const rugs = Math.max(0, Number(p.creator_rugged ?? 0));
+                              const fastTip =
+                                typeof p.creator_fast_rug_min === 'number'
+                                  ? ` · Fastest rug: ${p.creator_fast_rug_min.toFixed(1)}m`
+                                  : '';
+                              const badgeClass =
+                                rugs > 0
+                                  ? 'bg-rose-500/15 text-rose-500 dark:text-rose-400 border-rose-500/30'
+                                  : launches > 3
+                                    ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30'
+                                    : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30';
+                              return (
+                                <div className="space-y-0.5">
+                                  <div className="flex items-center gap-1 text-[11px]">
+                                    <a
+                                      href={`https://solscan.io/account/${p.creator}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-slate-600 dark:text-slate-300 hover:text-teal-500 dark:hover:text-teal-400 transition-colors"
+                                      title={`Dev wallet: ${p.creator} (view on Solscan)`}
+                                    >
+                                      {p.creator.slice(0, 4)}...{p.creator.slice(-4)}
+                                    </a>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleCopy(p.creator!)}
+                                      className="text-slate-400 hover:text-slate-200 p-0.5 rounded transition-colors shrink-0"
+                                      title={`Copy dev wallet (${p.creator})`}
+                                    >
+                                      {copiedKey === p.creator ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                                    </button>
+                                  </div>
+                                  <span
+                                    className={`inline-block px-1.5 py-0.2 rounded border text-[10px] font-semibold tabular-nums ${badgeClass}`}
+                                    title={`Dev wallet launched ${launches} tracked coin(s), ${rugs} rug pull(s)${fastTip}`}
+                                  >
+                                    {launches} launched · {rugs} {rugs === 1 ? 'rug' : 'rugs'}
+                                  </span>
+                                </div>
+                              );
+                            })()
+                          ) : (
+                            <span className="text-[11px] text-slate-400 dark:text-slate-500">Unknown</span>
+                          )}
+                        </td>
+
                         {/* Actions */}
                         <td className="py-2.5 px-2 text-right space-x-1.5 whitespace-nowrap">
                           {p.tx_buy && (
@@ -1531,7 +1630,9 @@ export function PythonSniperView() {
           <div className="flex flex-wrap items-center justify-between gap-4 pb-2 border-b border-slate-100 dark:border-slate-800">
             <div className="flex items-center gap-3">
               <h2 className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
-                {isLiveMode ? `Live Wallet Trade Ledger (${trades.length} events)` : `Full Paper Trade Ledger (${trades.length} events)`}
+                {isLiveMode
+                  ? `Live Wallet Trade Ledger (${trades.length} ${trades.length === 1 ? 'trade' : 'trades'})`
+                  : `Full Paper Trade Ledger (${trades.length} ${trades.length === 1 ? 'trade' : 'trades'})`}
               </h2>
               <span className="text-[11px] text-slate-500">
                 Win Rate: <strong className="text-slate-900 dark:text-slate-100">{winRateText}</strong>
@@ -1569,59 +1670,85 @@ export function PythonSniperView() {
                 <thead>
                   <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500 font-mono text-[11px]">
                     <th className="py-2 px-2 font-semibold">Time</th>
-                    <th className="py-2 px-2 font-semibold">Action</th>
+                    <th className="py-2 px-2 font-semibold">Status</th>
                     <th className="py-2 px-2 font-semibold">Outcome</th>
                     <th className="py-2 px-2 font-semibold">Coin</th>
-                    <th className="py-2 px-2 font-semibold text-right">Entry ($ / SOL)</th>
-                    <th className="py-2 px-2 font-semibold text-right">Exit ($ / SOL)</th>
-                    <th className="py-2 px-2 font-semibold text-right">Amount ($ / SOL)</th>
+                    <th className="py-2 px-2 font-semibold text-right">Buy Price ($ / SOL)</th>
+                    <th className="py-2 px-2 font-semibold text-right">Sell Price ($ / SOL)</th>
+                    <th className="py-2 px-2 font-semibold text-right">Buy / Exit ($ &amp; Diff)</th>
                     <th className="py-2 px-2 font-semibold text-right">PnL ($ / SOL)</th>
                     <th className="py-2 px-2 font-semibold text-right">PnL %</th>
-                    <th className="py-2 px-2 font-semibold">Exit reason</th>
+                    <th className="py-2 px-2 font-semibold">Reason</th>
                     <th className="py-2 px-2 font-semibold text-center">Chart</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70 font-mono">
                   {filteredTrades.map((t, idx) => {
-                    const isBuy = t.action === 'BUY';
+                    const status = t.tradeStatus || (t.action === 'BUY' ? 'OPEN' : t.action === 'PARTIAL' ? 'PARTIAL' : 'CLOSED');
+                    const isOpenOnly = status === 'OPEN';
+                    const isPartial = status === 'PARTIAL';
                     const numPnlUsd = parseFloat(t.pnlUsd);
                     const numPnlPct = parseFloat(t.pnlPct);
-                    const numAmount = parseFloat(t.amount || '0');
+                    const buyTotalNum = parseFloat(t.buyAmountUsd ?? t.amount ?? '0');
+                    const exitTotalNum = parseFloat(t.exitAmountUsd ?? (isOpenOnly ? '' : t.amount) ?? '');
+                    const hasExitTotal = !isOpenOnly && Number.isFinite(exitTotalNum);
+                    const diffNum = Number.isFinite(parseFloat(t.diffUsd || ''))
+                      ? parseFloat(t.diffUsd!)
+                      : hasExitTotal && Number.isFinite(buyTotalNum)
+                        ? exitTotalNum - buyTotalNum
+                        : NaN;
+
                     const tradeSolPx = t.solPriceUsd ? parseFloat(t.solPriceUsd) : null;
                     const effectiveSolPx = tradeSolPx && Number.isFinite(tradeSolPx) && tradeSolPx > 0 ? tradeSolPx : solPriceUsd;
 
-                    const hasPnl = !isBuy && !isNaN(numPnlUsd);
+                    const hasPnl = !isOpenOnly && !isNaN(numPnlUsd);
                     const isProfit = hasPnl && numPnlUsd > 0;
                     const isLoss = hasPnl && numPnlUsd < 0;
 
-                    const amtDisp = fmtUnsignedUsdAndSol(isNaN(numAmount) ? 0 : numAmount, effectiveSolPx, 2);
+                    const buyDisp = fmtUnsignedUsdAndSol(Number.isFinite(buyTotalNum) ? buyTotalNum : 0, effectiveSolPx, 2);
+                    const exitDisp = hasExitTotal ? fmtUnsignedUsdAndSol(exitTotalNum, effectiveSolPx, 2) : null;
+                    const diffDisp = !isNaN(diffNum) ? fmtSignedUsdAndSol(diffNum, effectiveSolPx, 2) : null;
                     const pnlDisp = fmtSignedUsdAndSol(isNaN(numPnlUsd) ? 0 : numPnlUsd, effectiveSolPx, 4);
 
                     const chartUrl = (t.dexscreener || (t.mint ? `https://dexscreener.com/solana/${t.mint}` : '')).trim();
+                    const hasEntryTimeDiff = Boolean(t.entryTime && t.exitTime && t.entryTime !== t.exitTime);
 
                     return (
-                      <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-slate-900/40 transition-colors">
+                      <tr key={`${t.mint || idx}-${t.entryTime || t.time}-${idx}`} className="hover:bg-slate-50 dark:hover:bg-slate-900/40 transition-colors">
                         {/* Time */}
-                        <td className="py-2 px-2 text-slate-500 whitespace-nowrap text-[11px]" title={t.time}>
-                          {fmtDate(t.time)}
+                        <td className="py-2 px-2 text-slate-500 whitespace-nowrap text-[11px]" title={hasEntryTimeDiff ? `Bought: ${t.entryTime}\nSold: ${t.exitTime}` : t.time}>
+                          <div>{fmtDate(t.time)}</div>
+                          {hasEntryTimeDiff && (
+                            <div className="text-[10px] text-slate-400">
+                              In: {fmtDate(t.entryTime!)}
+                            </div>
+                          )}
                         </td>
 
-                        {/* Action badge */}
-                        <td className="py-2 px-2">
+                        {/* Status badge */}
+                        <td className="py-2 px-2 whitespace-nowrap">
                           <span
                             className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                              isBuy ? 'bg-sky-500/20 text-sky-400 border border-sky-500/30' : 'bg-purple-500/20 text-purple-400 border border-purple-500/30'
+                              isOpenOnly
+                                ? 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
+                                : isPartial
+                                  ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                                  : 'bg-purple-500/20 text-purple-400 border border-purple-500/30'
                             }`}
                           >
-                            {t.action}
+                            {isOpenOnly ? 'OPEN' : isPartial ? 'PARTIAL' : 'CLOSED'}
                           </span>
                         </td>
 
-                        {/* Result / Outcome badge */}
+                        {/* Outcome badge */}
                         <td className="py-2 px-2 whitespace-nowrap">
-                          {isBuy ? (
+                          {isOpenOnly ? (
                             <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-500/10 text-sky-400">
-                              ENTRY
+                              HOLDING
+                            </span>
+                          ) : isPartial ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-teal-500/15 text-teal-400 border border-teal-500/30">
+                              SCALED
                             </span>
                           ) : isProfit ? (
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">
@@ -1658,7 +1785,7 @@ export function PythonSniperView() {
                           )}
                         </td>
 
-                        {/* Entry price ($ & SOL) */}
+                        {/* Buy Price ($ & SOL) */}
                         <td className="py-2 px-2 text-right text-slate-600 dark:text-slate-300 tabular-nums">
                           {t.entryPrice ? (
                             <div className="flex flex-wrap items-baseline gap-x-1 justify-end">
@@ -1670,10 +1797,10 @@ export function PythonSniperView() {
                           )}
                         </td>
 
-                        {/* Exit price ($ & SOL) */}
+                        {/* Sell Price ($ & SOL) */}
                         <td
                           className={`py-2 px-2 text-right tabular-nums font-semibold ${
-                            isBuy
+                            isOpenOnly
                               ? 'text-slate-500 font-normal'
                               : isProfit
                                 ? 'text-emerald-500 dark:text-emerald-400'
@@ -1682,7 +1809,7 @@ export function PythonSniperView() {
                                   : 'text-slate-300'
                           }`}
                         >
-                          {!isBuy && t.exitPrice ? (
+                          {!isOpenOnly && t.exitPrice ? (
                             <div className="flex flex-wrap items-baseline gap-x-1 justify-end">
                               <span>${fmtUsdPrice(t.exitPrice)}</span>
                               <span className="text-[10px] font-normal opacity-80 whitespace-nowrap">· {fmtSolPrice(t.exitPrice, effectiveSolPx)}</span>
@@ -1692,21 +1819,38 @@ export function PythonSniperView() {
                           )}
                         </td>
 
-                        {/* Amount ($ & SOL) */}
-                        <td className="py-2 px-2 text-right tabular-nums">
-                          <div className="flex flex-wrap items-baseline gap-x-1 justify-end">
-                            <span>{amtDisp.usdText}</span>
-                            <span className="text-[10px] text-slate-400 whitespace-nowrap">· {amtDisp.solText}</span>
-                          </div>
+                        {/* Buy Total / Exit Total & Difference */}
+                        <td className="py-2 px-2 text-right tabular-nums whitespace-nowrap">
+                          {isOpenOnly ? (
+                            <div>
+                              <div className="text-slate-700 dark:text-slate-200">
+                                Buy {buyDisp.usdText} <span className="text-[10px] text-slate-400">({buyDisp.solText})</span>
+                              </div>
+                              <div className="text-[10px] text-slate-400">Exit —</div>
+                            </div>
+                          ) : (
+                            <div>
+                              <div className="text-slate-700 dark:text-slate-200">
+                                <span className="text-slate-400">{buyDisp.usdText}</span>
+                                <span className="text-slate-500 mx-1">→</span>
+                                <span className="font-semibold">{exitDisp ? exitDisp.usdText : '—'}</span>
+                              </div>
+                              {diffDisp && (
+                                <div className={`text-[10px] font-bold ${diffNum > 0 ? 'text-emerald-500 dark:text-emerald-400' : diffNum < 0 ? 'text-rose-500 dark:text-rose-400' : 'text-slate-400'}`}>
+                                  Diff: {diffDisp.usdText} ({diffDisp.solText})
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </td>
 
                         {/* PnL ($ & SOL) */}
                         <td
                           className={`py-2 px-2 text-right font-bold tabular-nums text-xs ${
-                            isBuy ? 'text-slate-400' : isProfit ? 'text-emerald-500 dark:text-emerald-400' : isLoss ? 'text-rose-500 dark:text-rose-400' : 'text-slate-400'
+                            isOpenOnly ? 'text-slate-400' : isProfit ? 'text-emerald-500 dark:text-emerald-400' : isLoss ? 'text-rose-500 dark:text-rose-400' : 'text-slate-400'
                           }`}
                         >
-                          {isBuy ? (
+                          {isOpenOnly ? (
                             '—'
                           ) : (
                             <div className="flex flex-wrap items-baseline gap-x-1 justify-end">
@@ -1719,47 +1863,69 @@ export function PythonSniperView() {
                         {/* PnL (%) */}
                         <td
                           className={`py-2 px-2 text-right font-bold tabular-nums text-xs whitespace-nowrap ${
-                            isBuy ? 'text-slate-400' : isProfit ? 'text-emerald-500 dark:text-emerald-400' : isLoss ? 'text-rose-500 dark:text-rose-400' : 'text-slate-400'
+                            isOpenOnly ? 'text-slate-400' : isProfit ? 'text-emerald-500 dark:text-emerald-400' : isLoss ? 'text-rose-500 dark:text-rose-400' : 'text-slate-400'
                           }`}
                         >
-                          {isBuy ? '—' : !isNaN(numPnlPct) ? `${numPnlPct >= 0 ? '+' : ''}${numPnlPct.toFixed(2)}%` : '—'}
+                          {isOpenOnly ? '—' : !isNaN(numPnlPct) ? `${numPnlPct >= 0 ? '+' : ''}${numPnlPct.toFixed(2)}%` : '—'}
                         </td>
 
                         {/* Exit reason */}
                         <td className="py-2 px-2">
-                          <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-semibold whitespace-nowrap ${
-                              t.reason.startsWith('principal_recovery')
-                                ? 'bg-teal-500/15 text-teal-500 border border-teal-500/30'
-                                : t.reason.startsWith('scale_out')
-                                  ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                                  : t.reason.startsWith('take_profit')
-                                    ? 'bg-emerald-500/10 text-emerald-500'
-                                    : t.reason.startsWith('trailing_stop')
-                                      ? 'bg-amber-500/10 text-amber-500'
-                                      : t.reason.startsWith('manual')
-                                        ? 'bg-blue-500/10 text-blue-500'
-                                        : t.reason.startsWith('rugpull')
-                                          ? 'bg-rose-500/10 text-rose-400'
-                                          : 'bg-slate-500/10 text-slate-400'
-                            }`}
-                          >
-                            {t.reason || '—'}
-                          </span>
+                          <div className="flex flex-wrap items-center gap-1">
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-semibold whitespace-nowrap ${
+                                t.reason.startsWith('principal_recovery')
+                                  ? 'bg-teal-500/15 text-teal-500 border border-teal-500/30'
+                                  : t.reason.startsWith('scale_out')
+                                    ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                                    : t.reason.startsWith('take_profit')
+                                      ? 'bg-emerald-500/10 text-emerald-500'
+                                      : t.reason.startsWith('trailing_stop')
+                                        ? 'bg-amber-500/10 text-amber-500'
+                                        : t.reason.startsWith('manual')
+                                          ? 'bg-blue-500/10 text-blue-500'
+                                          : t.reason.startsWith('rugpull') || t.reason.startsWith('rug_')
+                                            ? 'bg-rose-500/10 text-rose-400'
+                                            : 'bg-slate-500/10 text-slate-400'
+                              }`}
+                            >
+                              {t.reason || '—'}
+                            </span>
+                            {(t.exitCount ?? 0) > 1 && (
+                              <span
+                                className="text-[10px] text-slate-400"
+                                title={(t.partialReasons || []).join(' → ')}
+                              >
+                                ({t.exitCount} exits)
+                              </span>
+                            )}
+                          </div>
                         </td>
 
                         {/* DexScreener & Solscan TX links */}
                         <td className="py-2 px-2 text-center">
                           <div className="inline-flex items-center gap-1 justify-center">
-                            {(t.txSell || t.txBuy) && (
+                            {t.txBuy && (
                               <a
-                                href={`https://solscan.io/tx/${t.txSell || t.txBuy}`}
+                                href={`https://solscan.io/tx/${t.txBuy}`}
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-500/10 text-slate-600 dark:text-slate-300 hover:bg-slate-500/20 text-[11px] font-semibold transition-colors whitespace-nowrap"
-                                title="Inspect transaction on Solscan"
+                                title="Inspect buy transaction on Solscan"
                               >
-                                <span>Solscan</span>
+                                <span>{t.txSell ? 'Buy TX' : 'Solscan'}</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            )}
+                            {t.txSell && (
+                              <a
+                                href={`https://solscan.io/tx/${t.txSell}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-500/10 text-slate-600 dark:text-slate-300 hover:bg-slate-500/20 text-[11px] font-semibold transition-colors whitespace-nowrap"
+                                title="Inspect sell transaction on Solscan"
+                              >
+                                <span>{t.txBuy ? 'Sell TX' : 'Solscan'}</span>
                                 <ExternalLink className="w-3 h-3" />
                               </a>
                             )}
@@ -1860,10 +2026,11 @@ export function PythonSniperView() {
                 onClick={() => {
                   setDraftSettings({
                     ...draftSettings,
-                    take_profit_pct: 35,
-                    trailing_stop_pct: 12,
-                    stop_loss_pct: 30,
-                    auto_rug_exit: false,
+                    take_profit_pct: 25,
+                    trailing_stop_pct: 8,
+                    stop_loss_pct: 20,
+                    max_hold_minutes: 60,
+                    auto_rug_exit: true,
                     rug_liq_drop_pct: 50,
                     slippage_pct: 3,
                     use_real_swap_quotes: true,
@@ -1875,11 +2042,12 @@ export function PythonSniperView() {
                     min_buys_m5: 8,
                     min_buy_sell_ratio_m5: 1.5,
                     min_recent_buys_60s: 3,
-                    max_price_change_m5_pct: 250,
+                    max_price_change_m5_pct: 200,
                     use_rugcheck: true,
                     strict_rugcheck: true,
                     require_lp_locked: false,
                     block_insider_bundles: true,
+                    block_creator_dump: true,
                     check_creator_history: true,
                     max_creator_launches: 5,
                     max_creator_rugged_coins: 0,
@@ -1894,12 +2062,17 @@ export function PythonSniperView() {
                     parallel_rug_screen_enabled: true,
                     jupiter_quota_guard_enabled: true,
                     direct_dex_fallback_enabled: true,
+                    early_rug_shield_enabled: true,
                     anti_rug_tight_score_enabled: false,
                     anti_rug_pool_depth_check_enabled: true,
-                    anti_rug_sell_sim_enabled: false,
+                    anti_rug_sell_sim_enabled: true,
                     anti_rug_copycat_cooldown_enabled: true,
                     option_enabled: {
+                      ...(draftSettings.option_enabled && typeof draftSettings.option_enabled === 'object'
+                        ? draftSettings.option_enabled
+                        : {}),
                       min_age_minutes: false,
+                      early_rug_shield_enabled: true,
                     },
                     enabled_platforms: Array.isArray(draftSettings.enabled_platforms)
                       ? draftSettings.enabled_platforms
@@ -1915,6 +2088,15 @@ export function PythonSniperView() {
                 className="px-3 py-2 rounded-xl text-xs font-semibold border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 transition-colors"
               >
                 Apply Quick Profit &amp; Safe Preset
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleResetDefaults('settings')}
+                disabled={resettingDefaults !== null}
+                className="px-3 py-2 rounded-xl text-xs font-semibold border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-800/80 hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 inline-flex items-center gap-1.5 transition-colors disabled:opacity-50"
+              >
+                <RotateCcw className={`w-3.5 h-3.5 ${resettingDefaults === 'settings' ? 'animate-spin' : ''}`} />
+                <span>{resettingDefaults === 'settings' ? 'Resetting…' : 'Reset Settings to Default'}</span>
               </button>
               {isSettingsDirty && (
                 <button
@@ -1952,6 +2134,7 @@ export function PythonSniperView() {
             Number(draftSettings.ultra_early_grace_sec ?? 0) > 0 ||
             draftSettings.use_rugcheck === false ||
             draftSettings.strict_rugcheck === false ||
+            draftSettings.early_rug_shield_enabled === false ||
             Number(draftSettings.max_top10_holder_pct ?? 100) > 45 ||
             Number(draftSettings.rugcheck_max_score ?? 100) > 60) && (
             <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-800 dark:text-amber-300 flex flex-wrap items-center justify-between gap-3">
@@ -1960,7 +2143,7 @@ export function PythonSniperView() {
                 <div>
                   <p className="font-bold">Weak Anti-Rug Filter Settings Detected</p>
                   <p className="text-[11px] opacity-90">
-                    Low liquidity (&lt;$1,500), non-zero ultra-early bypass, disabled RugCheck/strict safety, or high Top-10% (&gt;45%) increases rugpull risk on brand-new coins. Click <strong>Apply Quick Profit &amp; Safe Preset</strong> to harden protection.
+                    Low liquidity (&lt;$1,500), non-zero ultra-early bypass, disabled RugCheck/Early-Launch Rug Shield, or high Top-10% (&gt;45%) increases rugpull risk on brand-new coins. Click <strong>Apply Quick Profit &amp; Safe Preset</strong> to harden protection.
                   </p>
                 </div>
               </div>
@@ -2590,7 +2773,16 @@ export function PythonSniperView() {
                 </div>
               </div>
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => void handleResetDefaults('pro_desk')}
+                disabled={resettingDefaults !== null}
+                className="inline-flex items-center gap-2 px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-800/80 hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold text-xs transition-colors disabled:opacity-50"
+              >
+                <RotateCcw className={`w-3.5 h-3.5 ${resettingDefaults === 'pro_desk' ? 'animate-spin' : ''}`} />
+                {resettingDefaults === 'pro_desk' ? 'Resetting…' : 'Reset Pro Desk to Default'}
+              </button>
               <button
                 type="button"
                 onClick={handleSaveSettings}
@@ -2807,7 +2999,7 @@ export function PythonSniperView() {
 
               <div
                 className={`rounded-xl border p-4 space-y-4 transition-colors ${
-                  isPyOptEnabled('jito_dont_front_enabled')
+                  isPyOptEnabled('jito_dontfront_enabled')
                     ? 'border-teal-500/40 bg-teal-500/[0.03]'
                     : 'border-slate-200 dark:border-slate-800 opacity-60'
                 }`}
@@ -2817,8 +3009,8 @@ export function PythonSniperView() {
                   <label className="relative inline-flex items-center cursor-pointer">
                     <input
                       type="checkbox"
-                      checked={isPyOptEnabled('jito_dont_front_enabled')}
-                      onChange={(e) => togglePyOpt('jito_dont_front_enabled', e.target.checked)}
+                      checked={isPyOptEnabled('jito_dontfront_enabled')}
+                      onChange={(e) => togglePyOpt('jito_dontfront_enabled', e.target.checked)}
                       className="sr-only peer"
                     />
                     <div className="w-9 h-5 bg-slate-300 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
@@ -2835,7 +3027,7 @@ export function PythonSniperView() {
                       setDraftSettings({ ...draftSettings, jito_tip_sol: Number(e.target.value) });
                       markSettingsDirty(true);
                     }}
-                    disabled={!isPyOptEnabled('jito_dont_front_enabled')}
+                    disabled={!isPyOptEnabled('jito_dontfront_enabled')}
                     className="w-full px-3 py-2 rounded-xl font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
                   />
                 </div>

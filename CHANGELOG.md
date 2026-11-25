@@ -2,6 +2,52 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.41.0 — Best Quick-Profit Defaults + Dedicated Reset-to-Default Buttons for Settings & Pro Desk
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Quick-Profit Default Configuration (`sniper/bot.py`, `sniper/settings.json`, `server/sniperManager.ts`, `server/config/defaults.ts`)**:
+  - **Python Sniper Settings Defaults**: Tuned out-of-the-box and preset defaults for faster, safer profit-taking (`+25%` Take Profit arming a tight `8%` trailing stop, `-20%` Stop Loss, `60m` max hold, `+200%` 5m chase cap, `$5,000` min liquidity, `0s` grace bypass, **Early-Launch Rugpull Shield** ON, and fast/parallel anti-rug screening ON).
+  - **Pro Desk Defaults (Python Sniper & Spot Bot)**: Enabled optimal execution and protection modules by default (`Anti-Sybil`, `Smart Money`, `Reused Socials`, `Live WebSocket Exits`, `Jito dontfront` with `0.0002 SOL` tip, `Orphan Sweep`, `Wash-Trade Filter`, `SOL Red-Market Regime Pause`, tightened `60%` `Anti-Top-Wick Guard`, `0.6x–1.5x` `Conviction Sizing`, faster `2-loss / 15m` `Streak Throttle`, `Narrative Cap`, and `Auto ATA Rent Reclaim`).
+- **One-Click "Reset to Default" Buttons on Both Settings & Pro Desk (`PythonSniperView.tsx`, `SettingsView.tsx`, `ProDeskView.tsx`, `server/routes/api.ts`)**:
+  - Added scoped reset endpoints (`POST /api/sniper/settings/reset` and `POST /api/settings/reset`) supporting `scope: 'settings' | 'pro_desk' | 'all'`.
+  - Added **Reset Settings to Default** and **Reset Pro Desk to Default** buttons in **Python Sniper Bot** (each resets only its own tab's fields to Quick-Profit defaults and saves immediately without wiping the other tab) as well as **Reset to Default** buttons in **Solana Spot Bot** Settings and Pro Desk.
+- **UI Field Sync Fix (`PythonSniperView.tsx`)**:
+  - Fixed the `jito_dontfront_enabled` key mapping in Python Sniper Pro Desk so the Jito Sandwich Protection toggle and tip amount persist cleanly with `bot.py` and `SniperManager`.
+
+---
+
+## v1.40.0 — Early-Launch Rugpull Shield (Pre-Buy Dev/Bundle Blocking + Instant Dev-Dump & LP-Collapse Auto-Exit)
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Early-Launch Rugpull Shield (`early_rug_shield_enabled`, ON by default in `sniper/bot.py`, `SniperManager`, and `PythonSniperView.tsx`)**:
+  - **Pre-Buy Launch & Structure Trap Blocking (`passes_filters`)**: Blocks Pump.fun dev sniper bundles (`initial_buy_sol > 8.0 SOL`), thin bonding-curve spoofs (`real_sol < 1.5 SOL`), early 60s dump waves on `<3m` coins, and accelerates honeypot pattern detection (`>= 6` buys / `0` sells after `20s`).
+  - **On-Chain Creator Resolution & Dev Holdings Verification (`_resolve_creator_via_rpc`, `_rpc_owner_token_pct`)**: Resolves deployer wallets from the earliest mint transaction fee payer whenever PumpPortal and RugCheck omit `creator`, checks on-chain token ownership if RugCheck omits `creatorBalance`, and records deployer history even on brand-new `<60s` pools.
+  - **Dev-Linked Sybil & Pump.fun Bonding Curve Bundle Detection (`_analyze_sybil_details`)**: Extends fresh-wallet funder probing onto Pump.fun bonding curves (excluding curve/pool accounts, with RPC top-holder fallback), probes the deployer wallet alongside top holders to block any shared-funder dev+holder bundle immediately, and blocks coordinated `>= 4` fresh-wallet sniper clusters owning `>= 20%`.
+  - **Tighter Early Whale-Split & Hidden Sell-Tax Checks (`_check_sell_route`, `hard_rug_check`)**: Detects Token-2022 / toxic pool hidden sell taxes (`> 30%` roundtrip SOL exit loss even when reported price impact looks low) and caps `<3m` launches at `<= 18%` per single non-pool wallet and `<= 34%` across the top 3 wallets.
+  - **Real-Time Post-Buy `creator_dump_exit` & Catastrophic LP-Collapse Exit (`pumpportal.ts`, `sniperManager.ts`, `bot.py monitor()` / `check_exits()`)**: Streams deployer address & `creatorSold` state over PumpPortal WebSocket so an open early position is market-sold immediately when the dev sells, automatically blacklists that dev/socials, and triggers an emergency exit if AMM liquidity collapses (`>= 75%` drained or `< $350` for 2 consecutive polls with no healthy reverse quote).
+- **UI Toggle & Safe Preset Hardening (`PythonSniperView.tsx`)**:
+  - Added the **Early-Launch Rugpull Shield** card under **Speed & Anti-Rug Protections**, updated the weak-filter warning banner, and upgraded **Apply Quick Profit & Safe Preset** to enable `early_rug_shield_enabled`, `auto_rug_exit`, and pre-buy `anti_rug_sell_sim_enabled`.
+
+---
+
+## v1.39.0 — Python Sniper Bot: Dev Wallet Reputation in Open Positions & Consolidated Single-Row Trade History
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Dev Wallet Address, Launch Count & Rug Pulls in Open Positions (`PythonSniperView.tsx`, `sniper/bot.py`, `server/sniperManager.ts`)**:
+  - Persists creator reputation metrics (`creator`, `creator_launches`, `creator_rugged`, `creator_fast_rug_min`) onto open positions from `hard_rug_check` / `_evaluate_creator_history` and continuously enriches them from `sniper/creator_history.json` in `SniperManager.getStatus()`.
+  - Added a dedicated **Dev wallet** column in the Python Sniper Bot **Open positions** table showing the truncated deployer address (copyable + Solscan account link) alongside a color-coded reputation badge (`X launched · Y rugs`, highlighting fastest rug time on hover).
+- **Single Consolidated Row per Coin Trade in Trade History (`src/utils/sniperFormat.ts`, `server/sniperManager.ts`, `PythonSniperView.tsx`)**:
+  - Replaced separate `BUY` / `SELL` event rows in `Trade history` with `consolidateSniperTrades`, updating the existing trade entry in-place once exited (including merging intermediate partial `principal_recovery` / `scale_out` exits into the same coin record).
+  - Updated ledger counts (`Trade history (N)` and ledger header) to count actual coin trades instead of raw events, and updated columns to show **Buy Price ($ / SOL)**, **Sell Price ($ / SOL)**, **Buy / Exit ($ & Diff)** (total buy amount, total exit proceeds, and exact net difference), **PnL ($ / SOL)**, **PnL %**, **Status** (`OPEN` / `PARTIAL` / `CLOSED`), and **Reason** in one clean row.
+
+---
+
 ## v1.38.2 — Fix Python Sniper Scan Exception (`size_mult` KeyError in `_evaluate_sol_regime`)
 
 **Risk Warning: Trading can lose all of your money.**

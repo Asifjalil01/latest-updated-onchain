@@ -12,6 +12,7 @@ import {
   fmtSignedUsdAndSol,
   fmtUnsignedUsdAndSol,
   pairTradesWithEntryAndExit,
+  consolidateSniperTrades,
   orderLogsNewestFirst,
   formatBotUptime,
   formatTrailingModeHint,
@@ -2535,6 +2536,399 @@ test('v1.37.0: Python sniper option_enabled checkboxes, creator launch/rug speed
     fs.rmSync(pyTmpDir, { recursive: true, force: true });
   }
 });
+
+test('v1.39.0: consolidateSniperTrades merges BUY & SELL into one entry per coin trade with buy/sell price & exit diff', () => {
+  const rows = [
+    // DUVAL: buy then full profit sell
+    { time: '2026-11-24T18:59:15Z', action: 'BUY', symbol: 'DUVAL', mint: 'MintDuval', price: '0.00001404', amount: '6.25', pnlUsd: '', pnlPct: '', reason: 'sniper_entry', txSig: 'txDuvalBuy' },
+    // SuperELON: still open
+    { time: '2026-11-24T18:59:15Z', action: 'BUY', symbol: 'SuperELON', mint: 'MintElON', price: '0.00008701', amount: '6.75', pnlUsd: '', pnlPct: '', reason: 'sniper_entry', txSig: 'txElonBuy' },
+    { time: '2026-11-24T19:00:05Z', action: 'SELL', symbol: 'DUVAL', mint: 'MintDuval', price: '0.00001868', amount: '8.15', pnlUsd: '1.9001', pnlPct: '30.40', reason: 'take_profit_35', entryPrice: '0.00001404', txSig: 'txDuvalSell' },
+    // MOON: buy + partial principal recovery + final trailing stop
+    { time: '2026-11-24T19:01:00Z', action: 'BUY', symbol: 'MOON', mint: 'MintMoon', price: '0.00010000', amount: '5.00', pnlUsd: '', pnlPct: '', reason: 'sniper_entry', txSig: 'txMoonBuy' },
+    { time: '2026-11-24T19:02:00Z', action: 'SELL', symbol: 'MOON', mint: 'MintMoon', price: '0.00022000', amount: '5.20', pnlUsd: '2.70', pnlPct: '108.00', reason: 'principal_recovery_50pct', txSig: 'txMoonPart' },
+    { time: '2026-11-24T19:03:00Z', action: 'SELL', symbol: 'MOON', mint: 'MintMoon', price: '0.00030500', amount: '5.50', pnlUsd: '3.63', pnlPct: '194.00', reason: 'trailing_stop_15', txSig: 'txMoonFinal' },
+    // Re-entry on DUVAL (separate trade record)
+    { time: '2026-11-24T19:05:00Z', action: 'BUY', symbol: 'DUVAL', mint: 'MintDuval', price: '0.00002000', amount: '4.00', pnlUsd: '', pnlPct: '', reason: 'sniper_entry', txSig: 'txDuvalRebuy' },
+  ];
+
+  const consolidated = consolidateSniperTrades(rows, 200);
+  // 7 raw rows -> 4 consolidated coin trades
+  assert.equal(consolidated.length, 4);
+
+  // Newest activity first: DUVAL re-entry (OPEN)
+  assert.equal(consolidated[0].symbol, 'DUVAL');
+  assert.equal(consolidated[0].tradeStatus, 'OPEN');
+  assert.equal(consolidated[0].entryPrice, '0.00002000');
+  assert.equal(consolidated[0].exitPrice, '');
+  assert.equal(consolidated[0].buyAmountUsd, '4.00');
+  assert.equal(consolidated[0].exitAmountUsd, '');
+  assert.equal(consolidated[0].txBuy, 'txDuvalRebuy');
+
+  // Second newest: MOON (1 row combining buy + partial + final sell)
+  assert.equal(consolidated[1].symbol, 'MOON');
+  assert.equal(consolidated[1].tradeStatus, 'CLOSED');
+  assert.equal(consolidated[1].entryPrice, '0.00010000');
+  assert.equal(consolidated[1].exitPrice, '0.00030500');
+  assert.equal(consolidated[1].buyAmountUsd, '5.0000');
+  assert.equal(consolidated[1].exitAmountUsd, '10.7000');
+  assert.equal(consolidated[1].diffUsd, '5.7000');
+  assert.equal(consolidated[1].pnlUsd, '6.3300');
+  assert.equal(consolidated[1].pnlPct, '126.60');
+  assert.equal(consolidated[1].exitCount, 2);
+  assert.equal(consolidated[1].txBuy, 'txMoonBuy');
+  assert.equal(consolidated[1].txSell, 'txMoonFinal');
+
+  // Third newest: first DUVAL closed trade
+  assert.equal(consolidated[2].symbol, 'DUVAL');
+  assert.equal(consolidated[2].tradeStatus, 'CLOSED');
+  assert.equal(consolidated[2].entryPrice, '0.00001404');
+  assert.equal(consolidated[2].exitPrice, '0.00001868');
+  assert.equal(consolidated[2].buyAmountUsd, '6.2500');
+  assert.equal(consolidated[2].exitAmountUsd, '8.1500');
+  assert.equal(consolidated[2].diffUsd, '1.9000');
+  assert.equal(consolidated[2].pnlPct, '30.40');
+  assert.equal(consolidated[2].reason, 'take_profit_35');
+
+  // Fourth: SuperELON still open
+  assert.equal(consolidated[3].symbol, 'SuperELON');
+  assert.equal(consolidated[3].tradeStatus, 'OPEN');
+});
+
+test('v1.39.0: Open positions expose dev wallet address, launches count, and rug pull count from creator_history & bot.py', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-dev-wallet-'));
+  try {
+    const devWallet = 'DevWal1111111111111111111111111111111111111';
+    const mintA = 'MintOpenAAA11111111111111111111111111111111';
+    fs.writeFileSync(
+      path.join(tmpDir, 'creator_history.json'),
+      JSON.stringify({
+        [devWallet]: {
+          PriorRugMint1: { symbol: 'PRUG1', pool_created_at_ms: 1700000000000, rugged: true, rugged_at_ms: 1700000600000 },
+          PriorCleanMint2: { symbol: 'PCLN2', pool_created_at_ms: 1700005000000, rugged: false },
+          [mintA]: { symbol: 'OPENA', pool_created_at_ms: 1700010000000, rugged: false },
+        },
+      }),
+      'utf-8'
+    );
+
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    await mgr.switchMode('paper');
+    const { stateFile } = getSniperFilePaths('paper', tmpDir);
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({
+        mode: 'paper',
+        cash: 40,
+        positions: {
+          [mintA]: {
+            symbol: 'OPENA',
+            qty: 1000,
+            entry_price: 0.01,
+            current_price: 0.012,
+            cost: 10,
+            opened: Date.now() / 1000 - 45,
+            url: `https://dexscreener.com/solana/${mintA}`,
+            dex: 'pumpfun',
+            source: 'pumpportal',
+          },
+        },
+        blacklist: [],
+        closed: 0,
+        wins: 0,
+        total_pnl: 0,
+        day_pnl: 0,
+      }),
+      'utf-8'
+    );
+
+    const status = mgr.getStatus();
+    const pos = status.state.positions[mintA];
+    assert.equal(pos.creator, devWallet);
+    assert.equal(pos.creator_launches, 3);
+    assert.equal(pos.creator_rugged, 1);
+    assert.equal(pos.creator_fast_rug_min, 10);
+
+    // Also verify bot.py hard_rug_check -> scan_and_buy / acct.buy stores creator stats on new positions
+    const pyScript = [
+      'import sys, types, json, time',
+      'req = types.ModuleType("requests")',
+      'class DummySess:',
+      '    def get(self, *a, **k): raise RuntimeError("no net")',
+      '    def post(self, *a, **k): raise RuntimeError("no net")',
+      'req.Session = lambda: DummySess()',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      `TMP_DIR = ${JSON.stringify(tmpDir)}`,
+      'bot._base_dir = lambda: TMP_DIR',
+      'bot.get_json = lambda *a, **k: None',
+      'bot._rpc_earliest_tx_ms = lambda *a, **k: 0',
+      'bot._rpc_mint_account_info = lambda m, cfg=None: {"decimals": 6, "supply_ui": 1000000000.0, "mint_auth": None, "freeze_auth": None, "disallowed_extensions": []}',
+      'bot._fetch_rugcheck_report = lambda m: {"score_normalised": 10, "creator": "DevFromRc1111111111111111111111111111111111", "creatorTokens": [{"mint": "OldM1", "rugged": False}, {"mint": "OldM2", "rugged": False}], "risks": [], "topHolders": [{"address": "H1", "owner": "H1", "pct": 3.0}]}',
+      'pair = {"baseToken": {"address": "NewBuyMint1", "symbol": "NBUY"}, "dexId": "pumpfun", "priceUsd": "0.001", "liquidity": {"usd": 9000}, "txns": {"m5": {"buys": 10, "sells": 3}}}',
+      'cfg = {**bot.CONFIG, "check_creator_history": True, "max_creator_launches": 5, "max_creator_rugged_coins": 0, "anti_sybil_enabled": False, "reused_socials_enabled": False}',
+      'ok, why = bot.hard_rug_check("NewBuyMint1", cfg, 20.0, pair=pair)',
+      'acct = bot.TradingAccount(cfg, mode="paper")',
+      'c_stats = pair.get("_creator_stats") or {}',
+      'acct.buy("NewBuyMint1", "NBUY", 0.001, "https://dexscreener.com/solana/NewBuyMint1", {"dex": "pumpfun", "source": "pumpportal", "age_s": 20, "creator": pair.get("_creator"), "creator_launches": c_stats.get("total_launches"), "creator_prior_launches": c_stats.get("prior_launches"), "creator_rugged": c_stats.get("rugged_count")})',
+      'p = acct.state["positions"]["NewBuyMint1"]',
+      'print(json.dumps({"ok": ok, "why": why, "creator": p.get("creator"), "launches": p.get("creator_launches"), "rugged": p.get("creator_rugged")}))',
+    ].join('\n');
+    const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyOut.ok, true, pyOut.why);
+    assert.equal(pyOut.creator, 'DevFromRc1111111111111111111111111111111111');
+    assert.equal(pyOut.launches, 3);
+    assert.equal(pyOut.rugged, 0);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('v1.40.0: Early-Launch Rugpull Shield blocks dev bundles/hidden sell-tax/dev-sybil & executes instant WS creator_dump_exit and AMM collapse exit', async () => {
+  const { PumpPortalWsProvider } = await import('../providers/pumpportal');
+  const pp = new PumpPortalWsProvider();
+  const mintDump = 'MintEarlyRugDump11111111111111111111111pump';
+  const devAddr = 'DevWalletEarly1111111111111111111111111111';
+  const t0 = Date.now() - 10_000;
+  pp.ingestFrame(
+    {
+      mint: mintDump,
+      symbol: 'FBOSS',
+      name: 'Fake Boss',
+      txType: 'create',
+      traderPublicKey: devAddr,
+      solAmount: 2.0,
+      vSolInBondingCurve: 35,
+      vTokensInBondingCurve: 900_000_000,
+      marketCapSol: 39,
+    },
+    t0
+  );
+  pp.ingestFrame(
+    {
+      mint: mintDump,
+      txType: 'sell',
+      traderPublicKey: devAddr,
+      solAmount: 1.9,
+      vSolInBondingCurve: 30.1,
+      vTokensInBondingCurve: 999_000_000,
+      marketCapSol: 30,
+    },
+    t0 + 4000
+  );
+  const snaps = pp.getLiveMintSnapshots([mintDump], 70, t0 + 5000);
+  assert.equal(snaps[mintDump]?.creator, devAddr);
+  assert.equal(snaps[mintDump]?.creatorSold, true);
+  assert.ok(snaps[mintDump]?.recentSellers.includes(devAddr));
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1400-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const status = mgr.getStatus();
+    assert.equal((status.settings as any).early_rug_shield_enabled, true);
+    mgr.attachOrchestrator({
+      pumpPortal: pp,
+      signer: { isUnlocked: () => false, getPublicKey: () => null, getMaskedPublicKey: () => 'Locked' },
+      rpcPool: { getHealthSnapshot: () => [] },
+    } as any);
+    mgr.setWsWatchedMints([mintDump]);
+    const feed = mgr.getPumpPortalFeed();
+    assert.equal(feed.open_prices[mintDump]?.creator, devAddr);
+    assert.equal(feed.open_prices[mintDump]?.creatorSold, true);
+
+    const pyScript = [
+      'import sys, types, json, time',
+      'req = types.ModuleType("requests")',
+      'class DummyResp:',
+      '    def __init__(self, code, data): self.status_code = code; self._d = data',
+      '    def json(self): return self._d',
+      'class DummySess:',
+      '    def get(self, url, **k):',
+      '        if "quote" in url:',
+      '            # Return 50% hidden sell-tax value loss on $5 trade (~0.0714 SOL -> 0.030 SOL) despite low reported priceImpactPct',
+      '            return DummyResp(200, {"outAmount": str(int(0.030 * 1e9)), "priceImpactPct": "0.01"})',
+      '        return DummyResp(404, {})',
+      '    def post(self, url, json=None, **k):',
+      '        m = (json or {}).get("method")',
+      '        p = (json or {}).get("params") or []',
+      '        target = p[0] if p else ""',
+      '        if m == "getSignaturesForAddress":',
+      '            return DummyResp(200, {"result": [{"signature": f"sig_{target}", "blockTime": int(time.time()) - 60}]})',
+      '        if m == "getTransaction":',
+      '            sig = target',
+      '            # Mint creation resolves CreatorA; CreatorA + Holder1 share FunderX',
+      '            if sig == "sig_MintRpcCreator1111111111111111111111111111":',
+      '                return DummyResp(200, {"result": {"transaction": {"message": {"accountKeys": [{"pubkey": "CreatorA111", "signer": True}]}}}})',
+      '            if sig in ("sig_CreatorA111", "sig_HolderSybil1"):',
+      '                return DummyResp(200, {"result": {"transaction": {"message": {"accountKeys": [{"pubkey": "FunderSharedX", "signer": True}, {"pubkey": sig[4:], "signer": True}]}}}})',
+      '        return DummyResp(200, {"result": None})',
+      'req.Session = lambda: DummySess()',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      `TMP_DIR = ${JSON.stringify(tmpDir)}`,
+      'bot._base_dir = lambda: TMP_DIR',
+      'bot._session = DummySess()',
+      'now_ms = int(time.time() * 1000)',
+      'cfg = {**bot.CONFIG, "enabled_platforms": [], "use_jupiter_price": False, "use_real_swap_quotes": False}',
+      // 1. passes_filters blocks dev sniper bundle (>8 SOL initial buy), thin curve spoof, and 20s 6b/0s honeypot
+      'dev_bundle_pair = {"baseToken": {"address": "MDevB", "symbol": "DBND"}, "dexId": "pumpfun", "pairCreatedAt": now_ms - 15000, "priceUsd": "0.0001", "liquidity": {"usd": 8000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 12, "sells": 2}}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 8, "sells_60s": 2, "initial_buy_sol": 10.5, "real_sol": 5.0, "v_sol": 35.0}}',
+      'thin_curve_pair = {"baseToken": {"address": "MThin", "symbol": "THIN"}, "dexId": "pumpfun", "pairCreatedAt": now_ms - 12000, "priceUsd": "0.0001", "liquidity": {"usd": 6000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 10, "sells": 2}}, "_pumpportal": {"has_trade_stream": True, "buys_60s": 8, "sells_60s": 2, "initial_buy_sol": 0.5, "real_sol": 0.4, "v_sol": 30.4}}',
+      'early_hp_pair = {"baseToken": {"address": "MHP", "symbol": "HP"}, "dexId": "raydium", "pairCreatedAt": now_ms - 22000, "priceUsd": "0.0001", "liquidity": {"usd": 8000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 7, "sells": 0}}}',
+      'out = {}',
+      'out["dev_bundle"] = list(bot.passes_filters(dev_bundle_pair, cfg, now_ms))',
+      'out["thin_curve"] = list(bot.passes_filters(thin_curve_pair, cfg, now_ms))',
+      'out["early_hp"] = list(bot.passes_filters(early_hp_pair, cfg, now_ms))',
+      // 2. _check_sell_route catches >30% hidden sell tax
+      'bot.get_sol_price_usd = lambda c: (70.0, time.time())',
+      'out["hidden_tax"] = list(bot._check_sell_route("MintTaxed1", 6, 0.001, cfg, 15.0))',
+      // 3. hard_rug_check resolves creator via RPC and catches dev-to-holder shared funder on Pump.fun curve + top-3 whale split
+      'bot._check_sell_route = lambda *a, **k: (True, "ok")',
+      'bot._rpc_mint_account_info = lambda m, c=None: {"mint_auth": None, "freeze_auth": None, "decimals": 6, "supply_ui": 1000000.0, "disallowed_extensions": []}',
+      'bot._evaluate_creator_history = lambda m, ca, r, c, pair=None: {"ok": True, "prior_launches": 0, "total_launches": 1, "rugged_count": 0, "fast_rug_min": None}',
+      'bot._rpc_owner_token_pct = lambda *a, **k: 0.0',
+      'bot.get_json = lambda u, **k: {"score_normalised": 10, "risks": [], "topHolders": [{"address": "HolderSybil1", "owner": "HolderSybil1", "pct": 4.0}, {"address": "HolderClean2", "owner": "HolderClean2", "pct": 3.0}]} if "rugcheck" in u else None',
+      'out["dev_sybil_pumpfun"] = list(bot.hard_rug_check("MintRpcCreator1111111111111111111111111111", cfg, age_s=20, pair={"dexId": "pumpfun", "priceUsd": "0.0001", "liquidity": {"usd": 8000}}))',
+      'bot.get_json = lambda u, **k: {"score_normalised": 10, "creator": "CleanDev1", "risks": [], "topHolders": [{"address": "W1", "owner": "W1", "pct": 11.6}, {"address": "W2", "owner": "W2", "pct": 11.6}, {"address": "W3", "owner": "W3", "pct": 11.6}]} if "rugcheck" in u else None',
+      'out["top3_split"] = list(bot.hard_rug_check("MintTop3Split1", {**cfg, "anti_sybil_enabled": False}, age_s=25, pair={"dexId": "pumpswap", "priceUsd": "0.0001", "liquidity": {"usd": 8000}}))',
+      // 4. monitor() emergency-sells open position when WS stream reports creatorSold=True & check_exits() catches catastrophic AMM LP collapse when auto_rug_exit=False
+      'acct = bot.TradingAccount(cfg, mode="paper")',
+      'acct.buy("MintWsDump1", "WSD", 0.001, meta={"dex": "pumpfun", "source": "pumpportal", "liquidity_usd": 6000.0, "liq_source": "pumpportal", "creator": "DevWs1"})',
+      'bot._poll_ws_monitor_feed = lambda c, force=False: ({"MintWsDump1": {"priceUsd": 0.0009, "liquidityUsd": 5000.0, "creator": "DevWs1", "creatorSold": True, "recentSellers": ["DevWs1"]}}, {})',
+      'bot.monitor(acct)',
+      'out["ws_dev_dump_exited"] = "MintWsDump1" not in acct.state["positions"]',
+      'hist = bot._load_creator_history()',
+      'out["dev_marked_rugged"] = bool((hist.get("DevWs1") or {}).get("MintWsDump1", {}).get("rugged"))',
+      // Catastrophic AMM collapse (>75% LP drop + -30% drop + no healthy quote) exits on 2nd poll even with auto_rug_exit=False & stop_loss_pct=0
+      'acct.cfg["stop_loss_pct"] = 0.0',
+      'acct.buy("MintAmmCollapse1", "COL", 0.001, meta={"dex": "raydium", "source": "gecko", "liquidity_usd": 8000.0, "liq_source": "dexscreener"})',
+      'acct.check_exits({"MintAmmCollapse1": 0.0007}, liquidities={"MintAmmCollapse1": 1000.0}, healthy_rev_quotes=set())',
+      'out["amm_collapse_1st_kept"] = "MintAmmCollapse1" in acct.state["positions"]',
+      'acct.check_exits({"MintAmmCollapse1": 0.00065}, liquidities={"MintAmmCollapse1": 900.0}, healthy_rev_quotes=set())',
+      'out["amm_collapse_2nd_exited"] = "MintAmmCollapse1" not in acct.state["positions"]',
+      'print(json.dumps(out))',
+    ].join('\n');
+
+    const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyOut.dev_bundle[0], false);
+    assert.equal(pyOut.dev_bundle[1], 'dev sniper bundle');
+    assert.equal(pyOut.thin_curve[0], false);
+    assert.equal(pyOut.thin_curve[1], 'thin bonding curve');
+    assert.equal(pyOut.early_hp[0], false);
+    assert.equal(pyOut.early_hp[1], 'honeypot pattern');
+    assert.equal(pyOut.hidden_tax[0], false);
+    assert.match(pyOut.hidden_tax[1], /hidden sell tax/i);
+    assert.equal(pyOut.dev_sybil_pumpfun[0], false);
+    assert.match(pyOut.dev_sybil_pumpfun[1], /dev-linked sybil bundle/i);
+    assert.equal(pyOut.top3_split[0], false);
+    assert.match(pyOut.top3_split[1], /top-3 early holders/i);
+    assert.equal(pyOut.ws_dev_dump_exited, true);
+    assert.equal(pyOut.dev_marked_rugged, true);
+    assert.equal(pyOut.amm_collapse_1st_kept, true);
+    assert.equal(pyOut.amm_collapse_2nd_exited, true);
+  } finally {
+    pp.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('v1.41.0: Quick-Profit + Pro Desk defaults & scoped resetSettingsToDefault for Settings and Pro Desk', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1410-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const defaults = mgr.getDefaultSettings();
+    assert.equal(defaults.take_profit_pct, 25);
+    assert.equal(defaults.trailing_stop_pct, 8);
+    assert.equal(defaults.stop_loss_pct, 20);
+    assert.equal(defaults.max_hold_minutes, 60);
+    assert.equal(defaults.max_price_change_m5_pct, 200);
+    assert.equal(defaults.jito_tip_sol, 0.0002);
+    assert.equal(defaults.max_short_spike_pct, 60);
+    assert.equal(defaults.conviction_min_mult, 0.6);
+    assert.equal(defaults.streak_loss_limit, 2);
+    assert.equal(defaults.streak_cooldown_minutes, 15);
+    assert.equal(defaults.early_rug_shield_enabled, true);
+
+    const upd = mgr.updateSettings({
+      trade_size_usd: 15,
+      take_profit_pct: 55,
+      stop_loss_pct: 35,
+      trailing_stop_pct: 18,
+      min_liquidity_usd: 12000,
+      anti_sybil_enabled: false,
+      streak_loss_limit: 5,
+      max_short_spike_pct: 120,
+      smart_wallets: ['SmartWalletResetKeep1'],
+      option_enabled: {
+        anti_sybil_enabled: false,
+        early_rug_shield_enabled: false,
+        jito_dont_front_enabled: false,
+      },
+    });
+    assert.equal(upd.ok, true);
+
+    const resetSettings = mgr.resetSettingsToDefault('settings');
+    assert.equal(resetSettings.ok, true);
+    const afterSettingsReset = resetSettings.settings as Record<string, any>;
+    assert.equal(afterSettingsReset.trade_size_usd, 5);
+    assert.equal(afterSettingsReset.take_profit_pct, 25);
+    assert.equal(afterSettingsReset.stop_loss_pct, 20);
+    assert.equal(afterSettingsReset.trailing_stop_pct, 8);
+    assert.equal(afterSettingsReset.min_liquidity_usd, 5000);
+    assert.equal(afterSettingsReset.early_rug_shield_enabled, true);
+    assert.equal(afterSettingsReset.option_enabled.early_rug_shield_enabled, true);
+    assert.equal(afterSettingsReset.anti_sybil_enabled, false);
+    assert.equal(afterSettingsReset.streak_loss_limit, 5);
+    assert.equal(afterSettingsReset.max_short_spike_pct, 120);
+    assert.deepEqual(afterSettingsReset.smart_wallets, ['SmartWalletResetKeep1']);
+    assert.equal(afterSettingsReset.option_enabled.anti_sybil_enabled, false);
+
+    mgr.updateSettings({ trade_size_usd: 22, take_profit_pct: 48 });
+
+    const resetPro = mgr.resetSettingsToDefault('pro_desk');
+    assert.equal(resetPro.ok, true);
+    const afterProReset = resetPro.settings as Record<string, any>;
+    assert.equal(afterProReset.anti_sybil_enabled, true);
+    assert.equal(afterProReset.jito_dontfront_enabled, true);
+    assert.equal(afterProReset.jito_tip_sol, 0.0002);
+    assert.equal(afterProReset.max_short_spike_pct, 60);
+    assert.equal(afterProReset.conviction_min_mult, 0.6);
+    assert.equal(afterProReset.streak_loss_limit, 2);
+    assert.equal(afterProReset.streak_cooldown_minutes, 15);
+    assert.equal(afterProReset.option_enabled.anti_sybil_enabled, true);
+    assert.equal('jito_dont_front_enabled' in afterProReset.option_enabled, false);
+    assert.equal(afterProReset.trade_size_usd, 22);
+    assert.equal(afterProReset.take_profit_pct, 48);
+
+    const rawPy = execFileSync(
+      'python3',
+      [
+        '-c',
+        'import sys, types, json; req = types.ModuleType("requests"); req.Session = lambda: None; sys.modules["requests"] = req; sys.path.insert(0, "sniper"); import bot; print(json.dumps({k: bot.CONFIG[k] for k in ["take_profit_pct","trailing_stop_pct","stop_loss_pct","max_hold_minutes","max_price_change_m5_pct","jito_tip_sol","max_short_spike_pct","conviction_min_mult","streak_loss_limit","streak_cooldown_minutes","early_rug_shield_enabled"]}))',
+      ],
+      { encoding: 'utf-8' }
+    );
+    const pyCfg = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyCfg.take_profit_pct, 25);
+    assert.equal(pyCfg.trailing_stop_pct, 8);
+    assert.equal(pyCfg.stop_loss_pct, 20);
+    assert.equal(pyCfg.max_hold_minutes, 60);
+    assert.equal(pyCfg.max_price_change_m5_pct, 200);
+    assert.equal(pyCfg.jito_tip_sol, 0.0002);
+    assert.equal(pyCfg.max_short_spike_pct, 60);
+    assert.equal(pyCfg.conviction_min_mult, 0.6);
+    assert.equal(pyCfg.streak_loss_limit, 2);
+    assert.equal(pyCfg.streak_cooldown_minutes, 15);
+    assert.equal(pyCfg.early_rug_shield_enabled, true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+
 
 
 

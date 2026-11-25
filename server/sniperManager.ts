@@ -10,6 +10,7 @@ import {
   createCloseAccountInstruction,
 } from '@solana/spl-token';
 import {
+  consolidateSniperTrades,
   isPyOptionEnabled,
   pairTradesWithEntryAndExit,
   validatePythonSniperSettings,
@@ -619,23 +620,23 @@ export class SniperManager {
     }
   }
 
-  private saveDefaultSettings() {
-    const defaults = {
+  public getDefaultSettings(): Record<string, any> {
+    return {
       mode: 'paper',
       start_balance_usd: 50.0,
       trade_size_usd: 5.0,
       max_open_positions: 3,
       daily_loss_limit_usd: 10.0,
-      take_profit_pct: 35.0,
-      stop_loss_pct: 30.0,
-      trailing_stop_pct: 12.0,
+      take_profit_pct: 25.0,
+      stop_loss_pct: 20.0,
+      trailing_stop_pct: 8.0,
       recover_principal_enabled: false,
       recover_principal_sell_pct: 50.0,
       scale_out_sell_pct: 25.0,
       scale_out_step_gain_pct: 100.0,
       auto_rug_exit: false,
       rug_liq_drop_pct: 50.0,
-      max_hold_minutes: 120,
+      max_hold_minutes: 60,
       min_age_minutes: 0,
       max_age_minutes: 2.0,
       ultra_early_grace_sec: 0,
@@ -646,7 +647,7 @@ export class SniperManager {
       min_buys_m5: 8,
       min_buy_sell_ratio_m5: 1.5,
       min_recent_buys_60s: 3,
-      max_price_change_m5_pct: 250.0,
+      max_price_change_m5_pct: 200.0,
       min_holders: 0,
       use_rugcheck: true,
       strict_rugcheck: true,
@@ -673,7 +674,7 @@ export class SniperManager {
       slippage_pct: 3.0,
       fee_pct: 1.0,
       priority_fee_tier: 'fast',
-      jito_tip_sol: 0.0,
+      jito_tip_sol: 0.0002,
       custom_rpc_url: '',
       log_rejects: false,
       jupiter_api_key: '',
@@ -685,6 +686,7 @@ export class SniperManager {
       anti_rug_pool_depth_check_enabled: true,
       anti_rug_sell_sim_enabled: false,
       anti_rug_copycat_cooldown_enabled: true,
+      early_rug_shield_enabled: true,
       python_binary_path: 'auto',
       rescan_delay_after_sell_sec: 0,
       anti_sybil_enabled: true,
@@ -713,19 +715,20 @@ export class SniperManager {
       sol_regime_max_drop_pct: 2.0,
       sol_regime_action: 'pause',
       anti_top_wick_enabled: true,
-      max_short_spike_pct: 70,
+      max_short_spike_pct: 60,
       conviction_sizing_enabled: true,
-      conviction_min_mult: 0.5,
+      conviction_min_mult: 0.6,
       conviction_max_mult: 1.5,
       streak_throttle_enabled: true,
-      streak_loss_limit: 3,
-      streak_cooldown_minutes: 20,
+      streak_loss_limit: 2,
+      streak_cooldown_minutes: 15,
       streak_action: 'half_size',
       narrative_cap_enabled: true,
       max_same_narrative_positions: 1,
       auto_reclaim_rent_enabled: true,
       option_enabled: {
         min_age_minutes: false,
+        early_rug_shield_enabled: true,
         anti_sybil_enabled: true,
         smart_money_enabled: true,
         smart_money_auto_exit_on_sell: true,
@@ -744,6 +747,10 @@ export class SniperManager {
         auto_reclaim_rent_enabled: true,
       },
     };
+  }
+
+  private saveDefaultSettings() {
+    const defaults = this.getDefaultSettings();
     fs.writeFileSync(this.settingsFile, JSON.stringify(defaults, null, 2), 'utf-8');
   }
 
@@ -796,7 +803,18 @@ export class SniperManager {
           this.recentlyDeletedMints.delete(mint);
         }
       }
-      for (const [_mint, pos] of Object.entries<any>(state.positions)) {
+      let creatorHist: Record<string, Record<string, any>> | null = null;
+      const histFile = path.join(this.baseDir, 'creator_history.json');
+      if (fs.existsSync(histFile)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(histFile, 'utf-8'));
+          if (parsed && typeof parsed === 'object') {
+            creatorHist = parsed;
+          }
+        } catch {}
+      }
+
+      for (const [mintKey, pos] of Object.entries<any>(state.positions)) {
         if (!pos.current_price || pos.current_price <= 0) {
           pos.current_price = pos.entry_price;
         }
@@ -822,6 +840,55 @@ export class SniperManager {
           if (pos.low_pct === undefined) {
             const low = pos.low_price || pos.entry_price;
             pos.low_pct = Number(((low / pos.entry_price - 1) * 100).toFixed(2));
+          }
+        }
+
+        // Enrich Dev / Creator wallet address & launch/rug stats from creator_history.json
+        let creatorAddr = typeof pos.creator === 'string' ? pos.creator.trim() : '';
+        if (!creatorAddr && creatorHist) {
+          for (const [cAddr, coins] of Object.entries(creatorHist)) {
+            if (coins && typeof coins === 'object' && Object.prototype.hasOwnProperty.call(coins, mintKey)) {
+              creatorAddr = cAddr;
+              pos.creator = cAddr;
+              break;
+            }
+          }
+        }
+        if (creatorAddr) {
+          pos.creator = creatorAddr;
+          const bucket = creatorHist?.[creatorAddr];
+          if (bucket && typeof bucket === 'object') {
+            const entries = Object.entries(bucket).filter(([, v]) => v && typeof v === 'object');
+            const diskTotal = Object.prototype.hasOwnProperty.call(bucket, mintKey)
+              ? entries.length
+              : entries.length + 1;
+            const ruggedEntries = entries.filter(([, v]) => Boolean((v as any).rugged));
+            const diskRugged = ruggedEntries.length;
+            let diskFastRugMin: number | null = null;
+            for (const [, v] of ruggedEntries) {
+              const info = v as any;
+              if (typeof info.rug_minutes === 'number' && Number.isFinite(info.rug_minutes)) {
+                diskFastRugMin = diskFastRugMin === null ? info.rug_minutes : Math.min(diskFastRugMin, info.rug_minutes);
+              } else {
+                const cMs = Number(info.pool_created_at_ms || info.first_seen_ms || (info.launch_ts ? info.launch_ts * 1000 : 0) || 0);
+                const rMs = Number(info.rugged_at_ms || (info.rug_ts ? info.rug_ts * 1000 : 0) || 0);
+                if (cMs > 0 && rMs >= cMs) {
+                  const mins = Math.round(((rMs - cMs) / 60000) * 10) / 10;
+                  diskFastRugMin = diskFastRugMin === null ? mins : Math.min(diskFastRugMin, mins);
+                }
+              }
+            }
+            const recordedTotal = Number(pos.creator_launches ?? (typeof pos.creator_prior_launches === 'number' ? pos.creator_prior_launches + 1 : 0));
+            const recordedRugged = Number(pos.creator_rugged ?? 0);
+            pos.creator_launches = Math.max(1, recordedTotal, diskTotal);
+            pos.creator_rugged = Math.max(0, recordedRugged, diskRugged);
+            if ((pos.creator_fast_rug_min === undefined || pos.creator_fast_rug_min === null) && diskFastRugMin !== null) {
+              pos.creator_fast_rug_min = diskFastRugMin;
+            }
+          } else {
+            const recordedTotal = Number(pos.creator_launches ?? (typeof pos.creator_prior_launches === 'number' ? pos.creator_prior_launches + 1 : 1));
+            pos.creator_launches = Math.max(1, Number.isFinite(recordedTotal) ? recordedTotal : 1);
+            pos.creator_rugged = Math.max(0, Number(pos.creator_rugged ?? 0) || 0);
           }
         }
       }
@@ -858,7 +925,7 @@ export class SniperManager {
       } catch {}
     }
 
-    const trades = pairTradesWithEntryAndExit(rawRows, 200);
+    const trades = consolidateSniperTrades(rawRows, 200);
 
     const stateSolPx = typeof state.sol_price_usd === 'number' && state.sol_price_usd > 0 ? state.sol_price_usd : null;
     const stateSolTsMs = typeof state.sol_price_updated_at === 'number' ? state.sol_price_updated_at * 1000 : 0;
@@ -1118,7 +1185,17 @@ export class SniperManager {
     mints: string[];
     pairs: any[];
     solPriceUsd: number | null;
-    open_prices: Record<string, { priceUsd: number; liquidityUsd: number; lastTradeAtMs: number }>;
+    open_prices: Record<
+      string,
+      {
+        priceUsd: number;
+        liquidityUsd: number;
+        lastTradeAtMs: number;
+        creator?: string;
+        creatorSold?: boolean;
+        recentSellers?: string[];
+      }
+    >;
     smart_sells: Record<string, string[]>;
   } {
     if (!this.orchestrator?.pumpPortal) {
@@ -1139,7 +1216,17 @@ export class SniperManager {
         ? pp.getSyntheticPairs(this.solPriceUsd, maxAgeMs)
         : [];
 
-    const open_prices: Record<string, { priceUsd: number; liquidityUsd: number; lastTradeAtMs: number }> = {};
+    const open_prices: Record<
+      string,
+      {
+        priceUsd: number;
+        liquidityUsd: number;
+        lastTradeAtMs: number;
+        creator?: string;
+        creatorSold?: boolean;
+        recentSellers?: string[];
+      }
+    > = {};
     const smart_sells: Record<string, string[]> = {};
     if (useWsExits && this.wsWatchedMints.length > 0 && typeof pp.getLiveMintSnapshots === 'function') {
       const snaps = pp.getLiveMintSnapshots(this.wsWatchedMints, this.solPriceUsd);
@@ -1155,11 +1242,16 @@ export class SniperManager {
         settings.smart_money_auto_exit_on_sell !== false &&
         smartSet.size > 0;
       for (const [mint, snap] of Object.entries<any>(snaps)) {
-        if (snap && snap.priceUsd > 0) {
+        if (snap && (snap.priceUsd > 0 || snap.creatorSold || (Array.isArray(snap.recentSellers) && snap.recentSellers.length > 0))) {
           open_prices[mint] = {
-            priceUsd: snap.priceUsd,
+            priceUsd: snap.priceUsd ?? 0,
             liquidityUsd: snap.liquidityUsd ?? 0,
             lastTradeAtMs: snap.lastTradeAtMs ?? Date.now(),
+            ...(snap.creator ? { creator: snap.creator } : {}),
+            ...(typeof snap.creatorSold === 'boolean' ? { creatorSold: snap.creatorSold } : {}),
+            ...(Array.isArray(snap.recentSellers) && snap.recentSellers.length > 0
+              ? { recentSellers: snap.recentSellers.slice(0, 30) }
+              : {}),
           };
         }
         if (smartSellActive && Array.isArray(snap?.recentSellers)) {
@@ -1341,6 +1433,109 @@ export class SniperManager {
       return { ok: true, settings: updated };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : 'Error saving settings' };
+    }
+  }
+
+  public resetSettingsToDefault(scope: 'settings' | 'pro_desk' | 'all' = 'all') {
+    try {
+      const current = this.readSettings();
+      const mode = this.getMode(current);
+      const defaults = this.getDefaultSettings();
+      const proDeskKeys = new Set<string>([
+        'anti_sybil_enabled',
+        'fresh_wallet_minutes',
+        'max_shared_funder_count',
+        'smart_money_enabled',
+        'smart_wallets',
+        'smart_money_min_confluence',
+        'smart_money_size_boost_pct',
+        'smart_money_auto_exit_on_sell',
+        'reused_socials_enabled',
+        'max_social_reuse_count',
+        'ws_exit_stream_enabled',
+        'jito_dontfront_enabled',
+        'jito_tip_sol',
+        'orphan_sweep_enabled',
+        'post_migration_pullback_enabled',
+        'migration_min_dip_pct',
+        'migration_wait_sec',
+        'pre_migration_curve_enabled',
+        'pre_migration_curve_min_pct',
+        'pre_migration_curve_max_pct',
+        'wash_trade_filter_enabled',
+        'min_unique_makers_ratio',
+        'min_unique_traders_5m',
+        'sol_regime_filter_enabled',
+        'sol_regime_max_drop_pct',
+        'sol_regime_action',
+        'anti_top_wick_enabled',
+        'max_short_spike_pct',
+        'conviction_sizing_enabled',
+        'conviction_min_mult',
+        'conviction_max_mult',
+        'streak_throttle_enabled',
+        'streak_loss_limit',
+        'streak_cooldown_minutes',
+        'streak_action',
+        'narrative_cap_enabled',
+        'max_same_narrative_positions',
+        'auto_reclaim_rent_enabled',
+      ]);
+
+      const currentOpt = current.option_enabled && typeof current.option_enabled === 'object' ? current.option_enabled : {};
+      const defaultOpt = (defaults.option_enabled || {}) as Record<string, boolean>;
+      let updated: Record<string, any>;
+
+      if (scope === 'pro_desk') {
+        updated = { ...current, mode };
+        for (const k of proDeskKeys) {
+          updated[k] = defaults[k];
+        }
+        const nextOpt: Record<string, boolean> = { ...currentOpt };
+        for (const k of proDeskKeys) {
+          if (k in defaultOpt) {
+            nextOpt[k] = defaultOpt[k];
+          } else {
+            delete nextOpt[k];
+          }
+        }
+        delete nextOpt.jito_dont_front_enabled;
+        updated.option_enabled = nextOpt;
+      } else if (scope === 'settings') {
+        updated = { ...defaults, mode };
+        for (const k of proDeskKeys) {
+          if (k in current) {
+            updated[k] = current[k];
+          }
+        }
+        const nextOpt: Record<string, boolean> = { ...defaultOpt };
+        for (const k of proDeskKeys) {
+          if (k in currentOpt) {
+            nextOpt[k] = Boolean(currentOpt[k]);
+          }
+        }
+        updated.option_enabled = nextOpt;
+      } else {
+        updated = { ...defaults, mode };
+      }
+
+      fs.writeFileSync(this.settingsFile, JSON.stringify(updated, null, 2), 'utf-8');
+      if (this.orchestrator) {
+        const rpcUrl = isPyOptionEnabled(updated, 'custom_rpc_url', true) ? updated.custom_rpc_url : '';
+        const jupKey = isPyOptionEnabled(updated, 'jupiter_api_key', true) ? updated.jupiter_api_key : '';
+        (this.orchestrator.rpcPool as any)?.setPrimaryCustomRpc?.(rpcUrl || '');
+        (this.orchestrator.jupiter as any)?.setApiKey?.(jupKey || '');
+      }
+      const scopeLabel =
+        scope === 'pro_desk'
+          ? 'Python Pro Desk reset to Quick-Profit default settings.'
+          : scope === 'settings'
+            ? 'Python Sniper Settings reset to Quick-Profit default settings.'
+            : 'Python Sniper Settings & Pro Desk reset to Quick-Profit defaults.';
+      this.appendLog('INFO', scopeLabel);
+      return { ok: true, scope, settings: updated };
+    } catch (err) {
+      return { ok: false, message: err instanceof Error ? err.message : 'Error resetting settings' };
     }
   }
 
@@ -2510,8 +2705,10 @@ export class SniperManager {
               ...prev,
               symbol: prev.symbol || pos.symbol || '',
               launch_ts: launchSec,
+              pool_created_at_ms: Number(prev.pool_created_at_ms || launchSec * 1000),
               rugged: true,
               rug_ts: nowSec,
+              rugged_at_ms: Number(prev.rugged_at_ms || nowSec * 1000),
               rug_minutes: rugMinutes,
               reason: 'rugpull_writeoff',
             };

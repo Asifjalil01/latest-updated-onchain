@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { AlertCircle, Info, Save } from 'lucide-react';
+import { AlertCircle, Info, RotateCcw, Save } from 'lucide-react';
 import { useBotStore } from '../../store/useBotStore';
 import { HoverTip, InfoTooltip } from '../ui/Primitives';
 import type { BotSettings, StopLossTier } from '../../types';
@@ -294,6 +294,32 @@ export function SettingsView() {
     }
   };
 
+  const handleResetDefaults = async () => {
+    setSaving(true);
+    setValidationError(null);
+    setFieldErrors({});
+    try {
+      await apiFetch('/api/settings/reset', {
+        method: 'POST',
+        body: JSON.stringify({ scope: 'settings', applyToOpenPositions }),
+      });
+      await hydrateAll();
+      pushToast({
+        kind: 'success',
+        title: 'Settings Reset to Default',
+        body: 'Restored best Quick-Profit Bot & Risk default settings.',
+      });
+    } catch (err) {
+      pushToast({
+        kind: 'error',
+        title: 'Reset failed',
+        body: err instanceof Error ? err.message : 'Error',
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const inputClass = (fieldKey: string, extra = 'w-full px-3 py-2 rounded-xl font-mono bg-slate-100 dark:bg-slate-900') =>
     fieldErrors[fieldKey]
       ? `${extra} border-2 border-rose-500 ring-2 ring-rose-500/35 bg-rose-500/10 dark:bg-rose-950/30 text-rose-700 dark:text-rose-200 focus:outline-none`
@@ -401,6 +427,17 @@ export function SettingsView() {
               </HoverTip>
             );
           })}
+          <HoverTip text="Reset all Settings back to the best Quick-Profit default configuration and save immediately.">
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => void handleResetDefaults()}
+              className="px-3 py-2 rounded-xl text-xs font-semibold border border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-800/80 hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 inline-flex items-center gap-1.5 disabled:opacity-50"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Reset to Default</span>
+            </button>
+          </HoverTip>
           <HoverTip text="Validate and save all draft settings to SQLite (and sync active positions if checked below).">
             <button
               type="submit"

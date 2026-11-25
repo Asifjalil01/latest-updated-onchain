@@ -87,6 +87,8 @@ export interface PumpPortalLiveSnapshot {
   recentSellers: string[];
   recentBuyers: string[];
   realSol: number;
+  creator: string;
+  creatorSold: boolean;
 }
 
 export interface PumpPortalRawMessage {
@@ -569,6 +571,8 @@ export class PumpPortalWsProvider {
         recentSellers: Array.from(recentSellers),
         recentBuyers: Array.from(recentBuyers),
         realSol,
+        creator: st.creator,
+        creatorSold: st.creatorSold,
       };
     }
 
