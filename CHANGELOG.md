@@ -2,6 +2,20 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.42.0 — Smart Money Watchlist Explorer Tab, Start Bot Whale Follow Prompt & Dynamic Win Rate Fix
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Smart Money / Whale Watchlist Explorer Tab (`PythonSniperView.tsx`, `sniperManager.ts`, `settings.json`)**:
+  - Added a dedicated **Smart Money** tab in Python Sniper Bot allowing users to view, manage, and manually inspect tracked smart money and whale wallet addresses, copy addresses, view on Solscan, and toggle `smart_money_enabled` on/off.
+- **Start Bot Whale Follow Prompt (`PythonSniperView.tsx`)**:
+  - Added a confirmation modal when clicking **Start Bot** asking whether to follow Smart Money / Whale Wallets for the session (with helpful guidance that whale trades can take hours or days to execute).
+- **Dynamic Win Rate Calculation Fix (`server/sniperManager.ts`)**:
+  - Updated `SniperManager.getStatus()` to derive `closed` and `wins` counts dynamically from consolidated trade ledger records (`consolidateSniperTrades`). Manual forced deletes and rugpull writeoffs (`rugpull_writeoff`, negative PnL) now correctly count towards total closed trades and accurately update the win rate percentage (e.g. 3 wins / 4 closed = 75%), resolving win-rate drift.
+
+---
+
 ## v1.41.2 — Anti-Glitch Price Stabilization (Eliminates Transient -99% Flash Drops)
 
 **Risk Warning: Trading can lose all of your money.**

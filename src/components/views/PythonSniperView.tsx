@@ -444,8 +444,11 @@ export function PythonSniperView() {
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [exportingCsv, setExportingCsv] = useState(false);
   const [clearingLogs, setClearingLogs] = useState(false);
-  const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'logs' | 'settings' | 'pro_desk'>('positions');
+  const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'smart_money' | 'logs' | 'settings' | 'pro_desk'>('positions');
   const [historySearch, setHistorySearch] = useState('');
+  const [newSmartWalletInput, setNewSmartWalletInput] = useState('');
+  const [showStartModal, setShowStartModal] = useState(false);
+  const [startSmartMoneyFollow, setStartSmartMoneyFollow] = useState(true);
 
   // Python Pro Desk Tool States
   const [pyRentReport, setPyRentReport] = useState<RentAuditReport | null>(null);
@@ -1002,8 +1005,10 @@ export function PythonSniperView() {
   }, 0);
 
   const openCost = positionsList.reduce((acc, p) => acc + (p.cost || 0), 0);
-  const closedCount = state.closed || 0;
-  const winsCount = state.wins || 0;
+  const closedFromTrades = trades.filter((t) => t.tradeStatus === 'CLOSED' || t.tradeStatus === 'PARTIAL');
+  const winsFromTrades = closedFromTrades.filter((t) => parseFloat(t.pnlUsd || t.diffUsd || '0') > 0);
+  const closedCount = closedFromTrades.length > 0 || trades.length > 0 ? closedFromTrades.length : (state.closed || 0);
+  const winsCount = closedFromTrades.length > 0 || trades.length > 0 ? winsFromTrades.length : (state.wins || 0);
   const winRateText = closedCount > 0 ? `${((winsCount / closedCount) * 100).toFixed(0)}% (${winsCount}/${closedCount})` : 'no closed trades';
   const maxSlots = isPyOptionEnabled(serverSettings, 'max_open_positions', true)
     ? Math.max(1, Number(serverSettings.max_open_positions || draftSettings.max_open_positions || 3))
@@ -1165,7 +1170,14 @@ export function PythonSniperView() {
 
           <button
             type="button"
-            onClick={() => void handleToggle()}
+            onClick={() => {
+              if (running) {
+                void handleToggle();
+              } else {
+                setStartSmartMoneyFollow(Boolean(draftSettings.smart_money_enabled !== false));
+                setShowStartModal(true);
+              }
+            }}
             className={`px-6 py-2.5 rounded-xl text-xs font-bold text-white flex items-center gap-2 shadow-lg transition-all ${
               running ? 'bg-rose-600 hover:bg-rose-500 shadow-rose-600/20' : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/20'
             }`}
@@ -1294,6 +1306,7 @@ export function PythonSniperView() {
         {[
           { id: 'positions', label: `Open positions (${positionsList.length})`, icon: Activity },
           { id: 'history', label: `Trade history (${trades.length})`, icon: History },
+          { id: 'smart_money', label: 'Smart Money', icon: Users },
           { id: 'logs', label: 'Scan log', icon: Terminal },
           { id: 'settings', label: `Settings${isSettingsDirty ? ' •' : ''}`, icon: Sliders },
           { id: 'pro_desk', label: 'Pro Desk', icon: ShieldCheck },
@@ -1620,6 +1633,161 @@ export function PythonSniperView() {
             <span className="text-slate-500 dark:text-slate-400 font-mono">
               {maxSlots > 0 ? `${positionsList.length} of ${maxSlots} slots in use` : `${positionsList.length} open (Slot limit OFF)`}
             </span>
+          </div>
+        </div>
+      )}
+
+      {/* Tab Content: Smart Money Watchlist */}
+      {activeTab === 'smart_money' && (
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6 shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-100 dark:border-slate-800">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">Smart Money &amp; Whale Watchlist Explorer</h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                Manage and manually inspect tracked profitable KOL and whale wallet addresses. Whale trades can take hours or days to materialize.
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={Boolean(draftSettings.smart_money_enabled !== false)}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, smart_money_enabled: e.target.checked });
+                    markSettingsDirty(true);
+                  }}
+                  className="rounded border-slate-300 text-teal-600 focus:ring-teal-500 w-4 h-4"
+                />
+                <span className="text-xs font-bold text-slate-700 dark:text-slate-300">Enable Smart Money Following</span>
+              </label>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-2">
+              <span className="text-[11px] font-mono text-slate-500 uppercase font-semibold">Min Confluence</span>
+              <div className="text-lg font-bold text-slate-900 dark:text-slate-100 font-mono">
+                {draftSettings.smart_money_min_confluence ?? 1} wallet(s)
+              </div>
+              <p className="text-[11px] text-slate-500">Number of tracked smart wallets required before boosting trade size.</p>
+            </div>
+            <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-2">
+              <span className="text-[11px] font-mono text-slate-500 uppercase font-semibold">Size Boost %</span>
+              <div className="text-lg font-bold text-emerald-600 dark:text-emerald-400 font-mono">
+                +{draftSettings.smart_money_size_boost_pct ?? 35}%
+              </div>
+              <p className="text-[11px] text-slate-500">Position size increase when smart money confluence matches.</p>
+            </div>
+            <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-2">
+              <span className="text-[11px] font-mono text-slate-500 uppercase font-semibold">Auto-Exit on Sell</span>
+              <div className="text-lg font-bold text-slate-900 dark:text-slate-100 font-mono">
+                {draftSettings.smart_money_auto_exit_on_sell !== false ? 'Enabled' : 'Disabled'}
+              </div>
+              <p className="text-[11px] text-slate-500">Immediately sell open position if tracked whale exits via WS stream.</p>
+            </div>
+          </div>
+
+          {/* Add Wallet Input */}
+          <div className="flex flex-wrap items-center gap-3 p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/30">
+            <input
+              type="text"
+              placeholder="Enter Solana Wallet Address (e.g. 5W9...)"
+              value={newSmartWalletInput}
+              onChange={(e) => setNewSmartWalletInput(e.target.value)}
+              className="flex-1 min-w-[280px] px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-slate-900 dark:text-slate-100 font-mono focus:outline-none focus:ring-2 focus:ring-teal-500"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                const addr = newSmartWalletInput.trim();
+                if (!addr) return;
+                const current = Array.isArray(draftSettings.smart_wallets) ? draftSettings.smart_wallets : [];
+                if (current.includes(addr)) {
+                  pushToast({ kind: 'info', title: 'Wallet already in watchlist' });
+                  return;
+                }
+                const updated = [...current, addr];
+                setDraftSettings({ ...draftSettings, smart_wallets: updated });
+                markSettingsDirty(true);
+                setNewSmartWalletInput('');
+                pushToast({ kind: 'success', title: 'Smart wallet added to watchlist' });
+              }}
+              className="px-4 py-2 rounded-lg bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold transition-colors"
+            >
+              Add Wallet Address
+            </button>
+          </div>
+
+          {/* Tracked Wallets Table */}
+          <div className="space-y-3">
+            <h4 className="text-xs font-bold text-slate-700 dark:text-slate-300">
+              Tracked Smart Wallets ({Array.isArray(draftSettings.smart_wallets) ? draftSettings.smart_wallets.length : 0})
+            </h4>
+            {(!Array.isArray(draftSettings.smart_wallets) || draftSettings.smart_wallets.length === 0) ? (
+              <div className="py-12 text-center text-xs text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl space-y-2">
+                <p className="font-semibold text-slate-700 dark:text-slate-300">No smart wallets currently tracked.</p>
+                <p>Add profitable whale or KOL wallet addresses above to monitor their trades during new coin launches.</p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-xs font-mono">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500 text-[11px]">
+                      <th className="py-2.5 px-3 font-semibold">#</th>
+                      <th className="py-2.5 px-3 font-semibold">Wallet Address</th>
+                      <th className="py-2.5 px-3 font-semibold">Status</th>
+                      <th className="py-2.5 px-3 font-semibold text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70">
+                    {draftSettings.smart_wallets.map((addr: string, idx: number) => (
+                      <tr key={addr} className="hover:bg-slate-50 dark:hover:bg-slate-900/40 transition-colors">
+                        <td className="py-2.5 px-3 text-slate-400 font-semibold">{idx + 1}</td>
+                        <td className="py-2.5 px-3 font-bold text-slate-900 dark:text-slate-100 select-all">
+                          {addr}
+                        </td>
+                        <td className="py-2.5 px-3">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
+                            Active Tracking
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-3 text-right space-x-2">
+                          <button
+                            type="button"
+                            onClick={() => handleCopy(addr)}
+                            className="px-2.5 py-1 rounded bg-slate-500/10 text-slate-600 dark:text-slate-300 hover:bg-slate-500/20 text-[11px] font-semibold transition-colors"
+                          >
+                            Copy
+                          </button>
+                          <a
+                            href={`https://solscan.io/account/${addr}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-teal-500/10 text-teal-600 dark:text-teal-400 hover:bg-teal-500/20 text-[11px] font-semibold transition-colors"
+                          >
+                            <span>Solscan</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const current = Array.isArray(draftSettings.smart_wallets) ? draftSettings.smart_wallets : [];
+                              const updated = current.filter((w: string) => w !== addr);
+                              setDraftSettings({ ...draftSettings, smart_wallets: updated });
+                              markSettingsDirty(true);
+                              pushToast({ kind: 'info', title: 'Wallet removed from watchlist' });
+                            }}
+                            className="px-2.5 py-1 rounded bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 text-[11px] font-bold transition-colors"
+                          >
+                            Remove
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -3777,6 +3945,71 @@ export function PythonSniperView() {
               </div>
             </div>
           </section>
+        </div>
+      )}
+
+
+      {/* Start Bot Whale Follow Confirmation Modal */}
+      {showStartModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 max-w-md w-full space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
+              <div className="flex items-center gap-2">
+                <Zap className="w-5 h-5 text-emerald-500" />
+                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">Start Python Sniper Bot</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowStartModal(false)}
+                className="text-slate-400 hover:text-slate-200 text-xs font-mono font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs text-slate-600 dark:text-slate-300">
+              <p>
+                You are about to start the Python new-launch sniper bot in <span className="font-bold uppercase text-teal-500">{mode}</span> mode.
+              </p>
+              <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-2">
+                <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={startSmartMoneyFollow}
+                    onChange={(e) => setStartSmartMoneyFollow(e.target.checked)}
+                    className="rounded border-slate-300 text-teal-600 focus:ring-teal-500 w-4 h-4"
+                  />
+                  <span className="font-bold text-slate-900 dark:text-slate-100">Follow Smart Money / Whale Wallets</span>
+                </label>
+                <p className="text-[11px] text-slate-500 pl-6">
+                  Note: Whale and KOL wallet trades can take hours or days to materialize into buys. Enable this option to mirror tracked high-winrate wallets during session.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={() => setShowStartModal(false)}
+                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 text-xs font-semibold hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  setShowStartModal(false);
+                  if (startSmartMoneyFollow !== Boolean(draftSettings.smart_money_enabled !== false)) {
+                    setDraftSettings({ ...draftSettings, smart_money_enabled: startSmartMoneyFollow });
+                  }
+                  await handleToggle();
+                }}
+                className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-lg shadow-emerald-600/20"
+              >
+                Start Bot Now
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -930,6 +930,12 @@ export class SniperManager {
     }
 
     const trades = consolidateSniperTrades(rawRows, 200);
+    const closedTrades = trades.filter((t) => t.tradeStatus === 'CLOSED' || t.tradeStatus === 'PARTIAL');
+    const winTrades = closedTrades.filter((t) => parseFloat(t.pnlUsd || t.diffUsd || '0') > 0);
+    if (closedTrades.length > 0 || trades.length > 0) {
+      state.closed = closedTrades.length;
+      state.wins = winTrades.length;
+    }
 
     const stateSolPx = typeof state.sol_price_usd === 'number' && state.sol_price_usd > 0 ? state.sol_price_usd : null;
     const stateSolTsMs = typeof state.sol_price_updated_at === 'number' ? state.sol_price_updated_at * 1000 : 0;
