@@ -4,7 +4,8 @@ import fs from 'fs';
 import path from 'path';
 import {defineConfig} from 'vite';
 
-const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'package.json'), 'utf8')) as {
+const configDir = import.meta.dirname || path.resolve('.');
+const pkg = JSON.parse(fs.readFileSync(path.resolve(configDir, 'package.json'), 'utf8')) as {
   version?: string;
 };
 
@@ -16,7 +17,7 @@ export default defineConfig(() => {
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(configDir, '.'),
       },
     },
     server: {

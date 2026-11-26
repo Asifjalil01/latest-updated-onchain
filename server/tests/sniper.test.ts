@@ -2928,6 +2928,116 @@ test('v1.41.0: Quick-Profit + Pro Desk defaults & scoped resetSettingsToDefault 
   }
 });
 
+test('v1.43.0: Rugpull crash_streak unfreezes dead positions, Pump.fun real_sol drain exits, and live whale discovery scales without placeholder wallets', async () => {
+  const { PumpPortalWsProvider } = await import('../providers/pumpportal');
+  const pp = new PumpPortalWsProvider();
+  const goodMint = 'MintGoodProfit1111111111111111111111111111pump';
+  const goodMint2 = 'MintGoodProfit2222222222222222222222222222pump';
+  const rugMint = 'MintRuggedTrap1111111111111111111111111111pump';
+  const creatorDev = 'CreatorDev1111111111111111111111111111111111';
+  const smartTrader = 'RealWhaleTrader1111111111111111111111111111';
+  const baseTs = Date.now() - 120_000;
+
+  // Create coins and simulate creator selling on rugMint + smartTrader profiting on two good mints (non-creator)
+  pp.ingestFrame({ mint: goodMint, symbol: 'G1', txType: 'create', traderPublicKey: creatorDev, solAmount: 0.5, vSolInBondingCurve: 30.5, vTokensInBondingCurve: 950_000_000, marketCapSol: 32 }, baseTs);
+  pp.ingestFrame({ mint: goodMint2, symbol: 'G2', txType: 'create', traderPublicKey: creatorDev, solAmount: 0.5, vSolInBondingCurve: 30.5, vTokensInBondingCurve: 950_000_000, marketCapSol: 32 }, baseTs + 1000);
+  pp.ingestFrame({ mint: rugMint, symbol: 'RUG', txType: 'create', traderPublicKey: creatorDev, solAmount: 1.0, vSolInBondingCurve: 31, vTokensInBondingCurve: 940_000_000, marketCapSol: 33 }, baseTs + 2000);
+
+  // smartTrader buys early & sells in profit on G1 and G2
+  pp.ingestFrame({ mint: goodMint, txType: 'buy', traderPublicKey: smartTrader, solAmount: 1.0, vSolInBondingCurve: 32, vTokensInBondingCurve: 900_000_000, marketCapSol: 35 }, baseTs + 5000);
+  pp.ingestFrame({ mint: goodMint, txType: 'sell', traderPublicKey: smartTrader, solAmount: 1.6, vSolInBondingCurve: 38, vTokensInBondingCurve: 780_000_000, marketCapSol: 48 }, baseTs + 25_000);
+  pp.ingestFrame({ mint: goodMint2, txType: 'buy', traderPublicKey: smartTrader, solAmount: 1.2, vSolInBondingCurve: 33, vTokensInBondingCurve: 890_000_000, marketCapSol: 36 }, baseTs + 30_000);
+  pp.ingestFrame({ mint: goodMint2, txType: 'sell', traderPublicKey: smartTrader, solAmount: 1.85, vSolInBondingCurve: 40, vTokensInBondingCurve: 760_000_000, marketCapSol: 52 }, baseTs + 50_000);
+
+  // creatorDev also trades profitably on rugMint then dumps -> must remain disqualified as creator/rugger
+  pp.ingestFrame({ mint: rugMint, txType: 'buy', traderPublicKey: creatorDev, solAmount: 0.2, vSolInBondingCurve: 31.2, vTokensInBondingCurve: 930_000_000, marketCapSol: 33.5 }, baseTs + 3000);
+  pp.ingestFrame({ mint: rugMint, txType: 'sell', traderPublicKey: creatorDev, solAmount: 4.0, vSolInBondingCurve: 30.01, vTokensInBondingCurve: 999_000_000, marketCapSol: 30 }, baseTs + 40_000);
+
+  const wsWhales = pp.getDiscoveredWhaleWallets(25);
+  assert.ok(wsWhales.some((w) => w.address === smartTrader));
+  assert.ok(!wsWhales.some((w) => w.address === creatorDev));
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1430-'));
+  try {
+    // Write legacy placeholder addresses into settings.json and ensure SniperManager purges them
+    fs.writeFileSync(
+      path.join(tmpDir, 'settings.json'),
+      JSON.stringify({
+        smart_wallets: [
+          'HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH',
+          'Avy9z2YfS4cZ1y5R341KkL9p6sXkQx7Yt8K6U3c7j4qR',
+          'RealCustomWhale1111111111111111111111111111',
+        ],
+      }),
+      'utf-8'
+    );
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const loaded = mgr.getStatus().settings as Record<string, any>;
+    assert.deepEqual(loaded.smart_wallets, ['RealCustomWhale1111111111111111111111111111']);
+    assert.equal(loaded.smart_money_max_wallets, 50);
+
+    // Attach PumpPortal provider and verify smart trade callback & drainRecentSmartBuys
+    mgr.attachOrchestrator({
+      pumpPortal: pp,
+      signer: { isUnlocked: () => false, getPublicKey: () => null, getMaskedPublicKey: () => 'Locked' },
+      rpcPool: { getHealthSnapshot: () => [] },
+    } as any);
+    pp.setTrackedSmartWallets([smartTrader]);
+    const smartMintNew = 'MintWhaleBuyNew1111111111111111111111111pump';
+    pp.ingestFrame({ mint: smartMintNew, symbol: 'WHALEBUY', txType: 'buy', traderPublicKey: smartTrader, solAmount: 2.5, vSolInBondingCurve: 35, vTokensInBondingCurve: 880_000_000, marketCapSol: 39 }, Date.now());
+    const feed = mgr.getPumpPortalFeed();
+    assert.ok(Array.isArray(feed.smart_buys) && feed.smart_buys.some((b) => b.wallet === smartTrader && b.mint === smartMintNew));
+
+    // Verify Python bot.py: crash_streak unfreezes real >70% crash on poll 2 (ignores 1-tick glitch on poll 1), Pumpfun real_sol drain exits, and recent_buyers boost score
+    const pyScript = [
+      'import sys, types, json, time',
+      'req = types.ModuleType("requests")',
+      'req.Session = lambda: None',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      `TMP_DIR = ${JSON.stringify(tmpDir)}`,
+      'bot._base_dir = lambda: TMP_DIR',
+      'cfg = {**bot.CONFIG, "stop_loss_pct": 20.0, "auto_rug_exit": True, "early_rug_shield_enabled": True, "smart_wallets": ["WhaleX111111111111111111111111111111111111"]}',
+      'acct = bot.TradingAccount(cfg, mode="paper")',
+      // 1) Dead position crash_streak: poll 1 glitch kept (crash_streak=1), poll 2 real crash accepted -> exited via stop_loss_20
+      'acct.buy("MintCrash1", "DEAD", 0.001, meta={"dex": "pumpfun", "source": "pumpportal", "liquidity_usd": 5000.0, "liq_source": "pumpportal"})',
+      'acct.check_exits({"MintCrash1": 0.0001})',
+      'kept_after_1 = "MintCrash1" in acct.state["positions"]',
+      'streak_after_1 = acct.state["positions"]["MintCrash1"].get("crash_streak") if kept_after_1 else -1',
+      'acct.check_exits({"MintCrash1": 0.0001})',
+      'exited_after_2 = "MintCrash1" not in acct.state["positions"]',
+      // 2) Pump.fun bonding curve real_sol drain check with stop_loss_pct=0 -> poll 1 keeps, poll 2 exits with rug_liquidity_drop
+      'acct.cfg["stop_loss_pct"] = 0.0',
+      'acct.buy("MintCurveDrain1", "DRN", 0.001, meta={"dex": "pumpfun", "source": "pumpportal", "liquidity_usd": 6000.0, "real_sol": 12.0, "liq_source": "pumpportal"})',
+      'acct.check_exits({"MintCurveDrain1": 0.0007}, real_sol_updates={"MintCurveDrain1": 2.0})',
+      'curve_kept_1 = "MintCurveDrain1" in acct.state["positions"]',
+      'acct.check_exits({"MintCurveDrain1": 0.00065}, real_sol_updates={"MintCurveDrain1": 1.8})',
+      'curve_exited_2 = "MintCurveDrain1" not in acct.state["positions"]',
+      // 3) Smart money score priority boost & recent_buyers detection
+      'now_ms = int(time.time() * 1000)',
+      'pair_plain = {"baseToken": {"address": "MPlain1", "symbol": "PLN"}, "pairCreatedAt": now_ms - 10000, "liquidity": {"usd": 8000}, "volume": {"m5": 4000}, "txns": {"m5": {"buys": 10, "sells": 3}}}',
+      'pair_whale = {"baseToken": {"address": "MWhale1", "symbol": "WHL"}, "pairCreatedAt": now_ms - 10000, "liquidity": {"usd": 8000}, "volume": {"m5": 4000}, "txns": {"m5": {"buys": 10, "sells": 3}}, "_pumpportal": {"recent_buyers": ["WhaleX111111111111111111111111111111111111"]}}',
+      's_plain = bot.score_candidate(pair_plain, cfg, now_ms)',
+      's_whale = bot.score_candidate(pair_whale, cfg, now_ms)',
+      'print(json.dumps({"kept_after_1": kept_after_1, "streak_after_1": streak_after_1, "exited_after_2": exited_after_2, "curve_kept_1": curve_kept_1, "curve_exited_2": curve_exited_2, "s_plain": s_plain, "s_whale": s_whale}))',
+    ].join('\n');
+
+    const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyOut.kept_after_1, true);
+    assert.equal(pyOut.streak_after_1, 1);
+    assert.equal(pyOut.exited_after_2, true);
+    assert.equal(pyOut.curve_kept_1, true);
+    assert.equal(pyOut.curve_exited_2, true);
+    assert.ok(pyOut.s_whale >= pyOut.s_plain + 140);
+  } finally {
+    pp.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+
 
 
 

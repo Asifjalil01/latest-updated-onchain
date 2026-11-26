@@ -2,6 +2,21 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.43.0 — Real Smart-Money Whale Discovery Engine + Anti-Freeze Rugpull Stop-Loss & Curve Drain Protection
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed & Improved
+- **Rugpull Position Unfreeze & Guaranteed Exit Execution (`sniper/bot.py`, `server/sniperManager.ts`)**:
+  - Decoupled single-tick glitch protection (`crash_streak`) from `liq_drop_streak` inside `check_exits()` and `refreshStoppedOpenPositions()`: a transient 1-poll >70% drop glitch is still filtered out, while a real sustained >70% rug crash executes cleanly via `stop_loss_pct` or `rug_liquidity_drop` on poll 2 instead of clamping `price = prev_cur` indefinitely.
+  - Strengthened **Early-Launch Rugpull Shield (`early_rug_shield_enabled`, ON by default)** with real-time Pump.fun bonding-curve `realSol` drain detection (`>= 65%` curve SOL outflow across 2 polls), tighter post-buy AMM liquidity drop exit (`>= 65%` / `< $350`), and stronger Pump.fun `10s+` thin bonding-curve entry gate (`< 2.5 SOL` real SOL blocked).
+- **Real Multi-Source Smart Money Discovery Engine (`server/providers/pumpportal.ts`, `server/sniperManager.ts`, `PythonSniperView.tsx`)**:
+  - Removed all placeholder/curated wallets and purged legacy fake addresses cleanly.
+  - Built continuous live wallet discovery across PumpPortal WebSocket trade streams (`traderLedgers` tracking real non-creator profitable wallets) and GeckoTerminal trending Solana pools filtered by RugCheck & `creator_history.json` to exclude token creators, slot-0 bundlers, and rugged devs (`smart_money_max_wallets`: 50 default, expandable up to 150).
+  - Wired `subscribeAccountTrade` live Smart Money buy alerts (`smart_buys`), live `[SmartMoney]` stream activity logs, search/profile metadata in the **Smart Money** tab, and `#1` candidate priority scoring (`score_candidate`) in `sniper/bot.py` (`recent_buyers` + `smart_buys`).
+
+---
+
 ## v1.42.0 — Smart Money Watchlist Explorer Tab, Start Bot Whale Follow Prompt & Dynamic Win Rate Fix
 
 **Risk Warning: Trading can lose all of your money.**

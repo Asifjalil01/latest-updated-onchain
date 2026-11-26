@@ -1048,6 +1048,11 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.json(sniperManager.clearLogs());
   });
 
+  router.post('/sniper/smart-money/discover', async (req: Request, res: Response) => {
+    const autoAdd = req.body?.autoAdd !== false;
+    res.json(await sniperManager.discoverSmartWallets({ autoAdd }));
+  });
+
   router.get('/sniper/pumpportal-mints', (_req: Request, res: Response) => {
     const feed = sniperManager.getPumpPortalFeed();
     res.json({
@@ -1057,12 +1062,15 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       solPriceUsd: feed.solPriceUsd,
       open_prices: feed.open_prices,
       smart_sells: feed.smart_sells,
+      smart_buys: feed.smart_buys,
     });
   });
 
   router.post('/sniper/ws-watch', (req: Request, res: Response) => {
     const mints = Array.isArray(req.body?.mints) ? req.body.mints : [];
-    res.json(sniperManager.setWsWatchedMints(mints));
+    const creators =
+      req.body?.creators && typeof req.body.creators === 'object' ? req.body.creators : undefined;
+    res.json(sniperManager.setWsWatchedMints(mints, creators));
   });
 
   router.post('/sniper/reverse-quotes', async (req: Request, res: Response) => {

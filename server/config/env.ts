@@ -69,9 +69,16 @@ export function loadAppEnv(): AppEnvConfig {
       ? Number(process.argv[argvPortIdx + 1])
       : NaN;
 
-  const host = cliHost || process.env.HOST || '127.0.0.1';
-  const portRaw = Number.isFinite(cliPortRaw) && cliPortRaw > 0 ? cliPortRaw : Number(process.env.PORT || 3000);
-  const port = Number.isFinite(portRaw) && portRaw > 0 ? portRaw : 3000;
+  const host = cliHost || process.env.HOST || '0.0.0.0';
+  const cliPort = Number.isFinite(cliPortRaw) && cliPortRaw > 0 ? cliPortRaw : undefined;
+  const envAppPort = process.env.APP_PORT ? Number(process.env.APP_PORT) : undefined;
+  // Always default to port 3000 as required by AI Studio runtime environment constraints.
+  // Note: process.env.PORT is 8080 in Cloud Run because Nginx listens on 8080 and proxies to localhost:3000.
+  const envPort =
+    process.env.PORT && process.env.PORT !== '8080' && Number(process.env.PORT) > 0
+      ? Number(process.env.PORT)
+      : undefined;
+  const port = cliPort || envAppPort || envPort || 3000;
 
   const dbPath = path.resolve(cwd, process.env.DB_PATH || './data/solana_spot_bot.db');
   const keystorePath = path.resolve(cwd, process.env.KEYSTORE_PATH || './data/signer.enc.json');

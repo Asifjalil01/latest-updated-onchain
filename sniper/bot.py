@@ -87,6 +87,9 @@ CONFIG = {
     "smart_money_min_confluence": 1,
     "smart_money_size_boost_pct": 35.0,
     "smart_money_auto_exit_on_sell": True,
+    "smart_money_auto_discover": True,
+    "smart_money_max_wallets": 50,
+    "smart_money_prioritize_entries": True,
     "reused_socials_enabled": True,
     "max_social_reuse_count": 2,
     # Pro Desk — Group 2: Zero-Lag Exits & MEV / Wallet Sweep
@@ -129,6 +132,8 @@ CONFIG = {
         "anti_sybil_enabled": True,
         "smart_money_enabled": True,
         "smart_money_auto_exit_on_sell": True,
+        "smart_money_auto_discover": True,
+        "smart_money_prioritize_entries": True,
         "reused_socials_enabled": True,
         "ws_exit_stream_enabled": True,
         "jito_dontfront_enabled": True,
@@ -161,6 +166,7 @@ _BOOL_OPTION_KEYS = {
     "anti_rug_pool_depth_check_enabled", "anti_rug_sell_sim_enabled",
     "anti_rug_copycat_cooldown_enabled", "early_rug_shield_enabled", "axiom_pulse_migrated_only_enabled", "log_rejects",
     "anti_sybil_enabled", "smart_money_enabled", "smart_money_auto_exit_on_sell",
+    "smart_money_auto_discover", "smart_money_prioritize_entries",
     "reused_socials_enabled", "ws_exit_stream_enabled", "jito_dontfront_enabled",
     "orphan_sweep_enabled", "post_migration_pullback_enabled", "pre_migration_curve_enabled",
     "wash_trade_filter_enabled", "sol_regime_filter_enabled", "anti_top_wick_enabled",
@@ -699,12 +705,15 @@ def _src_boosts(cfg):
 
 _ws_open_prices = {}
 _ws_smart_sells = {}
+_ws_smart_buys = {}           # mint -> set of tracked whale wallets
+_smart_buy_pending_mints = {} # mint -> ts
 _ws_feed_lock = threading.Lock()
 _last_ws_poll_ts = [0.0]
 
 def _ingest_ws_bridge_payload(resp):
     if not isinstance(resp, dict) or not resp.get("ok"):
         return
+    now_ts = time.time()
     with _ws_feed_lock:
         op = resp.get("open_prices")
         if isinstance(op, dict):
@@ -716,6 +725,22 @@ def _ingest_ws_bridge_payload(resp):
             for k, v in ss.items():
                 if isinstance(v, list) and v:
                     _ws_smart_sells[k] = v
+        sb = resp.get("smart_buys")
+        if isinstance(sb, list):
+            for ev in sb:
+                if not isinstance(ev, dict):
+                    continue
+                bmint = str(ev.get("mint") or "").strip()
+                bwal = str(ev.get("wallet") or "").strip()
+                if bmint and bwal:
+                    wset = _ws_smart_buys.setdefault(bmint, set())
+                    wset.add(bwal)
+                    _smart_buy_pending_mints[bmint] = now_ts
+        if len(_ws_smart_buys) > 500:
+            for k in list(_ws_smart_buys.keys())[:250]:
+                _ws_smart_buys.pop(k, None)
+        for k in [k for k, ts in _smart_buy_pending_mints.items() if now_ts - ts > 120.0]:
+            _smart_buy_pending_mints.pop(k, None)
 
 def _poll_ws_monitor_feed(cfg, force=False):
     if not opt_on(cfg, "ws_exit_stream_enabled", True) or not _bridge_base_url():
@@ -784,15 +809,29 @@ def fetch_candidate_mints(cfg, force=False):
     ths = [threading.Thread(target=run, args=s, daemon=True) for s in SOURCES]
     for t in ths: t.start()
     for t in ths: t.join(timeout=5)
-    # Prioritize real-time launch streams (pumpportal, gecko) ahead of older profile/jupiter lists
+    smart_priority = []
+    with _ws_feed_lock:
+        if _smart_buy_pending_mints:
+            smart_priority = list(_smart_buy_pending_mints.keys())
+            _smart_buy_pending_mints.clear()
+    # Prioritize real-time smart-wallet signals & launch streams ahead of older lists
     ordered_mints = []
     seen_batch = set()
+    for m in smart_priority:
+        if isinstance(m, str) and 39 <= len(m) <= 50 and m not in seen_batch:
+            seen_batch.add(m)
+            ordered_mints.append(m)
+            if m not in _src_of:
+                _src_of[m] = "smart_money"
     for src_name in ("pumpportal", "gecko", "dex_age_gap", "profiles", "jup", "boosts"):
         for m in by_src.get(src_name, []):
             if m not in seen_batch:
                 seen_batch.add(m)
                 ordered_mints.append(m)
     fresh = _fresh_only(ordered_mints)
+    for m in smart_priority:
+        if m in seen_batch and m not in fresh:
+            fresh.insert(0, m)
     _mark_seen(ordered_mints)
     due_retries = _get_due_pending_dex_mints(set(fresh), limit=30)
     if due_retries:
@@ -1009,8 +1048,11 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
                 return False, "dev sniper bundle", f"initial dev buy {init_buy:.2f} SOL > 8.0 SOL"
         if early_shield_on and is_curve_dex and pp.get("real_sol") is not None and (_f(pp.get("v_sol")) or 0.0) > 0.0:
             real_sol_val = _f(pp.get("real_sol"))
-            if real_sol_val is not None and real_sol_val < 1.5 and age_s >= 8.0:
-                return False, "thin bonding curve", f"real SOL {real_sol_val:.2f} < 1.5 SOL"
+            if real_sol_val is not None:
+                if age_s >= 10.0 and real_sol_val < 2.5:
+                    return False, "thin bonding curve", f"real SOL {real_sol_val:.2f} < 2.5 SOL"
+                if age_s >= 8.0 and real_sol_val < 1.5:
+                    return False, "thin bonding curve", f"real SOL {real_sol_val:.2f} < 1.5 SOL"
         if opt_on(cfg, "min_recent_buys_60s", True):
             min_60s = int(cfg.get("min_recent_buys_60s", 3) or 0)
             if age_s > grace_sec and min_60s > 0 and buys_60s < min_60s:
@@ -1145,7 +1187,12 @@ def score_candidate(pair, cfg, now_ms=None):
     vel_bonus = min(60.0, buys_60s * 3.5 + sol_vol_60s * 4.0)
 
     freshness = max(0.0, 1.0 - min(1.0, age_s / max_age_s)) * 20.0
-    score = (ratio * 20.0) + (turnover * 15.0) + vel_bonus + freshness + min(15.0, buys * 0.25)
+    smart_bonus = 0.0
+    if opt_on(cfg, "smart_money_prioritize_entries", True) and opt_on(cfg, "smart_money_enabled", True):
+        sb = pair.get("_smart_buyers") if isinstance(pair.get("_smart_buyers"), list) else _get_pair_smart_buyers(pair, pair.get("_rep"), cfg)
+        if sb:
+            smart_bonus = 150.0 * len(sb)
+    score = (ratio * 20.0) + (turnover * 15.0) + vel_bonus + freshness + min(15.0, buys * 0.25) + smart_bonus
     return round(score, 4)
 
 def rank_candidates(items, cfg, now_ms=None):
@@ -2006,8 +2053,19 @@ def _get_pair_smart_buyers(pair, rep, cfg):
     if not smart_set:
         return []
     hits = set()
+    mint_addr = str(((pair or {}).get("baseToken") or {}).get("address") or "").strip()
+    if mint_addr:
+        with _ws_feed_lock:
+            ws_buyers = set(_ws_smart_buys.get(mint_addr) or ())
+        for w in ws_buyers:
+            if w in smart_set:
+                hits.add(w)
+    for w in ((pair or {}).get("_smart_buyers") or []):
+        ws = str(w or "").strip()
+        if ws in smart_set:
+            hits.add(ws)
     pp = (pair or {}).get("_pumpportal") if isinstance((pair or {}).get("_pumpportal"), dict) else {}
-    for w in (pp.get("buyers") or []):
+    for w in (list(pp.get("buyers") or []) + list(pp.get("recent_buyers") or [])):
         ws = str(w or "").strip()
         if ws in smart_set:
             hits.add(ws)
@@ -2603,7 +2661,12 @@ class TradingAccount:
                 bl = self.state.setdefault("blacklist", [])
                 for mint in mints:
                     if mint in self.state.get("positions", {}):
-                        self.state["positions"].pop(mint, None)
+                        pos = self.state["positions"].pop(mint, None)
+                        if isinstance(pos, dict):
+                            cost = float(pos.get("cost") or 0.0)
+                            self.state["closed"] = int(self.state.get("closed") or 0) + 1
+                            self.state["total_pnl"] = float(self.state.get("total_pnl") or 0.0) - cost
+                            self.state["day_pnl"] = float(self.state.get("day_pnl") or 0.0) - cost
                         changed = True
                     if mint and mint not in bl:
                         bl.append(mint)
@@ -2856,6 +2919,9 @@ class TradingAccount:
                 "current_liquidity_usd": meta.get("liquidity_usd"),
                 "entry_liq_source": meta.get("liq_source", "dexscreener"),
                 "liq_drop_streak": 0,
+                "crash_streak": 0,
+                "peak_real_sol": meta.get("real_sol"),
+                "current_real_sol": meta.get("real_sol"),
                 **extra_pos,
             }
             self.state["blacklist"].append(mint)
@@ -3168,6 +3234,7 @@ class TradingAccount:
         rug_liq_drop_pct=60.0,
         dex="",
         liq_drop_confirmed=True,
+        curve_sol_drained=False,
     ):
         """Return (reason_or_none, trailing_active, drop_from_peak_pnl_pct)."""
         if not entry or entry <= 0 or not price or price <= 0:
@@ -3181,8 +3248,10 @@ class TradingAccount:
         drop_from_peak_pct = max(0.0, round(peak_chg_pct - change_pct, 6))
 
         # 1. Emergency auto-rug exit if AMM pool liquidity drains sharply below entry floor
-        # Pump.fun bonding curves cannot have LP withdrawn; never false-trigger rug_liquidity_drop on bonding curves.
+        # or Pump.fun bonding curve real SOL drains sharply across 2 polls.
         is_bonding_curve = str(dex or "").strip().lower() == "pumpfun"
+        if auto_rug_exit and is_bonding_curve and liq_drop_confirmed and curve_sol_drained:
+            return "rug_liquidity_drop", False, drop_from_peak_pct
         if (
             auto_rug_exit
             and not is_bonding_curve
@@ -3236,13 +3305,14 @@ class TradingAccount:
         return None, trailing_active, drop_from_peak_pct
 
     @locked
-    def check_exits(self, prices, liquidities=None, healthy_rev_quotes=None, dex_updates=None):
+    def check_exits(self, prices, liquidities=None, healthy_rev_quotes=None, dex_updates=None, real_sol_updates=None):
         if _should_stop():
             return 0
         self._drain_delete_queue()
         liquidities = liquidities or {}
         healthy_rev_quotes = healthy_rev_quotes or set()
         dex_updates = dex_updates or {}
+        real_sol_updates = real_sol_updates or {}
         exits = 0
         tp = float(self.cfg.get("take_profit_pct", 50) or 0.0) if opt_on(self.cfg, "take_profit_pct", True) else 0.0
         sl = float(self.cfg.get("stop_loss_pct", 0) or 0.0) if opt_on(self.cfg, "stop_loss_pct", True) else 0.0
@@ -3280,13 +3350,24 @@ class TradingAccount:
                         pos["liq_drop_streak"] = 0
                     pos["current_liquidity_usd"] = liq_val
 
+            if mint in real_sol_updates and real_sol_updates[mint] is not None:
+                rs_val = float(real_sol_updates[mint])
+                if rs_val >= 0:
+                    pos["current_real_sol"] = rs_val
+                    prev_peak_rs = _f(pos.get("peak_real_sol"))
+                    pos["peak_real_sol"] = max(prev_peak_rs, rs_val) if prev_peak_rs is not None else rs_val
+
             price = prices.get(mint)
             if price is None or price <= 0:
                 continue
             entry = pos["entry_price"]
             prev_cur = float(pos.get("current_price") or entry)
-            if prev_cur > 0 and price < prev_cur * 0.30 and int(pos.get("liq_drop_streak", 0) or 0) < 2:
-                price = prev_cur
+            if prev_cur > 0 and price < prev_cur * 0.30:
+                pos["crash_streak"] = int(pos.get("crash_streak", 0) or 0) + 1
+                if pos["crash_streak"] < 2 and int(pos.get("liq_drop_streak", 0) or 0) < 2:
+                    price = prev_cur
+            else:
+                pos["crash_streak"] = 0
             pos["current_price"] = price
             pos["last_updated"] = now_ts
             pos["peak_price"] = max(pos.get("peak_price", entry), price)
@@ -3303,10 +3384,33 @@ class TradingAccount:
             cur_liq = pos.get("current_liquidity_usd")
             early_shield_on = opt_on(self.cfg, "early_rug_shield_enabled", True)
             liq_drop_confirmed = False
+            curve_sol_drained = False
             eff_auto_rug = auto_rug
             eff_rug_drop = rug_drop
-            if (auto_rug or early_shield_on) and pos_dex != "pumpfun" and entry_liq is not None and entry_liq >= 500.0 and cur_liq is not None:
-                liq_drop_limit = max(20.0, min(95.0, float(rug_drop or 60.0))) if auto_rug else 75.0
+            if pos_dex == "pumpfun":
+                peak_rs = _f(pos.get("peak_real_sol"))
+                cur_rs = _f(pos.get("current_real_sol"))
+                if (
+                    (auto_rug or early_shield_on)
+                    and peak_rs is not None
+                    and peak_rs >= 3.0
+                    and cur_rs is not None
+                    and cur_rs <= peak_rs * 0.35
+                    and (auto_rug or change <= -25.0)
+                ):
+                    has_healthy_quote = mint in healthy_rev_quotes
+                    if has_healthy_quote and (change > -35.0 or not auto_rug):
+                        pos["liq_drop_streak"] = 0
+                    else:
+                        pos["liq_drop_streak"] = int(pos.get("liq_drop_streak") or 0) + 1
+                        if pos["liq_drop_streak"] >= 2:
+                            liq_drop_confirmed = True
+                            curve_sol_drained = True
+                            eff_auto_rug = True
+                else:
+                    pos["liq_drop_streak"] = 0
+            elif (auto_rug or early_shield_on) and entry_liq is not None and entry_liq >= 500.0 and cur_liq is not None:
+                liq_drop_limit = max(20.0, min(95.0, float(rug_drop or 60.0))) if auto_rug else 65.0
                 liq_floor_usd = 250.0 if auto_rug else 350.0
                 liq_drop_pct_now = (1.0 - float(cur_liq) / float(entry_liq)) * 100.0
                 looks_drained = float(cur_liq) < liq_floor_usd or liq_drop_pct_now >= liq_drop_limit
@@ -3350,6 +3454,7 @@ class TradingAccount:
                 rug_liq_drop_pct=eff_rug_drop,
                 dex=pos_dex,
                 liq_drop_confirmed=liq_drop_confirmed,
+                curve_sol_drained=curve_sol_drained,
             )
             was_active = bool(pos.get("trailing_active"))
             pos["trailing_active"] = trailing_active
@@ -3529,12 +3634,15 @@ def scan_and_buy(acct, cfg):
     _update_pending_dex_mints(fresh, pairs)
     with _stats_lock: _stats["no_pair"] += max(0, len(fresh) - len(pairs))
 
-    # 1. Filter all candidates first so we can rank passing launches by momentum instead of arbitrary dict order
+    # 1. Filter all candidates first so we can rank passing launches by momentum & smart money priority
     passing = []
     for mint, (_liq, pair) in pairs.items():
         if _should_stop():
             return
         if mint in acct.state["positions"] or mint in acct.state["blacklist"]: continue
+        sb_hits = _get_pair_smart_buyers(pair, pair.get("_rep"), cfg)
+        if sb_hits:
+            pair["_smart_buyers"] = sb_hits
         symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
         okp, code, detail = passes_filters(pair, cfg, now_ms, source=_src_of.get(mint, ""))
         with _stats_lock: _stats["checked"] += 1
@@ -3619,12 +3727,15 @@ def scan_and_buy(acct, cfg):
         if price is None or price <= 0: continue
         liq_usd = _f((pair.get("liquidity") or {}).get("usd"))
         smart_buyers = pair.get("_smart_buyers") if isinstance(pair.get("_smart_buyers"), list) else []
+        if smart_buyers:
+            log(f"🐋 [SmartMoney] {len(smart_buyers)} tracked whale(s) buying {symbol} ({smart_buyers[0][:6]}...) — prioritizing entry")
         conv_mult = _evaluate_conviction_mult(pair, cfg, len(smart_buyers))
         regime_mult = float((regime or {}).get("size_mult", 1.0) or 1.0)
         streak_mult = float((streak or {}).get("size_mult", 1.0) or 1.0)
         total_size_mult = round(max(0.1, min(3.0, conv_mult * regime_mult * streak_mult)), 3)
         c_stats = pair.get("_creator_stats") if isinstance(pair.get("_creator_stats"), dict) else {}
-        c_addr = pair.get("_creator") or c_stats.get("creator") or ((pair.get("_pumpportal") or {}).get("creator") if isinstance(pair.get("_pumpportal"), dict) else "") or ""
+        pp_dict = pair.get("_pumpportal") if isinstance(pair.get("_pumpportal"), dict) else {}
+        c_addr = pair.get("_creator") or c_stats.get("creator") or pp_dict.get("creator") or ""
         meta = {
             "dex": pair.get("dexId") or "?",
             "source": _src_of.get(mint, "?"),
@@ -3635,6 +3746,7 @@ def scan_and_buy(acct, cfg):
             "creator_fast_rug_min": c_stats.get("fast_rug_min"),
             "age_s": age_s,
             "liquidity_usd": liq_usd,
+            "real_sol": _f(pp_dict.get("real_sol")),
             "liq_source": "pumpportal" if pair.get("_synthetic") else "dexscreener",
             "decimals": _last_mint_decimals.get(mint),
             "size_mult": total_size_mult,
@@ -3794,7 +3906,8 @@ def monitor(acct):
             _last_ws_watch_sig[0] = mints_sig
             _last_ws_watch_sig[1] = time.time()
             try:
-                bridge_post("/api/sniper/ws-watch", {"mints": cur_mints}, timeout=2.5)
+                creators_map = {m: p.get("creator") for m, p in pos.items() if p.get("creator")}
+                bridge_post("/api/sniper/ws-watch", {"mints": cur_mints, "creators": creators_map}, timeout=2.5)
             except Exception:
                 pass
 
@@ -3813,6 +3926,7 @@ def monitor(acct):
     ws_open, ws_smart_sells = _poll_ws_monitor_feed(acct.cfg, force=False)
     prices = _jupiter_prices(mints, acct.cfg)
     liquidities = {}
+    real_sol_updates = {}
     early_shield_on = opt_on(acct.cfg, "early_rug_shield_enabled", True)
     block_dev_dump = opt_on(acct.cfg, "block_creator_dump", True)
     creator_dump_mints = []
@@ -3820,10 +3934,13 @@ def monitor(acct):
         if wm in pos and isinstance(snap, dict):
             wpx = _f(snap.get("priceUsd"))
             wliq = _f(snap.get("liquidityUsd"))
+            wrs = _f(snap.get("realSol"))
             if wpx and wpx > 0:
                 prices[wm] = wpx
             if wliq and wliq > 0:
                 liquidities[wm] = wliq
+            if wrs is not None and wrs >= 0:
+                real_sol_updates[wm] = wrs
             p_ref = pos[wm]
             snap_creator = str(snap.get("creator") or "").strip()
             if snap_creator and not p_ref.get("creator"):
@@ -3910,6 +4027,7 @@ def monitor(acct):
         liquidities=liquidities,
         healthy_rev_quotes=set(rev_prices.keys()),
         dex_updates=dex_updates,
+        real_sol_updates=real_sol_updates,
     )
     return prices
 

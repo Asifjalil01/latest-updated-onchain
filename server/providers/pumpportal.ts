@@ -106,10 +106,73 @@ export interface PumpPortalRawMessage {
   marketCapSol?: number | string;
 }
 
+export interface PumpPortalSmartTradeEvent {
+  wallet: string;
+  mint: string;
+  symbol: string;
+  side: 'buy' | 'sell';
+  solAmount: number;
+  priceSol: number;
+  tsMs: number;
+}
+
+export interface DiscoveredWsWhale {
+  address: string;
+  label: string;
+  category: string;
+  winRate: string;
+  wins: number;
+  totalTrades: number;
+  recentToken: string;
+  totalProfitSol: number;
+  source: string;
+  lastActiveMs: number;
+}
+
+interface TraderTokenPos {
+  mint: string;
+  symbol: string;
+  solSpent: number;
+  solReceived: number;
+  entryPriceSol: number;
+  lastPriceSol: number;
+  firstBuyAtMs: number;
+  won: boolean;
+  rugged: boolean;
+}
+
+interface TraderLedger {
+  address: string;
+  positions: Map<string, TraderTokenPos>;
+  wins: number;
+  losses: number;
+  ruggedTouches: number;
+  isCreatorAnywhere: boolean;
+  isEarlyBundler: boolean;
+  totalSolSpent: number;
+  realizedProfitSol: number;
+  recentToken: string;
+  lastSeenMs: number;
+}
+
 const MAX_TRACKED_TOKENS = 180;
 const MAX_SUBSCRIBED_MINTS = 60;
+const MAX_TRACKED_TRADERS = 1500;
 const TOKEN_RETENTION_MS = 10 * 60_000;
 const TRADE_WINDOW_MS = 5 * 60_000;
+
+const KNOWN_PROGRAM_ADDRS = new Set<string>([
+  'So11111111111111111111111111111111111111112',
+  '11111111111111111111111111111111',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+  '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1',
+  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+  'CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM',
+  'Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1',
+]);
 
 function toFiniteNum(val: unknown, fallback = 0): number {
   const n = typeof val === 'number' ? val : Number(val);
@@ -121,10 +184,14 @@ export class PumpPortalWsProvider {
   private enabled = false;
   private newTokenBuffer: PumpPortalEvent[] = [];
   private migrationBuffer: PumpPortalEvent[] = [];
+  private smartBuyBuffer: PumpPortalSmartTradeEvent[] = [];
   private tokenStates = new Map<string, PumpPortalTokenState>();
   private subscribedMints = new Set<string>();
   private pinnedOpenMints = new Set<string>();
+  private trackedSmartWallets = new Set<string>();
+  private traderLedgers = new Map<string, TraderLedger>();
   private tradeListeners = new Set<(tick: PumpPortalTradeTick) => void>();
+  private smartListeners = new Set<(ev: PumpPortalSmartTradeEvent) => void>();
   private itemsCount = 0;
   private lastOkMs: number | null = null;
   private errorCount = 0;
@@ -165,16 +232,109 @@ export class PumpPortalWsProvider {
     };
   }
 
-  setPinnedOpenMints(mints: string[]): void {
+  onSmartTrade(listener: (ev: PumpPortalSmartTradeEvent) => void): () => void {
+    this.smartListeners.add(listener);
+    return () => {
+      this.smartListeners.delete(listener);
+    };
+  }
+
+  setPinnedOpenMints(mints: string[], creatorsByMint?: Record<string, string>): void {
     const clean = new Set(mints.map((m) => String(m || '').trim()).filter((m) => m.length >= 32));
     const newlyAdded: string[] = [];
     for (const m of clean) {
       if (!this.pinnedOpenMints.has(m)) newlyAdded.push(m);
     }
     this.pinnedOpenMints = clean;
+    if (creatorsByMint) {
+      for (const [mint, rawCreator] of Object.entries(creatorsByMint)) {
+        const c = String(rawCreator || '').trim();
+        const st = this.tokenStates.get(mint);
+        if (st && c && !st.creator) {
+          st.creator = c;
+          if (st.trades.some((t) => t.side === 'sell' && t.trader === c)) {
+            st.creatorSold = true;
+          }
+        }
+      }
+    }
     for (const m of newlyAdded) {
       this.subscribeMintTrades(m);
     }
+  }
+
+  setTrackedSmartWallets(wallets: string[]): void {
+    const clean = new Set(
+      wallets
+        .map((w) => String(w || '').trim())
+        .filter((w) => w.length >= 32 && w.length <= 48 && !KNOWN_PROGRAM_ADDRS.has(w))
+    );
+    const toAdd: string[] = [];
+    const toRemove: string[] = [];
+    for (const w of clean) {
+      if (!this.trackedSmartWallets.has(w)) toAdd.push(w);
+    }
+    for (const w of this.trackedSmartWallets) {
+      if (!clean.has(w)) toRemove.push(w);
+    }
+    this.trackedSmartWallets = clean;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      if (toRemove.length > 0) {
+        try {
+          this.ws.send(JSON.stringify({ method: 'unsubscribeAccountTrade', keys: toRemove }));
+        } catch {}
+      }
+      if (toAdd.length > 0) {
+        try {
+          this.ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: toAdd }));
+        } catch {}
+      }
+    }
+  }
+
+  drainRecentSmartBuys(maxAgeMs = 120_000): PumpPortalSmartTradeEvent[] {
+    const cutoff = Date.now() - maxAgeMs;
+    this.smartBuyBuffer = this.smartBuyBuffer.filter((e) => e.tsMs >= cutoff);
+    return [...this.smartBuyBuffer];
+  }
+
+  getDiscoveredWhaleWallets(limit = 30): DiscoveredWsWhale[] {
+    const nowMs = Date.now();
+    const out: DiscoveredWsWhale[] = [];
+    for (const ledger of this.traderLedgers.values()) {
+      if (ledger.isCreatorAnywhere || ledger.isEarlyBundler || ledger.ruggedTouches > 0) continue;
+      let unrealizedWins = 0;
+      let unrealizedSol = 0;
+      let activeTrades = 0;
+      for (const p of ledger.positions.values()) {
+        if (p.rugged) continue;
+        activeTrades += 1;
+        if (p.entryPriceSol > 0 && p.lastPriceSol >= p.entryPriceSol * 1.25 && p.solSpent >= 0.2) {
+          unrealizedWins += 1;
+          unrealizedSol += p.solSpent * (p.lastPriceSol / p.entryPriceSol - 1);
+        }
+      }
+      const totalWins = ledger.wins + unrealizedWins;
+      const totalEstSol = ledger.realizedProfitSol + unrealizedSol;
+      const denom = Math.max(1, totalWins + ledger.losses, activeTrades);
+      if (totalWins < 1 || totalEstSol < 0.08 || ledger.totalSolSpent < 0.25) continue;
+      if (nowMs - ledger.lastSeenMs > 45 * 60_000) continue;
+      const winPct = Math.min(96, Math.max(55, Math.round((totalWins / denom) * 100)));
+      out.push({
+        address: ledger.address,
+        label: totalEstSol >= 2.0 ? 'PumpPortal Alpha Whale' : 'Active Curve Winner',
+        category: 'Live PumpPortal WS Trader',
+        winRate: `${winPct}%`,
+        wins: totalWins,
+        totalTrades: denom,
+        recentToken: ledger.recentToken || 'PUMP',
+        totalProfitSol: Number(totalEstSol.toFixed(2)),
+        source: 'PumpPortal Live WS',
+        lastActiveMs: ledger.lastSeenMs,
+      });
+    }
+    out.sort((a, b) => b.totalProfitSol - a.totalProfitSol || b.wins - a.wins);
+    return out.slice(0, limit);
   }
 
   private subscribeMintTrades(mint: string): void {
@@ -285,6 +445,11 @@ export class PumpPortalWsProvider {
       state.lastTradeAtMs = nowMs;
     }
 
+    if (state.creator && !KNOWN_PROGRAM_ADDRS.has(state.creator)) {
+      const cLedger = this.traderLedgers.get(state.creator);
+      if (cLedger) cLedger.isCreatorAnywhere = true;
+    }
+
     if (isTrade) {
       const side: 'buy' | 'sell' = txType === 'sell' ? 'sell' : 'buy';
       if (side === 'sell' && state.creator && trader && trader === state.creator) {
@@ -300,13 +465,127 @@ export class PumpPortalWsProvider {
       if (state.trades.length > 250 || (state.trades[0] && state.trades[0].tsMs < cutoff)) {
         state.trades = state.trades.filter((t) => t.tsMs >= cutoff).slice(-250);
       }
+
+      const curPriceSol =
+        state.vSolInBondingCurve > 0 && state.vTokensInBondingCurve > 0
+          ? state.vSolInBondingCurve / state.vTokensInBondingCurve
+          : 0;
+
+      // Update live whale profitability ledger & smart-wallet buy/sell events
+      if (trader && trader.length >= 32 && !KNOWN_PROGRAM_ADDRS.has(trader)) {
+        if (this.trackedSmartWallets.has(trader)) {
+          const smartEv: PumpPortalSmartTradeEvent = {
+            wallet: trader,
+            mint,
+            symbol: state.symbol || '?',
+            side,
+            solAmount: Math.max(0, solAmt),
+            priceSol: curPriceSol,
+            tsMs: nowMs,
+          };
+          if (side === 'buy') {
+            this.smartBuyBuffer.push(smartEv);
+            if (this.smartBuyBuffer.length > 100) this.smartBuyBuffer.shift();
+          }
+          for (const cb of this.smartListeners) {
+            try {
+              cb(smartEv);
+            } catch {}
+          }
+        }
+
+        if (trader !== state.creator && curPriceSol > 0) {
+          let ledger = this.traderLedgers.get(trader);
+          if (!ledger) {
+            if (this.traderLedgers.size >= MAX_TRACKED_TRADERS) {
+              let oldestKey: string | null = null;
+              let oldestTs = Infinity;
+              for (const [k, v] of this.traderLedgers.entries()) {
+                if (v.lastSeenMs < oldestTs) {
+                  oldestTs = v.lastSeenMs;
+                  oldestKey = k;
+                }
+              }
+              if (oldestKey) this.traderLedgers.delete(oldestKey);
+            }
+            ledger = {
+              address: trader,
+              positions: new Map(),
+              wins: 0,
+              losses: 0,
+              ruggedTouches: 0,
+              isCreatorAnywhere: false,
+              isEarlyBundler: false,
+              totalSolSpent: 0,
+              realizedProfitSol: 0,
+              recentToken: state.symbol || 'PUMP',
+              lastSeenMs: nowMs,
+            };
+            this.traderLedgers.set(trader, ledger);
+          }
+          ledger.lastSeenMs = nowMs;
+          if (state.symbol && state.symbol !== '?') ledger.recentToken = state.symbol;
+
+          let tpos = ledger.positions.get(mint);
+          if (side === 'buy') {
+            if (nowMs - state.createdAtMs <= 1500 && solAmt >= 5.0) {
+              ledger.isEarlyBundler = true;
+            }
+            if (!tpos) {
+              tpos = {
+                mint,
+                symbol: state.symbol || '?',
+                solSpent: solAmt,
+                solReceived: 0,
+                entryPriceSol: curPriceSol,
+                lastPriceSol: curPriceSol,
+                firstBuyAtMs: nowMs,
+                won: false,
+                rugged: false,
+              };
+              ledger.positions.set(mint, tpos);
+              if (ledger.positions.size > 30) {
+                const firstKey = ledger.positions.keys().next().value;
+                if (firstKey) ledger.positions.delete(firstKey);
+              }
+            } else {
+              tpos.solSpent += solAmt;
+              tpos.lastPriceSol = curPriceSol;
+            }
+            ledger.totalSolSpent += solAmt;
+          } else if (tpos) {
+            tpos.solReceived += solAmt;
+            tpos.lastPriceSol = curPriceSol;
+            if (!tpos.won && tpos.solSpent >= 0.2 && curPriceSol >= tpos.entryPriceSol * 1.15) {
+              tpos.won = true;
+              ledger.wins += 1;
+              ledger.realizedProfitSol += Math.max(0, tpos.solReceived - tpos.solSpent * 0.5);
+            } else if (tpos.entryPriceSol > 0 && curPriceSol <= tpos.entryPriceSol * 0.4 && tpos.solReceived < tpos.solSpent) {
+              ledger.losses += 1;
+            }
+          }
+        }
+      }
+
+      if (curPriceSol > 0) {
+        for (const ledger of this.traderLedgers.values()) {
+          const tp = ledger.positions.get(mint);
+          if (!tp) continue;
+          tp.lastPriceSol = curPriceSol;
+          if (state.creatorSold && tp.entryPriceSol > 0 && curPriceSol <= tp.entryPriceSol * 0.35 && !tp.rugged) {
+            tp.rugged = true;
+            ledger.ruggedTouches += 1;
+          }
+        }
+      }
+
       if (this.tradeListeners.size > 0 && state.vSolInBondingCurve > 0 && state.vTokensInBondingCurve > 0) {
         const tick: PumpPortalTradeTick = {
           mint,
           side,
           solAmount: Math.max(0, solAmt),
           trader,
-          priceSol: state.vSolInBondingCurve / state.vTokensInBondingCurve,
+          priceSol: curPriceSol,
           vSol: state.vSolInBondingCurve,
           vTokens: state.vTokensInBondingCurve,
           tsMs: nowMs,
@@ -373,6 +652,11 @@ export class PumpPortalWsProvider {
         if (this.subscribedMints.size > 0) {
           this.ws?.send(
             JSON.stringify({ method: 'subscribeTokenTrade', keys: Array.from(this.subscribedMints) })
+          );
+        }
+        if (this.trackedSmartWallets.size > 0) {
+          this.ws?.send(
+            JSON.stringify({ method: 'subscribeAccountTrade', keys: Array.from(this.trackedSmartWallets) })
           );
         }
       });
