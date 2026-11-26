@@ -87,6 +87,14 @@ interface SniperPosition {
   last_updated?: number;
   last_sell_error?: string;
   last_sell_error_at?: number;
+  smart_money_entry?: boolean;
+  smart_wallets_hit?: string[];
+  smart_wallet_details?: Array<{
+    address: string;
+    label?: string;
+    winRate?: number;
+    source?: string;
+  }>;
 }
 
 interface SniperLiveWallet {
@@ -113,6 +121,14 @@ interface SmartWalletProfile {
   wins?: number;
   totalTrades?: number;
   recentToken?: string;
+  recentMint?: string;
+  recentAction?: 'HOLDING' | 'CLOSED_PROFIT';
+  heldMints?: Array<{
+    mint: string;
+    symbol: string;
+    uiAmount: number;
+    ageHours: number;
+  }>;
   totalProfitSol?: number;
   source?: string;
   updatedAt?: number;
@@ -131,13 +147,17 @@ const PYTHON_PRO_DESK_KEYS: Array<[string, 'bool' | 'int' | 'float' | 'string' |
   ['fresh_wallet_minutes', 'int'],
   ['max_shared_funder_count', 'int'],
   ['smart_money_enabled', 'bool'],
+  ['smart_money_scan_mode', 'string'],
   ['smart_wallets', 'list'],
   ['smart_money_min_confluence', 'int'],
   ['smart_money_size_boost_pct', 'float'],
   ['smart_money_auto_exit_on_sell', 'bool'],
   ['smart_money_auto_discover', 'bool'],
   ['smart_money_max_wallets', 'int'],
+  ['smart_money_refresh_interval_sec', 'int'],
   ['smart_money_prioritize_entries', 'bool'],
+  ['smart_money_follow_older_coins', 'bool'],
+  ['smart_money_max_coin_age_hours', 'int'],
   ['reused_socials_enabled', 'bool'],
   ['max_social_reuse_count', 'int'],
   ['ws_exit_stream_enabled', 'bool'],
@@ -470,6 +490,8 @@ export function PythonSniperView() {
   const [smartWalletProfiles, setSmartWalletProfiles] = useState<Record<string, SmartWalletProfile>>({});
   const [showStartModal, setShowStartModal] = useState(false);
   const [startSmartMoneyFollow, setStartSmartMoneyFollow] = useState(true);
+  const [startScanMode, setStartScanMode] = useState<'both' | 'smart_money_only' | 'sniper_only'>('both');
+  const [savingSmartConfig, setSavingSmartConfig] = useState(false);
   const [discoveringWhales, setDiscoveringWhales] = useState(false);
   const [discoveredWhales, setDiscoveredWhales] = useState<Array<{
     address: string;
@@ -477,6 +499,8 @@ export function PythonSniperView() {
     category?: string;
     winRate: string;
     recentToken: string;
+    recentMint?: string;
+    recentAction?: 'HOLDING' | 'CLOSED_PROFIT';
     totalProfitSol: number;
     source?: string;
   }>>([]);
@@ -499,6 +523,7 @@ export function PythonSniperView() {
   const [pyBacktestResult, setPyBacktestResult] = useState<BacktestResult | null>(null);
   const [pyBacktestLoading, setPyBacktestLoading] = useState(false);
   const [pyNewWalletInput, setPyNewWalletInput] = useState('');
+  const [openPositionsSmartOnly, setOpenPositionsSmartOnly] = useState(false);
 
   useEffect(() => {
     if (activeTab === 'pro_desk') {
@@ -596,18 +621,66 @@ export function PythonSniperView() {
     }
   };
 
+  const saveQuickSniperSettings = async (patch: Record<string, any>, toastTitle?: string) => {
+    setSavingSmartConfig(true);
+    try {
+      const nextDraft = {
+        ...draftSettings,
+        ...patch,
+      };
+      if (typeof patch.smart_money_enabled === 'boolean') {
+        nextDraft.option_enabled = {
+          ...(nextDraft.option_enabled || {}),
+          smart_money_enabled: patch.smart_money_enabled,
+        };
+      }
+      if (typeof patch.smart_money_follow_older_coins === 'boolean') {
+        nextDraft.option_enabled = {
+          ...(nextDraft.option_enabled || {}),
+          smart_money_follow_older_coins: patch.smart_money_follow_older_coins,
+        };
+      }
+      const data = await apiFetch<any>('/api/sniper/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings: nextDraft }),
+      });
+      if (data?.ok) {
+        const saved = data.settings ? { ...nextDraft, ...data.settings } : nextDraft;
+        setServerSettings(saved);
+        setDraftSettings(saved);
+        markSettingsDirty(false);
+        if (toastTitle) {
+          pushToast({ kind: 'success', title: toastTitle });
+        }
+        void fetchStatus();
+      } else {
+        pushToast({
+          kind: 'error',
+          title: 'Could not save Smart Money config',
+          body: data?.message || 'Validation error',
+        });
+      }
+    } catch (err) {
+      pushToast({ kind: 'error', title: 'Save failed', body: err instanceof Error ? err.message : 'Error' });
+    } finally {
+      setSavingSmartConfig(false);
+    }
+  };
+
   const handleDiscoverWhales = async () => {
     setDiscoveringWhales(true);
     try {
       const res = await apiFetch<any>('/api/sniper/smart-money/discover', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ autoAdd: true }),
+        body: JSON.stringify({ autoAdd: true, scanHoldings: true }),
       });
       if (res?.ok && Array.isArray(res.discovered)) {
         setDiscoveredWhales(res.discovered);
         const added = Number(res.addedCount || 0);
         const total = Number(res.totalTracked || 0);
+        const holdingsFound = Number(res.holdingsScan?.foundCoins || 0);
         if (!isSettingsDirtyRef.current && res.settings && Array.isArray(res.settings.smart_wallets)) {
           setDraftSettings((prev) => ({ ...prev, smart_wallets: res.settings.smart_wallets }));
         } else if (added > 0) {
@@ -618,11 +691,11 @@ export function PythonSniperView() {
           });
         }
         pushToast({
-          kind: res.discovered.length > 0 ? 'success' : 'info',
-          title: 'Whale Discovery Scan Complete',
+          kind: res.discovered.length > 0 || holdingsFound > 0 ? 'success' : 'info',
+          title: 'Whale Discovery & Holdings Scan Complete',
           body:
-            res.message ||
-            `Found ${res.discovered.length} profitable traders across live pools & PumpPortal (${added} added · ${total} total tracked).`,
+            (res.message || `Found ${res.discovered.length} profitable traders (${added} added · ${total} total tracked).`) +
+            (holdingsFound > 0 ? ` Scanned ${res.holdingsScan.scannedWallets} whale portfolios → ${holdingsFound} live held coin(s).` : ''),
         });
         void fetchStatus();
       }
@@ -1248,7 +1321,15 @@ export function PythonSniperView() {
               if (running) {
                 void handleToggle();
               } else {
-                setStartSmartMoneyFollow(Boolean(draftSettings.smart_money_enabled !== false));
+                const curScanMode =
+                  draftSettings.smart_money_scan_mode === 'smart_money_only' ||
+                  draftSettings.smart_money_scan_mode === 'sniper_only'
+                    ? draftSettings.smart_money_scan_mode
+                    : 'both';
+                setStartScanMode(curScanMode);
+                setStartSmartMoneyFollow(
+                  curScanMode === 'sniper_only' ? false : Boolean(draftSettings.smart_money_enabled !== false)
+                );
                 setShowStartModal(true);
               }
             }}
@@ -1405,7 +1486,13 @@ export function PythonSniperView() {
       </div>
 
       {/* Tab Content: Open Positions */}
-      {activeTab === 'positions' && (
+      {activeTab === 'positions' && (() => {
+        const isSmartPosition = (p: typeof positionsList[number]) =>
+          Boolean(p.smart_money_entry || (Array.isArray(p.smart_wallets_hit) && p.smart_wallets_hit.length > 0));
+        const smartMoneyPositionsCount = positionsList.filter(isSmartPosition).length;
+        const visiblePositions = openPositionsSmartOnly ? positionsList.filter(isSmartPosition) : positionsList;
+
+        return (
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-5 space-y-4 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100 dark:border-slate-800">
             <div className="flex flex-wrap items-center gap-2">
@@ -1414,7 +1501,7 @@ export function PythonSniperView() {
                 (1s live refresh · Jupiter &amp; DexScreener quotes{priceAgeSec !== null && positionsList.length > 0 ? ` · updated ${priceAgeSec.toFixed(1)}s ago` : ''})
               </span>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {cooldownRemainingSec > 0 && running && (
                 <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30">
                   <PauseCircle className="w-3 h-3" />
@@ -1427,6 +1514,19 @@ export function PythonSniperView() {
                   <span>Scan auto-paused until a slot frees</span>
                 </span>
               )}
+              <button
+                type="button"
+                onClick={() => setOpenPositionsSmartOnly((v) => !v)}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-semibold transition-colors ${
+                  openPositionsSmartOnly
+                    ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/40'
+                    : 'bg-slate-50 dark:bg-slate-900/60 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-emerald-500/40'
+                }`}
+                title="Filter open positions to show only buys backed by tracked Smart Money / Whale wallets"
+              >
+                <Users className="w-3 h-3" />
+                <span>Whale Buys Only ({smartMoneyPositionsCount})</span>
+              </button>
               <span className="text-xs font-mono font-semibold text-slate-500 dark:text-slate-400">
                 {positionsList.length} of {maxSlots} slots in use
               </span>
@@ -1437,6 +1537,18 @@ export function PythonSniperView() {
             <div className="py-16 text-center text-xs text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl space-y-2">
               <p className="font-semibold text-slate-700 dark:text-slate-300">No open positions currently.</p>
               <p>When the Python bot discovers brand-new coins that pass the rug screen, they appear here with live 1s USD &amp; SOL pricing.</p>
+            </div>
+          ) : visiblePositions.length === 0 ? (
+            <div className="py-12 text-center text-xs text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl space-y-2.5">
+              <p className="font-semibold text-slate-700 dark:text-slate-300">No open positions triggered by tracked Smart Money whales right now.</p>
+              <p>{positionsList.length} open position(s) were entered via standard Auto Sniper rules.</p>
+              <button
+                type="button"
+                onClick={() => setOpenPositionsSmartOnly(false)}
+                className="px-3 py-1 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 text-[11px] font-semibold"
+              >
+                Show all open positions ({positionsList.length})
+              </button>
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -1457,11 +1569,12 @@ export function PythonSniperView() {
                     <th className="py-2 px-2 font-semibold text-right">Held</th>
                     <th className="py-2 px-2 font-semibold">Coin key</th>
                     <th className="py-2 px-2 font-semibold">Dev wallet</th>
+                    <th className="py-2 px-2 font-semibold">Entry Signal</th>
                     <th className="py-2 px-2 font-semibold text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70 font-mono">
-                  {positionsList.map((p) => {
+                  {visiblePositions.map((p) => {
                     const heldMins = (Date.now() / 1000 - p.opened) / 60;
                     const currentPrice = p.current_price !== undefined && p.current_price > 0 ? p.current_price : p.entry_price;
                     const inProfit = currentPrice >= p.entry_price;
@@ -1629,6 +1742,68 @@ export function PythonSniperView() {
                           )}
                         </td>
 
+                        {/* Entry Signal (Auto Sniper vs Smart Money Whale Copy) */}
+                        <td className="py-2.5 px-2 whitespace-nowrap">
+                          {(() => {
+                            const hitWallets = Array.isArray(p.smart_wallets_hit) ? p.smart_wallets_hit.filter(Boolean) : [];
+                            const details = Array.isArray(p.smart_wallet_details) ? p.smart_wallet_details : [];
+                            if (p.smart_money_entry || hitWallets.length > 0) {
+                              const walletRows = details.length > 0
+                                ? details
+                                : hitWallets.map((address) => ({ address, label: undefined, winRate: undefined, source: undefined }));
+                              return (
+                                <div className="space-y-1">
+                                  <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 text-[10px] font-bold"
+                                    title={`Bought with tracked Smart Money wallet(s): ${hitWallets.join(', ')}`}
+                                  >
+                                    <Users className="w-3 h-3 shrink-0" />
+                                    <span>Whale Copy{hitWallets.length > 1 ? ` (${hitWallets.length})` : ''}</span>
+                                  </span>
+                                  {walletRows.map((w) => {
+                                    const winHint = typeof w.winRate === 'number' ? ` · ${w.winRate.toFixed(0)}% WR` : '';
+                                    const nameHint = w.label ? `${w.label}${winHint}` : (w.winRate !== undefined ? `${w.winRate.toFixed(0)}% WR` : '');
+                                    return (
+                                      <div key={w.address} className="flex items-center gap-1 text-[11px]">
+                                        <a
+                                          href={`https://solscan.io/account/${w.address}`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="text-teal-600 dark:text-teal-400 hover:underline font-medium"
+                                          title={`Bought because Smart Money wallet ${w.address} entered${nameHint ? ` (${nameHint})` : ''} — view on Solscan`}
+                                        >
+                                          {w.address.slice(0, 4)}...{w.address.slice(-4)}
+                                        </a>
+                                        {nameHint && (
+                                          <span className="text-[10px] text-slate-500 dark:text-slate-400 truncate max-w-[110px]" title={nameHint}>
+                                            ({nameHint})
+                                          </span>
+                                        )}
+                                        <button
+                                          type="button"
+                                          onClick={() => handleCopy(w.address)}
+                                          className="text-slate-400 hover:text-slate-200 p-0.5 rounded transition-colors shrink-0"
+                                          title={`Copy whale wallet (${w.address})`}
+                                        >
+                                          {copiedKey === w.address ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                                        </button>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              );
+                            }
+                            return (
+                              <span
+                                className="inline-block px-1.5 py-0.5 rounded bg-slate-500/10 text-slate-500 dark:text-slate-400 border border-slate-500/20 text-[10px] font-medium"
+                                title="Entered by standard Auto Sniper launch scan filters"
+                              >
+                                Auto Sniper
+                              </span>
+                            );
+                          })()}
+                        </td>
+
                         {/* Actions */}
                         <td className="py-2.5 px-2 text-right space-x-1.5 whitespace-nowrap">
                           {p.tx_buy && (
@@ -1709,7 +1884,8 @@ export function PythonSniperView() {
             </span>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* Tab Content: Smart Money Watchlist & Explorer */}
       {activeTab === 'smart_money' && (
@@ -1731,9 +1907,15 @@ export function PythonSniperView() {
                   type="checkbox"
                   checked={Boolean(draftSettings.smart_money_enabled !== false)}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, smart_money_enabled: e.target.checked });
-                    markSettingsDirty(true);
+                    const enabled = e.target.checked;
+                    const curMode = String(draftSettings.smart_money_scan_mode || 'both');
+                    const nextMode = !enabled && curMode === 'smart_money_only' ? 'sniper_only' : enabled && curMode === 'sniper_only' ? 'both' : curMode;
+                    void saveQuickSniperSettings(
+                      { smart_money_enabled: enabled, smart_money_scan_mode: nextMode },
+                      enabled ? 'Smart Money following enabled' : 'Smart Money following paused'
+                    );
                   }}
+                  disabled={savingSmartConfig}
                   className="rounded border-slate-300 text-teal-600 focus:ring-teal-500 w-4 h-4 cursor-pointer"
                 />
                 <span className="text-xs font-bold text-slate-700 dark:text-slate-300">
@@ -1749,30 +1931,43 @@ export function PythonSniperView() {
             <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-1.5">
               <span className="text-[11px] font-mono text-slate-500 uppercase font-semibold block">Tracked Smart Wallets</span>
               <div className="text-xl font-bold font-mono text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                <span>{Array.isArray(draftSettings.smart_wallets) ? draftSettings.smart_wallets.length : 0} Wallets</span>
+                <span>
+                  {Array.isArray(draftSettings.smart_wallets) ? draftSettings.smart_wallets.length : 0} /{' '}
+                  {Number(draftSettings.smart_money_max_wallets ?? 50) <= 0 ? '∞' : Number(draftSettings.smart_money_max_wallets ?? 50)}
+                </span>
                 {Array.isArray(draftSettings.smart_wallets) && draftSettings.smart_wallets.length > 0 && (
                   <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-sans font-semibold">
                     Live
                   </span>
                 )}
               </div>
-              <p className="text-[11px] text-slate-500">Monitored on WebSocket stream for early entries.</p>
+              <p className="text-[11px] text-slate-500">
+                Refresh every {Number(draftSettings.smart_money_refresh_interval_sec || 30)}s · Set limit 0 for Unlimited.
+              </p>
             </div>
 
             <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-1.5">
-              <span className="text-[11px] font-mono text-slate-500 uppercase font-semibold block">Min Confluence</span>
-              <div className="text-xl font-bold font-mono text-slate-900 dark:text-slate-100">
-                {draftSettings.smart_money_min_confluence ?? 1} Required
+              <span className="text-[11px] font-mono text-slate-500 uppercase font-semibold block">Active Scan Mode</span>
+              <div className="text-base font-bold font-mono text-teal-600 dark:text-teal-400">
+                {draftSettings.smart_money_scan_mode === 'smart_money_only'
+                  ? 'Whale Wallets Only'
+                  : draftSettings.smart_money_scan_mode === 'sniper_only'
+                    ? 'Sniper Bot Only'
+                    : 'Both (Sniper + Whales)'}
               </div>
-              <p className="text-[11px] text-slate-500">Wallets needed on a token before boosting size.</p>
+              <p className="text-[11px] text-slate-500">
+                {draftSettings.smart_money_follow_older_coins !== false
+                  ? `Follows whale coins up to ${Number(draftSettings.smart_money_max_coin_age_hours ?? 72) || '∞'}h old`
+                  : 'New launches only'}
+              </p>
             </div>
 
             <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-1.5">
-              <span className="text-[11px] font-mono text-slate-500 uppercase font-semibold block">Size Boost %</span>
+              <span className="text-[11px] font-mono text-slate-500 uppercase font-semibold block">Confluence &amp; Boost</span>
               <div className="text-xl font-bold font-mono text-emerald-600 dark:text-emerald-400">
-                +{draftSettings.smart_money_size_boost_pct ?? 35}%
+                {draftSettings.smart_money_min_confluence ?? 1}W · +{draftSettings.smart_money_size_boost_pct ?? 35}%
               </div>
-              <p className="text-[11px] text-slate-500">Dynamic position size increase on whale hit.</p>
+              <p className="text-[11px] text-slate-500">Min whale confluence before boosting buy size.</p>
             </div>
 
             <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-1.5">
@@ -1784,20 +1979,164 @@ export function PythonSniperView() {
             </div>
           </div>
 
-          {/* Quick Action & Auto-Discovery Bar */}
-          <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/40">
-            <div className="flex flex-wrap items-center gap-2.5">
-              <button
-                type="button"
-                disabled={discoveringWhales}
-                onClick={() => void handleDiscoverWhales()}
-                className="px-3.5 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold flex items-center gap-1.5 transition-colors shadow-sm disabled:opacity-50"
-              >
-                <Search className={`w-3.5 h-3.5 ${discoveringWhales ? 'animate-spin' : ''}`} />
-                <span>{discoveringWhales ? 'Scanning On-Chain Pools & WS...' : 'Scan & Discover Active Whales'}</span>
-              </button>
+          {/* Solscan Portfolio vs Defi Activities + 1h-72h+ Held Coins Notice */}
+          <div className="p-3.5 rounded-xl border border-sky-500/25 bg-sky-500/[0.04] text-[11px] text-slate-600 dark:text-slate-300 flex flex-wrap items-start justify-between gap-3">
+            <div className="space-y-1">
+              <p className="font-semibold text-sky-700 dark:text-sky-300">
+                How to inspect coins on Solscan &amp; follow 1h–1d+ whale holdings:
+              </p>
+              <p>
+                Solscan&apos;s <span className="font-semibold">Portfolio</span> tab only shows tokens the whale is <span className="font-semibold">still holding</span> right now. When a whale already sold a winning trade in profit (tagged <span className="font-mono text-amber-500">Closed Profit</span>), look in their <span className="font-semibold">Defi Activities</span> tab or click the coin mint address directly. Active <span className="font-semibold">1h–72h+</span> holdings in whale portfolios are scanned automatically on-chain via RPC.
+              </p>
+            </div>
+          </div>
 
-              <label className="flex items-center gap-1.5 cursor-pointer select-none px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs">
+          {/* Quick Action, Scan Mode, Custom Wallet Limit & Refresh Interval Bar */}
+          <div className="flex flex-col gap-3 p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/40">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  disabled={discoveringWhales}
+                  onClick={() => void handleDiscoverWhales()}
+                  className="px-3.5 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold flex items-center gap-1.5 transition-colors shadow-sm disabled:opacity-50"
+                >
+                  <Search className={`w-3.5 h-3.5 ${discoveringWhales ? 'animate-spin' : ''}`} />
+                  <span>{discoveringWhales ? 'Scanning Pools & Portfolios...' : 'Scan & Discover Active Whales'}</span>
+                </button>
+
+                {/* Scan Mode Selector */}
+                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs">
+                  <span className="text-slate-500 font-medium">Mode:</span>
+                  <select
+                    value={String(draftSettings.smart_money_scan_mode || 'both')}
+                    onChange={(e) => {
+                      const nextMode = e.target.value as 'both' | 'smart_money_only' | 'sniper_only';
+                      const enabledFlag = nextMode !== 'sniper_only';
+                      void saveQuickSniperSettings(
+                        {
+                          smart_money_scan_mode: nextMode,
+                          smart_money_enabled: enabledFlag,
+                        },
+                        `Scan mode set to ${
+                          nextMode === 'smart_money_only'
+                            ? 'Whale Wallets Only'
+                            : nextMode === 'sniper_only'
+                              ? 'Sniper Bot Only'
+                              : 'Both (Sniper + Whales)'
+                        }`
+                      );
+                    }}
+                    disabled={savingSmartConfig}
+                    className="bg-transparent font-bold text-teal-600 dark:text-teal-400 focus:outline-none cursor-pointer"
+                  >
+                    <option value="both">Both (Sniper + Whales)</option>
+                    <option value="smart_money_only">Whale Wallets Only</option>
+                    <option value="sniper_only">Sniper Bot Only</option>
+                  </select>
+                </div>
+
+                {/* Custom Wallet Search / Track Limit (0 = Unlimited) */}
+                <div
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                  title="Maximum smart wallets to discover & track. Enter 0 for Unlimited (up to 5000)."
+                >
+                  <span className="text-slate-500 font-medium">Wallets Limit:</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={5000}
+                    step={25}
+                    value={draftSettings.smart_money_max_wallets ?? 50}
+                    onChange={(e) => {
+                      const val = Math.max(0, Math.min(5000, parseInt(e.target.value || '0', 10) || 0));
+                      setDraftSettings({ ...draftSettings, smart_money_max_wallets: val });
+                      markSettingsDirty(true);
+                    }}
+                    className="w-16 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded font-mono font-bold text-slate-800 dark:text-slate-100 focus:outline-none"
+                  />
+                  <span className="text-[10px] text-slate-400 font-mono">
+                    {Number(draftSettings.smart_money_max_wallets ?? 50) <= 0 ? '(∞)' : ''}
+                  </span>
+                </div>
+
+                {/* Refresh Interval Seconds */}
+                <div
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                  title="How often (in seconds) background whale discovery & portfolio scanning refreshes."
+                >
+                  <span className="text-slate-500 font-medium">Refresh (s):</span>
+                  <input
+                    type="number"
+                    min={10}
+                    max={86400}
+                    step={5}
+                    value={draftSettings.smart_money_refresh_interval_sec ?? 30}
+                    onChange={(e) => {
+                      const val = Math.max(10, Math.min(86400, parseInt(e.target.value || '30', 10) || 30));
+                      setDraftSettings({ ...draftSettings, smart_money_refresh_interval_sec: val });
+                      markSettingsDirty(true);
+                    }}
+                    className="w-16 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded font-mono font-bold text-slate-800 dark:text-slate-100 focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {isSettingsDirty && (
+                  <button
+                    type="button"
+                    disabled={savingSmartConfig}
+                    onClick={() =>
+                      void saveQuickSniperSettings(
+                        {
+                          smart_money_max_wallets: Number(draftSettings.smart_money_max_wallets ?? 50),
+                          smart_money_refresh_interval_sec: Number(draftSettings.smart_money_refresh_interval_sec ?? 30),
+                          smart_money_auto_discover: draftSettings.smart_money_auto_discover !== false,
+                          smart_money_prioritize_entries: draftSettings.smart_money_prioritize_entries !== false,
+                          smart_money_follow_older_coins: draftSettings.smart_money_follow_older_coins !== false,
+                          smart_money_max_coin_age_hours: Number(draftSettings.smart_money_max_coin_age_hours ?? 72),
+                          smart_money_scan_mode: String(draftSettings.smart_money_scan_mode || 'both'),
+                          smart_money_enabled: draftSettings.smart_money_enabled !== false,
+                          smart_wallets: Array.isArray(draftSettings.smart_wallets) ? draftSettings.smart_wallets : [],
+                        },
+                        'Smart Money config saved'
+                      )
+                    }
+                    className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>{savingSmartConfig ? 'Saving...' : 'Save Config'}</span>
+                  </button>
+                )}
+                {Array.isArray(draftSettings.smart_wallets) && draftSettings.smart_wallets.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(draftSettings.smart_wallets.join('\n'))}
+                      className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-medium transition-colors"
+                    >
+                      Copy All ({draftSettings.smart_wallets.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDraftSettings({ ...draftSettings, smart_wallets: [] });
+                        markSettingsDirty(true);
+                        pushToast({ kind: 'info', title: 'Watchlist cleared (click Save Config to persist)' });
+                      }}
+                      className="px-3 py-1.5 rounded-lg border border-rose-500/20 text-rose-500 hover:bg-rose-500/10 text-xs font-bold transition-colors"
+                    >
+                      Clear All
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Second Row: Auto-Discover, Prioritize Whale Buys, Follow 1h-72h+ Held Coins */}
+            <div className="flex flex-wrap items-center gap-2.5 pt-2 border-t border-slate-200/70 dark:border-slate-800/70 text-xs">
+              <label className="flex items-center gap-1.5 cursor-pointer select-none px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
                 <input
                   type="checkbox"
                   checked={Boolean(draftSettings.smart_money_auto_discover !== false)}
@@ -1810,7 +2149,7 @@ export function PythonSniperView() {
                 <span className="font-semibold text-slate-700 dark:text-slate-300">Auto-Discover</span>
               </label>
 
-              <label className="flex items-center gap-1.5 cursor-pointer select-none px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs">
+              <label className="flex items-center gap-1.5 cursor-pointer select-none px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
                 <input
                   type="checkbox"
                   checked={Boolean(draftSettings.smart_money_prioritize_entries !== false)}
@@ -1823,47 +2162,42 @@ export function PythonSniperView() {
                 <span className="font-semibold text-slate-700 dark:text-slate-300">Prioritize Whale Buys</span>
               </label>
 
-              <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs">
-                <span className="text-slate-500 font-medium">Cap:</span>
-                <select
-                  value={Number(draftSettings.smart_money_max_wallets || 50)}
+              <label
+                className="flex items-center gap-1.5 cursor-pointer select-none px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                title="Allows following coins that whales have held for 1h–72h+ instead of only brand-new launches."
+              >
+                <input
+                  type="checkbox"
+                  checked={Boolean(draftSettings.smart_money_follow_older_coins !== false)}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, smart_money_max_wallets: Number(e.target.value) });
+                    setDraftSettings({ ...draftSettings, smart_money_follow_older_coins: e.target.checked });
                     markSettingsDirty(true);
                   }}
-                  className="bg-transparent font-mono font-bold text-slate-800 dark:text-slate-200 focus:outline-none cursor-pointer"
-                >
-                  <option value={25}>25</option>
-                  <option value={50}>50</option>
-                  <option value={100}>100</option>
-                  <option value={150}>150</option>
-                </select>
-              </div>
-            </div>
+                  className="rounded border-slate-300 text-teal-600 focus:ring-teal-500 w-3.5 h-3.5 cursor-pointer"
+                />
+                <span className="font-semibold text-slate-700 dark:text-slate-300">Follow 1h–72h+ Whale Coins</span>
+              </label>
 
-            <div className="flex items-center gap-2">
-              {Array.isArray(draftSettings.smart_wallets) && draftSettings.smart_wallets.length > 0 && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => handleCopy(draftSettings.smart_wallets.join('\n'))}
-                    className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-medium transition-colors"
-                  >
-                    Copy All ({draftSettings.smart_wallets.length})
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDraftSettings({ ...draftSettings, smart_wallets: [] });
-                      markSettingsDirty(true);
-                      pushToast({ kind: 'info', title: 'Watchlist cleared' });
-                    }}
-                    className="px-3 py-1.5 rounded-lg border border-rose-500/20 text-rose-500 hover:bg-rose-500/10 text-xs font-bold transition-colors"
-                  >
-                    Clear All
-                  </button>
-                </>
-              )}
+              <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+                <span className="text-slate-500 font-medium">Max Coin Age (h):</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={720}
+                  step={6}
+                  value={draftSettings.smart_money_max_coin_age_hours ?? 72}
+                  disabled={draftSettings.smart_money_follow_older_coins === false}
+                  onChange={(e) => {
+                    const val = Math.max(0, Math.min(720, parseInt(e.target.value || '72', 10) || 0));
+                    setDraftSettings({ ...draftSettings, smart_money_max_coin_age_hours: val });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-14 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded font-mono font-bold text-slate-800 dark:text-slate-100 focus:outline-none disabled:opacity-50"
+                />
+                <span className="text-[10px] text-slate-400 font-mono">
+                  {Number(draftSettings.smart_money_max_coin_age_hours ?? 72) === 0 ? '(Any age)' : 'h'}
+                </span>
+              </div>
             </div>
           </div>
 
@@ -1905,13 +2239,76 @@ export function PythonSniperView() {
                         <span className="text-emerald-500 font-bold">{w.winRate} Win</span>
                       </div>
                       <div className="flex items-center justify-between font-mono text-[11px] text-slate-500">
-                        <span>Recent: ${w.recentToken}</span>
-                        <span>+{w.totalProfitSol} SOL PnL</span>
-                      </div>
-                      <div className="flex items-center justify-between pt-1 border-t border-slate-100 dark:border-slate-800">
-                        <span className="font-mono text-[10px] text-slate-400">
-                          {w.address.slice(0, 4)}...{w.address.slice(-4)}
+                        <span>
+                          Recent: <strong className="text-slate-800 dark:text-slate-200">${w.recentToken}</strong>
+                          {w.recentAction && (
+                            <span className={`ml-1.5 text-[10px] px-1.5 py-0.5 rounded ${w.recentAction === 'HOLDING' ? 'bg-emerald-500/15 text-emerald-500' : 'bg-amber-500/15 text-amber-500'}`}>
+                              {w.recentAction === 'HOLDING' ? 'Holding' : 'Closed Profit'}
+                            </span>
+                          )}
                         </span>
+                        <span>+{w.totalProfitSol} SOL</span>
+                      </div>
+                      {w.recentMint && (
+                        <div className="space-y-1 bg-slate-50 dark:bg-slate-900/70 px-2 py-1.5 rounded border border-slate-200/70 dark:border-slate-800">
+                          <div className="flex items-start justify-between gap-1.5 font-mono text-[10px]">
+                            <a
+                              href={`https://solscan.io/token/${w.recentMint}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-teal-600 dark:text-teal-400 hover:underline break-all select-all"
+                              title={`Open coin page on Solscan: ${w.recentMint}`}
+                            >
+                              {w.recentMint}
+                            </a>
+                            <button
+                              type="button"
+                              onClick={() => handleCopy(w.recentMint!)}
+                              className="text-slate-400 hover:text-slate-200 shrink-0 mt-0.5"
+                              title="Copy coin address"
+                            >
+                              <Copy className="w-3 h-3" />
+                            </button>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-sans">
+                            <a
+                              href={`https://dexscreener.com/solana/${w.recentMint}?maker=${w.address}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-600 dark:text-teal-300 hover:bg-teal-500/25 font-semibold"
+                              title="Open DexScreener coin chart filtered to this whale wallet's trades"
+                            >
+                              <span>Coin + Wallet</span>
+                              <ExternalLink className="w-2.5 h-2.5" />
+                            </a>
+                            <a
+                              href={`https://solscan.io/token/${w.recentMint}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-slate-200/70 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:text-teal-400 font-semibold"
+                            >
+                              <span>Coin ↗</span>
+                            </a>
+                            <a
+                              href={`https://solscan.io/account/${w.address}#defiactivities`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-600 dark:text-sky-400 hover:bg-sky-500/20 font-semibold"
+                            >
+                              <span>Wallet ↗</span>
+                            </a>
+                          </div>
+                        </div>
+                      )}
+                      <div className="flex items-center justify-between pt-1 border-t border-slate-100 dark:border-slate-800">
+                        <a
+                          href={`https://solscan.io/account/${w.address}#defiactivities`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="font-mono text-[10px] text-slate-400 hover:text-teal-400"
+                        >
+                          {w.address.slice(0, 4)}...{w.address.slice(-4)} ↗
+                        </a>
                         <button
                           type="button"
                           disabled={isTracked}
@@ -1962,7 +2359,7 @@ export function PythonSniperView() {
                 setDraftSettings({ ...draftSettings, smart_wallets: updated });
                 markSettingsDirty(true);
                 setNewSmartWalletInput('');
-                pushToast({ kind: 'success', title: 'Smart wallet added to watchlist' });
+                pushToast({ kind: 'success', title: 'Smart wallet added (click Save Config to persist)' });
               }}
               className="px-4 py-2 rounded-lg bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold transition-colors"
             >
@@ -1974,15 +2371,16 @@ export function PythonSniperView() {
           <div className="space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h4 className="text-xs font-bold text-slate-700 dark:text-slate-300">
-                Tracked Smart Wallets ({Array.isArray(draftSettings.smart_wallets) ? draftSettings.smart_wallets.length : 0} / {draftSettings.smart_money_max_wallets || 50})
+                Tracked Smart Wallets ({Array.isArray(draftSettings.smart_wallets) ? draftSettings.smart_wallets.length : 0} /{' '}
+                {Number(draftSettings.smart_money_max_wallets ?? 50) <= 0 ? 'Unlimited' : Number(draftSettings.smart_money_max_wallets ?? 50)})
               </h4>
               {Array.isArray(draftSettings.smart_wallets) && draftSettings.smart_wallets.length > 0 && (
                 <input
                   type="text"
-                  placeholder="Filter wallets, label, or token..."
+                  placeholder="Filter wallet, coin, or mint..."
                   value={smartWalletSearch}
                   onChange={(e) => setSmartWalletSearch(e.target.value)}
-                  className="px-3 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs text-slate-900 dark:text-slate-100 font-mono w-56"
+                  className="px-3 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs text-slate-900 dark:text-slate-100 font-mono w-60"
                 />
               )}
             </div>
@@ -2007,15 +2405,16 @@ export function PythonSniperView() {
                 </div>
               </div>
             ) : (
-              <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-xl max-h-[420px] overflow-y-auto">
+              <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-xl max-h-[460px] overflow-y-auto">
                 <table className="w-full text-left border-collapse text-xs font-mono">
                   <thead className="sticky top-0 z-10">
                     <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 text-slate-500 text-[11px]">
                       <th className="py-2.5 px-3 font-semibold">#</th>
                       <th className="py-2.5 px-3 font-semibold">Wallet Profile &amp; Source</th>
-                      <th className="py-2.5 px-3 font-semibold">Address</th>
+                      <th className="py-2.5 px-3 font-semibold">Recent / Held Coin &amp; Address</th>
+                      <th className="py-2.5 px-3 font-semibold">Wallet Address</th>
                       <th className="py-2.5 px-3 font-semibold">Est. Win Rate / PnL</th>
-                      <th className="py-2.5 px-3 font-semibold">WebSocket Status</th>
+                      <th className="py-2.5 px-3 font-semibold">Status</th>
                       <th className="py-2.5 px-3 font-semibold text-right">Actions</th>
                     </tr>
                   </thead>
@@ -2029,14 +2428,20 @@ export function PythonSniperView() {
                           addr.toLowerCase().includes(q) ||
                           String(profile?.label || '').toLowerCase().includes(q) ||
                           String(profile?.recentToken || '').toLowerCase().includes(q) ||
-                          String(profile?.source || '').toLowerCase().includes(q)
+                          String(profile?.recentMint || '').toLowerCase().includes(q) ||
+                          String(profile?.source || '').toLowerCase().includes(q) ||
+                          (Array.isArray(profile?.heldMints) &&
+                            profile.heldMints.some(
+                              (h) =>
+                                h.symbol.toLowerCase().includes(q) ||
+                                h.mint.toLowerCase().includes(q)
+                            ))
                         );
                       })
                       .map(({ addr, idx, profile }) => {
                         const label = profile?.label || `Discovered Trader #${idx + 1}`;
                         const subLine = [
                           profile?.category || 'Custom / Observed Wallet',
-                          profile?.recentToken ? `$${profile.recentToken}` : '',
                           profile?.source || '',
                         ]
                           .filter(Boolean)
@@ -2046,6 +2451,9 @@ export function PythonSniperView() {
                           typeof profile?.totalProfitSol === 'number' && profile.totalProfitSol > 0
                             ? `+${profile.totalProfitSol.toFixed(2)} SOL`
                             : '';
+                        const recentSym = profile?.recentToken ? `$${profile.recentToken}` : null;
+                        const recentMint = profile?.recentMint || null;
+                        const heldList = Array.isArray(profile?.heldMints) ? profile.heldMints : [];
                         return (
                           <tr key={addr} className="hover:bg-slate-50 dark:hover:bg-slate-900/40 transition-colors">
                             <td className="py-2.5 px-3 text-slate-400 font-semibold">{idx + 1}</td>
@@ -2053,8 +2461,106 @@ export function PythonSniperView() {
                               <span className="font-bold text-slate-900 dark:text-slate-100 block">{label}</span>
                               <span className="text-[10px] text-slate-500 font-sans block">{subLine}</span>
                             </td>
+                            <td className="py-2.5 px-3 max-w-[300px]">
+                              {recentSym || recentMint ? (
+                                <div className="space-y-1.5">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    <span className="font-bold text-slate-900 dark:text-slate-100">
+                                      {recentSym || 'Token'}
+                                    </span>
+                                    {profile?.recentAction && (
+                                      <span
+                                        className={`text-[9px] px-1.5 py-0.5 rounded font-sans font-bold uppercase ${
+                                          profile.recentAction === 'HOLDING'
+                                            ? 'bg-emerald-500/15 text-emerald-500'
+                                            : 'bg-amber-500/15 text-amber-500'
+                                        }`}
+                                        title={
+                                          profile.recentAction === 'HOLDING'
+                                            ? 'Whale currently holds this coin on-chain (visible in Solscan Portfolio)'
+                                            : 'Whale already exited in profit (visible in Solscan Defi Activities tab, not Portfolio)'
+                                        }
+                                      >
+                                        {profile.recentAction === 'HOLDING' ? 'Holding' : 'Exited Profit'}
+                                      </span>
+                                    )}
+                                  </div>
+                                  {recentMint && (
+                                    <div className="space-y-1">
+                                      <div className="flex items-start gap-1.5 text-[10px]">
+                                        <a
+                                          href={`https://dexscreener.com/solana/${recentMint}?maker=${addr}`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="text-teal-600 dark:text-teal-400 hover:underline break-all select-all font-mono"
+                                          title={`Open coin chart + this whale's trades: ${recentMint}`}
+                                        >
+                                          {recentMint}
+                                        </a>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleCopy(recentMint)}
+                                          className="text-slate-400 hover:text-slate-200 shrink-0 mt-0.5"
+                                          title="Copy direct coin mint address"
+                                        >
+                                          <Copy className="w-3 h-3" />
+                                        </button>
+                                      </div>
+                                      <div className="flex flex-wrap items-center gap-1 text-[10px] font-sans">
+                                        <a
+                                          href={`https://dexscreener.com/solana/${recentMint}?maker=${addr}`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          title="Open coin page filtered directly to this whale wallet's trades"
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-600 dark:text-teal-300 hover:bg-teal-500/25 font-semibold"
+                                        >
+                                          <span>Coin + Wallet</span>
+                                          <ExternalLink className="w-2.5 h-2.5" />
+                                        </a>
+                                        <a
+                                          href={`https://solscan.io/token/${recentMint}`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          title="Open Coin page on Solscan"
+                                          className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:text-teal-400 font-semibold"
+                                        >
+                                          <span>Coin ↗</span>
+                                        </a>
+                                        <a
+                                          href={`https://solscan.io/account/${addr}#defiactivities`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          title="Open Wallet swaps & Defi Activities on Solscan"
+                                          className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-600 dark:text-sky-400 hover:bg-sky-500/20 font-semibold"
+                                        >
+                                          <span>Wallet ↗</span>
+                                        </a>
+                                      </div>
+                                    </div>
+                                  )}
+                                  {heldList.length > 1 && (
+                                    <div className="flex flex-wrap gap-1 pt-0.5">
+                                      {heldList.slice(1, 3).map((h) => (
+                                        <a
+                                          key={h.mint}
+                                          href={`https://dexscreener.com/solana/${h.mint}?maker=${addr}`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="text-[9px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:text-teal-400"
+                                          title={`${h.mint} (${h.ageHours}h old) — view coin & wallet trades`}
+                                        >
+                                          +${h.symbol} ({h.ageHours}h)
+                                        </a>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              ) : (
+                                <span className="text-[10px] text-slate-400 italic">Waiting for next trade...</span>
+                              )}
+                            </td>
                             <td className="py-2.5 px-3 font-bold text-slate-700 dark:text-slate-300 select-all">
-                              {addr}
+                              <span title={addr}>{addr.slice(0, 8)}...{addr.slice(-6)}</span>
                             </td>
                             <td className="py-2.5 px-3 tabular-nums">
                               <span className="font-bold text-emerald-500 block">{winRate}</span>
@@ -2063,24 +2569,35 @@ export function PythonSniperView() {
                             <td className="py-2.5 px-3">
                               <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
                                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                                <span>Listening (&lt;200ms)</span>
+                                <span>Live (&lt;200ms)</span>
                               </span>
                             </td>
-                            <td className="py-2.5 px-3 text-right space-x-2 whitespace-nowrap">
+                            <td className="py-2.5 px-3 text-right space-x-1.5 whitespace-nowrap">
                               <button
                                 type="button"
                                 onClick={() => handleCopy(addr)}
-                                className="px-2.5 py-1 rounded bg-slate-500/10 text-slate-600 dark:text-slate-300 hover:bg-slate-500/20 text-[11px] font-semibold transition-colors"
+                                className="px-2 py-1 rounded bg-slate-500/10 text-slate-600 dark:text-slate-300 hover:bg-slate-500/20 text-[11px] font-semibold transition-colors"
                               >
                                 Copy
                               </button>
                               <a
+                                href={`https://solscan.io/account/${addr}#defiactivities`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title="View wallet swaps & Defi Activities on Solscan (shows closed profit coins)"
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded bg-sky-500/10 text-sky-600 dark:text-sky-400 hover:bg-sky-500/20 text-[11px] font-semibold transition-colors"
+                              >
+                                <span>Activities</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                              <a
                                 href={`https://solscan.io/account/${addr}`}
                                 target="_blank"
                                 rel="noopener noreferrer"
-                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-teal-500/10 text-teal-600 dark:text-teal-400 hover:bg-teal-500/20 text-[11px] font-semibold transition-colors"
+                                title="View current Solscan Portfolio balances"
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded bg-teal-500/10 text-teal-600 dark:text-teal-400 hover:bg-teal-500/20 text-[11px] font-semibold transition-colors"
                               >
-                                <span>Solscan</span>
+                                <span>Portfolio</span>
                                 <ExternalLink className="w-3 h-3" />
                               </a>
                               <button
@@ -2090,9 +2607,9 @@ export function PythonSniperView() {
                                   const updated = current.filter((w: string) => w !== addr);
                                   setDraftSettings({ ...draftSettings, smart_wallets: updated });
                                   markSettingsDirty(true);
-                                  pushToast({ kind: 'info', title: 'Wallet removed from watchlist' });
+                                  pushToast({ kind: 'info', title: 'Wallet removed (click Save Config to persist)' });
                                 }}
-                                className="px-2.5 py-1 rounded bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 text-[11px] font-bold transition-colors"
+                                className="px-2 py-1 rounded bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 text-[11px] font-bold transition-colors"
                               >
                                 Remove
                               </button>
@@ -3430,6 +3947,27 @@ export function PythonSniperView() {
                 </div>
                 <p className="text-xs text-slate-500">Prioritizes coins bought by tracked profitable KOL wallets and auto-exits instantly if they sell.</p>
                 <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+                  <div>
+                    <label className="block text-[10px] text-slate-500 mb-1">Bot Scan Strategy Mode</label>
+                    <select
+                      value={String(draftSettings.smart_money_scan_mode || 'both')}
+                      onChange={(e) => {
+                        const modeVal = e.target.value;
+                        setDraftSettings({
+                          ...draftSettings,
+                          smart_money_scan_mode: modeVal,
+                          smart_money_enabled: modeVal !== 'sniper_only',
+                        });
+                        markSettingsDirty(true);
+                      }}
+                      className="w-full px-2 py-1.5 rounded-lg font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                    >
+                      <option value="both">Both (Sniper + Whale Wallets)</option>
+                      <option value="smart_money_only">Whale Wallets Only (No Random Launches)</option>
+                      <option value="sniper_only">Sniper Bot Only (Ignore Whale Wallets)</option>
+                    </select>
+                  </div>
+
                   <div className="grid grid-cols-2 gap-2">
                     <div>
                       <label className="block text-[10px] text-slate-500 mb-1">Min Confluence</label>
@@ -3458,6 +3996,64 @@ export function PythonSniperView() {
                       />
                     </div>
                   </div>
+
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label className="block text-[10px] text-slate-500 mb-1">Max Wallets (0=∞)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={5000}
+                        value={draftSettings.smart_money_max_wallets ?? 50}
+                        onChange={(e) => {
+                          setDraftSettings({
+                            ...draftSettings,
+                            smart_money_max_wallets: Math.max(0, Math.min(5000, Number(e.target.value) || 0)),
+                          });
+                          markSettingsDirty(true);
+                        }}
+                        disabled={!isPyOptEnabled('smart_money_enabled')}
+                        className="w-full px-2 py-1.5 rounded-lg font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-slate-500 mb-1">Refresh (sec)</label>
+                      <input
+                        type="number"
+                        min={10}
+                        max={86400}
+                        value={draftSettings.smart_money_refresh_interval_sec ?? 30}
+                        onChange={(e) => {
+                          setDraftSettings({
+                            ...draftSettings,
+                            smart_money_refresh_interval_sec: Math.max(10, Math.min(86400, Number(e.target.value) || 30)),
+                          });
+                          markSettingsDirty(true);
+                        }}
+                        disabled={!isPyOptEnabled('smart_money_enabled')}
+                        className="w-full px-2 py-1.5 rounded-lg font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-slate-500 mb-1">Max Coin Age (h)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={720}
+                        value={draftSettings.smart_money_max_coin_age_hours ?? 72}
+                        onChange={(e) => {
+                          setDraftSettings({
+                            ...draftSettings,
+                            smart_money_max_coin_age_hours: Math.max(0, Math.min(720, Number(e.target.value) || 0)),
+                          });
+                          markSettingsDirty(true);
+                        }}
+                        disabled={!isPyOptEnabled('smart_money_enabled') || draftSettings.smart_money_follow_older_coins === false}
+                        className="w-full px-2 py-1.5 rounded-lg font-mono text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                      />
+                    </div>
+                  </div>
+
                   <div className="space-y-1.5 pt-1">
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
@@ -3470,7 +4066,28 @@ export function PythonSniperView() {
                         disabled={!isPyOptEnabled('smart_money_enabled')}
                         className="rounded text-teal-600 disabled:opacity-50"
                       />
-                      <span className="text-[11px] text-slate-700 dark:text-slate-300">Auto-discover profitable active whales (up to {draftSettings.smart_money_max_wallets || 50})</span>
+                      <span className="text-[11px] text-slate-700 dark:text-slate-300">
+                        Auto-discover profitable active whales (
+                        {Number(draftSettings.smart_money_max_wallets ?? 50) <= 0
+                          ? 'Unlimited'
+                          : `up to ${Number(draftSettings.smart_money_max_wallets ?? 50)}`}
+                        )
+                      </span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={draftSettings.smart_money_follow_older_coins !== false}
+                        onChange={(e) => {
+                          setDraftSettings({ ...draftSettings, smart_money_follow_older_coins: e.target.checked });
+                          markSettingsDirty(true);
+                        }}
+                        disabled={!isPyOptEnabled('smart_money_enabled')}
+                        className="rounded text-teal-600 disabled:opacity-50"
+                      />
+                      <span className="text-[11px] text-slate-700 dark:text-slate-300">
+                        Follow 1h–72h+ coins actively held or bought by whales
+                      </span>
                     </label>
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
@@ -4379,22 +4996,55 @@ export function PythonSniperView() {
 
             <div className="space-y-3 text-xs text-slate-600 dark:text-slate-300">
               <p>
-                You are about to start the Python new-launch sniper bot in <span className="font-bold uppercase text-teal-500">{mode}</span> mode.
+                Choose how the Python bot selects coins to trade in <span className="font-bold uppercase text-teal-500">{mode}</span> mode:
               </p>
-              <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-2">
-                <label className="flex items-center gap-2.5 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={startSmartMoneyFollow}
-                    onChange={(e) => setStartSmartMoneyFollow(e.target.checked)}
-                    className="rounded border-slate-300 text-teal-600 focus:ring-teal-500 w-4 h-4"
-                  />
-                  <span className="font-bold text-slate-900 dark:text-slate-100">Follow Smart Money / Whale Wallets</span>
-                </label>
-                <p className="text-[11px] text-slate-500 pl-6">
-                  Note: Whale and KOL wallet trades can take hours or days to materialize into buys. Enable this option to mirror tracked high-winrate wallets during session.
-                </p>
+
+              <div className="space-y-2">
+                {[
+                  {
+                    id: 'both' as const,
+                    title: 'Both: Sniper Launches + Whale Wallets',
+                    desc: 'Snipes safe new launches AND copies tracked whale wallets (including 1h–72h+ held coins).',
+                  },
+                  {
+                    id: 'smart_money_only' as const,
+                    title: 'Whale Wallets Only (Smart Money Copy)',
+                    desc: 'Only buys coins actively bought or held on-chain by your tracked profitable whale wallets.',
+                  },
+                  {
+                    id: 'sniper_only' as const,
+                    title: 'Sniper Bot Only (New Launches Only)',
+                    desc: 'Scans new token launches via your Sniper filters and ignores Smart Money wallet triggers.',
+                  },
+                ].map((opt) => (
+                  <label
+                    key={opt.id}
+                    className={`flex items-start gap-2.5 p-3 rounded-xl border cursor-pointer transition-colors ${
+                      startScanMode === opt.id
+                        ? 'border-teal-500 bg-teal-500/[0.06]'
+                        : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 hover:border-slate-300 dark:hover:border-slate-700'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="startScanMode"
+                      checked={startScanMode === opt.id}
+                      onChange={() => {
+                        setStartScanMode(opt.id);
+                        setStartSmartMoneyFollow(opt.id !== 'sniper_only');
+                      }}
+                      className="mt-0.5 text-teal-600 focus:ring-teal-500"
+                    />
+                    <div className="space-y-0.5">
+                      <span className="font-bold text-slate-900 dark:text-slate-100 block">{opt.title}</span>
+                      <span className="text-[11px] text-slate-500 block">{opt.desc}</span>
+                    </div>
+                  </label>
+                ))}
               </div>
+              <p className="text-[11px] text-slate-500">
+                Note: Whale wallet trades can take hours or days to materialize; on-chain portfolio scanning also tracks coins they have already been holding for 1h–72h+.
+              </p>
             </div>
 
             <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
@@ -4407,14 +5057,20 @@ export function PythonSniperView() {
               </button>
               <button
                 type="button"
+                disabled={savingSmartConfig}
                 onClick={async () => {
                   setShowStartModal(false);
-                  if (startSmartMoneyFollow !== Boolean(draftSettings.smart_money_enabled !== false)) {
-                    setDraftSettings({ ...draftSettings, smart_money_enabled: startSmartMoneyFollow });
+                  const wantSmart = startScanMode !== 'sniper_only' && startSmartMoneyFollow;
+                  const curMode = String(draftSettings.smart_money_scan_mode || 'both');
+                  if (startScanMode !== curMode || wantSmart !== Boolean(draftSettings.smart_money_enabled !== false)) {
+                    await saveQuickSniperSettings({
+                      smart_money_scan_mode: startScanMode,
+                      smart_money_enabled: wantSmart,
+                    });
                   }
                   await handleToggle();
                 }}
-                className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-lg shadow-emerald-600/20"
+                className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-lg shadow-emerald-600/20 disabled:opacity-50"
               >
                 Start Bot Now
               </button>

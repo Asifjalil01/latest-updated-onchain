@@ -3037,10 +3037,266 @@ test('v1.43.0: Rugpull crash_streak unfreezes dead positions, Pump.fun real_sol 
   }
 });
 
+test('v1.43.1: Open positions record triggering Smart Money wallets in bot.py and enrich wallet details in SniperManager', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1431-'));
+  try {
+    const whaleAddr = 'WhaleAlpha8888888888888888888888888888888888';
+    const metaPath = path.join(tmpDir, 'smart_wallets_meta.json');
+    fs.writeFileSync(
+      metaPath,
+      JSON.stringify({
+        [whaleAddr]: {
+          address: whaleAddr,
+          label: 'Top Alpha Whale',
+          winRate: 84.5,
+          source: 'pumpportal_ws',
+        },
+      }),
+      'utf-8'
+    );
 
+    // Run Python bot.py to open one whale-backed position (including duplicate wallet) and one standard Auto Sniper position
+    const pyScript = [
+      'import sys, types, json',
+      'req = types.ModuleType("requests")',
+      'req.Session = lambda: None',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      `TMP_DIR = ${JSON.stringify(tmpDir)}`,
+      `WHALE = ${JSON.stringify(whaleAddr)}`,
+      'bot._base_dir = lambda: TMP_DIR',
+      'cfg = {**bot.CONFIG, "smart_wallets": [WHALE], "smart_money_enabled": True}',
+      'acct = bot.TradingAccount(cfg, mode="paper")',
+      'acct.buy("MintWhaleOpen111", "WOPEN", 0.0005, meta={"dex": "pumpfun", "source": "pumpportal", "smart_wallets_hit": [WHALE, WHALE], "smart_money_entry": True})',
+      'acct.buy("MintPlainOpen222", "PLAIN", 0.0004, meta={"dex": "raydium", "source": "dexscreener"})',
+      'acct.save()',
+      'print(json.dumps({"whale_pos": acct.state["positions"]["MintWhaleOpen111"], "plain_pos": acct.state["positions"]["MintPlainOpen222"]}))',
+    ].join('\n');
 
+    const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyOut.whale_pos.smart_money_entry, true);
+    assert.deepEqual(pyOut.whale_pos.smart_wallets_hit, [whaleAddr]);
+    assert.equal(pyOut.plain_pos.smart_money_entry, false);
+    assert.deepEqual(pyOut.plain_pos.smart_wallets_hit, []);
 
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    const status = mgr.getStatus();
+    const whaleOpen = status.state?.positions?.MintWhaleOpen111;
+    const plainOpen = status.state?.positions?.MintPlainOpen222;
+    assert.ok(whaleOpen);
+    assert.equal(whaleOpen.smart_money_entry, true);
+    assert.deepEqual(whaleOpen.smart_wallets_hit, [whaleAddr]);
+    assert.deepEqual(whaleOpen.smart_wallet_details, [
+      {
+        address: whaleAddr,
+        label: 'Top Alpha Whale',
+        winRate: 84.5,
+        source: 'pumpportal_ws',
+      },
+    ]);
+    assert.ok(plainOpen);
+    assert.equal(plainOpen.smart_money_entry, false);
+    assert.deepEqual(plainOpen.smart_wallets_hit, []);
+    assert.deepEqual(plainOpen.smart_wallet_details, []);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
 
+test('v1.44.0: Custom unlimited wallet limit, refresh interval clamping, whale_held_mints feed, and scan mode + older whale coin filters', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1440-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
 
+    // 1) Unlimited (0), custom > 200 (500), and refresh interval clamping
+    const saveUnlimited = mgr.updateSettings({
+      smart_money_max_wallets: 0,
+      smart_money_refresh_interval_sec: 45,
+      smart_money_scan_mode: 'smart_money_only',
+      smart_money_follow_older_coins: true,
+      smart_money_max_coin_age_hours: 72,
+    });
+    assert.equal(saveUnlimited.ok, true);
+    assert.equal(saveUnlimited.settings?.smart_money_max_wallets, 0);
+    assert.equal(saveUnlimited.settings?.smart_money_refresh_interval_sec, 45);
+    assert.equal(saveUnlimited.settings?.smart_money_scan_mode, 'smart_money_only');
+
+    const saveLargeCap = mgr.updateSettings({
+      smart_money_max_wallets: 500,
+      smart_money_refresh_interval_sec: 3, // clamped up to min 10s
+      smart_money_scan_mode: 'both',
+    });
+    assert.equal(saveLargeCap.ok, true);
+    assert.equal(saveLargeCap.settings?.smart_money_max_wallets, 500);
+    assert.equal(saveLargeCap.settings?.smart_money_refresh_interval_sec, 10);
+    assert.equal(saveLargeCap.settings?.smart_money_scan_mode, 'both');
+
+    // 2) Inject a whale holding entry into recentWhaleHoldings and verify getPumpPortalFeed exposes whale_held_mints
+    const whaleAddr = 'WhaleHolder99999999999999999999999999999999';
+    const heldMint = 'MintHeld6HoursOld111111111111111111111111111';
+    (mgr as any).recentWhaleHoldings.push({
+      mint: heldMint,
+      wallet: whaleAddr,
+      symbol: 'JIMMY',
+      uiAmount: 150000,
+      ageHours: 6.5,
+      discoveredAtMs: Date.now(),
+    });
+    const feed = mgr.getPumpPortalFeed();
+    assert.ok(Array.isArray(feed.whale_held_mints));
+    assert.equal(feed.whale_held_mints.length, 1);
+    assert.equal(feed.whale_held_mints[0].mint, heldMint);
+    assert.equal(feed.whale_held_mints[0].wallet, whaleAddr);
+
+    // 3) Verify Python bot.py: smart_money_only rejects non-whale coins, accepts 6h whale coins, while sniper_only rejects 6h coins
+    const pyScript = [
+      'import sys, types, json, time',
+      'req = types.ModuleType("requests")',
+      'req.Session = lambda: None',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      'now_ms = int(time.time() * 1000)',
+      'whale = "WhaleHolder99999999999999999999999999999999"',
+      'base_cfg = {**bot.CONFIG, "smart_wallets": [whale], "smart_money_enabled": True, "smart_money_follow_older_coins": True, "smart_money_max_coin_age_hours": 72, "max_age_minutes": 2.0, "min_liquidity_usd": 4000.0, "min_volume_m5_usd": 500.0, "min_buys_m5": 2, "min_buy_sell_ratio_m5": 1.1}',
+      'pair_fresh_plain = {"baseToken": {"address": "MFreshPlain", "symbol": "FPLN"}, "priceUsd": "0.001", "pairCreatedAt": now_ms - 30000, "liquidity": {"usd": 9000}, "volume": {"m5": 2500}, "txns": {"m5": {"buys": 8, "sells": 2}}, "priceChange": {"m5": 15}}',
+      'pair_old_whale = {"baseToken": {"address": "MOldWhale6h", "symbol": "JIMMY"}, "priceUsd": "0.002", "pairCreatedAt": now_ms - (6 * 3600 * 1000), "liquidity": {"usd": 25000}, "volume": {"m5": 4000}, "txns": {"m5": {"buys": 10, "sells": 3}}, "priceChange": {"m5": 10}, "_pumpportal": {"recent_buyers": [whale]}}',
+      'cfg_sm_only = {**base_cfg, "smart_money_scan_mode": "smart_money_only"}',
+      'cfg_sniper_only = {**base_cfg, "smart_money_scan_mode": "sniper_only"}',
+      'ok_sm_plain, reason_sm_plain, _ = bot.passes_filters(pair_fresh_plain, cfg_sm_only)',
+      'ok_sm_old, reason_sm_old, _ = bot.passes_filters(pair_old_whale, cfg_sm_only)',
+      'ok_sn_old, reason_sn_old, _ = bot.passes_filters(pair_old_whale, cfg_sniper_only)',
+      'ok_sn_fresh, reason_sn_fresh, _ = bot.passes_filters(pair_fresh_plain, cfg_sniper_only)',
+      'print(json.dumps({"ok_sm_plain": ok_sm_plain, "reason_sm_plain": reason_sm_plain, "ok_sm_old": ok_sm_old, "reason_sm_old": reason_sm_old, "ok_sn_old": ok_sn_old, "reason_sn_old": reason_sn_old, "ok_sn_fresh": ok_sn_fresh}))',
+    ].join('\n');
+
+    const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyOut.ok_sm_plain, false);
+    assert.equal(pyOut.reason_sm_plain, 'not whale buy');
+    assert.equal(pyOut.ok_sm_old, true);
+    assert.equal(pyOut.ok_sn_old, false);
+    assert.equal(pyOut.ok_sn_fresh, true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('v1.44.1: Active whale traders outrank capped clean holders, WS smart trades persist mint meta, and bot.py throttles passive whale_held_mints', async () => {
+  const { PumpPortalWsProvider } = await import('../providers/pumpportal');
+  const pp = new PumpPortalWsProvider();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1441-'));
+  try {
+    const activeWhale = 'ActiveLiveTrader1111111111111111111111111111';
+    const devCreator = 'DevLauncher111111111111111111111111111111111';
+    const tokenMint = 'MintActiveTrade1111111111111111111111111pump';
+    const baseTs = Date.now() - 60_000;
+
+    pp.ingestFrame({ mint: tokenMint, symbol: 'ACTV', txType: 'create', traderPublicKey: devCreator, solAmount: 0.5, vSolInBondingCurve: 30.5, vTokensInBondingCurve: 950_000_000, marketCapSol: 32 }, baseTs);
+    pp.ingestFrame({ mint: tokenMint, txType: 'buy', traderPublicKey: activeWhale, solAmount: 0.4, vSolInBondingCurve: 31.2, vTokensInBondingCurve: 910_000_000, marketCapSol: 34 }, baseTs + 3000);
+    pp.ingestFrame({ mint: tokenMint, txType: 'sell', traderPublicKey: activeWhale, solAmount: 0.65, vSolInBondingCurve: 34.0, vTokensInBondingCurve: 850_000_000, marketCapSol: 40 }, baseTs + 15_000);
+
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    mgr.attachOrchestrator({
+      pumpPortal: pp,
+      signer: { isUnlocked: () => false, getPublicKey: () => null, getMaskedPublicKey: () => 'Locked' },
+      rpcPool: { getHealthSnapshot: () => [] },
+    } as any);
+
+    // Mock GeckoTerminal + RugCheck fetch responses: 1 pool with 6 top holders -> capped to 3 Clean Holders <= 4.5 SOL and ranked BELOW activeWhale
+    const poolAddr = 'PoolMockAddr11111111111111111111111111111111';
+    const mintPool = 'MintPoolClaudia11111111111111111111111111111';
+    (mgr as any).fetchJsonWithTimeout = async (url: string) => {
+      if (url.includes('trending_pools')) {
+        return {
+          data: [
+            {
+              attributes: {
+                address: poolAddr,
+                name: 'CLAUDIA / SOL',
+                reserve_in_usd: '120000',
+                volume_usd: { h1: '45000' },
+                price_change_percentage: { h1: '25', h24: '80' },
+                base_token_price_usd: '0.01',
+              },
+              relationships: { base_token: { data: { id: `solana_${mintPool}` } } },
+            },
+          ],
+        };
+      }
+      if (url.includes('new_pools')) return { data: [] };
+      if (url.includes('/trades')) return { data: [] };
+      if (url.includes('rugcheck.xyz')) {
+        return {
+          score_normalised: 5,
+          rugged: false,
+          topHolders: [
+            { owner: 'HolderA1111111111111111111111111111111111111', pct: 2.5, insider: false },
+            { owner: 'HolderB1111111111111111111111111111111111111', pct: 2.0, insider: false },
+            { owner: 'HolderC1111111111111111111111111111111111111', pct: 1.5, insider: false },
+            { owner: 'HolderD1111111111111111111111111111111111111', pct: 1.2, insider: false },
+            { owner: 'HolderE1111111111111111111111111111111111111', pct: 1.0, insider: false },
+          ],
+        };
+      }
+      return null;
+    };
+
+    const disc = await mgr.discoverSmartWallets({ autoAdd: true });
+    assert.equal(disc.ok, true);
+    const cleanHolders = disc.discovered.filter((d) => d.source === 'RugCheck Clean Holder');
+    assert.equal(cleanHolders.length, 3);
+    assert.ok(cleanHolders.every((h) => h.totalProfitSol <= 4.5));
+    assert.equal(disc.discovered[0].address, activeWhale);
+    assert.equal(disc.discovered[0].recentMint, tokenMint);
+
+    // Live WS smart trade event persists recentMint & recentAction into smart_wallets_meta.json
+    pp.setTrackedSmartWallets([activeWhale]);
+    const liveMint = 'MintLiveSmartBuy222222222222222222222222pump';
+    pp.ingestFrame(
+      { mint: liveMint, symbol: 'LIVEW', txType: 'buy', traderPublicKey: activeWhale, solAmount: 1.2, vSolInBondingCurve: 35, vTokensInBondingCurve: 840_000_000, marketCapSol: 42 },
+      Date.now()
+    );
+    const profiles = mgr.getStatus().smart_wallet_profiles as Record<string, any>;
+    assert.equal(profiles[activeWhale]?.recentMint, liveMint);
+    assert.equal(profiles[activeWhale]?.recentToken, 'LIVEW');
+    assert.equal(profiles[activeWhale]?.recentAction, 'HOLDING');
+
+    // Python bot.py: passive whale_held_mints throttled to once per 60s, live smart_buys always queued immediately
+    const pyScript = [
+      'import sys, types, json',
+      'req = types.ModuleType("requests")',
+      'req.Session = lambda: None',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      'bot._ws_smart_buys.clear()',
+      'bot._smart_buy_pending_mints.clear()',
+      'bot._whale_held_eval_ts.clear()',
+      'with bot._stats_lock: bot._stats.update({"smart_buys": 0, "whale_held": 0})',
+      'payload = {"ok": True, "smart_buys": [{"mint": "MintLiveBuy11111111111111111111111111111111", "wallet": "W1"}], "whale_held_mints": [{"mint": "MintHeldOlder111111111111111111111111111111", "wallet": "W2"}]}',
+      'bot._ingest_ws_bridge_payload(payload)',
+      'first_pending = sorted(bot._smart_buy_pending_mints.keys())',
+      'bot._smart_buy_pending_mints.clear()',
+      // Second poll 2s later: passive held mint should be throttled (0 added), live smart_buy still added
+      'bot._ingest_ws_bridge_payload(payload)',
+      'second_pending = sorted(bot._smart_buy_pending_mints.keys())',
+      'with bot._stats_lock: stats_snap = {"sb": bot._stats["smart_buys"], "wh": bot._stats["whale_held"]}',
+      'print(json.dumps({"first_pending": first_pending, "second_pending": second_pending, "stats": stats_snap}))',
+    ].join('\n');
+
+    const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyOut.first_pending.length, 2);
+    assert.deepEqual(pyOut.second_pending, ['MintLiveBuy11111111111111111111111111111111']);
+    assert.equal(pyOut.stats.sb, 2);
+    assert.equal(pyOut.stats.wh, 1);
+  } finally {
+    pp.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
 
 

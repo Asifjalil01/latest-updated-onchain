@@ -124,6 +124,7 @@ export interface DiscoveredWsWhale {
   wins: number;
   totalTrades: number;
   recentToken: string;
+  recentMint?: string;
   totalProfitSol: number;
   source: string;
   lastActiveMs: number;
@@ -152,6 +153,7 @@ interface TraderLedger {
   totalSolSpent: number;
   realizedProfitSol: number;
   recentToken: string;
+  recentMint: string;
   lastSeenMs: number;
 }
 
@@ -279,14 +281,14 @@ export class PumpPortalWsProvider {
     }
     this.trackedSmartWallets = clean;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      if (toRemove.length > 0) {
+      for (let i = 0; i < toRemove.length; i += 100) {
         try {
-          this.ws.send(JSON.stringify({ method: 'unsubscribeAccountTrade', keys: toRemove }));
+          this.ws.send(JSON.stringify({ method: 'unsubscribeAccountTrade', keys: toRemove.slice(i, i + 100) }));
         } catch {}
       }
-      if (toAdd.length > 0) {
+      for (let i = 0; i < toAdd.length; i += 100) {
         try {
-          this.ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: toAdd }));
+          this.ws.send(JSON.stringify({ method: 'subscribeAccountTrade', keys: toAdd.slice(i, i + 100) }));
         } catch {}
       }
     }
@@ -309,7 +311,7 @@ export class PumpPortalWsProvider {
       for (const p of ledger.positions.values()) {
         if (p.rugged) continue;
         activeTrades += 1;
-        if (p.entryPriceSol > 0 && p.lastPriceSol >= p.entryPriceSol * 1.25 && p.solSpent >= 0.2) {
+        if (p.entryPriceSol > 0 && p.lastPriceSol >= p.entryPriceSol * 1.15 && p.solSpent >= 0.12) {
           unrealizedWins += 1;
           unrealizedSol += p.solSpent * (p.lastPriceSol / p.entryPriceSol - 1);
         }
@@ -317,7 +319,7 @@ export class PumpPortalWsProvider {
       const totalWins = ledger.wins + unrealizedWins;
       const totalEstSol = ledger.realizedProfitSol + unrealizedSol;
       const denom = Math.max(1, totalWins + ledger.losses, activeTrades);
-      if (totalWins < 1 || totalEstSol < 0.08 || ledger.totalSolSpent < 0.25) continue;
+      if (totalWins < 1 || totalEstSol < 0.04 || ledger.totalSolSpent < 0.12) continue;
       if (nowMs - ledger.lastSeenMs > 45 * 60_000) continue;
       const winPct = Math.min(96, Math.max(55, Math.round((totalWins / denom) * 100)));
       out.push({
@@ -328,6 +330,7 @@ export class PumpPortalWsProvider {
         wins: totalWins,
         totalTrades: denom,
         recentToken: ledger.recentToken || 'PUMP',
+        recentMint: ledger.recentMint || '',
         totalProfitSol: Number(totalEstSol.toFixed(2)),
         source: 'PumpPortal Live WS',
         lastActiveMs: ledger.lastSeenMs,
@@ -519,12 +522,14 @@ export class PumpPortalWsProvider {
               totalSolSpent: 0,
               realizedProfitSol: 0,
               recentToken: state.symbol || 'PUMP',
+              recentMint: mint,
               lastSeenMs: nowMs,
             };
             this.traderLedgers.set(trader, ledger);
           }
           ledger.lastSeenMs = nowMs;
           if (state.symbol && state.symbol !== '?') ledger.recentToken = state.symbol;
+          ledger.recentMint = mint;
 
           let tpos = ledger.positions.get(mint);
           if (side === 'buy') {
@@ -655,9 +660,12 @@ export class PumpPortalWsProvider {
           );
         }
         if (this.trackedSmartWallets.size > 0) {
-          this.ws?.send(
-            JSON.stringify({ method: 'subscribeAccountTrade', keys: Array.from(this.trackedSmartWallets) })
-          );
+          const allW = Array.from(this.trackedSmartWallets);
+          for (let i = 0; i < allW.length; i += 100) {
+            this.ws?.send(
+              JSON.stringify({ method: 'subscribeAccountTrade', keys: allW.slice(i, i + 100) })
+            );
+          }
         }
       });
 

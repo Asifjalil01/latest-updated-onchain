@@ -1050,7 +1050,12 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
 
   router.post('/sniper/smart-money/discover', async (req: Request, res: Response) => {
     const autoAdd = req.body?.autoAdd !== false;
-    res.json(await sniperManager.discoverSmartWallets({ autoAdd }));
+    const disc = await sniperManager.discoverSmartWallets({ autoAdd });
+    let holdingsScan: any = null;
+    if (req.body?.scanHoldings !== false) {
+      holdingsScan = await sniperManager.scanTrackedWhaleHoldings({ batchSize: 5 }).catch(() => null);
+    }
+    res.json({ ...disc, holdingsScan });
   });
 
   router.get('/sniper/pumpportal-mints', (_req: Request, res: Response) => {
@@ -1063,6 +1068,7 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       open_prices: feed.open_prices,
       smart_sells: feed.smart_sells,
       smart_buys: feed.smart_buys,
+      whale_held_mints: feed.whale_held_mints,
     });
   });
 

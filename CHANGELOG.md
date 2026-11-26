@@ -2,6 +2,52 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.44.1 — Direct Coin + Wallet Inspector Links, Active Whale Ranking Fix & Smart-Money Telemetry
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed & Improved
+- **Direct Coin Address & Dual Coin/Wallet Inspector Links (`PythonSniperView.tsx`)**:
+  - Updated **Smart Money → Recent / Held Coin & Address** and discovered whale cards to display the full coin mint address alongside copy button, **`Coin + Wallet`** (`dexscreener.com/solana/<mint>?maker=<wallet>`, showing both the coin chart and that whale's exact buys/sells in one page), **`Coin ↗`** (`solscan.io/token/<mint>`), and **`Wallet ↗`** (`solscan.io/account/<wallet>#defiactivities`).
+- **Active Trader Discovery Priority & Passive `$CLAUDIA` Holder De-Duplication (`server/sniperManager.ts`, `server/providers/pumpportal.ts`)**:
+  - Fixed `discoverSmartWallets()` so passive `Top Clean Holder` entries are capped at 3 per pool (`0.4–4.5 SOL` score) and ranked strictly below active swap traders (`PumpPortal Live WS` and `GeckoTerminal On-Chain`), preventing one pool's holders from filling every top watchlist slot.
+  - Lowered active WS curve-trader discovery thresholds in `getDiscoveredWhaleWallets()` and persisted live WS `buy`/`sell` coin updates (`recentMint`, `recentToken`, `recentAction`) directly into `smart_wallets_meta.json`.
+  - Parallelized on-chain RPC token portfolio scans in `scanTrackedWhaleHoldings()` and logged throttled alerts whenever held whale coins are filtered out by the `Max Coin Age (h)` cap.
+- **`smart_money_only` Scan Telemetry & Whale Decision Logs (`sniper/bot.py`)**:
+  - Replaced misleading `Sources:` / `Window: coins 0m–2m old` banners with accurate `Strategy: WHALE WALLETS ONLY (smart_money_only)` and `Whale Rules: coin-age <=Xh` banners when running in Whale Wallets Only mode.
+  - Added 60-second throttling for passive `whale_held_mints` re-evaluation (keeping live `smart_buys` instant), accurate `[SmartMoney] scan summary (60s)` live/held counters, and throttled `[SmartMoney]` skip/rejection reasons in Scan Log.
+
+---
+
+## v1.44.0 — Whale Coin Mint Addresses, 1h–72h+ Portfolio Holdings Scanner, Scan Mode Selector & Unlimited Wallet Discovery
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **On-Chain Whale Portfolio Holdings Scanner & 1h–72h+ Coin Following (`server/sniperManager.ts`, `sniper/bot.py`)**:
+  - Added `scanTrackedWhaleHoldings()` using RPC `getParsedTokenAccountsByOwner` (SPL + Token-2022) + DexScreener enrichment to continuously inspect what tokens tracked whale wallets actually hold on-chain—even coins accumulated hours or days ago (`1h–72h+`).
+  - Added `smart_money_follow_older_coins` (`true` default) and `smart_money_max_coin_age_hours` (`72` default, `0 = Any age`) so whale-backed coins safely bypass the tight 2-minute new-launch age cap while keeping full RugCheck, honeypot, and liquidity safeguards active.
+- **Coin Mint Address Display & Solscan Defi Activities Link (`PythonSniperView.tsx`, `server/providers/pumpportal.ts`)**:
+  - Displayed each whale's triggering/held **coin mint address** (`recentMint` + `heldMints` with copy button and direct `solscan.io/token/<mint>` link), tagged `Holding` (currently in wallet Portfolio) vs `Exited Profit` (sold in profit and visible under Solscan **Defi Activities**), and added a dedicated **Activities** (`#defiactivities`) button alongside **Portfolio**.
+- **3-Way Bot Scan Mode Selector (`PythonSniperView.tsx`, `sniper/bot.py`, `sniper/settings.json`)**:
+  - Added `smart_money_scan_mode` (`Both: Sniper + Whales`, `Whale Wallets Only`, `Sniper Bot Only`) accessible directly inside the **Start Python Bot** confirmation modal, **Smart Money** toolbar, and **Pro Desk**.
+- **Unlimited / Custom Wallet Cap & Configurable Refresh Interval (`PythonSniperView.tsx`, `server/sniperManager.ts`, `server/providers/pumpportal.ts`)**:
+  - Removed the 50/100/150 wallet cap dropdown and expanded discovery across multi-page GeckoTerminal trending/new pools + live PumpPortal WebSocket streams. Users can now set any custom **Wallets Limit** (`0 = Unlimited`, up to `5000`) and custom **Refresh (s)** interval (`10–86400s`), with chunked `subscribeAccountTrade` WebSocket batching.
+
+---
+
+## v1.43.1 — Smart Money Entry Attribution & Whale Buys Filter in Open Positions
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Open Position Whale Attribution (`sniper/bot.py`, `server/sniperManager.ts`, `PythonSniperView.tsx`)**:
+  - Recorded triggering tracked Smart Money / Whale wallet addresses (`smart_wallets_hit`, `smart_money_entry`) directly onto opened positions inside `TradingAccount.buy()` and `scan_and_buy()`.
+  - Enriched each open position in `SniperManager.getStatus()` with saved wallet profile details (`label`, `winRate`, `source`) from `smart_wallets_meta.json`.
+  - Added an **Entry Signal** column and **Whale Buys Only** filter toggle inside **Python Sniper Bot → Open positions**, displaying whether each coin was entered by `Whale Copy` (with clickable Solscan link, copy button, and saved wallet label/win rate) or standard `Auto Sniper`.
+
+---
+
 ## v1.43.0 — Real Smart-Money Whale Discovery Engine + Anti-Freeze Rugpull Stop-Loss & Curve Drain Protection
 
 **Risk Warning: Trading can lose all of your money.**

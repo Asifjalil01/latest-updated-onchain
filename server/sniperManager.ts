@@ -255,6 +255,16 @@ export class SniperManager {
   private liveSwapActiveCount = 0;
   private lastLiveSwapAtMs = 0;
   private wsWatchedMints: string[] = [];
+  private recentWhaleHoldings: Array<{
+    mint: string;
+    wallet: string;
+    symbol: string;
+    uiAmount: number;
+    ageHours: number;
+    discoveredAtMs: number;
+  }> = [];
+  private whaleHoldingsCursor = 0;
+  private lastSmartOldHoldingsLogMs = 0;
 
   constructor(options?: { baseDir?: string; startTimers?: boolean }) {
     this.baseDir = options?.baseDir || SNIPER_DIR;
@@ -289,18 +299,48 @@ export class SniperManager {
         if (this.running) {
           const now = Date.now();
           const settings = this.readSettings();
-          const smEnabled = isPyOptionEnabled(settings, 'smart_money_enabled', true) && settings.smart_money_enabled !== false;
+          const scanMode = String(settings.smart_money_scan_mode || 'both').trim().toLowerCase();
+          const smEnabled =
+            scanMode === 'smart_money_only' ||
+            (scanMode !== 'sniper_only' &&
+              isPyOptionEnabled(settings, 'smart_money_enabled', true) &&
+              settings.smart_money_enabled !== false);
           const autoDisc =
             smEnabled &&
             isPyOptionEnabled(settings, 'smart_money_auto_discover', true) &&
             settings.smart_money_auto_discover !== false;
-          const maxWallets = Math.min(200, Math.max(10, Number(settings.smart_money_max_wallets || 50)));
+          const followOlder =
+            smEnabled &&
+            (scanMode === 'smart_money_only' ||
+              (isPyOptionEnabled(settings, 'smart_money_follow_older_coins', true) &&
+                settings.smart_money_follow_older_coins !== false));
+          const rawMaxWallets = Number(settings.smart_money_max_wallets ?? 50);
+          const maxWallets = !Number.isFinite(rawMaxWallets)
+            ? 50
+            : rawMaxWallets <= 0
+              ? 0
+              : Math.min(5000, Math.max(1, Math.round(rawMaxWallets)));
+          const refreshMs = Math.max(
+            10_000,
+            Math.min(86_400_000, Number(settings.smart_money_refresh_interval_sec ?? 30) * 1000)
+          );
           const wallets = Array.isArray(settings.smart_wallets) ? settings.smart_wallets : [];
 
-          if (autoDisc && !autoDiscoverInFlight && now - lastAutoDiscoverAt >= 35_000) {
+          if (smEnabled && !autoDiscoverInFlight && now - lastAutoDiscoverAt >= refreshMs) {
             lastAutoDiscoverAt = now;
             autoDiscoverInFlight = true;
-            void this.discoverSmartWallets({ autoAdd: wallets.length < maxWallets, silentIfEmpty: true }).finally(() => {
+            const needMore = maxWallets === 0 || wallets.length < maxWallets;
+            void (async () => {
+              if (autoDisc) {
+                await this.discoverSmartWallets({ autoAdd: needMore, silentIfEmpty: true });
+              }
+              const latestWallets = Array.isArray(this.readSettings().smart_wallets)
+                ? this.readSettings().smart_wallets
+                : wallets;
+              if (followOlder && latestWallets.length > 0) {
+                await this.scanTrackedWhaleHoldings({ batchSize: 10 });
+              }
+            })().finally(() => {
               autoDiscoverInFlight = false;
             });
           }
@@ -308,10 +348,11 @@ export class SniperManager {
           if (now - lastSmartLog >= 25_000) {
             lastSmartLog = now;
             if (smEnabled) {
+              const capTxt = maxWallets === 0 ? 'Unlimited' : String(maxWallets);
               if (wallets.length > 0) {
                 this.appendLog(
                   'INFO',
-                  `[SmartMoney] Live stream monitoring ${wallets.length}/${maxWallets} verified whale wallet(s) (<200ms account trade WS)...`
+                  `[SmartMoney] Live stream monitoring ${wallets.length}/${capTxt} verified whale wallet(s) (mode: ${scanMode}, refresh ${Math.round(refreshMs / 1000)}s)...`
                 );
               } else {
                 this.appendLog(
@@ -355,7 +396,17 @@ export class SniperManager {
         if (this.lastSmartEventLogByWallet.size > 300) {
           this.lastSmartEventLogByWallet.clear();
         }
-        const meta = this.readSmartWalletsMeta()[ev.wallet];
+        const allMeta = this.readSmartWalletsMeta();
+        const meta = allMeta[ev.wallet] || {};
+        allMeta[ev.wallet] = {
+          ...meta,
+          address: ev.wallet,
+          recentToken: ev.symbol && ev.symbol !== '?' ? ev.symbol : (meta.recentToken || ev.mint.slice(0, 6)),
+          recentMint: ev.mint,
+          recentAction: ev.side === 'buy' ? 'HOLDING' : 'CLOSED_PROFIT',
+          lastActiveMs: now,
+        };
+        this.saveSmartWalletsMeta(allMeta);
         const label = meta?.label ? `${meta.label} (${ev.wallet.slice(0, 4)}..${ev.wallet.slice(-4)})` : `${ev.wallet.slice(0, 6)}...`;
         const icon = ev.side === 'buy' ? '🟢' : '🔴';
         this.appendLog(
@@ -830,6 +881,10 @@ export class SniperManager {
       smart_money_auto_exit_on_sell: true,
       smart_money_auto_discover: true,
       smart_money_max_wallets: 50,
+      smart_money_refresh_interval_sec: 30,
+      smart_money_scan_mode: 'both',
+      smart_money_follow_older_coins: true,
+      smart_money_max_coin_age_hours: 72,
       smart_money_prioritize_entries: true,
       reused_socials_enabled: true,
       max_social_reuse_count: 2,
@@ -867,6 +922,7 @@ export class SniperManager {
         smart_money_enabled: true,
         smart_money_auto_exit_on_sell: true,
         smart_money_auto_discover: true,
+        smart_money_follow_older_coins: true,
         smart_money_prioritize_entries: true,
         reused_socials_enabled: true,
         ws_exit_stream_enabled: true,
@@ -950,6 +1006,8 @@ export class SniperManager {
         } catch {}
       }
 
+      const smartMeta = this.readSmartWalletsMeta();
+
       for (const [mintKey, pos] of Object.entries<any>(state.positions)) {
         if (!pos.current_price || pos.current_price <= 0) {
           pos.current_price = pos.entry_price;
@@ -1026,6 +1084,27 @@ export class SniperManager {
             pos.creator_launches = Math.max(1, Number.isFinite(recordedTotal) ? recordedTotal : 1);
             pos.creator_rugged = Math.max(0, Number(pos.creator_rugged ?? 0) || 0);
           }
+        }
+
+        // Enrich triggering Smart Money / Whale wallets with profile metadata
+        const rawHits: string[] = Array.isArray(pos.smart_wallets_hit)
+          ? pos.smart_wallets_hit.map((w: any) => String(w || '').trim()).filter(Boolean)
+          : [];
+        const hitWallets = Array.from(new Set(rawHits));
+        pos.smart_wallets_hit = hitWallets;
+        pos.smart_money_entry = Boolean(pos.smart_money_entry || hitWallets.length > 0);
+        if (hitWallets.length > 0) {
+          pos.smart_wallet_details = hitWallets.map((address) => {
+            const m = smartMeta[address];
+            return {
+              address,
+              label: typeof m?.label === 'string' && m.label.trim() ? m.label.trim() : undefined,
+              winRate: typeof m?.winRate === 'number' && Number.isFinite(m.winRate) ? m.winRate : undefined,
+              source: typeof m?.source === 'string' && m.source.trim() ? m.source.trim() : undefined,
+            };
+          });
+        } else {
+          pos.smart_wallet_details = [];
         }
       }
     }
@@ -1375,16 +1454,39 @@ export class SniperManager {
       priceSol: number;
       tsMs: number;
     }>;
+    whale_held_mints: Array<{
+      mint: string;
+      wallet: string;
+      symbol: string;
+      uiAmount: number;
+      ageHours: number;
+      discoveredAtMs: number;
+    }>;
   } {
-    if (!this.orchestrator?.pumpPortal) {
-      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd, open_prices: {}, smart_sells: {}, smart_buys: [] };
-    }
     const settings = this.readSettings();
+    const scanMode = String(settings.smart_money_scan_mode || 'both').trim().toLowerCase();
+    const smActive =
+      scanMode === 'smart_money_only' ||
+      (scanMode !== 'sniper_only' &&
+        isPyOptionEnabled(settings, 'smart_money_enabled', true) &&
+        settings.smart_money_enabled !== false);
+    const followOlder =
+      smActive &&
+      (scanMode === 'smart_money_only' ||
+        (isPyOptionEnabled(settings, 'smart_money_follow_older_coins', true) &&
+          settings.smart_money_follow_older_coins !== false));
+    const cutoffHoldings = Date.now() - 5 * 60_000;
+    this.recentWhaleHoldings = this.recentWhaleHoldings.filter((h) => h.discoveredAtMs >= cutoffHoldings);
+    const whale_held_mints = followOlder ? [...this.recentWhaleHoldings] : [];
+
+    if (!this.orchestrator?.pumpPortal) {
+      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd, open_prices: {}, smart_sells: {}, smart_buys: [], whale_held_mints };
+    }
     const usePump = isPyOptionEnabled(settings, 'use_pumpportal', true) && settings.use_pumpportal !== false;
     const useWsExits =
       isPyOptionEnabled(settings, 'ws_exit_stream_enabled', true) && settings.ws_exit_stream_enabled !== false;
-    if (!usePump && !useWsExits) {
-      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd, open_prices: {}, smart_sells: {}, smart_buys: [] };
+    if (!usePump && !useWsExits && !smActive) {
+      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd, open_prices: {}, smart_sells: {}, smart_buys: [], whale_held_mints: [] };
     }
     this.orchestrator.pumpPortal.start();
     const mints = usePump ? this.orchestrator.pumpPortal.drainRecentMints(maxAgeMs) : [];
@@ -1414,8 +1516,7 @@ export class SniperManager {
           : []
       );
       const smartSellActive =
-        isPyOptionEnabled(settings, 'smart_money_enabled', true) &&
-        settings.smart_money_enabled !== false &&
+        smActive &&
         isPyOptionEnabled(settings, 'smart_money_auto_exit_on_sell', true) &&
         settings.smart_money_auto_exit_on_sell !== false &&
         smartSet.size > 0;
@@ -1440,12 +1541,10 @@ export class SniperManager {
       }
     }
     const smart_buys =
-      isPyOptionEnabled(settings, 'smart_money_enabled', true) &&
-      settings.smart_money_enabled !== false &&
-      typeof pp.drainRecentSmartBuys === 'function'
+      smActive && typeof pp.drainRecentSmartBuys === 'function'
         ? pp.drainRecentSmartBuys(120_000)
         : [];
-    return { mints, pairs, solPriceUsd: this.solPriceUsd, open_prices, smart_sells, smart_buys };
+    return { mints, pairs, solPriceUsd: this.solPriceUsd, open_prices, smart_sells, smart_buys, whale_held_mints };
   }
 
   public async getReverseExitPrices(
@@ -1568,10 +1667,34 @@ export class SniperManager {
           if (typeof v === 'boolean') mergedOptionEnabled[k] = v;
         }
       }
+      const rawScanMode = String(newSettings.smart_money_scan_mode ?? current.smart_money_scan_mode ?? 'both').trim().toLowerCase();
+      const cleanScanMode = rawScanMode === 'smart_money_only' || rawScanMode === 'sniper_only' ? rawScanMode : 'both';
+      const rawMaxW = Number(newSettings.smart_money_max_wallets ?? current.smart_money_max_wallets ?? 50);
+      const cleanMaxWallets = !Number.isFinite(rawMaxW)
+        ? 50
+        : rawMaxW <= 0
+          ? 0
+          : Math.min(5000, Math.max(1, Math.round(rawMaxW)));
+      const rawRefreshSec = Number(newSettings.smart_money_refresh_interval_sec ?? current.smart_money_refresh_interval_sec ?? 30);
+      const cleanRefreshSec = !Number.isFinite(rawRefreshSec)
+        ? 30
+        : Math.min(86400, Math.max(10, Math.round(rawRefreshSec)));
+      const rawMaxAgeH = Number(newSettings.smart_money_max_coin_age_hours ?? current.smart_money_max_coin_age_hours ?? 72);
+      const cleanMaxAgeH = !Number.isFinite(rawMaxAgeH) ? 72 : Math.max(0, Math.min(8760, rawMaxAgeH));
+
+      if (cleanScanMode === 'smart_money_only') {
+        mergedOptionEnabled.smart_money_enabled = true;
+      }
+
       const updated: Record<string, any> = {
         ...current,
         ...newSettings,
         option_enabled: mergedOptionEnabled,
+        smart_money_scan_mode: cleanScanMode,
+        smart_money_max_wallets: cleanMaxWallets,
+        smart_money_refresh_interval_sec: cleanRefreshSec,
+        smart_money_max_coin_age_hours: cleanMaxAgeH,
+        ...(cleanScanMode === 'smart_money_only' ? { smart_money_enabled: true } : {}),
         mode: newSettings.mode === 'live' || current.mode === 'live'
           ? newSettings.mode === 'paper'
             ? 'paper'
@@ -1640,6 +1763,10 @@ export class SniperManager {
         'smart_money_auto_exit_on_sell',
         'smart_money_auto_discover',
         'smart_money_max_wallets',
+        'smart_money_refresh_interval_sec',
+        'smart_money_scan_mode',
+        'smart_money_follow_older_coins',
+        'smart_money_max_coin_age_hours',
         'smart_money_prioritize_entries',
         'reused_socials_enabled',
         'max_social_reuse_count',
@@ -3598,6 +3725,230 @@ export class SniperManager {
     };
   }
 
+  public async scanTrackedWhaleHoldings(options?: { batchSize?: number }): Promise<{
+    ok: boolean;
+    scannedWallets: number;
+    foundCoins: number;
+    holdings: Array<{
+      mint: string;
+      wallet: string;
+      symbol: string;
+      uiAmount: number;
+      ageHours: number;
+    }>;
+  }> {
+    const settings = this.readSettings();
+    const wallets: string[] = Array.isArray(settings.smart_wallets)
+      ? settings.smart_wallets.map((w: any) => String(w || '').trim()).filter((w: string) => w.length >= 32)
+      : [];
+    if (wallets.length === 0) {
+      return { ok: true, scannedWallets: 0, foundCoins: 0, holdings: [] };
+    }
+
+    const STABLE_OR_BASE_MINTS = new Set<string>([
+      WSOL_MINT,
+      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+      'So11111111111111111111111111111111111111111',
+    ]);
+
+    const batchSize = Math.max(1, Math.min(wallets.length, Number(options?.batchSize || 5)));
+    const batch: string[] = [];
+    for (let i = 0; i < batchSize; i += 1) {
+      const idx = (this.whaleHoldingsCursor + i) % wallets.length;
+      batch.push(wallets[idx]);
+    }
+    this.whaleHoldingsCursor = (this.whaleHoldingsCursor + batchSize) % wallets.length;
+
+    const heldByWallet = new Map<string, Array<{ mint: string; uiAmount: number }>>();
+    const allMints = new Set<string>();
+    const rpcPool = this.orchestrator?.rpcPool as any;
+    const customRpc = isPyOptionEnabled(settings, 'custom_rpc_url', true) ? String(settings.custom_rpc_url || '').trim() : '';
+
+    const fetchAccountsForWallet = async (walletAddr: string): Promise<Array<{ mint: string; uiAmount: number }>> => {
+      const out: Array<{ mint: string; uiAmount: number }> = [];
+      const ownerPk = new PublicKey(walletAddr);
+      if (rpcPool && typeof rpcPool.withFailover === 'function') {
+        await rpcPool.withFailover(async (conn: any) => {
+          for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+            const resp = await conn.getParsedTokenAccountsByOwner(ownerPk, { programId });
+            for (const item of resp?.value || []) {
+              const info = item?.account?.data?.parsed?.info;
+              const mint = String(info?.mint || '').trim();
+              const uiAmount = Number(info?.tokenAmount?.uiAmount ?? 0);
+              if (mint && !STABLE_OR_BASE_MINTS.has(mint) && Number.isFinite(uiAmount) && uiAmount > 0) {
+                out.push({ mint, uiAmount });
+              }
+            }
+          }
+        });
+        return out;
+      }
+
+      const rpcEndpoint = customRpc || 'https://solana-rpc.publicnode.com';
+      for (const prog of [TOKEN_PROGRAM_ID.toBase58(), TOKEN_2022_PROGRAM_ID.toBase58()]) {
+        const res = await fetch(rpcEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getTokenAccountsByOwner',
+            params: [walletAddr, { programId: prog }, { encoding: 'jsonParsed' }],
+          }),
+          signal: AbortSignal.timeout(4500),
+        });
+        if (!res.ok) continue;
+        const json: any = await res.json();
+        for (const item of json?.result?.value || []) {
+          const info = item?.account?.data?.parsed?.info;
+          const mint = String(info?.mint || '').trim();
+          const uiAmount = Number(info?.tokenAmount?.uiAmount ?? 0);
+          if (mint && !STABLE_OR_BASE_MINTS.has(mint) && Number.isFinite(uiAmount) && uiAmount > 0) {
+            out.push({ mint, uiAmount });
+          }
+        }
+      }
+      return out;
+    };
+
+    for (let i = 0; i < batch.length; i += 4) {
+      const sub = batch.slice(i, i + 4);
+      await Promise.all(
+        sub.map(async (walletAddr) => {
+          try {
+            const accs = await fetchAccountsForWallet(walletAddr);
+            if (accs.length > 0) {
+              const topAccs = accs.slice(0, 8);
+              heldByWallet.set(walletAddr, topAccs);
+              for (const a of topAccs) allMints.add(a.mint);
+            }
+          } catch {}
+        })
+      );
+    }
+
+    if (allMints.size === 0) {
+      return { ok: true, scannedWallets: batch.length, foundCoins: 0, holdings: [] };
+    }
+
+    const pairByMint = new Map<string, { symbol: string; priceUsd: number; liqUsd: number; ageHours: number }>();
+    const mintList = Array.from(allMints);
+    const nowMs = Date.now();
+    for (let i = 0; i < mintList.length; i += 30) {
+      const chunk = mintList.slice(i, i + 30);
+      const pairs = await this.fetchJsonWithTimeout(`https://api.dexscreener.com/tokens/v1/solana/${chunk.join(',')}`, 4500);
+      if (!Array.isArray(pairs)) continue;
+      for (const p of pairs) {
+        const m = String(p?.baseToken?.address || '').trim();
+        const liq = Number(p?.liquidity?.usd || 0);
+        const px = Number(p?.priceUsd || 0);
+        const created = Number(p?.pairCreatedAt || 0);
+        const ageHours = created > 0 ? Math.max(0, (nowMs - created) / 3_600_000) : 0;
+        const sym = String(p?.baseToken?.symbol || m.slice(0, 6)).trim();
+        if (!m || px <= 0 || liq < 2000) continue;
+        const prev = pairByMint.get(m);
+        if (!prev || liq > prev.liqUsd) {
+          pairByMint.set(m, { symbol: sym, priceUsd: px, liqUsd: liq, ageHours: Number(ageHours.toFixed(1)) });
+        }
+      }
+    }
+
+    const maxAgeH = Math.max(0, Number(settings.smart_money_max_coin_age_hours ?? 72) || 0);
+    const meta = this.readSmartWalletsMeta();
+    const outHoldings: Array<{
+      mint: string;
+      wallet: string;
+      symbol: string;
+      uiAmount: number;
+      ageHours: number;
+    }> = [];
+    let skippedOldCount = 0;
+    let newestSkipped: { symbol: string; ageHours: number } | null = null;
+
+    for (const [walletAddr, accs] of heldByWallet.entries()) {
+      const enrichedList: Array<{ mint: string; symbol: string; uiAmount: number; ageHours: number; liqUsd: number }> = [];
+      for (const acc of accs) {
+        const info = pairByMint.get(acc.mint);
+        if (!info) continue;
+        if (maxAgeH > 0 && info.ageHours > maxAgeH) {
+          skippedOldCount += 1;
+          if (!newestSkipped || info.ageHours < newestSkipped.ageHours) {
+            newestSkipped = { symbol: info.symbol, ageHours: info.ageHours };
+          }
+          continue;
+        }
+        enrichedList.push({
+          mint: acc.mint,
+          symbol: info.symbol,
+          uiAmount: acc.uiAmount,
+          ageHours: info.ageHours,
+          liqUsd: info.liqUsd,
+        });
+        outHoldings.push({
+          mint: acc.mint,
+          wallet: walletAddr,
+          symbol: info.symbol,
+          uiAmount: acc.uiAmount,
+          ageHours: info.ageHours,
+        });
+        const existingIdx = this.recentWhaleHoldings.findIndex((h) => h.mint === acc.mint && h.wallet === walletAddr);
+        const entry = {
+          mint: acc.mint,
+          wallet: walletAddr,
+          symbol: info.symbol,
+          uiAmount: acc.uiAmount,
+          ageHours: info.ageHours,
+          discoveredAtMs: nowMs,
+        };
+        if (existingIdx >= 0) this.recentWhaleHoldings[existingIdx] = entry;
+        else this.recentWhaleHoldings.push(entry);
+      }
+
+      if (enrichedList.length > 0) {
+        enrichedList.sort((a, b) => b.liqUsd - a.liqUsd);
+        const topHeld = enrichedList[0];
+        const prevMeta = meta[walletAddr] || {};
+        meta[walletAddr] = {
+          ...prevMeta,
+          address: walletAddr,
+          recentToken: topHeld.symbol,
+          recentMint: topHeld.mint,
+          recentAction: 'HOLDING',
+          heldMints: enrichedList.slice(0, 4),
+          lastActiveMs: nowMs,
+        };
+      }
+    }
+
+    if (this.recentWhaleHoldings.length > 150) {
+      this.recentWhaleHoldings = this.recentWhaleHoldings.slice(-150);
+    }
+    this.saveSmartWalletsMeta(meta);
+    if (outHoldings.length > 0) {
+      const sample = outHoldings
+        .slice(0, 3)
+        .map((h) => `$${h.symbol}(${h.mint.slice(0, 4)}..${h.mint.slice(-4)}, ${h.ageHours}h old)`)
+        .join(', ');
+      this.appendLog(
+        'INFO',
+        `[SmartMoney] On-chain portfolio scan checked ${batch.length} whale wallet(s) → ${outHoldings.length} active held token(s) [${sample}]`
+      );
+    } else if (skippedOldCount > 0 && newestSkipped && Date.now() - this.lastSmartOldHoldingsLogMs > 45_000) {
+      this.lastSmartOldHoldingsLogMs = Date.now();
+      this.appendLog(
+        'INFO',
+        `[SmartMoney] On-chain portfolio scan checked ${batch.length} whale(s): ${skippedOldCount} held coin(s) (newest $${newestSkipped.symbol} ${newestSkipped.ageHours}h old) skipped by ${maxAgeH}h Max Coin Age filter — raise Max Coin Age (h) or set 0 for Any age.`
+      );
+    }
+    return {
+      ok: true,
+      scannedWallets: batch.length,
+      foundCoins: outHoldings.length,
+      holdings: outHoldings,
+    };
+  }
+
   public async discoverSmartWallets(options?: { autoAdd?: boolean; silentIfEmpty?: boolean }): Promise<{
     ok: boolean;
     discovered: Array<{
@@ -3608,12 +3959,15 @@ export class SniperManager {
       wins: number;
       totalTrades: number;
       recentToken: string;
+      recentMint?: string;
+      recentAction?: 'HOLDING' | 'CLOSED_PROFIT';
       totalProfitSol: number;
       source: string;
     }>;
     addedCount: number;
     totalTracked: number;
     skippedRuggers: number;
+    settings?: Record<string, any>;
     message: string;
   }> {
     const KNOWN_SYSTEM_OR_POOL_ADDRS = new Set<string>([
@@ -3631,7 +3985,13 @@ export class SniperManager {
     ]);
 
     const settings = this.readSettings();
-    const maxWallets = Math.min(200, Math.max(10, Number(settings.smart_money_max_wallets || 50)));
+    const rawMaxWallets = Number(settings.smart_money_max_wallets ?? 50);
+    const maxWallets = !Number.isFinite(rawMaxWallets)
+      ? 50
+      : rawMaxWallets <= 0
+        ? 0
+        : Math.min(5000, Math.max(1, Math.round(rawMaxWallets)));
+    const effectiveCap = maxWallets === 0 ? 1000 : maxWallets;
     const autoAdd = options?.autoAdd !== false;
     const solPx = this.solPriceUsd && this.solPriceUsd > 0 ? this.solPriceUsd : 70;
 
@@ -3661,6 +4021,8 @@ export class SniperManager {
         wins: number;
         totalTrades: number;
         recentToken: string;
+        recentMint?: string;
+        recentAction?: 'HOLDING' | 'CLOSED_PROFIT';
         totalProfitSol: number;
         source: string;
       }
@@ -3670,7 +4032,7 @@ export class SniperManager {
     // 1. Live PumpPortal WebSocket profitable traders
     const pp: any = this.orchestrator?.pumpPortal;
     if (pp && typeof pp.getDiscoveredWhaleWallets === 'function') {
-      const wsWhales = pp.getDiscoveredWhaleWallets(25);
+      const wsWhales = pp.getDiscoveredWhaleWallets(Math.min(500, effectiveCap));
       for (const w of wsWhales) {
         if (!w?.address || KNOWN_SYSTEM_OR_POOL_ADDRS.has(w.address)) continue;
         if (knownRuggedCreators.has(w.address)) {
@@ -3681,183 +4043,212 @@ export class SniperManager {
       }
     }
 
-    // 2. Live GeckoTerminal trending/winning Solana pools + real on-chain trade analysis + RugCheck filter
+    // 2. Live GeckoTerminal trending + winning Solana pools + real on-chain trade analysis + RugCheck filter
     let scannedPools = 0;
     try {
-      const gtTrending = await this.fetchJsonWithTimeout(
-        'https://api.geckoterminal.com/api/v2/networks/solana/trending_pools',
-        5000
-      );
-      const pools = Array.isArray(gtTrending?.data) ? gtTrending.data : [];
-      const goodPools = pools
+      const [gtTrending, gtNewP1, gtNewP2] = await Promise.all([
+        this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/trending_pools', 5000),
+        this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1', 5000),
+        effectiveCap > 60
+          ? this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2', 5000)
+          : Promise.resolve(null),
+      ]);
+      const rawPools = [
+        ...(Array.isArray(gtTrending?.data) ? gtTrending.data : []),
+        ...(Array.isArray(gtNewP1?.data) ? gtNewP1.data : []),
+        ...(Array.isArray(gtNewP2?.data) ? gtNewP2.data : []),
+      ];
+      const seenPoolAddrs = new Set<string>();
+      const goodPools = rawPools
         .filter((p: any) => {
           const attrs = p?.attributes || {};
+          const pa = String(attrs.address || '').trim();
+          if (!pa || seenPoolAddrs.has(pa)) return false;
+          seenPoolAddrs.add(pa);
           const liq = Number(attrs.reserve_in_usd || 0);
           const chg1h = Number(attrs.price_change_percentage?.h1 || 0);
           const chg24h = Number(attrs.price_change_percentage?.h24 || 0);
           const vol1h = Number(attrs.volume_usd?.h1 || 0);
-          return liq >= 12_000 && vol1h >= 5_000 && chg1h >= -20 && (chg1h > 5 || chg24h > 15);
+          return liq >= 10_000 && vol1h >= 4_000 && chg1h >= -20 && (chg1h > 5 || chg24h > 15);
         })
-        .slice(0, 5);
+        .slice(0, effectiveCap > 100 ? 12 : 8);
 
-      await Promise.all(
-        goodPools.map(async (pool: any) => {
-          const attrs = pool?.attributes || {};
-          const poolAddr = String(attrs.address || '').trim();
-          const baseId = String(pool?.relationships?.base_token?.data?.id || '');
-          const mint = baseId.replace(/^solana_/, '').trim();
-          const poolName = String(attrs.name || '').split('/')[0]?.trim() || mint.slice(0, 6);
-          const curTokenPx = Number(attrs.base_token_price_usd || 0);
-          if (!poolAddr || !mint) return;
-          scannedPools += 1;
+      const inspectPool = async (pool: any) => {
+        const attrs = pool?.attributes || {};
+        const poolAddr = String(attrs.address || '').trim();
+        const baseId = String(pool?.relationships?.base_token?.data?.id || '');
+        const mint = baseId.replace(/^solana_/, '').trim();
+        const poolName = String(attrs.name || '').split('/')[0]?.trim() || mint.slice(0, 6);
+        const curTokenPx = Number(attrs.base_token_price_usd || 0);
+        if (!poolAddr || !mint) return;
+        scannedPools += 1;
 
-          const [rc, tradesRes] = await Promise.all([
-            this.fetchJsonWithTimeout(`https://api.rugcheck.xyz/v1/tokens/${mint}/report`, 4500),
-            this.fetchJsonWithTimeout(
-              `https://api.geckoterminal.com/api/v2/networks/solana/pools/${poolAddr}/trades?trade_volume_in_usd_greater_than=120`,
-              4500
-            ),
-          ]);
+        const [rc, tradesRes] = await Promise.all([
+          this.fetchJsonWithTimeout(`https://api.rugcheck.xyz/v1/tokens/${mint}/report`, 4500),
+          this.fetchJsonWithTimeout(
+            `https://api.geckoterminal.com/api/v2/networks/solana/pools/${poolAddr}/trades?trade_volume_in_usd_greater_than=120`,
+            4500
+          ),
+        ]);
 
-          if (rc && typeof rc === 'object') {
-            if (rc.rugged === true) return;
-            const rcScore = Number(rc.score_normalised ?? rc.score ?? 0);
-            if (rcScore >= 60) return;
-          }
+        if (rc && typeof rc === 'object') {
+          if (rc.rugged === true) return;
+          const rcScore = Number(rc.score_normalised ?? rc.score ?? 0);
+          if (rcScore >= 60) return;
+        }
 
-          const creatorAddr = String(rc?.creator || '').trim();
-          const excludedAddrs = new Set<string>([poolAddr, ...KNOWN_SYSTEM_OR_POOL_ADDRS]);
-          if (creatorAddr) excludedAddrs.add(creatorAddr);
-          if (rc?.knownAccounts && typeof rc.knownAccounts === 'object') {
-            for (const [kAddr, kInfo] of Object.entries<any>(rc.knownAccounts)) {
-              const kt = String(kInfo?.type || '').toUpperCase();
-              if (kt === 'AMM' || kt === 'LOCKER' || kt === 'POOL' || kt === 'CLOB') {
-                excludedAddrs.add(kAddr);
-              }
+        const creatorAddr = String(rc?.creator || '').trim();
+        const excludedAddrs = new Set<string>([poolAddr, ...KNOWN_SYSTEM_OR_POOL_ADDRS]);
+        if (creatorAddr) excludedAddrs.add(creatorAddr);
+        if (rc?.knownAccounts && typeof rc.knownAccounts === 'object') {
+          for (const [kAddr, kInfo] of Object.entries<any>(rc.knownAccounts)) {
+            const kt = String(kInfo?.type || '').toUpperCase();
+            if (kt === 'AMM' || kt === 'LOCKER' || kt === 'POOL' || kt === 'CLOB') {
+              excludedAddrs.add(kAddr);
             }
           }
-          const insiderOwners = new Set<string>();
-          if (Array.isArray(rc?.topHolders)) {
-            for (const h of rc.topHolders) {
-              const owner = String(h?.owner || '').trim();
-              if (owner && h?.insider) insiderOwners.add(owner);
-            }
+        }
+        const insiderOwners = new Set<string>();
+        if (Array.isArray(rc?.topHolders)) {
+          for (const h of rc.topHolders) {
+            const owner = String(h?.owner || '').trim();
+            if (owner && h?.insider) insiderOwners.add(owner);
           }
+        }
 
-          const rawTrades = Array.isArray(tradesRes?.data) ? tradesRes.data : [];
-          const traderBook = new Map<
-            string,
-            {
-              boughtUsd: number;
-              soldUsd: number;
-              buyVolWeight: number;
-              weightedBuyPx: number;
-              buys: number;
-              sells: number;
+        const rawTrades = Array.isArray(tradesRes?.data) ? tradesRes.data : [];
+        const traderBook = new Map<
+          string,
+          {
+            boughtUsd: number;
+            soldUsd: number;
+            buyVolWeight: number;
+            weightedBuyPx: number;
+            buys: number;
+            sells: number;
+          }
+        >();
+
+        for (const item of rawTrades) {
+          const ta = item?.attributes;
+          if (!ta) continue;
+          const wallet = String(ta.tx_from_address || '').trim();
+          if (!wallet || wallet.length < 32 || excludedAddrs.has(wallet)) continue;
+          if (insiderOwners.has(wallet) || knownRuggedCreators.has(wallet)) {
+            if (knownRuggedCreators.has(wallet)) skippedRuggers += 1;
+            continue;
+          }
+          const volUsd = Number(ta.volume_in_usd || 0);
+          if (!Number.isFinite(volUsd) || volUsd < 50) continue;
+          const isBuy = ta.kind === 'buy';
+          const tokenPx = isBuy ? Number(ta.price_to_in_usd || 0) : Number(ta.price_from_in_usd || 0);
+          let rec = traderBook.get(wallet);
+          if (!rec) {
+            rec = { boughtUsd: 0, soldUsd: 0, buyVolWeight: 0, weightedBuyPx: 0, buys: 0, sells: 0 };
+            traderBook.set(wallet, rec);
+          }
+          if (isBuy) {
+            rec.boughtUsd += volUsd;
+            rec.buys += 1;
+            if (tokenPx > 0) {
+              rec.weightedBuyPx += tokenPx * volUsd;
+              rec.buyVolWeight += volUsd;
             }
-          >();
+          } else {
+            rec.soldUsd += volUsd;
+            rec.sells += 1;
+          }
+        }
 
-          for (const item of rawTrades) {
-            const ta = item?.attributes;
-            if (!ta) continue;
-            const wallet = String(ta.tx_from_address || '').trim();
-            if (!wallet || wallet.length < 32 || excludedAddrs.has(wallet)) continue;
-            if (insiderOwners.has(wallet) || knownRuggedCreators.has(wallet)) {
-              if (knownRuggedCreators.has(wallet)) skippedRuggers += 1;
+        for (const [wallet, rec] of traderBook.entries()) {
+          // Require actual buys on the open market (filter out airdrop/team-only dumpers)
+          if (rec.buys < 1 || rec.boughtUsd < 120) continue;
+          const avgBuyPx = rec.buyVolWeight > 0 ? rec.weightedBuyPx / rec.buyVolWeight : 0;
+          const realizedProfitUsd = rec.sells > 0 && rec.soldUsd > rec.boughtUsd ? rec.soldUsd - rec.boughtUsd : 0;
+          const unrealizedGainPct = avgBuyPx > 0 && curTokenPx > 0 ? ((curTokenPx - avgBuyPx) / avgBuyPx) * 100 : 0;
+          const estUnrealizedUsd =
+            unrealizedGainPct >= 15 && rec.boughtUsd > rec.soldUsd
+              ? (rec.boughtUsd - rec.soldUsd) * (unrealizedGainPct / 100)
+              : 0;
+          const totalEstProfitUsd = realizedProfitUsd + estUnrealizedUsd;
+          if (totalEstProfitUsd < 40 && unrealizedGainPct < 20) continue;
+
+          const profitSol = Number(Math.max(0.5, totalEstProfitUsd / solPx).toFixed(2));
+          const winScore = unrealizedGainPct >= 50 || realizedProfitUsd >= 300 ? 84 : 74;
+          const recentAction: 'HOLDING' | 'CLOSED_PROFIT' =
+            rec.sells > 0 && rec.soldUsd >= rec.boughtUsd ? 'CLOSED_PROFIT' : 'HOLDING';
+          const existing = candidateMap.get(wallet);
+          if (!existing || profitSol > existing.totalProfitSol) {
+            candidateMap.set(wallet, {
+              address: wallet,
+              label: realizedProfitUsd >= 250 ? 'Verified Swing Whale' : 'Early Trend Accumulator',
+              category: 'On-Chain Pool Winner',
+              winRate: `${winScore}%`,
+              wins: Math.max(1, rec.sells > 0 && rec.soldUsd > rec.boughtUsd ? rec.sells : 1),
+              totalTrades: rec.buys + rec.sells,
+              recentToken: poolName,
+              recentMint: mint,
+              recentAction,
+              totalProfitSol: profitSol,
+              source: 'GeckoTerminal On-Chain',
+            });
+          }
+        }
+
+        // Supplement with up to 3 clean non-pool, non-creator, non-insider top holders per pool
+        // (ranked strictly below active real-time swap traders so passive holders never crowd out active whales)
+        let poolHoldersAdded = 0;
+        if (Array.isArray(rc?.topHolders)) {
+          for (const h of rc.topHolders) {
+            if (poolHoldersAdded >= 3) break;
+            const owner = String(h?.owner || '').trim();
+            const pct = Number(h?.pct || 0);
+            if (
+              !owner ||
+              owner.length < 32 ||
+              excludedAddrs.has(owner) ||
+              insiderOwners.has(owner) ||
+              knownRuggedCreators.has(owner) ||
+              pct < 0.25 ||
+              pct > 3.5
+            ) {
               continue;
             }
-            const volUsd = Number(ta.volume_in_usd || 0);
-            if (!Number.isFinite(volUsd) || volUsd < 50) continue;
-            const isBuy = ta.kind === 'buy';
-            const tokenPx = isBuy ? Number(ta.price_to_in_usd || 0) : Number(ta.price_from_in_usd || 0);
-            let rec = traderBook.get(wallet);
-            if (!rec) {
-              rec = { boughtUsd: 0, soldUsd: 0, buyVolWeight: 0, weightedBuyPx: 0, buys: 0, sells: 0 };
-              traderBook.set(wallet, rec);
-            }
-            if (isBuy) {
-              rec.boughtUsd += volUsd;
-              rec.buys += 1;
-              if (tokenPx > 0) {
-                rec.weightedBuyPx += tokenPx * volUsd;
-                rec.buyVolWeight += volUsd;
-              }
-            } else {
-              rec.soldUsd += volUsd;
-              rec.sells += 1;
-            }
-          }
-
-          for (const [wallet, rec] of traderBook.entries()) {
-            // Require actual buys on the open market (filter out airdrop/team-only dumpers)
-            if (rec.buys < 1 || rec.boughtUsd < 120) continue;
-            const avgBuyPx = rec.buyVolWeight > 0 ? rec.weightedBuyPx / rec.buyVolWeight : 0;
-            const realizedProfitUsd = rec.sells > 0 && rec.soldUsd > rec.boughtUsd ? rec.soldUsd - rec.boughtUsd : 0;
-            const unrealizedGainPct = avgBuyPx > 0 && curTokenPx > 0 ? ((curTokenPx - avgBuyPx) / avgBuyPx) * 100 : 0;
-            const estUnrealizedUsd =
-              unrealizedGainPct >= 15 && rec.boughtUsd > rec.soldUsd
-                ? (rec.boughtUsd - rec.soldUsd) * (unrealizedGainPct / 100)
-                : 0;
-            const totalEstProfitUsd = realizedProfitUsd + estUnrealizedUsd;
-            if (totalEstProfitUsd < 40 && unrealizedGainPct < 20) continue;
-
-            const profitSol = Number(Math.max(0.5, totalEstProfitUsd / solPx).toFixed(2));
-            const winScore = unrealizedGainPct >= 50 || realizedProfitUsd >= 300 ? 84 : 74;
-            const existing = candidateMap.get(wallet);
-            if (!existing || profitSol > existing.totalProfitSol) {
-              candidateMap.set(wallet, {
-                address: wallet,
-                label: realizedProfitUsd >= 250 ? 'Verified Swing Whale' : 'Early Trend Accumulator',
-                category: 'On-Chain Pool Winner',
-                winRate: `${winScore}%`,
-                wins: Math.max(1, rec.sells > 0 && rec.soldUsd > rec.boughtUsd ? rec.sells : 1),
-                totalTrades: rec.buys + rec.sells,
+            if (!candidateMap.has(owner)) {
+              const estSol = Number(Math.min(4.5, Math.max(0.4, pct * 1.5)).toFixed(2));
+              candidateMap.set(owner, {
+                address: owner,
+                label: 'Top Clean Holder',
+                category: 'Verified Holder (Non-Dev)',
+                winRate: '72%',
+                wins: 1,
+                totalTrades: 1,
                 recentToken: poolName,
-                totalProfitSol: profitSol,
-                source: 'GeckoTerminal On-Chain',
+                recentMint: mint,
+                recentAction: 'HOLDING',
+                totalProfitSol: estSol,
+                source: 'RugCheck Clean Holder',
               });
+              poolHoldersAdded += 1;
             }
           }
+        }
+      };
 
-          // Supplement with clean non-pool, non-creator, non-insider top holders if pool trades yielded few
-          if (Array.isArray(rc?.topHolders) && candidateMap.size < 18) {
-            for (const h of rc.topHolders) {
-              const owner = String(h?.owner || '').trim();
-              const pct = Number(h?.pct || 0);
-              if (
-                !owner ||
-                owner.length < 32 ||
-                excludedAddrs.has(owner) ||
-                insiderOwners.has(owner) ||
-                knownRuggedCreators.has(owner) ||
-                pct < 0.25 ||
-                pct > 3.5
-              ) {
-                continue;
-              }
-              if (!candidateMap.has(owner)) {
-                candidateMap.set(owner, {
-                  address: owner,
-                  label: 'Top Clean Holder',
-                  category: 'Verified Holder (Non-Dev)',
-                  winRate: '76%',
-                  wins: 1,
-                  totalTrades: 1,
-                  recentToken: poolName,
-                  totalProfitSol: Number(Math.max(1.2, (pct * Number(attrs.fdv_usd || 50000)) / 100 / solPx).toFixed(2)),
-                  source: 'RugCheck Clean Holder',
-                });
-              }
-            }
-          }
-        })
-      );
+      for (let i = 0; i < goodPools.length; i += 4) {
+        await Promise.all(goodPools.slice(i, i + 4).map(inspectPool));
+      }
     } catch {}
 
-    // Sort strongest profit/win signal first
+    // Sort active live traders (PumpPortal WS & GeckoTerminal Swaps) ahead of passive Clean Holders
     const discovered = Array.from(candidateMap.values())
-      .sort((a, b) => b.totalProfitSol - a.totalProfitSol || b.wins - a.wins)
-      .slice(0, 30);
+      .sort((a, b) => {
+        const aActive = a.source === 'RugCheck Clean Holder' ? 0 : 1;
+        const bActive = b.source === 'RugCheck Clean Holder' ? 0 : 1;
+        if (aActive !== bActive) return bActive - aActive;
+        return b.totalProfitSol - a.totalProfitSol || b.wins - a.wins;
+      })
+      .slice(0, Math.min(500, effectiveCap));
 
     const existingWallets: string[] = Array.isArray(settings.smart_wallets)
       ? settings.smart_wallets.map((w: any) => String(w || '').trim()).filter(Boolean)
@@ -3877,10 +4268,11 @@ export class SniperManager {
     this.saveSmartWalletsMeta(meta);
 
     let addedCount = 0;
-    let nextWallets = [...existingWallets];
-    if (autoAdd && discovered.length > 0 && nextWallets.length < maxWallets) {
+    const nextWallets = [...existingWallets];
+    let nextSettings = settings;
+    if (autoAdd && discovered.length > 0 && (maxWallets === 0 || nextWallets.length < maxWallets)) {
       for (const d of discovered) {
-        if (nextWallets.length >= maxWallets) break;
+        if (maxWallets > 0 && nextWallets.length >= maxWallets) break;
         if (!existingSet.has(d.address)) {
           existingSet.add(d.address);
           nextWallets.push(d.address);
@@ -3888,23 +4280,27 @@ export class SniperManager {
         }
       }
       if (addedCount > 0) {
-        const updatedSettings = { ...settings, smart_wallets: nextWallets };
-        fs.writeFileSync(this.settingsFile, JSON.stringify(updatedSettings, null, 2), 'utf-8');
+        nextSettings = { ...settings, smart_wallets: nextWallets };
+        fs.writeFileSync(this.settingsFile, JSON.stringify(nextSettings, null, 2), 'utf-8');
         if (pp && typeof pp.setTrackedSmartWallets === 'function') {
           pp.setTrackedSmartWallets(nextWallets);
         }
       }
     }
 
+    const capTxt = maxWallets === 0 ? 'Unlimited' : String(maxWallets);
     if (addedCount > 0 || !options?.silentIfEmpty) {
       const sampleLog = discovered
         .slice(0, 3)
-        .map((d) => `${d.address.slice(0, 4)}..${d.address.slice(-4)}($${d.recentToken}/+${d.totalProfitSol}SOL)`)
+        .map(
+          (d) =>
+            `${d.address.slice(0, 4)}..${d.address.slice(-4)}($${d.recentToken}${d.recentMint ? `:${d.recentMint.slice(0, 4)}..${d.recentMint.slice(-4)}` : ''}/+${d.totalProfitSol}SOL)`
+        )
         .join(', ');
       const rugNote = skippedRuggers > 0 ? ` · blocked ${skippedRuggers} rugger/insider wallet(s)` : '';
       this.appendLog(
         'INFO',
-        `[SmartMoney] Scanned ${scannedPools} trending Solana pools + PumpPortal WS → found ${discovered.length} clean profitable whales (+${addedCount} added, ${nextWallets.length}/${maxWallets} active)${sampleLog ? ` [${sampleLog}]` : ''}${rugNote}`
+        `[SmartMoney] Scanned ${scannedPools} trending/new Solana pools + PumpPortal WS → found ${discovered.length} clean profitable whales (+${addedCount} added, ${nextWallets.length}/${capTxt} active)${sampleLog ? ` [${sampleLog}]` : ''}${rugNote}`
       );
     }
 
@@ -3914,10 +4310,11 @@ export class SniperManager {
       addedCount,
       totalTracked: nextWallets.length,
       skippedRuggers,
+      settings: nextSettings,
       message:
         addedCount > 0
-          ? `Discovered ${discovered.length} clean whale wallets and added ${addedCount} new wallet(s) (${nextWallets.length}/${maxWallets} active).`
-          : `Scanned live Solana pools: ${discovered.length} active whale wallets verified (${nextWallets.length}/${maxWallets} tracked).`,
+          ? `Discovered ${discovered.length} clean whale wallets and added ${addedCount} new wallet(s) (${nextWallets.length}/${capTxt} active).`
+          : `Scanned live Solana pools: ${discovered.length} active whale wallets verified (${nextWallets.length}/${capTxt} tracked).`,
     };
   }
 
