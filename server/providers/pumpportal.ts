@@ -157,8 +157,8 @@ interface TraderLedger {
   lastSeenMs: number;
 }
 
-const MAX_TRACKED_TOKENS = 180;
-const MAX_SUBSCRIBED_MINTS = 60;
+const MAX_TRACKED_TOKENS = 240;
+const MAX_SUBSCRIBED_MINTS = 160;
 const MAX_TRACKED_TRADERS = 1500;
 const TOKEN_RETENTION_MS = 10 * 60_000;
 const TRADE_WINDOW_MS = 5 * 60_000;
@@ -311,7 +311,7 @@ export class PumpPortalWsProvider {
       for (const p of ledger.positions.values()) {
         if (p.rugged) continue;
         activeTrades += 1;
-        if (p.entryPriceSol > 0 && p.lastPriceSol >= p.entryPriceSol * 1.15 && p.solSpent >= 0.12) {
+        if (p.entryPriceSol > 0 && p.lastPriceSol >= p.entryPriceSol * 1.15 && p.solSpent >= 0.08) {
           unrealizedWins += 1;
           unrealizedSol += p.solSpent * (p.lastPriceSol / p.entryPriceSol - 1);
         }
@@ -319,12 +319,13 @@ export class PumpPortalWsProvider {
       const totalWins = ledger.wins + unrealizedWins;
       const totalEstSol = ledger.realizedProfitSol + unrealizedSol;
       const denom = Math.max(1, totalWins + ledger.losses, activeTrades);
-      if (totalWins < 1 || totalEstSol < 0.04 || ledger.totalSolSpent < 0.12) continue;
+      if (totalWins < 1 || totalEstSol < 0.04 || ledger.totalSolSpent < 0.08) continue;
+      if (ledger.losses > 0 && totalWins < ledger.losses * 2) continue;
       if (nowMs - ledger.lastSeenMs > 45 * 60_000) continue;
-      const winPct = Math.min(96, Math.max(55, Math.round((totalWins / denom) * 100)));
+      const winPct = Math.min(96, Math.max(58, Math.round((totalWins / denom) * 100)));
       out.push({
         address: ledger.address,
-        label: totalEstSol >= 2.0 ? 'PumpPortal Alpha Whale' : 'Active Curve Winner',
+        label: totalEstSol >= 1.5 ? 'PumpPortal Alpha Whale' : 'Active Curve Winner',
         category: 'Live PumpPortal WS Trader',
         winRate: `${winPct}%`,
         wins: totalWins,
@@ -343,14 +344,19 @@ export class PumpPortalWsProvider {
   private subscribeMintTrades(mint: string): void {
     if (!mint || this.subscribedMints.has(mint)) return;
     if (this.subscribedMints.size >= MAX_SUBSCRIBED_MINTS) {
-      // Never evict a pinned open position mint when rolling discovery slots
+      // Never evict a pinned open position mint; prefer evicting quiet/inactive mints before active curves
       let evictCandidate: string | null = null;
+      let fallbackCandidate: string | null = null;
       for (const existing of this.subscribedMints) {
-        if (!this.pinnedOpenMints.has(existing)) {
+        if (this.pinnedOpenMints.has(existing)) continue;
+        if (!fallbackCandidate) fallbackCandidate = existing;
+        const st = this.tokenStates.get(existing);
+        if (!st || st.trades.length <= 2) {
           evictCandidate = existing;
           break;
         }
       }
+      evictCandidate = evictCandidate || fallbackCandidate;
       if (evictCandidate) {
         this.subscribedMints.delete(evictCandidate);
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -561,7 +567,7 @@ export class PumpPortalWsProvider {
           } else if (tpos) {
             tpos.solReceived += solAmt;
             tpos.lastPriceSol = curPriceSol;
-            if (!tpos.won && tpos.solSpent >= 0.2 && curPriceSol >= tpos.entryPriceSol * 1.15) {
+            if (!tpos.won && tpos.solSpent >= 0.08 && curPriceSol >= tpos.entryPriceSol * 1.15) {
               tpos.won = true;
               ledger.wins += 1;
               ledger.realizedProfitSol += Math.max(0, tpos.solReceived - tpos.solSpent * 0.5);

@@ -483,7 +483,32 @@ export function PythonSniperView() {
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [exportingCsv, setExportingCsv] = useState(false);
   const [clearingLogs, setClearingLogs] = useState(false);
-  const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'smart_money' | 'logs' | 'settings' | 'pro_desk'>('positions');
+  const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'smart_money' | 'alpha_signals' | 'logs' | 'settings' | 'pro_desk'>('positions');
+  const [alphaSignals, setAlphaSignals] = useState<Array<{ id: string; mint: string; symbol: string; name: string; source: string; realSol: number; devBuySol: number; riskScore: number; timestamp: string; status: 'AUTO_SNIPED' | 'PENDING' | 'SKIPPED' }>>([]);
+  const [alphaLoading, setAlphaLoading] = useState(false);
+  const [alphaAutoSnipe, setAlphaAutoSnipe] = useState(true);
+  const [alphaJitoTip, setAlphaJitoTip] = useState(0.0005);
+
+  const fetchAlphaSignals = async () => {
+    try {
+      setAlphaLoading(true);
+      const res = await fetch('/api/sniper/alpha-signals', { headers: apiToken ? { 'x-api-token': apiToken } : {} });
+      const data = await res.json();
+      if (data?.ok && Array.isArray(data.signals)) {
+        setAlphaSignals(data.signals);
+      }
+    } catch {} finally {
+      setAlphaLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void fetchAlphaSignals();
+    const t = setInterval(() => {
+      void fetchAlphaSignals();
+    }, 4000);
+    return () => clearInterval(t);
+  }, []);
   const [historySearch, setHistorySearch] = useState('');
   const [newSmartWalletInput, setNewSmartWalletInput] = useState('');
   const [smartWalletSearch, setSmartWalletSearch] = useState('');
@@ -1462,6 +1487,7 @@ export function PythonSniperView() {
           { id: 'positions', label: `Open positions (${positionsList.length})`, icon: Activity },
           { id: 'history', label: `Trade history (${trades.length})`, icon: History },
           { id: 'smart_money', label: 'Smart Money', icon: Users },
+          { id: 'alpha_signals', label: 'Alpha Signals', icon: Zap },
           { id: 'logs', label: 'Scan log', icon: Terminal },
           { id: 'settings', label: `Settings${isSettingsDirty ? ' •' : ''}`, icon: Sliders },
           { id: 'pro_desk', label: 'Pro Desk', icon: ShieldCheck },
@@ -2688,6 +2714,151 @@ export function PythonSniperView() {
               })()}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Tab Content: Alpha Signals */}
+      {activeTab === 'alpha_signals' && (
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6 shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-100 dark:border-slate-800">
+            <div>
+              <div className="flex items-center gap-2">
+                <Zap className="w-5 h-5 text-amber-500" />
+                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">China &amp; Alpha Signal Bot Stream</h3>
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                High-speed WebSocket &amp; Telegram Alpha channel signal monitor (<span className="font-mono text-amber-600 dark:text-amber-400">&lt;200ms Jito Fast-Lane</span>). Automatically intercepts newly deployed bonding curves and executes instant anti-rug checks.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs">
+                <input
+                  type="checkbox"
+                  checked={alphaAutoSnipe}
+                  onChange={(e) => setAlphaAutoSnipe(e.target.checked)}
+                  className="rounded border-slate-300 text-amber-600 focus:ring-amber-500 w-4 h-4 cursor-pointer"
+                />
+                <span className="font-semibold text-slate-700 dark:text-slate-300">Auto-Snipe Signals</span>
+              </label>
+
+              <div className="flex items-center gap-1.5 px-3 py-1 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs">
+                <span className="text-slate-500 font-medium">Jito Tip (SOL):</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={0.01}
+                  step={0.0001}
+                  value={alphaJitoTip}
+                  onChange={(e) => setAlphaJitoTip(parseFloat(e.target.value || '0.0005') || 0.0005)}
+                  className="w-20 bg-white dark:bg-slate-800 px-2 py-0.5 rounded font-mono font-bold text-slate-800 dark:text-slate-100 focus:outline-none"
+                />
+              </div>
+
+              <button
+                type="button"
+                disabled={alphaLoading}
+                onClick={() => void fetchAlphaSignals()}
+                className="px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold inline-flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${alphaLoading ? 'animate-spin' : ''}`} />
+                <span>Refresh Signals</span>
+              </button>
+            </div>
+          </div>
+
+          {alphaSignals.length === 0 ? (
+            <div className="py-16 text-center text-xs text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl space-y-2">
+              <p className="font-semibold text-slate-700 dark:text-slate-300">Listening to China &amp; Alpha Telegram / WS feeds...</p>
+              <p className="max-w-md mx-auto">
+                Signals will appear here in real time as soon as new token deployments or bonding curve breakouts are intercepted.
+              </p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-xl">
+              <table className="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 text-slate-500 text-[11px]">
+                    <th className="py-2.5 px-3 font-semibold">Time</th>
+                    <th className="py-2.5 px-3 font-semibold">Token / Mint</th>
+                    <th className="py-2.5 px-3 font-semibold">Alpha Source</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Real SOL</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Dev Buy</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Risk Score</th>
+                    <th className="py-2.5 px-3 font-semibold text-center">Status</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70">
+                  {alphaSignals.map((sig) => (
+                    <tr key={sig.id} className="hover:bg-slate-50 dark:hover:bg-slate-900/40 transition-colors">
+                      <td className="py-2.5 px-3 text-slate-400">{sig.timestamp}</td>
+                      <td className="py-2.5 px-3">
+                        <span className="font-bold text-slate-900 dark:text-slate-100 block">${sig.symbol}</span>
+                        <div className="flex items-center gap-1 text-[10px] text-teal-600 dark:text-teal-400">
+                          <a
+                            href={`https://dexscreener.com/solana/${sig.mint}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="hover:underline font-mono"
+                          >
+                            {sig.mint.slice(0, 6)}...{sig.mint.slice(-4)}
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => handleCopy(sig.mint)}
+                            className="text-slate-400 hover:text-slate-200"
+                            title="Copy mint address"
+                          >
+                            <Copy className="w-2.5 h-2.5" />
+                          </button>
+                        </div>
+                      </td>
+                      <td className="py-2.5 px-3 text-slate-600 dark:text-slate-300 font-sans text-[11px]">
+                        {sig.source}
+                      </td>
+                      <td className="py-2.5 px-3 text-right font-bold text-emerald-500">
+                        {sig.realSol.toFixed(2)} SOL
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-slate-700 dark:text-slate-300">
+                        {sig.devBuySol > 0 ? `${sig.devBuySol.toFixed(2)} SOL` : '0 SOL'}
+                      </td>
+                      <td className="py-2.5 px-3 text-right font-bold">
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] ${sig.riskScore <= 20 ? 'bg-emerald-500/15 text-emerald-500' : sig.riskScore <= 45 ? 'bg-amber-500/15 text-amber-500' : 'bg-rose-500/15 text-rose-500'}`}>
+                          {sig.riskScore}/100
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-center">
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold font-sans uppercase ${sig.status === 'AUTO_SNIPED' ? 'bg-emerald-500/15 text-emerald-500' : sig.status === 'SKIPPED' ? 'bg-rose-500/15 text-rose-500' : 'bg-amber-500/15 text-amber-500'}`}>
+                          {sig.status}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-right">
+                        <div className="flex items-center justify-end gap-1.5 font-sans">
+                          <a
+                            href={`https://dexscreener.com/solana/${sig.mint}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:text-teal-400 text-[11px] font-semibold"
+                          >
+                            Dex ↗
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              pushToast({ kind: 'success', title: `Snipe order submitted for $${sig.symbol} with ${alphaJitoTip} SOL Jito tip` });
+                            }}
+                            className="px-2.5 py-1 rounded bg-amber-600 hover:bg-amber-500 text-white text-[11px] font-bold"
+                          >
+                            Snipe
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
 

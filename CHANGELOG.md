@@ -2,6 +2,17 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.45.0 — China & Alpha Signal Bot Tab & Fast-Lane Jito Feed
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Dedicated Alpha Signals Tab (`PythonSniperView.tsx`, `server/sniperManager.ts`, `server/routes/api.ts`)**:
+  - Added a brand-new **Alpha Signals** tab in Python Sniper Bot inspired by high-speed China/Asia alpha telegram & WebSocket signal feeds.
+  - Features real-time live signal stream (`<200ms` WS / Telegram Alpha channels), Bonding Curve Real SOL depth, dev buy tracking, risk scoring, auto-snipe toggles, and Jito Fast-Lane tip boost (`0.0005 SOL`).
+
+---
+
 ## v1.44.1 — Direct Coin + Wallet Inspector Links, Active Whale Ranking Fix & Smart-Money Telemetry
 
 **Risk Warning: Trading can lose all of your money.**

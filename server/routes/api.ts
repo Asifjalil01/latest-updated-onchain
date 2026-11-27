@@ -1058,6 +1058,10 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.json({ ...disc, holdingsScan });
   });
 
+  router.get('/sniper/alpha-signals', (_req: Request, res: Response) => {
+    res.json(sniperManager.getAlphaSignals());
+  });
+
   router.get('/sniper/pumpportal-mints', (_req: Request, res: Response) => {
     const feed = sniperManager.getPumpPortalFeed();
     res.json({
