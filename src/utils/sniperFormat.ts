@@ -517,6 +517,45 @@ export function validatePythonSniperSettings(
     }
   }
 
+  const pSize = parseFloat(String(settings.pulse_trade_size_usd ?? 5));
+  if (!Number.isFinite(pSize) || pSize <= 0) {
+    return {
+      valid: false,
+      error: 'Pulse Trade size $ must be greater than $0.',
+      recovery: null,
+    };
+  }
+  const pMinAge = parseFloat(String(settings.pulse_min_age_minutes ?? 2));
+  const pMaxAge = parseFloat(String(settings.pulse_max_age_minutes ?? 180));
+  if (!Number.isFinite(pMinAge) || pMinAge < 0) {
+    return {
+      valid: false,
+      error: 'Pulse Minimum coin age (minutes) must be 0 or greater.',
+      recovery: null,
+    };
+  }
+  if (Number.isFinite(pMaxAge) && pMaxAge > 0 && pMinAge > pMaxAge) {
+    return {
+      valid: false,
+      error: `Pulse Minimum coin age (${pMinAge}m) cannot exceed Maximum coin age (${pMaxAge}m).`,
+      recovery: null,
+    };
+  }
+  const pCurveMin = parseFloat(String(settings.pulse_stage2_min_curve_pct ?? 65));
+  const pCurveMax = parseFloat(String(settings.pulse_stage2_max_curve_pct ?? 94));
+  if (!Number.isFinite(pCurveMin) || !Number.isFinite(pCurveMax) || pCurveMin < 0 || pCurveMax > 100 || pCurveMin >= pCurveMax) {
+    return {
+      valid: false,
+      error: 'Pulse Stage 2 curve % range must satisfy 0 <= Min % < Max % <= 100.',
+      recovery: null,
+    };
+  }
+
+  const scanModeNorm = String(settings.smart_money_scan_mode || '').trim().toLowerCase();
+  if (scanModeNorm === 'pulse_only') {
+    return { valid: true, error: null, recovery: null };
+  }
+
   const recoverEnabled =
     isPyOptionEnabled(settings, 'recover_principal_enabled', true) &&
     (settings.recover_principal_enabled === true || settings.recover_principal_enabled === 'true');

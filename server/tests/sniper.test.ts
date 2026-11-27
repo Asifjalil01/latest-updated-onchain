@@ -3496,5 +3496,256 @@ test('v1.45.1: Alpha Signals Only mode isolates from Whale/Sniper launches, auto
   }
 });
 
+test('v1.45.4: Photon/Axiom/GMGN Pulse (Stage 2-3) uses independent settings, filters stage2/stage3 cleanly, isolates pulse_only feed, and executes in bot.py', async () => {
+  const { PumpPortalWsProvider } = await import('../providers/pumpportal');
+  const pp = new PumpPortalWsProvider();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1454-'));
+  try {
+    const stage1Newborn = 'Stage1NewbornMint11111111111111111111111pump';
+    const stage2Curve = 'Stage2CurveMint1111111111111111111111111pump';
+    const stage3Migrated = 'Stage3MigratedMint11111111111111111111111111';
+    const bundledStage3 = 'BundledStage3Mint11111111111111111111111111';
+    const manualCoin = 'ManualPulseCoin11111111111111111111111111111';
+    const whaleAddr = 'WhalePulseIgnored111111111111111111111111111';
+
+    const baseTs = Date.now() - 4 * 60_000; // 4 minutes old -> passes Pulse 2m-180m window even when Sniper max_age=0.5m
+
+    // Stage 1 newborn (~3% curve, 5s old) -> must be ignored by Pulse
+    pp.ingestFrame(
+      { mint: stage1Newborn, symbol: 'STG1', txType: 'create', traderPublicKey: 'DevS1111111111111111111111111111111111111111', solAmount: 0.5, vSolInBondingCurve: 31.0, vTokensInBondingCurve: 980_000_000, marketCapSol: 32 },
+      Date.now() - 5_000
+    );
+
+    // Tracked whale buys Stage 1 newborn -> pulse_only must still ignore smart_buys
+    pp.setTrackedSmartWallets([whaleAddr]);
+    pp.ingestFrame(
+      { mint: stage1Newborn, txType: 'buy', traderPublicKey: whaleAddr, solAmount: 0.4, vSolInBondingCurve: 31.4, vTokensInBondingCurve: 970_000_000, marketCapSol: 33 },
+      Date.now() - 3_000
+    );
+
+    // Stage 2 bonding curve (~80% curve: vSol=98 => realSol=68 => 68/85 = 80%)
+    pp.ingestFrame(
+      { mint: stage2Curve, symbol: 'STG2', txType: 'create', traderPublicKey: 'DevS2111111111111111111111111111111111111111', solAmount: 1.5, vSolInBondingCurve: 31.5, vTokensInBondingCurve: 950_000_000, marketCapSol: 33 },
+      baseTs
+    );
+    for (let i = 0; i < 12; i += 1) {
+      pp.ingestFrame(
+        {
+          mint: stage2Curve,
+          txType: 'buy',
+          traderPublicKey: `PulseBuyer${i}1111111111111111111111111111111`,
+          solAmount: 2.0,
+          vSolInBondingCurve: i === 11 ? 98.0 : 40.0 + i * 5,
+          vTokensInBondingCurve: 550_000_000 - i * 10_000_000,
+          marketCapSol: 120 + i * 10,
+        },
+        baseTs + 10_000 + i * 2000
+      );
+    }
+
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    (mgr as any).solPriceUsd = 150;
+    mgr.attachOrchestrator({
+      pumpPortal: pp,
+      signer: { isUnlocked: () => false, getPublicKey: () => null, getMaskedPublicKey: () => 'Locked' },
+      rpcPool: { getHealthSnapshot: () => [] },
+    } as any);
+
+    // Mock GeckoTerminal + DexScreener + RugCheck for Stage 3 graduated pools
+    (mgr as any).fetchJsonWithTimeout = async (url: string) => {
+      if (url.includes('geckoterminal.com')) {
+        return {
+          data: [
+            {
+              attributes: {
+                address: 'PoolStg3Clean111111111111111111111111111111',
+                reserve_in_usd: '32000',
+                volume_usd: { h1: '18000' },
+                pool_created_at: new Date(Date.now() - 8 * 60_000).toISOString(),
+              },
+              relationships: {
+                dex: { data: { id: 'pumpswap' } },
+                base_token: { data: { id: `solana_${stage3Migrated}` } },
+              },
+            },
+            {
+              attributes: {
+                address: 'PoolStg3Bundle11111111111111111111111111111',
+                reserve_in_usd: '28000',
+                volume_usd: { h1: '12000' },
+                pool_created_at: new Date(Date.now() - 6 * 60_000).toISOString(),
+              },
+              relationships: {
+                dex: { data: { id: 'raydium' } },
+                base_token: { data: { id: `solana_${bundledStage3}` } },
+              },
+            },
+          ],
+        };
+      }
+      if (url.includes('tokens/v1/solana/')) {
+        return [
+          {
+            baseToken: { address: stage3Migrated, symbol: 'STG3', name: 'Migrated Stage 3' },
+            dexId: 'pumpswap',
+            pairCreatedAt: Date.now() - 8 * 60_000,
+            priceUsd: '0.0042',
+            liquidity: { usd: 32000 },
+            volume: { m5: 9500 },
+            txns: { m5: { buys: 24, sells: 8 } },
+            priceChange: { m5: 14 },
+          },
+          {
+            baseToken: { address: bundledStage3, symbol: 'BNDL3', name: 'Bundled Stage 3' },
+            dexId: 'raydium',
+            pairCreatedAt: Date.now() - 6 * 60_000,
+            priceUsd: '0.0031',
+            liquidity: { usd: 28000 },
+            volume: { m5: 5500 },
+            txns: { m5: { buys: 18, sells: 5 } },
+            priceChange: { m5: 11 },
+          },
+        ];
+      }
+      if (url.includes(`rugcheck.xyz/v1/tokens/${bundledStage3}/report`)) {
+        return { score_normalised: 15, insiderNetworks: [{ id: 'c1', size: 6 }], insidersDetected: 6, risks: [] };
+      }
+      if (url.includes('rugcheck.xyz')) {
+        return { score_normalised: 10, insiderNetworks: [], insidersDetected: 0, risks: [] };
+      }
+      return null;
+    };
+
+    // Validation check: inverted Stage 2 curve rejected, while valid pulse_only bypasses Sniper recover_principal constraint
+    const badCurve = mgr.updateSettings({
+      pulse_stage2_min_curve_pct: 95,
+      pulse_stage2_max_curve_pct: 60,
+    });
+    assert.equal(badCurve.ok, false);
+
+    // Intentionally configure wildly different Sniper settings vs Pulse independent settings
+    const saveRes = mgr.updateSettings({
+      smart_money_scan_mode: 'pulse_only',
+      trade_size_usd: 99.0,
+      max_age_minutes: 0.5,
+      min_liquidity_usd: 500000.0,
+      take_profit_pct: 400.0,
+      stop_loss_pct: 45.0,
+      trailing_stop_pct: 20.0,
+      recover_principal_enabled: true,
+      pulse_stage: 'both',
+      pulse_auto_find: true,
+      pulse_auto_buy: true,
+      pulse_trade_size_usd: 7.5,
+      pulse_take_profit_pct: 25.0,
+      pulse_stop_loss_pct: 12.0,
+      pulse_trailing_stop_pct: 6.0,
+      pulse_max_hold_minutes: 45,
+      pulse_min_age_minutes: 2.0,
+      pulse_max_age_minutes: 120.0,
+      pulse_stage2_min_curve_pct: 65.0,
+      pulse_stage2_max_curve_pct: 94.0,
+      pulse_stage2_min_real_sol: 40.0,
+      pulse_stage3_min_liquidity_usd: 15000.0,
+      pulse_min_buys_m5: 10,
+      pulse_min_buy_sell_ratio_m5: 1.05,
+      pulse_min_unique_traders_5m: 5,
+      pulse_rugcheck_max_score: 50.0,
+    });
+    assert.equal(saveRes.ok, true);
+    assert.equal(saveRes.settings?.pulse_trade_size_usd, 7.5);
+    assert.equal(saveRes.settings?.trade_size_usd, 99.0);
+
+    // Discover Stage 2 + Stage 3 coins: both clean Stage 2 & Stage 3 qualify, bundled Stage 3 marked SKIPPED, Stage 1 ignored
+    const discBoth = await mgr.discoverPulseSignals({ force: true });
+    assert.equal(discBoth.ok, true);
+    assert.ok(discBoth.signals.some((s) => s.mint === stage2Curve && s.stage === 'stage2' && s.status === 'AUTO_BUY'));
+    assert.ok(discBoth.signals.some((s) => s.mint === stage3Migrated && s.stage === 'stage3' && s.status === 'AUTO_BUY'));
+    assert.ok(!discBoth.signals.some((s) => s.mint === stage1Newborn));
+    const bundledRow = discBoth.signals.find((s) => s.mint === bundledStage3);
+    assert.equal(bundledRow?.status, 'SKIPPED');
+
+    // Feed isolation in pulse_only
+    const feed = mgr.getPumpPortalFeed();
+    assert.deepEqual(feed.smart_buys, []);
+    assert.deepEqual(feed.whale_held_mints, []);
+    assert.deepEqual(feed.alpha_signals, []);
+    assert.ok(feed.pulse_signals.some((s) => s.mint === stage2Curve));
+    assert.ok(feed.pulse_signals.some((s) => s.mint === stage3Migrated));
+    assert.ok(!feed.mints.includes(stage1Newborn));
+    assert.ok(!feed.mints.includes(bundledStage3));
+
+    // Manual Pulse buy queueing works immediately
+    const manualQueue = await mgr.queueManualPulseBuy(manualCoin, 0.0008);
+    assert.equal(manualQueue.ok, true);
+    assert.ok(mgr.getPumpPortalFeed().pulse_signals.some((s) => s.mint === manualCoin && s.status === 'MANUAL_QUEUED'));
+
+    // Switching pulse_stage to stage3 filters out stage2 candidates cleanly
+    mgr.updateSettings({ pulse_stage: 'stage3' });
+    const stage3OnlySignals = mgr.getPulseSignals().signals;
+    assert.ok(!stage3OnlySignals.some((s) => s.mint === stage2Curve));
+    assert.ok(stage3OnlySignals.some((s) => s.mint === stage3Migrated));
+
+    // Python bot.py: pulse_only ignores Sniper thresholds & enforces Pulse independent size/age/stage/TP/SL/trailing
+    const pyScript = [
+      'import sys, types, json, time',
+      'req = types.ModuleType("requests")',
+      'req.Session = lambda: None',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      `TMP_DIR = ${JSON.stringify(tmpDir)}`,
+      'bot._base_dir = lambda: TMP_DIR',
+      'now_ms = int(time.time() * 1000)',
+      'stg2_m = "Stage2CurveMint1111111111111111111111111pump"',
+      'stg3_m = "Stage3MigratedMint11111111111111111111111111"',
+      'stg1_m = "Stage1NewbornMint11111111111111111111111pump"',
+      'bot._ws_pulse_signals.clear()',
+      'bot._pulse_pending_mints.clear()',
+      'bot._pulse_pairs.clear()',
+      'bot._ingest_ws_bridge_payload({"ok": True, "pulse_signals": [',
+      '  {"mint": stg2_m, "symbol": "STG2", "stage": "stage2", "source": "Photon/Axiom Stage 2", "curvePct": 80.0, "realSol": 68.0, "riskScore": 15, "status": "AUTO_BUY"},',
+      '  {"mint": stg3_m, "symbol": "STG3", "stage": "stage3", "source": "Axiom/GMGN Stage 3", "curvePct": 100.0, "liquidityUsd": 32000.0, "riskScore": 14, "status": "AUTO_BUY"}',
+      ']})',
+      'cfg_pulse = {**bot.CONFIG, "smart_money_scan_mode": "pulse_only", "trade_size_usd": 99.0, "max_age_minutes": 0.5, "min_liquidity_usd": 500000.0, "take_profit_pct": 400.0, "stop_loss_pct": 45.0, "trailing_stop_pct": 20.0, "pulse_stage": "both", "pulse_trade_size_usd": 7.5, "pulse_take_profit_pct": 25.0, "pulse_stop_loss_pct": 12.0, "pulse_trailing_stop_pct": 6.0, "pulse_max_hold_minutes": 45, "pulse_min_age_minutes": 2.0, "pulse_max_age_minutes": 120.0, "pulse_stage2_min_curve_pct": 65.0, "pulse_stage2_max_curve_pct": 94.0, "pulse_stage2_min_real_sol": 40.0, "pulse_stage3_min_liquidity_usd": 15000.0, "pulse_min_buys_m5": 10, "pulse_min_buy_sell_ratio_m5": 1.05, "pulse_min_unique_traders_5m": 5}',
+      'pair_stg2 = {"baseToken": {"address": stg2_m, "symbol": "STG2"}, "dexId": "pumpfun", "priceUsd": "0.001", "pairCreatedAt": now_ms - 4 * 60000, "liquidity": {"usd": 20000}, "volume": {"m5": 6000}, "txns": {"m5": {"buys": 14, "sells": 4}}, "_pumpportal": {"curve_pct": 80.0, "real_sol": 68.0, "migrated": False, "unique_traders_5m": 12}}',
+      'pair_stg3 = {"baseToken": {"address": stg3_m, "symbol": "STG3"}, "dexId": "pumpswap", "priceUsd": "0.004", "pairCreatedAt": now_ms - 8 * 60000, "liquidity": {"usd": 32000}, "volume": {"m5": 9500}, "txns": {"m5": {"buys": 24, "sells": 8}}, "_pumpportal": {"curve_pct": 100.0, "migrated": True, "unique_traders_5m": 18}}',
+      'pair_stg1 = {"baseToken": {"address": stg1_m, "symbol": "STG1"}, "dexId": "pumpfun", "priceUsd": "0.0001", "pairCreatedAt": now_ms - 5000, "liquidity": {"usd": 5000}, "volume": {"m5": 1000}, "txns": {"m5": {"buys": 12, "sells": 2}}, "_pumpportal": {"curve_pct": 4.0, "real_sol": 2.0, "migrated": False}}',
+      'ok2, why2, _ = bot.passes_filters(pair_stg2, cfg_pulse)',
+      'ok3, why3, _ = bot.passes_filters(pair_stg3, cfg_pulse)',
+      'ok1, why1, _ = bot.passes_filters(pair_stg1, cfg_pulse)',
+      'ok2_in_s3_only, why2_s3, _ = bot.passes_filters(pair_stg2, {**cfg_pulse, "pulse_stage": "stage3"})',
+      'acct = bot.TradingAccount(cfg_pulse, mode="paper")',
+      'acct.buy(stg2_m, "STG2", 0.001, meta={"dex": "pumpfun", "source": "pulse_stage2", "pulse_entry": True, "pulse_stage": "stage2", "pulse_source": "Photon/Axiom Stage 2", "pulse_curve_pct": 80.0, "pulse_risk_score": 15})',
+      'pos = acct.state["positions"][stg2_m]',
+      'buy_cost = pos["cost"]',
+      'entry_px = pos["entry_price"]',
+      // +28% from fill arms 6% Pulse trailing stop (TP=25%, Sniper TP=400% must NOT block it); then -10% drop from peak triggers Pulse trailing exit!
+      'acct.check_exits({stg2_m: entry_px * 1.28})',
+      'trail_armed = acct.state["positions"][stg2_m].get("trailing_active")',
+      'acct.check_exits({stg2_m: entry_px * 1.18})',
+      'exited_by_pulse_trail = stg2_m not in acct.state["positions"]',
+      'print(json.dumps({"ok2": ok2, "why2": why2, "ok3": ok3, "why3": why3, "ok1": ok1, "why1": why1, "ok2_in_s3_only": ok2_in_s3_only, "why2_s3": why2_s3, "buy_cost": buy_cost, "pulse_entry": pos.get("pulse_entry"), "pulse_stage": pos.get("pulse_stage"), "trail_armed": trail_armed, "exited_by_pulse_trail": exited_by_pulse_trail}))',
+    ].join('\n');
+
+    const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyOut.ok2, true);
+    assert.equal(pyOut.ok3, true);
+    assert.equal(pyOut.ok1, false);
+    assert.equal(pyOut.why1, 'not pulse signal');
+    assert.equal(pyOut.ok2_in_s3_only, false);
+    assert.equal(pyOut.why2_s3, 'pulse stage mismatch');
+    assert.ok(pyOut.buy_cost > 7.0 && pyOut.buy_cost < 8.5, `Expected Pulse $7.50 buy size, got ${pyOut.buy_cost}`);
+    assert.equal(pyOut.pulse_entry, true);
+    assert.equal(pyOut.pulse_stage, 'stage2');
+    assert.equal(pyOut.trail_armed, true);
+    assert.equal(pyOut.exited_by_pulse_trail, true);
+  } finally {
+    pp.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 

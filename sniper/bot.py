@@ -100,6 +100,30 @@ CONFIG = {
     "alpha_signal_refresh_interval_sec": 10,
     "alpha_signal_max_risk_score": 45,
     "alpha_signal_min_real_sol": 1.5,
+    # Photon / Axiom / GMGN Pulse (Stage 2 & Stage 3) independent settings
+    "pulse_stage": "both",
+    "pulse_auto_find": True,
+    "pulse_auto_buy": True,
+    "pulse_trade_size_usd": 5.0,
+    "pulse_take_profit_pct": 30.0,
+    "pulse_stop_loss_pct": 15.0,
+    "pulse_trailing_stop_pct": 8.0,
+    "pulse_max_hold_minutes": 90,
+    "pulse_jito_tip_sol": 0.0005,
+    "pulse_refresh_interval_sec": 10,
+    "pulse_min_age_minutes": 2.0,
+    "pulse_max_age_minutes": 180.0,
+    "pulse_stage2_min_curve_pct": 65.0,
+    "pulse_stage2_max_curve_pct": 94.0,
+    "pulse_stage2_min_real_sol": 40.0,
+    "pulse_stage3_min_liquidity_usd": 15000.0,
+    "pulse_stage3_require_pullback": False,
+    "pulse_stage3_pullback_pct": 12.0,
+    "pulse_stage3_wait_sec": 30.0,
+    "pulse_min_buys_m5": 10,
+    "pulse_min_buy_sell_ratio_m5": 1.05,
+    "pulse_min_unique_traders_5m": 10,
+    "pulse_rugcheck_max_score": 50.0,
     "reused_socials_enabled": True,
     "max_social_reuse_count": 2,
     # Pro Desk — Group 2: Zero-Lag Exits & MEV / Wallet Sweep
@@ -722,6 +746,9 @@ _whale_held_eval_ts = {}      # mint -> last queued timestamp for passive whale 
 _ws_alpha_signals = {}        # mint -> latest alpha signal metadata dict
 _alpha_pending_mints = {}     # mint -> ts
 _alpha_pairs = {}             # mint -> cached pair payload from alpha signal
+_ws_pulse_signals = {}        # mint -> latest Pulse (Stage 2/3) metadata dict
+_pulse_pending_mints = {}     # mint -> ts
+_pulse_pairs = {}             # mint -> cached pair payload from Pulse scanner
 _ws_feed_lock = threading.Lock()
 _last_ws_poll_ts = [0.0]
 
@@ -732,6 +759,7 @@ def _ingest_ws_bridge_payload(resp):
     sb_added = 0
     wh_added = 0
     al_added = 0
+    pl_added = 0
     with _ws_feed_lock:
         op = resp.get("open_prices")
         if isinstance(op, dict):
@@ -791,6 +819,30 @@ def _ingest_ws_bridge_payload(resp):
                     if isinstance(ev.get("pair"), dict):
                         _alpha_pairs[amint] = ev["pair"]
                     al_added += 1
+        pl = resp.get("pulse_signals")
+        if isinstance(pl, list):
+            for ev in pl:
+                if not isinstance(ev, dict):
+                    continue
+                pmint = str(ev.get("mint") or "").strip()
+                pstat = str(ev.get("status") or "").strip().upper()
+                if pmint and pstat in ("AUTO_BUY", "READY", "MANUAL_QUEUED"):
+                    _ws_pulse_signals[pmint] = {
+                        "mint": pmint,
+                        "symbol": str(ev.get("symbol") or pmint[:6]),
+                        "stage": str(ev.get("stage") or "stage3").strip().lower(),
+                        "source": str(ev.get("source") or "Photon/Axiom/GMGN Pulse"),
+                        "dexId": str(ev.get("dexId") or ""),
+                        "curvePct": float(ev.get("curvePct") or 0.0),
+                        "realSol": float(ev.get("realSol") or 0.0),
+                        "liquidityUsd": float(ev.get("liquidityUsd") or 0.0),
+                        "riskScore": float(ev.get("riskScore") or 0.0),
+                        "status": pstat,
+                    }
+                    _pulse_pending_mints[pmint] = now_ts
+                    if isinstance(ev.get("pair"), dict):
+                        _pulse_pairs[pmint] = ev["pair"]
+                    pl_added += 1
         if len(_ws_smart_buys) > 1000:
             for k in list(_ws_smart_buys.keys())[:500]:
                 _ws_smart_buys.pop(k, None)
@@ -803,15 +855,24 @@ def _ingest_ws_bridge_payload(resp):
         if len(_alpha_pairs) > 500:
             for k in list(_alpha_pairs.keys())[:250]:
                 _alpha_pairs.pop(k, None)
+        if len(_ws_pulse_signals) > 500:
+            for k in list(_ws_pulse_signals.keys())[:250]:
+                _ws_pulse_signals.pop(k, None)
+        if len(_pulse_pairs) > 500:
+            for k in list(_pulse_pairs.keys())[:250]:
+                _pulse_pairs.pop(k, None)
         for k in [k for k, ts in _smart_buy_pending_mints.items() if now_ts - ts > 180.0]:
             _smart_buy_pending_mints.pop(k, None)
         for k in [k for k, ts in _alpha_pending_mints.items() if now_ts - ts > 180.0]:
             _alpha_pending_mints.pop(k, None)
-    if sb_added or wh_added or al_added:
+        for k in [k for k, ts in _pulse_pending_mints.items() if now_ts - ts > 180.0]:
+            _pulse_pending_mints.pop(k, None)
+    if sb_added or wh_added or al_added or pl_added:
         with _stats_lock:
             _stats["smart_buys"] = _stats.get("smart_buys", 0) + sb_added
             _stats["whale_held"] = _stats.get("whale_held", 0) + wh_added
             _stats["alpha_signals"] = _stats.get("alpha_signals", 0) + al_added
+            _stats["pulse_signals"] = _stats.get("pulse_signals", 0) + pl_added
 
 def _poll_ws_monitor_feed(cfg, force=False):
     if not opt_on(cfg, "ws_exit_stream_enabled", True) or not _bridge_base_url():
@@ -826,7 +887,7 @@ def _poll_ws_monitor_feed(cfg, force=False):
 
 def _src_pumpportal(cfg):
     scan_mode = _get_scan_mode(cfg)
-    if not opt_on(cfg, "use_pumpportal", True) and scan_mode not in ("smart_money_only", "alpha_signal_only"):
+    if not opt_on(cfg, "use_pumpportal", True) and scan_mode not in ("smart_money_only", "alpha_signal_only", "pulse_only"):
         return []
     if _bridge_base_url():
         resp = bridge_get("/api/sniper/pumpportal-mints", timeout=4)
@@ -844,7 +905,7 @@ def _src_pumpportal(cfg):
                         _pumpportal_pairs.pop(k, None)
             if isinstance(resp.get("mints"), list):
                 return [m for m in resp["mints"] if isinstance(m, str) and m]
-    if scan_mode in ("smart_money_only", "alpha_signal_only"):
+    if scan_mode in ("smart_money_only", "alpha_signal_only", "pulse_only"):
         return []
     data = get_json(f"{PUMPP}/coins/new")
     if not isinstance(data, list): return []
@@ -852,7 +913,7 @@ def _src_pumpportal(cfg):
 
 def _get_scan_mode(cfg):
     raw = str((cfg or {}).get("smart_money_scan_mode") or "both").strip().lower()
-    if raw in ("both", "smart_money_only", "sniper_only", "alpha_signal_only"):
+    if raw in ("both", "smart_money_only", "sniper_only", "alpha_signal_only", "pulse_only"):
         return raw
     return "both"
 
@@ -867,7 +928,7 @@ SOURCES = [
 
 def fetch_candidate_mints(cfg, force=False):
     scan_mode = _get_scan_mode(cfg)
-    active_sources = [("pumpportal", 1.5, _src_pumpportal)] if scan_mode in ("smart_money_only", "alpha_signal_only") else SOURCES
+    active_sources = [("pumpportal", 1.5, _src_pumpportal)] if scan_mode in ("smart_money_only", "alpha_signal_only", "pulse_only") else SOURCES
     by_src = {}
     lock = threading.Lock()
     def run(name, cd, fn):
@@ -894,13 +955,25 @@ def fetch_candidate_mints(cfg, force=False):
     for t in ths: t.join(timeout=5)
     smart_priority = []
     alpha_priority = []
+    pulse_priority = []
     with _ws_feed_lock:
-        if _smart_buy_pending_mints and scan_mode not in ("sniper_only", "alpha_signal_only"):
+        if _smart_buy_pending_mints and scan_mode not in ("sniper_only", "alpha_signal_only", "pulse_only"):
             smart_priority = list(_smart_buy_pending_mints.keys())
             _smart_buy_pending_mints.clear()
-        if _alpha_pending_mints and scan_mode not in ("sniper_only", "smart_money_only"):
+        if _alpha_pending_mints and scan_mode not in ("sniper_only", "smart_money_only", "pulse_only"):
             alpha_priority = list(_alpha_pending_mints.keys())
             _alpha_pending_mints.clear()
+        if _pulse_pending_mints and scan_mode not in ("sniper_only", "smart_money_only", "alpha_signal_only"):
+            pulse_priority = list(_pulse_pending_mints.keys())
+            _pulse_pending_mints.clear()
+    if scan_mode == "pulse_only":
+        ordered_mints = []
+        for m in pulse_priority:
+            if isinstance(m, str) and 39 <= len(m) <= 50 and m not in ordered_mints:
+                ordered_mints.append(m)
+                _src_of[m] = "pulse"
+        _src_stats["pulse"] = {"items": len(ordered_mints), "ok_at": time.time()}
+        return ordered_mints
     if scan_mode == "alpha_signal_only":
         ordered_mints = []
         for m in alpha_priority:
@@ -917,7 +990,7 @@ def fetch_candidate_mints(cfg, force=False):
                 _src_of[m] = "smart_money"
         _src_stats["smart_money"] = {"items": len(ordered_mints), "ok_at": time.time()}
         return ordered_mints
-    # Prioritize real-time smart-wallet signals, alpha signals & launch streams ahead of older lists
+    # Prioritize real-time smart-wallet signals, alpha signals, pulse signals & launch streams ahead of older lists
     ordered_mints = []
     seen_batch = set()
     for m in smart_priority:
@@ -926,6 +999,12 @@ def fetch_candidate_mints(cfg, force=False):
             ordered_mints.append(m)
             if m not in _src_of:
                 _src_of[m] = "smart_money"
+    for m in pulse_priority:
+        if isinstance(m, str) and 39 <= len(m) <= 50 and m not in seen_batch:
+            seen_batch.add(m)
+            ordered_mints.append(m)
+            if m not in _src_of:
+                _src_of[m] = "pulse"
     for m in alpha_priority:
         if isinstance(m, str) and 39 <= len(m) <= 50 and m not in seen_batch:
             seen_batch.add(m)
@@ -939,6 +1018,9 @@ def fetch_candidate_mints(cfg, force=False):
                 ordered_mints.append(m)
     fresh = _fresh_only(ordered_mints)
     for m in alpha_priority:
+        if m in seen_batch and m not in fresh:
+            fresh.insert(0, m)
+    for m in pulse_priority:
         if m in seen_batch and m not in fresh:
             fresh.insert(0, m)
     for m in smart_priority:
@@ -1109,26 +1191,45 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
     scan_mode = _get_scan_mode(cfg)
     sb_hits = pair.get("_smart_buyers") if isinstance(pair.get("_smart_buyers"), list) else _get_pair_smart_buyers(pair, pair.get("_rep"), cfg)
     alpha_sig = pair.get("_alpha_signal") if isinstance(pair.get("_alpha_signal"), dict) else _get_pair_alpha_signal(pair, cfg)
+    pulse_sig = pair.get("_pulse_signal") if isinstance(pair.get("_pulse_signal"), dict) else _get_pair_pulse_signal(pair, cfg)
+    if scan_mode == "pulse_only" and not pulse_sig:
+        return False, "not pulse signal", "pulse_only requires Pulse Stage 2/3 trigger"
     if scan_mode == "alpha_signal_only" and not alpha_sig:
         return False, "not alpha signal", "alpha_signal_only requires Alpha Signal trigger"
     if scan_mode == "smart_money_only" and not sb_hits:
         return False, "not whale buy", "smart_money_only requires tracked whale wallet"
-    whale_older_ok = bool(sb_hits) and (
+
+    is_pulse = bool(pulse_sig)
+    is_manual_pulse = is_pulse and str(pulse_sig.get("status") or "").upper() == "MANUAL_QUEUED"
+    whale_older_ok = (not is_pulse) and bool(sb_hits) and (
         opt_on(cfg, "smart_money_follow_older_coins", True) or scan_mode == "smart_money_only"
     )
-    ok_plat, plat_detail = matches_enabled_platforms(pair, mint_addr, src_hint, cfg)
-    if not ok_plat:
-        return False, "wrong website", plat_detail
+    if not is_pulse:
+        ok_plat, plat_detail = matches_enabled_platforms(pair, mint_addr, src_hint, cfg)
+        if not ok_plat:
+            return False, "wrong website", plat_detail
     liq_pre = _f((pair.get("liquidity") or {}).get("usd")) or 0.0
     sym_pre = (pair.get("baseToken") or {}).get("symbol") or ""
     if _is_symbol_on_cooldown(sym_pre, liq_pre, cfg):
         return False, "copycat cooldown", f"{sym_pre} cooled down 10m after rug reject"
     now_ms = now_ms or int(time.time() * 1000)
     created = int(pair.get("pairCreatedAt") or 0)
-    if created <= 0: return False, "missing data", "no pairCreatedAt"
-    age_s = (now_ms - created) / 1000.0
-    if age_s < -10: return False, "clock skew", "sync your PC clock"
-    if whale_older_ok:
+    if created <= 0:
+        if not is_manual_pulse:
+            return False, "missing data", "no pairCreatedAt"
+        age_s = 120.0
+    else:
+        age_s = (now_ms - created) / 1000.0
+        if age_s < -10: return False, "clock skew", "sync your PC clock"
+    if is_pulse:
+        if not is_manual_pulse:
+            p_min_m = max(0.0, float(cfg.get("pulse_min_age_minutes", 2.0) or 0.0))
+            p_max_m = max(0.0, float(cfg.get("pulse_max_age_minutes", 180.0) or 0.0))
+            if p_min_m > 0.0 and age_s < p_min_m * 60.0:
+                return False, "pulse too young", f"{age_s / 60:.1f}m < {p_min_m:g}m pulse min"
+            if p_max_m > 0.0 and age_s > p_max_m * 60.0:
+                return False, "pulse too old", f"{age_s / 60:.1f}m > {p_max_m:g}m pulse window"
+    elif whale_older_ok:
         max_whale_h = max(0.0, float(cfg.get("smart_money_max_coin_age_hours", 72) or 0.0))
         if max_whale_h > 0.0 and age_s > max_whale_h * 3600.0:
             return False, "too old (whale cap)", f"{age_s / 3600:.1f}h > {max_whale_h:g}h whale cap"
@@ -1147,13 +1248,19 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
     early_shield_on = opt_on(cfg, "early_rug_shield_enabled", True)
     m5 = (pair.get("txns") or {}).get("m5") or {}
     buys, sells = int(m5.get("buys") or 0), int(m5.get("sells") or 0)
-    ratio = float(cfg.get("min_buy_sell_ratio_m5", 1.5) or 0) if opt_on(cfg, "min_buy_sell_ratio_m5", True) else 0.0
-    if whale_older_ok and age_s > 600.0 and ratio > 0.6:
-        ratio = 0.6
-    elif alpha_sig and ratio > 1.0:
-        ratio = 1.0
-    if ratio > 0 and buys < sells * ratio:
-        return False, "selling pressure", f"{buys}b/{sells}s in last 5m"
+    if is_pulse:
+        if not is_manual_pulse:
+            p_ratio = max(0.5, float(cfg.get("pulse_min_buy_sell_ratio_m5", 1.05) or 1.05))
+            if buys < sells * p_ratio:
+                return False, "pulse selling pressure", f"{buys}b/{sells}s < {p_ratio:g}x pulse ratio"
+    else:
+        ratio = float(cfg.get("min_buy_sell_ratio_m5", 1.5) or 0) if opt_on(cfg, "min_buy_sell_ratio_m5", True) else 0.0
+        if whale_older_ok and age_s > 600.0 and ratio > 0.6:
+            ratio = 0.6
+        elif alpha_sig and ratio > 1.0:
+            ratio = 1.0
+        if ratio > 0 and buys < sells * ratio:
+            return False, "selling pressure", f"{buys}b/{sells}s in last 5m"
     if (early_shield_on and age_s >= 20 and buys >= 6 and sells == 0) or (age_s >= 30 and buys >= 12 and sells == 0):
         return False, "honeypot pattern", f"{buys} buys / 0 sells in 5m"
 
@@ -1164,12 +1271,12 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
         or mint_addr.lower().endswith("pump")
     )
 
-    grace_sec = max(0.0, float(cfg.get("ultra_early_grace_sec", 0) or 0)) if opt_on(cfg, "ultra_early_grace_sec", True) else 0.0
+    grace_sec = 0.0 if is_pulse else (max(0.0, float(cfg.get("ultra_early_grace_sec", 0) or 0)) if opt_on(cfg, "ultra_early_grace_sec", True) else 0.0)
     pp = pair.get("_pumpportal") if isinstance(pair.get("_pumpportal"), dict) else None
     if pp and pp.get("has_trade_stream"):
         buys_60s = int(pp.get("buys_60s") or 0)
         sells_60s = int(pp.get("sells_60s") or 0)
-        if buys_60s < sells_60s or (early_shield_on and age_s < 180 and sells_60s >= 3 and buys_60s <= sells_60s):
+        if not is_manual_pulse and (buys_60s < sells_60s or (early_shield_on and age_s < 180 and sells_60s >= 3 and buys_60s <= sells_60s)):
             return False, "selling pressure (60s)", f"{buys_60s}b/{sells_60s}s last 60s"
         if early_shield_on and pp.get("creator_sold") and opt_on(cfg, "block_creator_dump", True):
             return False, "creator dump", "creator/dev already sold during launch"
@@ -1177,64 +1284,117 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
             init_buy = _f(pp.get("initial_buy_sol")) or 0.0
             if init_buy > 8.0:
                 return False, "dev sniper bundle", f"initial dev buy {init_buy:.2f} SOL > 8.0 SOL"
-        if early_shield_on and is_curve_dex and pp.get("real_sol") is not None and (_f(pp.get("v_sol")) or 0.0) > 0.0:
-            real_sol_val = _f(pp.get("real_sol"))
-            if real_sol_val is not None:
-                if age_s >= 10.0 and real_sol_val < 2.5:
-                    return False, "thin bonding curve", f"real SOL {real_sol_val:.2f} < 2.5 SOL"
-                if age_s >= 8.0 and real_sol_val < 1.5:
-                    return False, "thin bonding curve", f"real SOL {real_sol_val:.2f} < 1.5 SOL"
-        if opt_on(cfg, "min_recent_buys_60s", True):
-            min_60s = int(cfg.get("min_recent_buys_60s", 3) or 0)
-            if age_s > grace_sec and min_60s > 0 and buys_60s < min_60s:
-                return False, "low 60s velocity", f"{buys_60s} buys < {min_60s} in 60s"
+        if not is_pulse:
+            if early_shield_on and is_curve_dex and pp.get("real_sol") is not None and (_f(pp.get("v_sol")) or 0.0) > 0.0:
+                real_sol_val = _f(pp.get("real_sol"))
+                if real_sol_val is not None:
+                    if age_s >= 10.0 and real_sol_val < 2.5:
+                        return False, "thin bonding curve", f"real SOL {real_sol_val:.2f} < 2.5 SOL"
+                    if age_s >= 8.0 and real_sol_val < 1.5:
+                        return False, "thin bonding curve", f"real SOL {real_sol_val:.2f} < 1.5 SOL"
+            if opt_on(cfg, "min_recent_buys_60s", True):
+                min_60s = int(cfg.get("min_recent_buys_60s", 3) or 0)
+                if age_s > grace_sec and min_60s > 0 and buys_60s < min_60s:
+                    return False, "low 60s velocity", f"{buys_60s} buys < {min_60s} in 60s"
 
-    # Pro Desk Group 3A: Pre-Migration Bonding Curve Surge Filter
-    if opt_on(cfg, "pre_migration_curve_enabled", False) and is_curve_dex:
-        real_sol = _f((pp or {}).get("real_sol_in_curve")) if pp else None
-        if real_sol is None:
-            real_sol = _f(pair.get("_real_sol_in_curve"))
-        if real_sol is not None:
-            curve_pct = min(100.0, max(0.0, (real_sol / 85.0) * 100.0))
-            c_min = float(cfg.get("pre_migration_curve_min_pct", 75.0) or 0.0)
-            c_max = float(cfg.get("pre_migration_curve_max_pct", 92.0) or 100.0)
-            if curve_pct < c_min or curve_pct > c_max:
-                return False, "curve out of range", f"curve {curve_pct:.1f}% not in {c_min:g}-{c_max:g}%"
-
-    # Pro Desk Group 3B: Post-Migration Pullback / Reclaim Entry
     m5c = _f((pair.get("priceChange") or {}).get("m5"))
-    if opt_on(cfg, "post_migration_pullback_enabled", False) and is_migrated_dex:
-        wait_s = max(5.0, float(cfg.get("migration_wait_sec", 45.0) or 45.0))
-        min_dip = max(1.0, float(cfg.get("migration_min_dip_pct", 15.0) or 15.0))
-        with _market_struct_lock:
-            peak_rec = _migration_peaks.get(mint_addr)
-            if peak_rec is None:
-                peak_rec = px
-                _migration_peaks[mint_addr] = px
-                if len(_migration_peaks) > 500:
-                    _migration_peaks.pop(next(iter(_migration_peaks)), None)
-            elif px > peak_rec:
-                peak_rec = px
-                _migration_peaks[mint_addr] = px
-        if age_s < wait_s:
-            return False, "waiting migration settle", f"age {age_s:.0f}s < {wait_s:g}s"
-        dip_pct = ((peak_rec - px) / peak_rec * 100.0) if peak_rec > 0 else 0.0
-        m5_dip = -m5c if (m5c is not None and m5c < 0) else 0.0
-        eff_dip = max(dip_pct, m5_dip)
-        if eff_dip < min_dip:
-            return False, "waiting post-migration dip", f"dip {eff_dip:.1f}% < {min_dip:g}%"
+    if is_pulse:
+        p_stage_pref = str(cfg.get("pulse_stage") or "both").strip().lower()
+        if not is_manual_pulse:
+            if p_stage_pref == "stage2" and not is_curve_dex:
+                return False, "pulse stage mismatch", f"pulse_stage=stage2 skips migrated {dex_low or 'amm'}"
+            if p_stage_pref == "stage3" and is_curve_dex:
+                return False, "pulse stage mismatch", "pulse_stage=stage3 skips bonding curve"
+            if is_curve_dex:
+                real_sol = _f((pp or {}).get("real_sol")) if pp else None
+                if real_sol is None:
+                    real_sol = _f((pp or {}).get("real_sol_in_curve")) if pp else None
+                if real_sol is None:
+                    real_sol = _f(pulse_sig.get("realSol"))
+                curve_pct = _f((pp or {}).get("curve_pct")) if pp else None
+                if curve_pct is None:
+                    curve_pct = _f(pulse_sig.get("curvePct"))
+                if curve_pct is None and real_sol is not None:
+                    curve_pct = min(100.0, max(0.0, (real_sol / 85.0) * 100.0))
+                p_cmin = float(cfg.get("pulse_stage2_min_curve_pct", 65.0) or 65.0)
+                p_cmax = float(cfg.get("pulse_stage2_max_curve_pct", 94.0) or 94.0)
+                p_rsol = float(cfg.get("pulse_stage2_min_real_sol", 40.0) or 0.0)
+                if curve_pct is not None and (curve_pct < p_cmin or curve_pct > p_cmax):
+                    return False, "pulse stage2 curve", f"curve {curve_pct:.1f}% not in {p_cmin:g}-{p_cmax:g}%"
+                if real_sol is not None and p_rsol > 0 and real_sol < p_rsol:
+                    return False, "pulse stage2 sol", f"real SOL {real_sol:.1f} < {p_rsol:g} SOL"
+            else:
+                p_s3_liq = max(0.0, float(cfg.get("pulse_stage3_min_liquidity_usd", 15000.0) or 0.0))
+                if p_s3_liq > 0 and liq_pre < p_s3_liq:
+                    return False, "pulse stage3 liq", f"${liq_pre:.0f} < ${p_s3_liq:.0f} Stage 3 min"
+                if bool(cfg.get("pulse_stage3_require_pullback", False)):
+                    wait_s = max(5.0, float(cfg.get("pulse_stage3_wait_sec", 30.0) or 30.0))
+                    min_dip = max(1.0, float(cfg.get("pulse_stage3_pullback_pct", 12.0) or 12.0))
+                    with _market_struct_lock:
+                        peak_rec = _migration_peaks.get(mint_addr)
+                        if peak_rec is None or px > peak_rec:
+                            peak_rec = px
+                            _migration_peaks[mint_addr] = px
+                            if len(_migration_peaks) > 500:
+                                _migration_peaks.pop(next(iter(_migration_peaks)), None)
+                    if age_s < wait_s:
+                        return False, "pulse stage3 wait", f"age {age_s:.0f}s < {wait_s:g}s"
+                    dip_pct = ((peak_rec - px) / peak_rec * 100.0) if peak_rec > 0 else 0.0
+                    m5_dip = -m5c if (m5c is not None and m5c < 0) else 0.0
+                    eff_dip = max(dip_pct, m5_dip)
+                    if eff_dip < min_dip:
+                        return False, "pulse stage3 dip", f"pullback {eff_dip:.1f}% < {min_dip:g}%"
+    else:
+        # Pro Desk Group 3A: Pre-Migration Bonding Curve Surge Filter
+        if opt_on(cfg, "pre_migration_curve_enabled", False) and is_curve_dex:
+            real_sol = _f((pp or {}).get("real_sol_in_curve")) if pp else None
+            if real_sol is None:
+                real_sol = _f(pair.get("_real_sol_in_curve"))
+            if real_sol is not None:
+                curve_pct = min(100.0, max(0.0, (real_sol / 85.0) * 100.0))
+                c_min = float(cfg.get("pre_migration_curve_min_pct", 75.0) or 0.0)
+                c_max = float(cfg.get("pre_migration_curve_max_pct", 92.0) or 100.0)
+                if curve_pct < c_min or curve_pct > c_max:
+                    return False, "curve out of range", f"curve {curve_pct:.1f}% not in {c_min:g}-{c_max:g}%"
+
+        # Pro Desk Group 3B: Post-Migration Pullback / Reclaim Entry
+        if opt_on(cfg, "post_migration_pullback_enabled", False) and is_migrated_dex:
+            wait_s = max(5.0, float(cfg.get("migration_wait_sec", 45.0) or 45.0))
+            min_dip = max(1.0, float(cfg.get("migration_min_dip_pct", 15.0) or 15.0))
+            with _market_struct_lock:
+                peak_rec = _migration_peaks.get(mint_addr)
+                if peak_rec is None:
+                    peak_rec = px
+                    _migration_peaks[mint_addr] = px
+                    if len(_migration_peaks) > 500:
+                        _migration_peaks.pop(next(iter(_migration_peaks)), None)
+                elif px > peak_rec:
+                    peak_rec = px
+                    _migration_peaks[mint_addr] = px
+            if age_s < wait_s:
+                return False, "waiting migration settle", f"age {age_s:.0f}s < {wait_s:g}s"
+            dip_pct = ((peak_rec - px) / peak_rec * 100.0) if peak_rec > 0 else 0.0
+            m5_dip = -m5c if (m5c is not None and m5c < 0) else 0.0
+            eff_dip = max(dip_pct, m5_dip)
+            if eff_dip < min_dip:
+                return False, "waiting post-migration dip", f"dip {eff_dip:.1f}% < {min_dip:g}%"
 
     # Pro Desk Group 3C: Wash-Trading / Fake Volume Guard
-    if opt_on(cfg, "wash_trade_filter_enabled", True):
+    if is_pulse or opt_on(cfg, "wash_trade_filter_enabled", True):
         min_ratio = max(0.05, min(1.0, float(cfg.get("min_unique_makers_ratio", 0.25) or 0.25)))
-        min_uniq = max(1, int(cfg.get("min_unique_traders_5m", 6) or 6))
+        min_uniq = max(
+            1,
+            int(cfg.get("pulse_min_unique_traders_5m", 10) or 10)
+            if is_pulse
+            else int(cfg.get("min_unique_traders_5m", 6) or 6),
+        )
         total_m5 = buys + sells
         has_uniq_data = (
             (isinstance(pp, dict) and pp.get("unique_traders_5m") is not None)
             or (isinstance(m5, dict) and m5.get("makers") is not None)
             or (pair.get("_unique_traders_5m") is not None)
         )
-        if total_m5 >= 6 and has_uniq_data:
+        if total_m5 >= 6 and has_uniq_data and not is_manual_pulse:
             uniq_5m = int(
                 ((pp or {}).get("unique_traders_5m") or 0)
                 or (m5.get("makers") or 0)
@@ -1255,7 +1415,7 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
         _short_px_window[mint_addr] = win[-20:]
         if len(_short_px_window) > 600:
             _short_px_window.pop(next(iter(_short_px_window)), None)
-    if opt_on(cfg, "anti_top_wick_enabled", True):
+    if opt_on(cfg, "anti_top_wick_enabled", True) and not is_manual_pulse:
         max_spike = max(5.0, float(cfg.get("max_short_spike_pct", 70.0) or 70.0))
         if len(win) >= 2:
             base_px = win[0][1]
@@ -1266,7 +1426,7 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
         if pp_spike is not None and pp_spike > max_spike:
             return False, "top wick spike", f"+{pp_spike:.1f}% 15s spike > +{max_spike:g}% cap"
 
-    if opt_on(cfg, "max_price_change_m5_pct", True):
+    if not is_pulse and opt_on(cfg, "max_price_change_m5_pct", True):
         max_m5c = float(cfg.get("max_price_change_m5_pct", 300) or 0)
         if m5c is not None and max_m5c > 0 and m5c > max_m5c:
             return False, "already pumped", f"+{m5c:.0f}% in 5m"
@@ -1278,7 +1438,12 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
     if liq > 0 and fdv > 0 and fdv > liq * max_fdv_mult:
         return False, "inflated mcap/liq", f"MCap ${fdv:.0f} vs LP ${liq:.0f}"
 
-    if age_s > grace_sec:
+    if is_pulse:
+        if not is_manual_pulse:
+            p_min_buys = max(1, int(cfg.get("pulse_min_buys_m5", 10) or 10))
+            if buys < p_min_buys:
+                return False, "pulse few buys", f"{buys} buys < {p_min_buys} pulse min"
+    elif age_s > grace_sec:
         min_liq = float(cfg.get("min_liquidity_usd", 5000) or 0) if opt_on(cfg, "min_liquidity_usd", True) else 0.0
         eff_min_liq = max(min_liq, 2500.0) if (pool_depth_on and min_liq > 0) else (2500.0 if pool_depth_on else min_liq)
         if whale_older_ok and eff_min_liq > 2500.0:
@@ -1303,7 +1468,7 @@ def score_candidate(pair, cfg, now_ms=None):
     now_ms = now_ms or int(time.time() * 1000)
     created = int(pair.get("pairCreatedAt") or 0)
     age_s = max(0.0, (now_ms - created) / 1000.0) if created > 0 else 120.0
-    max_age_m = float(cfg.get("max_age_minutes", 2) or 2) if opt_on(cfg, "max_age_minutes", True) else 60.0
+    max_age_m = float(cfg.get("pulse_max_age_minutes", 180) or 180) if _get_scan_mode(cfg) == "pulse_only" else (float(cfg.get("max_age_minutes", 2) or 2) if opt_on(cfg, "max_age_minutes", True) else 60.0)
     max_age_s = max(10.0, max_age_m * 60.0)
 
     m5 = (pair.get("txns") or {}).get("m5") or {}
@@ -1323,7 +1488,7 @@ def score_candidate(pair, cfg, now_ms=None):
     freshness = max(0.0, 1.0 - min(1.0, age_s / max_age_s)) * 20.0
     smart_bonus = 0.0
     scan_mode = _get_scan_mode(cfg)
-    if scan_mode not in ("sniper_only", "alpha_signal_only") and opt_on(cfg, "smart_money_prioritize_entries", True) and opt_on(cfg, "smart_money_enabled", True):
+    if scan_mode not in ("sniper_only", "alpha_signal_only", "pulse_only") and opt_on(cfg, "smart_money_prioritize_entries", True) and opt_on(cfg, "smart_money_enabled", True):
         sb = pair.get("_smart_buyers") if isinstance(pair.get("_smart_buyers"), list) else _get_pair_smart_buyers(pair, pair.get("_rep"), cfg)
         if sb:
             smart_bonus = 150.0 * len(sb)
@@ -1332,7 +1497,12 @@ def score_candidate(pair, cfg, now_ms=None):
         al = pair.get("_alpha_signal") if isinstance(pair.get("_alpha_signal"), dict) else _get_pair_alpha_signal(pair, cfg)
         if al:
             alpha_bonus = max(20.0, 120.0 - float(al.get("riskScore") or 30.0))
-    score = (ratio * 20.0) + (turnover * 15.0) + vel_bonus + freshness + min(15.0, buys * 0.25) + smart_bonus + alpha_bonus
+    pulse_bonus = 0.0
+    if scan_mode in ("both", "pulse_only"):
+        pl = pair.get("_pulse_signal") if isinstance(pair.get("_pulse_signal"), dict) else _get_pair_pulse_signal(pair, cfg)
+        if pl:
+            pulse_bonus = max(25.0, 130.0 - float(pl.get("riskScore") or 25.0))
+    score = (ratio * 20.0) + (turnover * 15.0) + vel_bonus + freshness + min(15.0, buys * 0.25) + smart_bonus + alpha_bonus + pulse_bonus
     return round(score, 4)
 
 def rank_candidates(items, cfg, now_ms=None):
@@ -2185,9 +2355,22 @@ def _analyze_sybil_funders(mint, rep, cfg):
     res = _analyze_sybil_details(mint, rep, cfg)
     return res["shared_cnt"], res["shared_funder"]
 
+def _get_pair_pulse_signal(pair, cfg):
+    scan_mode = _get_scan_mode(cfg)
+    if scan_mode in ("sniper_only", "smart_money_only", "alpha_signal_only"):
+        return None
+    if isinstance((pair or {}).get("_pulse_signal"), dict):
+        return pair["_pulse_signal"]
+    mint_addr = str(((pair or {}).get("baseToken") or {}).get("address") or "").strip()
+    if not mint_addr:
+        return None
+    with _ws_feed_lock:
+        sig = _ws_pulse_signals.get(mint_addr)
+        return dict(sig) if isinstance(sig, dict) else None
+
 def _get_pair_alpha_signal(pair, cfg):
     scan_mode = _get_scan_mode(cfg)
-    if scan_mode in ("sniper_only", "smart_money_only"):
+    if scan_mode in ("sniper_only", "smart_money_only", "pulse_only"):
         return None
     if isinstance((pair or {}).get("_alpha_signal"), dict):
         return pair["_alpha_signal"]
@@ -2200,7 +2383,7 @@ def _get_pair_alpha_signal(pair, cfg):
 
 def _get_pair_smart_buyers(pair, rep, cfg):
     scan_mode = _get_scan_mode(cfg)
-    if scan_mode in ("sniper_only", "alpha_signal_only"):
+    if scan_mode in ("sniper_only", "alpha_signal_only", "pulse_only"):
         return []
     if scan_mode != "smart_money_only" and not opt_on(cfg, "smart_money_enabled", True):
         return []
@@ -2362,11 +2545,17 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
     creator_chk_on = opt_on(cfg, "check_creator_history", True)
     sybil_on = opt_on(cfg, "anti_sybil_enabled", True)
     socials_on = opt_on(cfg, "reused_socials_enabled", True)
+    is_pulse_cand = bool((pair or {}).get("_pulse_signal")) or _get_scan_mode(cfg) == "pulse_only"
+    eff_rc_cap = (
+        float(cfg.get("pulse_rugcheck_max_score", 50.0) or 50.0)
+        if is_pulse_cand
+        else float(cfg.get("rugcheck_max_score", 55) or 55)
+    )
     cache_key = (
         f"{mint}:{int(tight_score_on)}:{int(pool_depth_on)}:{int(sell_sim_on)}:{int(early_shield_on)}:{int(lp_req_on)}:"
         f"{int(creator_chk_on)}:{int(sybil_on)}:{int(socials_on)}:{int(opt_on(cfg, 'use_rugcheck', True))}:{int(opt_on(cfg, 'strict_rugcheck', True))}:"
         f"{int(cfg.get('max_creator_launches', 5))}:{int(cfg.get('max_creator_rugged_coins', 0))}:"
-        f"{float(cfg.get('creator_fast_rug_window_min', 60) or 0):g}"
+        f"{float(cfg.get('creator_fast_rug_window_min', 60) or 0):g}:{int(is_pulse_cand)}:{eff_rc_cap:g}"
     )
     ttl = max(60, int(cfg.get("rug_recheck_minutes", 15) or 15) * 60) if opt_on(cfg, "rug_recheck_minutes", True) else 60
     with _rug_lock:
@@ -2505,15 +2694,15 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                     verdict = (False, "creator/dev already sold during launch curve")
 
                 # Enforce RugCheck risk score at EVERY age (never skip young tokens)
-                if verdict[0] and (opt_on(cfg, "rugcheck_max_score", True) or tight_score_on):
+                if verdict[0] and (is_pulse_cand or opt_on(cfg, "rugcheck_max_score", True) or tight_score_on):
                     sn = _f(rep.get("score_normalised"))
                     if sn is None and _f(rep.get("score")) is not None:
                         raw_s = _f(rep.get("score")) or 0.0
                         sn = min(100.0, raw_s / 100.0) if raw_s > 100.0 else raw_s
                     if sn is not None:
                         if sn > 100: sn /= 1000.0
-                        max_rc_score = float(cfg.get("rugcheck_max_score", 55) or 55) if opt_on(cfg, "rugcheck_max_score", True) else 100.0
-                        if tight_score_on:
+                        max_rc_score = eff_rc_cap if (is_pulse_cand or opt_on(cfg, "rugcheck_max_score", True)) else 100.0
+                        if tight_score_on and not is_pulse_cand:
                             max_rc_score = min(max_rc_score, 45.0)
                         if sn >= max_rc_score:
                             verdict = (False, f"rugcheck risk score {sn:.0f}/100 >= {max_rc_score:.0f}")
@@ -2883,7 +3072,13 @@ class TradingAccount:
             self.save()
         return resp
 
-    def can_open(self):
+    def _effective_trade_size_usd(self, is_pulse=False):
+        c = self.cfg
+        if is_pulse or _get_scan_mode(c) == "pulse_only":
+            return max(0.5, float(c.get("pulse_trade_size_usd", 5.0) or 5.0))
+        return float(c.get("trade_size_usd", 5.0) or 5.0) if opt_on(c, "trade_size_usd", True) else 5.0
+
+    def can_open(self, is_pulse=False):
         self._roll_day()
         c = self.cfg
         if opt_on(c, "max_open_positions", True):
@@ -2892,7 +3087,7 @@ class TradingAccount:
         if opt_on(c, "daily_loss_limit_usd", True):
             dll = float(c.get("daily_loss_limit_usd", 0) or 0)
             if dll > 0 and self.state["day_pnl"] <= -dll: return False, "daily loss limit"
-        req_size = float(c.get("trade_size_usd", 5.0) or 5.0) if opt_on(c, "trade_size_usd", True) else 5.0
+        req_size = self._effective_trade_size_usd(is_pulse=is_pulse)
         if self.mode == "live":
             sol_px = self.state.get("sol_price_usd") or 0.0
             bal_sol = self.state.get("wallet_sol")
@@ -2940,15 +3135,16 @@ class TradingAccount:
             return False
         meta = meta or {}
         c = self.cfg
+        is_pulse = bool(meta.get("pulse_entry")) or _get_scan_mode(c) == "pulse_only"
         url = url or f"https://dexscreener.com/solana/{mint}"
         fast_lock = self.mode == "live" and opt_on(c, "fast_live_buy_enabled", True)
         eff_slip_pct = float(c.get("slippage_pct", 2.0) or 0.0) if opt_on(c, "slippage_pct", True) else 0.0
         eff_fee_pct = float(c.get("fee_pct", 1.0) or 0.0) if opt_on(c, "fee_pct", True) else 0.0
         with self.lock:
-            ok, _why = self.can_open()
+            ok, _why = self.can_open(is_pulse=is_pulse)
             if not ok or mint in self.state["positions"] or self.is_slots_full()[0]:
                 return False
-            base_size = float(c.get("trade_size_usd", 5.0) or 5.0) if opt_on(c, "trade_size_usd", True) else 5.0
+            base_size = self._effective_trade_size_usd(is_pulse=is_pulse)
             size_mult = float(meta.get("size_mult", 1.0) or 1.0)
             size = round(max(0.5, base_size * size_mult), 4)
             sol_px = self.state.get("sol_price_usd")
@@ -3080,6 +3276,11 @@ class TradingAccount:
                 "alpha_signal_entry": bool(meta.get("alpha_signal_entry")),
                 "alpha_source": meta.get("alpha_source") or "",
                 "alpha_risk_score": meta.get("alpha_risk_score"),
+                "pulse_entry": bool(meta.get("pulse_entry")),
+                "pulse_stage": meta.get("pulse_stage") or "",
+                "pulse_source": meta.get("pulse_source") or "",
+                "pulse_curve_pct": meta.get("pulse_curve_pct"),
+                "pulse_risk_score": meta.get("pulse_risk_score"),
                 "age_at_entry": round(meta.get("age_s", 0), 1),
                 "entry_liquidity_usd": meta.get("liquidity_usd"),
                 "current_liquidity_usd": meta.get("liquidity_usd"),
@@ -3599,22 +3800,29 @@ class TradingAccount:
             else:
                 pos["liq_drop_streak"] = 0
 
+            pos_is_pulse = bool(pos.get("pulse_entry")) or _get_scan_mode(self.cfg) == "pulse_only"
+            eff_tp = max(0.0, float(self.cfg.get("pulse_take_profit_pct", 30.0) or 0.0)) if pos_is_pulse else tp
+            eff_sl = max(0.0, float(self.cfg.get("pulse_stop_loss_pct", 15.0) or 0.0)) if pos_is_pulse else sl
+            eff_trail = max(0.0, float(self.cfg.get("pulse_trailing_stop_pct", 8.0) or 0.0)) if pos_is_pulse else trail
+            eff_max_hold = max(0.0, float(self.cfg.get("pulse_max_hold_minutes", 90) or 0.0)) if pos_is_pulse else max_hold
+            eff_recover_enabled = False if pos_is_pulse else recover_enabled
+
             held_min = max(0.0, (now_ts - pos["opened"]) / 60.0)
             reason, trailing_active, _drop_pct = self.evaluate_exit_signal(
                 entry,
                 price,
                 pos["peak_price"],
-                tp,
-                trail,
+                eff_tp,
+                eff_trail,
                 held_min,
-                max_hold,
-                recover_principal_enabled=recover_enabled,
+                eff_max_hold,
+                recover_principal_enabled=eff_recover_enabled,
                 principal_recovered=bool(pos.get("principal_recovered", False)),
                 recover_sell_pct=recover_sell_pct,
                 scale_out_sell_pct=scale_sell_pct,
                 scale_out_step_gain_pct=scale_step,
                 next_scale_out_pct=pos.get("next_scale_out_pct"),
-                stop_loss_pct=sl,
+                stop_loss_pct=eff_sl,
                 auto_rug_exit=eff_auto_rug,
                 entry_liquidity_usd=entry_liq,
                 current_liquidity_usd=cur_liq,
@@ -3625,9 +3833,9 @@ class TradingAccount:
             )
             was_active = bool(pos.get("trailing_active"))
             pos["trailing_active"] = trailing_active
-            pos["trailing_floor_pct"] = round(max(0.01, pos["peak_pct"] - trail), 2) if (trailing_active and trail > 0) else None
+            pos["trailing_floor_pct"] = round(max(0.01, pos["peak_pct"] - eff_trail), 2) if (trailing_active and eff_trail > 0) else None
             if trailing_active and not was_active and not str(reason or "").startswith("principal_recovery"):
-                log(f"🎯 Trailing stop ARMED for {pos['symbol']}: peak +{pos['peak_pct']:.1f}% | exit floor +{pos['trailing_floor_pct']:.1f}% (-{trail:g}% from peak PnL)")
+                log(f"🎯 Trailing stop ARMED for {pos['symbol']}: peak +{pos['peak_pct']:.1f}% | exit floor +{pos['trailing_floor_pct']:.1f}% (-{eff_trail:g}% from peak PnL)")
 
             if reason:
                 if _should_stop():
@@ -3670,7 +3878,7 @@ PaperAccount = TradingAccount
 
 # ---------------------------------------------------------------- scan / monitor
 _stats_lock = threading.Lock()
-_stats = {"since": time.time(), "cands": 0, "no_pair": 0, "checked": 0, "rejects": {}, "rug": 0, "bought": 0, "smart_buys": 0, "whale_held": 0, "alpha_signals": 0}
+_stats = {"since": time.time(), "cands": 0, "no_pair": 0, "checked": 0, "rejects": {}, "rug": 0, "bought": 0, "smart_buys": 0, "whale_held": 0, "alpha_signals": 0, "pulse_signals": 0}
 _last_block_log = [0.0]
 _last_rescan_delay_log = [0.0]
 _last_smart_decision_log = {}
@@ -3680,12 +3888,18 @@ def _maybe_summary():
         if time.time() - _stats["since"] < 60: return
         cands, no_pair, checked = _stats["cands"], _stats["no_pair"], _stats["checked"]
         rejects, rug, bought = dict(_stats["rejects"]), _stats["rug"], _stats["bought"]
-        sb_cnt, wh_cnt, al_cnt = _stats.get("smart_buys", 0), _stats.get("whale_held", 0), _stats.get("alpha_signals", 0)
+        sb_cnt, wh_cnt, al_cnt, pl_cnt = _stats.get("smart_buys", 0), _stats.get("whale_held", 0), _stats.get("alpha_signals", 0), _stats.get("pulse_signals", 0)
         src_bits = [f"{n}={v.get('items', 0)}{'*' if time.time() - v.get('ok_at', 0) > 120 else ''}"
                     for n, v in sorted(_src_stats.items())]
-        _stats.update({"since": time.time(), "cands": 0, "no_pair": 0, "checked": 0, "rejects": {}, "rug": 0, "bought": 0, "smart_buys": 0, "whale_held": 0, "alpha_signals": 0})
+        _stats.update({"since": time.time(), "cands": 0, "no_pair": 0, "checked": 0, "rejects": {}, "rug": 0, "bought": 0, "smart_buys": 0, "whale_held": 0, "alpha_signals": 0, "pulse_signals": 0})
     rej_txt = " ".join(f"{k}:{v}" for k, v in sorted(rejects.items(), key=lambda kv: -kv[1]))
     scan_mode = _get_scan_mode(CONFIG)
+    if scan_mode == "pulse_only":
+        stage_pref = str(CONFIG.get("pulse_stage") or "both")
+        log(f"[Pulse] scan summary (60s): stage={stage_pref} signals-received={pl_cnt} candidates={cands} not-on-dex={no_pair} evaluated={checked} rejected[{rej_txt or '-'}] rug={rug} BOUGHT={bought}")
+        if cands == 0:
+            log("[Pulse] Photon/Axiom/GMGN Stage 2-3 scanner active — waiting for qualifying curve surge or migrated pool...")
+        return
     if scan_mode == "alpha_signal_only":
         log(f"[AlphaSignal] scan summary (60s): signals-received={al_cnt} candidates={cands} not-on-dex={no_pair} evaluated={checked} rejected[{rej_txt or '-'}] rug={rug} BOUGHT={bought}")
         if cands == 0:
@@ -3798,6 +4012,10 @@ def scan_and_buy(acct, cfg):
             ppp = _pumpportal_pairs[mint]
             liq = _f((ppp.get("liquidity") or {}).get("usd")) or 0.0
             pairs[mint] = (liq, ppp)
+        elif mint not in pairs and mint in _pulse_pairs:
+            plp = _pulse_pairs[mint]
+            liq = _f((plp.get("liquidity") or {}).get("usd")) or 0.0
+            pairs[mint] = (liq, plp)
         elif mint not in pairs and mint in _alpha_pairs:
             alp = _alpha_pairs[mint]
             liq = _f((alp.get("liquidity") or {}).get("usd")) or 0.0
@@ -3833,6 +4051,9 @@ def scan_and_buy(acct, cfg):
         alpha_sig = _get_pair_alpha_signal(pair, cfg)
         if alpha_sig:
             pair["_alpha_signal"] = alpha_sig
+        pulse_sig = _get_pair_pulse_signal(pair, cfg)
+        if pulse_sig:
+            pair["_pulse_signal"] = pulse_sig
         symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
         okp, code, detail = passes_filters(pair, cfg, now_ms, source=_src_of.get(mint, ""))
         with _stats_lock: _stats["checked"] += 1
@@ -3841,7 +4062,15 @@ def scan_and_buy(acct, cfg):
                 with _seen_lock:
                     _too_old_mints[mint] = time.time()
             with _stats_lock: _stats["rejects"][code] = _stats["rejects"].get(code, 0) + 1
-            if alpha_sig and _get_scan_mode(cfg) == "alpha_signal_only":
+            if pulse_sig and _get_scan_mode(cfg) == "pulse_only":
+                dkey = f"pulse:{mint}:{code}"
+                now_log = time.time()
+                if now_log - _last_smart_decision_log.get(dkey, 0.0) >= 60.0:
+                    _last_smart_decision_log[dkey] = now_log
+                    if len(_last_smart_decision_log) > 500:
+                        _last_smart_decision_log.clear()
+                    log(f"📡 [Pulse] – {symbol} ({mint[:6]}..) skipped: {code} ({detail})")
+            elif alpha_sig and _get_scan_mode(cfg) == "alpha_signal_only":
                 dkey = f"alpha:{mint}:{code}"
                 now_log = time.time()
                 if now_log - _last_smart_decision_log.get(dkey, 0.0) >= 60.0:
@@ -3939,11 +4168,16 @@ def scan_and_buy(acct, cfg):
             if str(w).strip()
         ))
         alpha_sig = pair.get("_alpha_signal") if isinstance(pair.get("_alpha_signal"), dict) else _get_pair_alpha_signal(pair, cfg)
+        pulse_sig = pair.get("_pulse_signal") if isinstance(pair.get("_pulse_signal"), dict) else _get_pair_pulse_signal(pair, cfg)
+        if _get_scan_mode(cfg) == "pulse_only" and not pulse_sig:
+            continue
         if _get_scan_mode(cfg) == "alpha_signal_only" and not alpha_sig:
             continue
         if _get_scan_mode(cfg) == "smart_money_only" and not smart_buyers:
             continue
-        if alpha_sig:
+        if pulse_sig:
+            log(f"📡 [Pulse] {pulse_sig.get('source', 'Pulse Stage 2-3')} triggered {symbol} ({str(pulse_sig.get('stage') or '').upper()}, risk={int(float(pulse_sig.get('riskScore') or 0))}/100) — entering trade")
+        elif alpha_sig:
             log(f"⚡ [AlphaSignal] {alpha_sig.get('source', 'Alpha Signal')} triggered {symbol} (risk={int(float(alpha_sig.get('riskScore') or 0))}/100) — entering trade")
         if smart_buyers:
             log(f"🐋 [SmartMoney] {len(smart_buyers)} tracked whale(s) buying {symbol} ({smart_buyers[0][:6]}...) — prioritizing entry")
@@ -3956,7 +4190,7 @@ def scan_and_buy(acct, cfg):
         c_addr = pair.get("_creator") or c_stats.get("creator") or pp_dict.get("creator") or ""
         meta = {
             "dex": pair.get("dexId") or "?",
-            "source": "alpha_signal" if alpha_sig else _src_of.get(mint, "?"),
+            "source": f"pulse_{(pulse_sig or {}).get('stage', 'stage3')}" if pulse_sig else ("alpha_signal" if alpha_sig else _src_of.get(mint, "?")),
             "creator": c_addr,
             "creator_launches": c_stats.get("total_launches"),
             "creator_prior_launches": c_stats.get("prior_launches"),
@@ -3967,6 +4201,11 @@ def scan_and_buy(acct, cfg):
             "alpha_signal_entry": bool(alpha_sig),
             "alpha_source": (alpha_sig or {}).get("source", ""),
             "alpha_risk_score": (alpha_sig or {}).get("riskScore"),
+            "pulse_entry": bool(pulse_sig),
+            "pulse_stage": (pulse_sig or {}).get("stage", ""),
+            "pulse_source": (pulse_sig or {}).get("source", ""),
+            "pulse_curve_pct": (pulse_sig or {}).get("curvePct"),
+            "pulse_risk_score": (pulse_sig or {}).get("riskScore"),
             "age_s": age_s,
             "liquidity_usd": liq_usd,
             "real_sol": _f(pp_dict.get("real_sol")),
@@ -3997,16 +4236,20 @@ def _reverse_quote_prices(pos_dict, cfg, sol_px, acct=None):
     now_ts = time.time()
     tp = float(cfg.get("take_profit_pct") or 0.0) if opt_on(cfg, "take_profit_pct", True) else 0.0
     sl = float(cfg.get("stop_loss_pct") or 0.0) if opt_on(cfg, "stop_loss_pct", True) else 0.0
+    p_tp = float(cfg.get("pulse_take_profit_pct") or 30.0)
+    p_sl = float(cfg.get("pulse_stop_loss_pct") or 15.0)
     near_exit = False
     for _m, p in pos_dict.items():
         pnl = float(p.get("pnl_pct") or 0.0)
+        eff_tp = p_tp if (p.get("pulse_entry") or _get_scan_mode(cfg) == "pulse_only") else tp
+        eff_sl = p_sl if (p.get("pulse_entry") or _get_scan_mode(cfg) == "pulse_only") else sl
         if p.get("trailing_active"):
             near_exit = True
             break
-        if tp > 0 and pnl >= tp * 0.7:
+        if eff_tp > 0 and pnl >= eff_tp * 0.7:
             near_exit = True
             break
-        if sl > 0 and pnl <= -sl * 0.7:
+        if eff_sl > 0 and pnl <= -eff_sl * 0.7:
             near_exit = True
             break
     min_interval = 1.2 if near_exit else 4.0
@@ -4362,7 +4605,12 @@ def run(once=False):
             t_sz = float(CONFIG.get("trade_size_usd", 5.0) or 5.0) if opt_on(CONFIG, "trade_size_usd", True) else 5.0
             log(f"Wallet balance: {float(bal_sol):.4f} SOL (${float(bal_usd):.2f}) | trade size ${t_sz:.2f}")
     scan_mode_banner = _get_scan_mode(CONFIG)
-    if scan_mode_banner == "alpha_signal_only":
+    if scan_mode_banner == "pulse_only":
+        p_stage = str(CONFIG.get("pulse_stage") or "both")
+        p_refresh = int(CONFIG.get("pulse_refresh_interval_sec", 10) or 10)
+        p_tip = float(CONFIG.get("pulse_jito_tip_sol", 0.0005) or 0.0005)
+        log(f"Strategy: PHOTON / AXIOM / GMGN PULSE (pulse_only) | Stage={p_stage} (refresh {p_refresh}s, Jito tip {p_tip:g} SOL) · Independent Pulse Settings (Ignores Sniper/Whales){sol_banner}")
+    elif scan_mode_banner == "alpha_signal_only":
         al_refresh = int(CONFIG.get("alpha_signal_refresh_interval_sec", 10) or 10)
         al_tip = float(CONFIG.get("alpha_signal_jito_tip_sol", 0.0005) or 0.0005)
         log(f"Strategy: ALPHA SIGNALS ONLY (alpha_signal_only) | Auto-Finding China/Asia WS + Boost + Momentum Signals (refresh {al_refresh}s, Jito tip {al_tip:g} SOL) · Ignores Whale Wallets & Random Sniper Launches{sol_banner}")
@@ -4372,10 +4620,11 @@ def run(once=False):
     else:
         log(f"Sources: gecko={opt_on(CONFIG, 'use_gecko', True)} jupiter={opt_on(CONFIG, 'use_jupiter_recent', True)} profiles={opt_on(CONFIG, 'use_dex_profiles', True)} pumpportal={opt_on(CONFIG, 'use_pumpportal', True)} boosts={opt_on(CONFIG, 'use_promoted_feeds', False)} | mode={scan_mode_banner}{sol_banner}")
     plats = CONFIG.get("enabled_platforms") if (opt_on(CONFIG, "enabled_platforms", True) and isinstance(CONFIG.get("enabled_platforms"), list)) else []
-    log(f"Websites: {', '.join(str(x) for x in plats) if plats else 'ALL (no restriction)'}")
+    if scan_mode_banner != "pulse_only":
+        log(f"Websites: {', '.join(str(x) for x in plats) if plats else 'ALL (no restriction)'}")
     tp_cfg = float(CONFIG.get("take_profit_pct", 50) or 0.0) if opt_on(CONFIG, "take_profit_pct", True) else 0.0
     tr_cfg = float(CONFIG.get("trailing_stop_pct", 0) or 0.0) if opt_on(CONFIG, "trailing_stop_pct", True) else 0.0
-    rec_enabled = opt_on(CONFIG, "recover_principal_enabled", False)
+    rec_enabled = opt_on(CONFIG, "recover_principal_enabled", False) and scan_mode_banner != "pulse_only"
     rec_sell_pct = float(CONFIG.get("recover_principal_sell_pct", 50.0) or 50.0) if opt_on(CONFIG, "recover_principal_sell_pct", True) else 50.0
     scale_sell_pct = float(CONFIG.get("scale_out_sell_pct", 25.0) or 25.0) if opt_on(CONFIG, "scale_out_sell_pct", True) else 0.0
     scale_step_pct = float(CONFIG.get("scale_out_step_gain_pct", 100.0) or 0.0) if opt_on(CONFIG, "scale_out_step_gain_pct", True) else 0.0
@@ -4404,7 +4653,17 @@ def run(once=False):
     liq_banner = float(CONFIG.get("min_liquidity_usd", 5000) or 0) if opt_on(CONFIG, "min_liquidity_usd", True) else 0
     pump_banner = f"+{float(CONFIG.get('max_price_change_m5_pct', 250) or 0):.0f}%" if opt_on(CONFIG, "max_price_change_m5_pct", True) else "OFF"
     creator_banner = f"owner-chk={'ON' if opt_on(CONFIG, 'check_creator_history', True) else 'OFF'}"
-    if scan_mode_banner == "alpha_signal_only":
+    if scan_mode_banner == "pulse_only":
+        p_sz = float(CONFIG.get("pulse_trade_size_usd", 5.0) or 5.0)
+        p_tp = float(CONFIG.get("pulse_take_profit_pct", 30.0) or 30.0)
+        p_sl = float(CONFIG.get("pulse_stop_loss_pct", 15.0) or 15.0)
+        p_tr = float(CONFIG.get("pulse_trailing_stop_pct", 8.0) or 8.0)
+        p_cmin = float(CONFIG.get("pulse_stage2_min_curve_pct", 65.0) or 65.0)
+        p_cmax = float(CONFIG.get("pulse_stage2_max_curve_pct", 94.0) or 94.0)
+        p_s3 = float(CONFIG.get("pulse_stage3_min_liquidity_usd", 15000.0) or 15000.0)
+        p_rc = float(CONFIG.get("pulse_rugcheck_max_score", 50.0) or 50.0)
+        log(f"Pulse Rules: size=${p_sz:g} | TP +{p_tp:g}% / SL -{p_sl:g}% / Trail {p_tr:g}% | Stage2 curve {p_cmin:g}-{p_cmax:g}% | Stage3 liq>=${p_s3:.0f} | RugCheck<{p_rc:g} | {creator_banner}")
+    elif scan_mode_banner == "alpha_signal_only":
         al_risk = int(CONFIG.get("alpha_signal_max_risk_score", 45) or 45)
         al_ratio_raw = float(CONFIG.get("min_buy_sell_ratio_m5", 1.5) or 0) if opt_on(CONFIG, "min_buy_sell_ratio_m5", True) else 0.0
         al_ratio = min(1.0, al_ratio_raw) if al_ratio_raw > 0 else 0.0

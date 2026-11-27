@@ -2,6 +2,21 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.45.4 — Photon / Axiom / GMGN Pulse (Stage 2–3) Strategy, Dedicated Tab & Independent Settings
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Dedicated `Pulse (Stage 2–3)` Tab & Quick Buy (`PythonSniperView.tsx`, `server/routes/api.ts`)**:
+  - Added a dedicated **Pulse (Stage 2–3)** tab with one-click **Start / Stop Pulse Bot**, live **Target Stage** switcher (**Stage 2 Only — About to Graduate 65–94% Curve**, **Stage 3 Only — Migrated AMM Pools**, or **Both Stage 2 + 3**), **Quick Manual Buy by Mint**, and a live Stage 2–3 signal stream with RugCheck pre-screening.
+  - Added `Pulse Stage 2` / `Pulse Stage 3` attribution badges in **Open positions → Entry Signal**.
+- **Independent Pulse Settings (`pulse_*`) (`sniper/bot.py`, `server/sniperManager.ts`, `src/utils/sniperFormat.ts`)**:
+  - Added independent Pulse configuration (`pulse_trade_size_usd`, `pulse_take_profit_pct`, `pulse_stop_loss_pct`, `pulse_trailing_stop_pct`, `pulse_max_hold_minutes`, `pulse_jito_tip_sol`, `pulse_min_age_minutes`, `pulse_max_age_minutes`, Stage 2 `pulse_stage2_min_curve_pct`/`max_curve_pct`/`min_real_sol`, Stage 3 `pulse_stage3_min_liquidity_usd`/`require_pullback`/`pullback_pct`, and `pulse_rugcheck_max_score`) so changing Sniper Bot settings never affects Pulse trading.
+- **Isolated `pulse_only` Execution Mode (`server/sniperManager.ts`, `sniper/bot.py`, `PythonSniperView.tsx`)**:
+  - Added **Photon / Axiom / GMGN Pulse (Stage 2–3)** to the Start Bot modal, Smart Money selector, and Pro Desk; filters out Stage-1 newborn spam (`<2m` or unbonded curves) and strictly isolates from Whale Wallets and Sniper launches.
+
+---
+
 ## v1.45.3 — Alpha Signal Buy/Sell 1.0x Ratio & RugCheck Bundled-Insider Pre-Screening
 
 **Risk Warning: Trading can lose all of your money.**

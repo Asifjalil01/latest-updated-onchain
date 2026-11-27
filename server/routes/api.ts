@@ -1082,6 +1082,30 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.status(result.ok ? 200 : 400).json(result);
   });
 
+  router.get('/sniper/pulse-signals', async (req: Request, res: Response) => {
+    const discover = req.query?.discover === '1' || req.query?.discover === 'true';
+    if (discover) {
+      await sniperManager.discoverPulseSignals({ force: true });
+    }
+    res.json(sniperManager.getPulseSignals());
+  });
+
+  router.post('/sniper/pulse-signals/discover', async (_req: Request, res: Response) => {
+    const disc = await sniperManager.discoverPulseSignals({ force: true });
+    res.json({ ...sniperManager.getPulseSignals(), added: disc.added });
+  });
+
+  router.post('/sniper/pulse-signals/buy', async (req: Request, res: Response) => {
+    const mint = typeof req.body?.mint === 'string' ? req.body.mint.trim() : '';
+    const jitoTipSol = req.body?.jitoTipSol !== undefined ? Number(req.body.jitoTipSol) : undefined;
+    if (!mint) {
+      res.status(400).json({ ok: false, message: 'Mint is required' });
+      return;
+    }
+    const result = await sniperManager.queueManualPulseBuy(mint, jitoTipSol);
+    res.status(result.ok ? 200 : 400).json(result);
+  });
+
   router.get('/sniper/pumpportal-mints', (_req: Request, res: Response) => {
     const feed = sniperManager.getPumpPortalFeed();
     res.json({
@@ -1094,6 +1118,7 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       smart_buys: feed.smart_buys,
       whale_held_mints: feed.whale_held_mints,
       alpha_signals: feed.alpha_signals,
+      pulse_signals: feed.pulse_signals,
     });
   });
 

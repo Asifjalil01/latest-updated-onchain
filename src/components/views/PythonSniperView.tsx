@@ -98,6 +98,11 @@ interface SniperPosition {
   alpha_signal_entry?: boolean;
   alpha_source?: string;
   alpha_risk_score?: number;
+  pulse_entry?: boolean;
+  pulse_stage?: string;
+  pulse_source?: string;
+  pulse_curve_pct?: number;
+  pulse_risk_score?: number;
 }
 
 interface SniperLiveWallet {
@@ -167,6 +172,29 @@ const PYTHON_PRO_DESK_KEYS: Array<[string, 'bool' | 'int' | 'float' | 'string' |
   ['alpha_signal_refresh_interval_sec', 'int'],
   ['alpha_signal_max_risk_score', 'int'],
   ['alpha_signal_min_real_sol', 'float'],
+  ['pulse_stage', 'string'],
+  ['pulse_auto_find', 'bool'],
+  ['pulse_auto_buy', 'bool'],
+  ['pulse_trade_size_usd', 'float'],
+  ['pulse_take_profit_pct', 'float'],
+  ['pulse_stop_loss_pct', 'float'],
+  ['pulse_trailing_stop_pct', 'float'],
+  ['pulse_max_hold_minutes', 'int'],
+  ['pulse_jito_tip_sol', 'float'],
+  ['pulse_refresh_interval_sec', 'int'],
+  ['pulse_min_age_minutes', 'float'],
+  ['pulse_max_age_minutes', 'float'],
+  ['pulse_stage2_min_curve_pct', 'float'],
+  ['pulse_stage2_max_curve_pct', 'float'],
+  ['pulse_stage2_min_real_sol', 'float'],
+  ['pulse_stage3_min_liquidity_usd', 'float'],
+  ['pulse_stage3_require_pullback', 'bool'],
+  ['pulse_stage3_pullback_pct', 'float'],
+  ['pulse_stage3_wait_sec', 'float'],
+  ['pulse_min_buys_m5', 'int'],
+  ['pulse_min_buy_sell_ratio_m5', 'float'],
+  ['pulse_min_unique_traders_5m', 'int'],
+  ['pulse_rugcheck_max_score', 'float'],
   ['reused_socials_enabled', 'bool'],
   ['max_social_reuse_count', 'int'],
   ['ws_exit_stream_enabled', 'bool'],
@@ -492,7 +520,7 @@ export function PythonSniperView() {
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [exportingCsv, setExportingCsv] = useState(false);
   const [clearingLogs, setClearingLogs] = useState(false);
-  const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'smart_money' | 'alpha_signals' | 'logs' | 'settings' | 'pro_desk'>('positions');
+  const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'smart_money' | 'alpha_signals' | 'pulse' | 'logs' | 'settings' | 'pro_desk'>('positions');
   const [alphaSignals, setAlphaSignals] = useState<Array<{
     id: string;
     mint: string;
@@ -512,6 +540,31 @@ export function PythonSniperView() {
   }>>([]);
   const [alphaLoading, setAlphaLoading] = useState(false);
   const [alphaLastScanAt, setAlphaLastScanAt] = useState<number | null>(null);
+
+  const [pulseSignals, setPulseSignals] = useState<Array<{
+    id: string;
+    mint: string;
+    symbol: string;
+    name: string;
+    stage: 'stage2' | 'stage3';
+    source: string;
+    dexId: string;
+    curvePct: number;
+    realSol: number;
+    liquidityUsd: number;
+    buys5m: number;
+    sells5m: number;
+    priceChange5m: number;
+    volume5m: number;
+    riskScore: number;
+    timestamp: string;
+    status: 'AUTO_BUY' | 'READY' | 'PENDING' | 'SKIPPED';
+    skipReason?: string;
+  }>>([]);
+  const [pulseLoading, setPulseLoading] = useState(false);
+  const [pulseLastScanAt, setPulseLastScanAt] = useState<number | null>(null);
+  const [pulseManualMint, setPulseManualMint] = useState('');
+  const [pulseManualBuying, setPulseManualBuying] = useState(false);
 
   const fetchAlphaSignals = async (discoverNow = false) => {
     try {
@@ -533,6 +586,57 @@ export function PythonSniperView() {
     }
   };
 
+  const fetchPulseSignals = async (discoverNow = false) => {
+    try {
+      setPulseLoading(true);
+      const url = discoverNow ? '/api/sniper/pulse-signals/discover' : '/api/sniper/pulse-signals';
+      const data = await apiFetch<any>(
+        url,
+        discoverNow ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) } : undefined
+      );
+      if (data?.ok && Array.isArray(data.signals)) {
+        setPulseSignals(data.signals);
+        if (typeof data.lastScanAtMs === 'number') setPulseLastScanAt(data.lastScanAtMs);
+        if (discoverNow && typeof data.added === 'number' && data.added > 0) {
+          pushToast({ kind: 'success', title: `Pulse scanner found ${data.added} Stage 2–3 coin(s)` });
+        }
+      }
+    } catch {} finally {
+      setPulseLoading(false);
+    }
+  };
+
+  const handleManualPulseBuy = async (mintOverride?: string) => {
+    const mint = (mintOverride ?? pulseManualMint).trim();
+    if (!mint || mint.length < 32) {
+      pushToast({ kind: 'error', title: 'Valid Solana token mint required' });
+      return;
+    }
+    setPulseManualBuying(true);
+    try {
+      const tipVal = Number(draftSettings.pulse_jito_tip_sol ?? 0.0005);
+      const res = await apiFetch<any>('/api/sniper/pulse-signals/buy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mint, jitoTipSol: tipVal }),
+      });
+      pushToast({
+        kind: res?.ok ? 'success' : 'error',
+        title: res?.message || `Queued Pulse buy for ${mint.slice(0, 6)}...`,
+      });
+      if (!mintOverride) setPulseManualMint('');
+      void fetchPulseSignals(false);
+    } catch (err) {
+      pushToast({
+        kind: 'error',
+        title: 'Pulse buy failed',
+        body: err instanceof Error ? err.message : 'Error',
+      });
+    } finally {
+      setPulseManualBuying(false);
+    }
+  };
+
   useEffect(() => {
     void fetchAlphaSignals(activeTab === 'alpha_signals');
     const t = setInterval(() => {
@@ -540,13 +644,22 @@ export function PythonSniperView() {
     }, activeTab === 'alpha_signals' ? 4000 : 8000);
     return () => clearInterval(t);
   }, [activeTab]);
+
+  useEffect(() => {
+    void fetchPulseSignals(activeTab === 'pulse');
+    const t = setInterval(() => {
+      void fetchPulseSignals(activeTab === 'pulse');
+    }, activeTab === 'pulse' ? 4000 : 8000);
+    return () => clearInterval(t);
+  }, [activeTab]);
+
   const [historySearch, setHistorySearch] = useState('');
   const [newSmartWalletInput, setNewSmartWalletInput] = useState('');
   const [smartWalletSearch, setSmartWalletSearch] = useState('');
   const [smartWalletProfiles, setSmartWalletProfiles] = useState<Record<string, SmartWalletProfile>>({});
   const [showStartModal, setShowStartModal] = useState(false);
   const [startSmartMoneyFollow, setStartSmartMoneyFollow] = useState(true);
-  const [startScanMode, setStartScanMode] = useState<'both' | 'smart_money_only' | 'sniper_only' | 'alpha_signal_only'>('both');
+  const [startScanMode, setStartScanMode] = useState<'both' | 'smart_money_only' | 'sniper_only' | 'alpha_signal_only' | 'pulse_only'>('both');
   const [savingSmartConfig, setSavingSmartConfig] = useState(false);
   const [discoveringWhales, setDiscoveringWhales] = useState(false);
   const [discoveredWhales, setDiscoveredWhales] = useState<Array<{
@@ -1392,12 +1505,13 @@ export function PythonSniperView() {
                 const curScanMode =
                   draftSettings.smart_money_scan_mode === 'smart_money_only' ||
                   draftSettings.smart_money_scan_mode === 'sniper_only' ||
-                  draftSettings.smart_money_scan_mode === 'alpha_signal_only'
+                  draftSettings.smart_money_scan_mode === 'alpha_signal_only' ||
+                  draftSettings.smart_money_scan_mode === 'pulse_only'
                     ? draftSettings.smart_money_scan_mode
                     : 'both';
                 setStartScanMode(curScanMode);
                 setStartSmartMoneyFollow(
-                  curScanMode === 'sniper_only' || curScanMode === 'alpha_signal_only'
+                  curScanMode === 'sniper_only' || curScanMode === 'alpha_signal_only' || curScanMode === 'pulse_only'
                     ? false
                     : Boolean(draftSettings.smart_money_enabled !== false)
                 );
@@ -1534,6 +1648,7 @@ export function PythonSniperView() {
           { id: 'history', label: `Trade history (${trades.length})`, icon: History },
           { id: 'smart_money', label: 'Smart Money', icon: Users },
           { id: 'alpha_signals', label: 'Alpha Signals', icon: Zap },
+          { id: 'pulse', label: 'Pulse (Stage 2–3)', icon: Radio },
           { id: 'logs', label: 'Scan log', icon: Terminal },
           { id: 'settings', label: `Settings${isSettingsDirty ? ' •' : ''}`, icon: Sliders },
           { id: 'pro_desk', label: 'Pro Desk', icon: ShieldCheck },
@@ -1865,6 +1980,25 @@ export function PythonSniperView() {
                                 </div>
                               );
                             }
+                            if (p.pulse_entry) {
+                              const stageBadge = p.pulse_stage === 'stage2' ? 'Pulse Stage 2' : 'Pulse Stage 3';
+                              return (
+                                <div className="space-y-0.5">
+                                  <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-600 dark:text-cyan-400 border border-cyan-500/30 text-[10px] font-bold"
+                                    title={`Bought from ${p.pulse_source || stageBadge}${typeof p.pulse_curve_pct === 'number' ? ` · Curve ${p.pulse_curve_pct.toFixed(0)}%` : ''}${typeof p.pulse_risk_score === 'number' ? ` (Risk ${p.pulse_risk_score}/100)` : ''}`}
+                                  >
+                                    <Radio className="w-3 h-3 shrink-0" />
+                                    <span>{stageBadge}</span>
+                                  </span>
+                                  {p.pulse_source && (
+                                    <span className="block text-[10px] text-slate-500 dark:text-slate-400 truncate max-w-[150px]" title={p.pulse_source}>
+                                      {p.pulse_source}
+                                    </span>
+                                  )}
+                                </div>
+                              );
+                            }
                             if (p.alpha_signal_entry) {
                               return (
                                 <div className="space-y-0.5">
@@ -2039,20 +2173,24 @@ export function PythonSniperView() {
             <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-1.5">
               <span className="text-[11px] font-mono text-slate-500 uppercase font-semibold block">Active Scan Mode</span>
               <div className="text-base font-bold font-mono text-teal-600 dark:text-teal-400">
-                {draftSettings.smart_money_scan_mode === 'alpha_signal_only'
-                  ? 'Alpha Signals Only'
-                  : draftSettings.smart_money_scan_mode === 'smart_money_only'
-                    ? 'Whale Wallets Only'
-                    : draftSettings.smart_money_scan_mode === 'sniper_only'
-                      ? 'Sniper Bot Only'
-                      : 'Both (Sniper + Whales)'}
+                {draftSettings.smart_money_scan_mode === 'pulse_only'
+                  ? 'Pulse (Stage 2–3)'
+                  : draftSettings.smart_money_scan_mode === 'alpha_signal_only'
+                    ? 'Alpha Signals Only'
+                    : draftSettings.smart_money_scan_mode === 'smart_money_only'
+                      ? 'Whale Wallets Only'
+                      : draftSettings.smart_money_scan_mode === 'sniper_only'
+                        ? 'Sniper Bot Only'
+                        : 'Both (Sniper + Whales)'}
               </div>
               <p className="text-[11px] text-slate-500">
-                {draftSettings.smart_money_scan_mode === 'alpha_signal_only'
-                  ? 'Locked to Alpha Signals Only (Whales & Sniper paused)'
-                  : draftSettings.smart_money_follow_older_coins !== false
-                    ? `Follows whale coins up to ${Number(draftSettings.smart_money_max_coin_age_hours ?? 72) || '∞'}h old`
-                    : 'New launches only'}
+                {draftSettings.smart_money_scan_mode === 'pulse_only'
+                  ? 'Locked to Pulse Stage 2–3 (Independent Pulse Settings)'
+                  : draftSettings.smart_money_scan_mode === 'alpha_signal_only'
+                    ? 'Locked to Alpha Signals Only (Whales & Sniper paused)'
+                    : draftSettings.smart_money_follow_older_coins !== false
+                      ? `Follows whale coins up to ${Number(draftSettings.smart_money_max_coin_age_hours ?? 72) || '∞'}h old`
+                      : 'New launches only'}
               </p>
             </div>
 
@@ -2105,21 +2243,23 @@ export function PythonSniperView() {
                   <select
                     value={String(draftSettings.smart_money_scan_mode || 'both')}
                     onChange={(e) => {
-                      const nextMode = e.target.value as 'both' | 'smart_money_only' | 'sniper_only' | 'alpha_signal_only';
+                      const nextMode = e.target.value as 'both' | 'smart_money_only' | 'sniper_only' | 'alpha_signal_only' | 'pulse_only';
                       const patch: Record<string, any> = { smart_money_scan_mode: nextMode };
-                      if (nextMode !== 'alpha_signal_only') {
+                      if (nextMode !== 'alpha_signal_only' && nextMode !== 'pulse_only') {
                         patch.smart_money_enabled = nextMode !== 'sniper_only';
                       }
                       void saveQuickSniperSettings(
                         patch,
                         `Scan mode set to ${
-                          nextMode === 'alpha_signal_only'
-                            ? 'Alpha Signals Only'
-                            : nextMode === 'smart_money_only'
-                              ? 'Whale Wallets Only'
-                              : nextMode === 'sniper_only'
-                                ? 'Sniper Bot Only'
-                                : 'Both (Sniper + Whales)'
+                          nextMode === 'pulse_only'
+                            ? 'Pulse (Stage 2–3) Only'
+                            : nextMode === 'alpha_signal_only'
+                              ? 'Alpha Signals Only'
+                              : nextMode === 'smart_money_only'
+                                ? 'Whale Wallets Only'
+                                : nextMode === 'sniper_only'
+                                  ? 'Sniper Bot Only'
+                                  : 'Both (Sniper + Whales)'
                         }`
                       );
                     }}
@@ -2130,6 +2270,7 @@ export function PythonSniperView() {
                     <option value="smart_money_only">Whale Wallets Only</option>
                     <option value="sniper_only">Sniper Bot Only</option>
                     <option value="alpha_signal_only">Alpha Signals Only</option>
+                    <option value="pulse_only">Pulse (Stage 2–3) Only</option>
                   </select>
                 </div>
 
@@ -3078,6 +3219,708 @@ export function PythonSniperView() {
                             className="px-2.5 py-1 rounded bg-amber-600 hover:bg-amber-500 text-white text-[11px] font-bold"
                           >
                             Snipe
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Tab Content: Photon / Axiom / GMGN Pulse (Stage 2-3) */}
+      {activeTab === 'pulse' && (
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6 shadow-sm">
+          {/* Header + Start / Stop + Stage Selector */}
+          <div className="flex flex-wrap items-start justify-between gap-4 pb-4 border-b border-slate-100 dark:border-slate-800">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 flex-wrap">
+                <Radio className="w-5 h-5 text-cyan-500" />
+                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                  Photon / Axiom / GMGN Pulse (Stage 2 &amp; Stage 3)
+                </h3>
+                <span
+                  className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                    draftSettings.smart_money_scan_mode === 'pulse_only'
+                      ? 'bg-cyan-500/15 text-cyan-600 dark:text-cyan-400 border-cyan-500/30'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-500 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {draftSettings.smart_money_scan_mode === 'pulse_only'
+                    ? 'MODE: PULSE STAGE 2–3 ONLY (INDEPENDENT SETTINGS)'
+                    : `MODE: ${String(draftSettings.smart_money_scan_mode || 'both').toUpperCase()}`}
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-3xl">
+                Filters out Stage-1 newborn spam and focuses exclusively on <span className="font-semibold text-amber-500">Stage 2 (About to Graduate bonding curves)</span> and <span className="font-semibold text-emerald-500">Stage 3 (Migrated PumpSwap / Raydium / Meteora pools)</span>. Uses Pulse&apos;s own independent size, age, TP/SL, and RugCheck limits — completely separate from Sniper settings.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={savingSmartConfig}
+                onClick={async () => {
+                  if (running && draftSettings.smart_money_scan_mode === 'pulse_only') {
+                    await handleToggle();
+                    return;
+                  }
+                  if (draftSettings.smart_money_scan_mode !== 'pulse_only') {
+                    await saveQuickSniperSettings({
+                      smart_money_scan_mode: 'pulse_only',
+                      pulse_auto_find: true,
+                      pulse_auto_buy: true,
+                    });
+                  }
+                  if (!running) {
+                    await handleToggle();
+                  } else {
+                    pushToast({
+                      kind: 'success',
+                      title: 'Switched live bot to Pulse (Stage 2–3) Only',
+                    });
+                  }
+                }}
+                className={`px-4 py-2 rounded-xl text-xs font-bold text-white flex items-center gap-1.5 shadow-md transition-colors disabled:opacity-50 ${
+                  running && draftSettings.smart_money_scan_mode === 'pulse_only'
+                    ? 'bg-rose-600 hover:bg-rose-500'
+                    : 'bg-cyan-600 hover:bg-cyan-500'
+                }`}
+              >
+                {running && draftSettings.smart_money_scan_mode === 'pulse_only' ? (
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                ) : (
+                  <Play className="w-3.5 h-3.5 fill-current" />
+                )}
+                <span>
+                  {running && draftSettings.smart_money_scan_mode === 'pulse_only'
+                    ? 'Stop Pulse Bot'
+                    : 'Start Pulse Bot'}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                disabled={savingSmartConfig}
+                onClick={() => {
+                  const isPulseOnly = draftSettings.smart_money_scan_mode === 'pulse_only';
+                  const nextMode = isPulseOnly ? 'both' : 'pulse_only';
+                  void saveQuickSniperSettings(
+                    {
+                      smart_money_scan_mode: nextMode,
+                      ...(nextMode === 'pulse_only' ? { pulse_auto_find: true } : {}),
+                    },
+                    nextMode === 'pulse_only'
+                      ? 'Bot locked to Pulse Stage 2–3 Only (Independent Settings)'
+                      : 'Switched back to Both (Sniper + Whales)'
+                  );
+                }}
+                className={`px-3 py-2 rounded-xl text-xs font-bold border transition-colors ${
+                  draftSettings.smart_money_scan_mode === 'pulse_only'
+                    ? 'bg-cyan-500/15 text-cyan-600 dark:text-cyan-400 border-cyan-500/40'
+                    : 'bg-slate-50 dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-cyan-500/40'
+                }`}
+              >
+                {draftSettings.smart_money_scan_mode === 'pulse_only'
+                  ? '✓ Pulse Mode Active'
+                  : 'Lock to Pulse Mode'}
+              </button>
+
+              <button
+                type="button"
+                disabled={pulseLoading}
+                onClick={() => void fetchPulseSignals(true)}
+                className="px-3.5 py-2 rounded-xl bg-slate-900 dark:bg-slate-800 hover:bg-slate-800 dark:hover:bg-slate-700 text-white text-xs font-bold inline-flex items-center gap-1.5 border border-slate-700 disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${pulseLoading ? 'animate-spin' : ''}`} />
+                <span>{pulseLoading ? 'Scanning...' : 'Scan Stage 2–3 Now'}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Stage Selector + Quick Toggles */}
+          <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[11px] font-mono uppercase font-bold text-slate-500 mr-1">Target Stage:</span>
+              {(
+                [
+                  { id: 'stage2', label: 'Stage 2 Only (About to Graduate)' },
+                  { id: 'stage3', label: 'Stage 3 Only (Migrated AMM)' },
+                  { id: 'both', label: 'Both (Stage 2 + 3)' },
+                ] as const
+              ).map((opt) => {
+                const active = String(draftSettings.pulse_stage || 'both') === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    disabled={savingSmartConfig}
+                    onClick={async () => {
+                      await saveQuickSniperSettings(
+                        { pulse_stage: opt.id },
+                        `Pulse stage set to ${opt.label}`
+                      );
+                      void fetchPulseSignals(true);
+                    }}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-colors ${
+                      active
+                        ? 'bg-cyan-600 text-white border-cyan-500 shadow-sm'
+                        : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-cyan-500/40'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5 text-xs">
+              <label className="flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+                <input
+                  type="checkbox"
+                  checked={draftSettings.pulse_auto_find !== false}
+                  onChange={(e) =>
+                    void saveQuickSniperSettings(
+                      { pulse_auto_find: e.target.checked },
+                      e.target.checked ? 'Pulse Auto-Find enabled' : 'Pulse Auto-Find paused'
+                    )
+                  }
+                  disabled={savingSmartConfig}
+                  className="rounded border-slate-300 text-cyan-600 focus:ring-cyan-500 w-4 h-4 cursor-pointer"
+                />
+                <span className="font-semibold text-slate-700 dark:text-slate-300">Auto-Find</span>
+              </label>
+
+              <label className="flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+                <input
+                  type="checkbox"
+                  checked={draftSettings.pulse_auto_buy !== false}
+                  onChange={(e) =>
+                    void saveQuickSniperSettings(
+                      { pulse_auto_buy: e.target.checked },
+                      e.target.checked ? 'Pulse Auto-Buy enabled' : 'Pulse Auto-Buy paused (manual buy only)'
+                    )
+                  }
+                  disabled={savingSmartConfig}
+                  className="rounded border-slate-300 text-cyan-600 focus:ring-cyan-500 w-4 h-4 cursor-pointer"
+                />
+                <span className="font-semibold text-slate-700 dark:text-slate-300">Auto-Buy Qualified</span>
+              </label>
+            </div>
+          </div>
+
+          {/* Quick Manual Buy Bar */}
+          <div className="p-4 rounded-xl border border-cyan-500/25 bg-cyan-500/[0.04] flex flex-wrap items-end justify-between gap-3">
+            <div className="flex-1 min-w-[260px] space-y-1">
+              <label className="block text-[11px] font-bold text-cyan-700 dark:text-cyan-300">
+                Quick Buy Any Photon / Axiom / GMGN Coin by Mint Address
+              </label>
+              <input
+                type="text"
+                value={pulseManualMint}
+                onChange={(e) => setPulseManualMint(e.target.value)}
+                placeholder="Paste Solana token mint address..."
+                className="w-full px-3 py-2 rounded-lg font-mono text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-slate-100 focus:outline-none focus:border-cyan-500"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="block text-[11px] font-medium text-slate-500">Jito Tip (SOL)</label>
+              <input
+                type="number"
+                min={0}
+                max={0.01}
+                step={0.0001}
+                value={draftSettings.pulse_jito_tip_sol ?? 0.0005}
+                onChange={(e) => {
+                  const val = Math.max(0, Math.min(0.01, parseFloat(e.target.value || '0.0005') || 0));
+                  setDraftSettings({ ...draftSettings, pulse_jito_tip_sol: val });
+                  markSettingsDirty(true);
+                }}
+                className="w-24 px-2.5 py-2 rounded-lg font-mono text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-slate-100"
+              />
+            </div>
+            <button
+              type="button"
+              disabled={pulseManualBuying || !pulseManualMint.trim()}
+              onClick={() => void handleManualPulseBuy()}
+              className="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold shadow-sm disabled:opacity-50"
+            >
+              {pulseManualBuying
+                ? 'Queuing Buy...'
+                : `Buy Coin Now ($${Number(draftSettings.pulse_trade_size_usd ?? 5).toFixed(2)})`}
+            </button>
+          </div>
+
+          {/* Independent Pulse Settings Panel */}
+          <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/40 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-200/70 dark:border-slate-800">
+              <div>
+                <h4 className="text-xs font-bold text-slate-900 dark:text-slate-100">
+                  Independent Pulse Strategy Settings (Does NOT Use Sniper Settings)
+                </h4>
+                <p className="text-[11px] text-slate-500">
+                  Trade size, exits, coin age, curve %, AMM liquidity, and RugCheck threshold applied exclusively when Pulse trades.
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={savingSmartConfig}
+                onClick={async () => {
+                  await saveQuickSniperSettings(
+                    {
+                      pulse_stage: String(draftSettings.pulse_stage || 'both'),
+                      pulse_trade_size_usd: Number(draftSettings.pulse_trade_size_usd ?? 5),
+                      pulse_take_profit_pct: Number(draftSettings.pulse_take_profit_pct ?? 30),
+                      pulse_stop_loss_pct: Number(draftSettings.pulse_stop_loss_pct ?? 15),
+                      pulse_trailing_stop_pct: Number(draftSettings.pulse_trailing_stop_pct ?? 8),
+                      pulse_max_hold_minutes: Number(draftSettings.pulse_max_hold_minutes ?? 90),
+                      pulse_jito_tip_sol: Number(draftSettings.pulse_jito_tip_sol ?? 0.0005),
+                      pulse_refresh_interval_sec: Number(draftSettings.pulse_refresh_interval_sec ?? 10),
+                      pulse_min_age_minutes: Number(draftSettings.pulse_min_age_minutes ?? 2),
+                      pulse_max_age_minutes: Number(draftSettings.pulse_max_age_minutes ?? 180),
+                      pulse_stage2_min_curve_pct: Number(draftSettings.pulse_stage2_min_curve_pct ?? 65),
+                      pulse_stage2_max_curve_pct: Number(draftSettings.pulse_stage2_max_curve_pct ?? 94),
+                      pulse_stage2_min_real_sol: Number(draftSettings.pulse_stage2_min_real_sol ?? 40),
+                      pulse_stage3_min_liquidity_usd: Number(draftSettings.pulse_stage3_min_liquidity_usd ?? 15000),
+                      pulse_stage3_require_pullback: Boolean(draftSettings.pulse_stage3_require_pullback),
+                      pulse_stage3_pullback_pct: Number(draftSettings.pulse_stage3_pullback_pct ?? 12),
+                      pulse_stage3_wait_sec: Number(draftSettings.pulse_stage3_wait_sec ?? 30),
+                      pulse_min_buys_m5: Number(draftSettings.pulse_min_buys_m5 ?? 10),
+                      pulse_min_buy_sell_ratio_m5: Number(draftSettings.pulse_min_buy_sell_ratio_m5 ?? 1.05),
+                      pulse_min_unique_traders_5m: Number(draftSettings.pulse_min_unique_traders_5m ?? 10),
+                      pulse_rugcheck_max_score: Number(draftSettings.pulse_rugcheck_max_score ?? 50),
+                    },
+                    'Pulse independent settings saved'
+                  );
+                  void fetchPulseSignals(true);
+                }}
+                className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold inline-flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>Save Pulse Settings</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-6 gap-3 text-xs">
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Trade Size ($)</label>
+                <input
+                  type="number"
+                  step="0.5"
+                  min={0.5}
+                  value={draftSettings.pulse_trade_size_usd ?? 5}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_trade_size_usd: parseFloat(e.target.value || '5') || 5 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Take Profit (%)</label>
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  value={draftSettings.pulse_take_profit_pct ?? 30}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_take_profit_pct: parseFloat(e.target.value || '0') || 0 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Stop Loss (%)</label>
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  value={draftSettings.pulse_stop_loss_pct ?? 15}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_stop_loss_pct: parseFloat(e.target.value || '0') || 0 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Trailing Stop (%)</label>
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  value={draftSettings.pulse_trailing_stop_pct ?? 8}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_trailing_stop_pct: parseFloat(e.target.value || '0') || 0 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Max Hold (min)</label>
+                <input
+                  type="number"
+                  step="5"
+                  min={0}
+                  value={draftSettings.pulse_max_hold_minutes ?? 90}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_max_hold_minutes: parseInt(e.target.value || '0', 10) || 0 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Refresh (sec)</label>
+                <input
+                  type="number"
+                  step="5"
+                  min={5}
+                  max={300}
+                  value={draftSettings.pulse_refresh_interval_sec ?? 10}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_refresh_interval_sec: parseInt(e.target.value || '10', 10) || 10 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Min Age (min)</label>
+                <input
+                  type="number"
+                  step="0.5"
+                  min={0}
+                  value={draftSettings.pulse_min_age_minutes ?? 2}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_min_age_minutes: parseFloat(e.target.value || '0') || 0 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Max Age (min)</label>
+                <input
+                  type="number"
+                  step="5"
+                  min={0}
+                  value={draftSettings.pulse_max_age_minutes ?? 180}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_max_age_minutes: parseFloat(e.target.value || '0') || 0 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Stage 2 Min Curve %</label>
+                <input
+                  type="number"
+                  step="1"
+                  min={10}
+                  max={99}
+                  value={draftSettings.pulse_stage2_min_curve_pct ?? 65}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_stage2_min_curve_pct: parseFloat(e.target.value || '65') || 65 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Stage 2 Max Curve %</label>
+                <input
+                  type="number"
+                  step="1"
+                  min={20}
+                  max={100}
+                  value={draftSettings.pulse_stage2_max_curve_pct ?? 94}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_stage2_max_curve_pct: parseFloat(e.target.value || '94') || 94 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Stage 2 Min Real SOL</label>
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  value={draftSettings.pulse_stage2_min_real_sol ?? 40}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_stage2_min_real_sol: parseFloat(e.target.value || '0') || 0 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Stage 3 Min Liq ($)</label>
+                <input
+                  type="number"
+                  step="1000"
+                  min={1000}
+                  value={draftSettings.pulse_stage3_min_liquidity_usd ?? 15000}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_stage3_min_liquidity_usd: parseFloat(e.target.value || '15000') || 15000 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Min 5m Buys</label>
+                <input
+                  type="number"
+                  step="1"
+                  min={1}
+                  value={draftSettings.pulse_min_buys_m5 ?? 10}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_min_buys_m5: parseInt(e.target.value || '10', 10) || 10 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Min Buy/Sell Ratio</label>
+                <input
+                  type="number"
+                  step="0.05"
+                  min={0.5}
+                  value={draftSettings.pulse_min_buy_sell_ratio_m5 ?? 1.05}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_min_buy_sell_ratio_m5: parseFloat(e.target.value || '1.05') || 1.05 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Min Traders (5m)</label>
+                <input
+                  type="number"
+                  step="1"
+                  min={1}
+                  value={draftSettings.pulse_min_unique_traders_5m ?? 10}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_min_unique_traders_5m: parseInt(e.target.value || '10', 10) || 10 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Max RugCheck Score</label>
+                <input
+                  type="number"
+                  step="5"
+                  min={10}
+                  max={100}
+                  value={draftSettings.pulse_rugcheck_max_score ?? 50}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_rugcheck_max_score: parseFloat(e.target.value || '50') || 50 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-500 mb-1">Stage 3 Pullback Dip %</label>
+                <input
+                  type="number"
+                  step="1"
+                  min={1}
+                  max={60}
+                  disabled={!draftSettings.pulse_stage3_require_pullback}
+                  value={draftSettings.pulse_stage3_pullback_pct ?? 12}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_stage3_pullback_pct: parseFloat(e.target.value || '12') || 12 });
+                    markSettingsDirty(true);
+                  }}
+                  className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
+                />
+              </div>
+              <div className="flex flex-col justify-end">
+                <label className="flex items-center gap-2 cursor-pointer px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(draftSettings.pulse_stage3_require_pullback)}
+                    onChange={(e) => {
+                      setDraftSettings({ ...draftSettings, pulse_stage3_require_pullback: e.target.checked });
+                      markSettingsDirty(true);
+                    }}
+                    className="rounded text-cyan-600 focus:ring-cyan-500"
+                  />
+                  <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">Wait Pullback Dip</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          {/* Summary Strip */}
+          <div className="text-[11px] font-mono text-slate-500 flex flex-wrap items-center justify-between gap-2">
+            <span>
+              Showing {pulseSignals.length} Stage 2–3 Pulse candidate(s)
+              {pulseLastScanAt ? ` · Last scan: ${new Date(pulseLastScanAt).toLocaleTimeString()}` : ''}
+            </span>
+            <span>
+              Age {Number(draftSettings.pulse_min_age_minutes ?? 2)}m–
+              {Number(draftSettings.pulse_max_age_minutes ?? 180) > 0 ? `${Number(draftSettings.pulse_max_age_minutes ?? 180)}m` : 'any'} ·
+              Curve {Number(draftSettings.pulse_stage2_min_curve_pct ?? 65)}–{Number(draftSettings.pulse_stage2_max_curve_pct ?? 94)}% ·
+              AMM Liq &ge; ${Number(draftSettings.pulse_stage3_min_liquidity_usd ?? 15000).toLocaleString()} ·
+              RugCheck &le; {Number(draftSettings.pulse_rugcheck_max_score ?? 50)}
+            </span>
+          </div>
+
+          {/* Signals Table */}
+          {pulseSignals.length === 0 ? (
+            <div className="py-16 text-center text-xs text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl space-y-2">
+              <p className="font-semibold text-slate-700 dark:text-slate-300">
+                Scanning PumpPortal Bonding Curves (Stage 2) &amp; Graduated AMM Pools (Stage 3)...
+              </p>
+              <p className="max-w-lg mx-auto">
+                Click &ldquo;Scan Stage 2–3 Now&rdquo; or press &ldquo;Start Pulse Bot&rdquo; above to automatically buy qualifying Photon/Axiom/GMGN Stage 2 &amp; Stage 3 coins with Pulse&apos;s own settings.
+              </p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-xl">
+              <table className="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 text-slate-500 text-[11px]">
+                    <th className="py-2.5 px-3 font-semibold">Time</th>
+                    <th className="py-2.5 px-3 font-semibold">Token / Mint</th>
+                    <th className="py-2.5 px-3 font-semibold">Stage &amp; Source</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Curve / Liquidity</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">5m Flow &amp; Chg</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Risk Score</th>
+                    <th className="py-2.5 px-3 font-semibold text-center">Status</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70">
+                  {pulseSignals.map((sig) => (
+                    <tr key={sig.id} className="hover:bg-slate-50 dark:hover:bg-slate-900/40 transition-colors">
+                      <td className="py-2.5 px-3 text-slate-400">{sig.timestamp}</td>
+                      <td className="py-2.5 px-3">
+                        <span className="font-bold text-slate-900 dark:text-slate-100 block">${sig.symbol}</span>
+                        <div className="flex items-center gap-1 text-[10px] text-cyan-600 dark:text-cyan-400">
+                          <a
+                            href={`https://solscan.io/token/${sig.mint}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="hover:underline font-mono"
+                            title={`Inspect ${sig.mint} on Solscan`}
+                          >
+                            {sig.mint.slice(0, 6)}...{sig.mint.slice(-4)}
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => handleCopy(sig.mint)}
+                            className="text-slate-400 hover:text-slate-200"
+                            title="Copy mint address"
+                          >
+                            {copiedKey === sig.mint ? <Check className="w-2.5 h-2.5 text-emerald-400" /> : <Copy className="w-2.5 h-2.5" />}
+                          </button>
+                        </div>
+                      </td>
+                      <td className="py-2.5 px-3 font-sans">
+                        <span
+                          className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase mb-0.5 ${
+                            sig.stage === 'stage2'
+                              ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30'
+                              : 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30'
+                          }`}
+                        >
+                          {sig.stage === 'stage2' ? `Stage 2 · ${sig.curvePct.toFixed(0)}% Curve` : `Stage 3 · Migrated`}
+                        </span>
+                        <span className="block text-[11px] text-slate-500 dark:text-slate-400">{sig.source}</span>
+                      </td>
+                      <td className="py-2.5 px-3 text-right">
+                        <span className="font-bold text-emerald-500 block">
+                          ${sig.liquidityUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                        </span>
+                        <span className="text-[10px] text-slate-400">
+                          {sig.realSol.toFixed(1)} SOL · {sig.curvePct.toFixed(0)}%
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-slate-700 dark:text-slate-300">
+                        <span className="block">
+                          {sig.buys5m}B / {sig.sells5m}S
+                        </span>
+                        <span className={`text-[10px] ${sig.priceChange5m >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                          {sig.priceChange5m >= 0 ? '+' : ''}
+                          {sig.priceChange5m.toFixed(1)}% (5m)
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-right font-bold">
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] ${
+                            sig.riskScore <= 25
+                              ? 'bg-emerald-500/15 text-emerald-500'
+                              : sig.riskScore <= 50
+                                ? 'bg-amber-500/15 text-amber-500'
+                                : 'bg-rose-500/15 text-rose-500'
+                          }`}
+                        >
+                          {sig.riskScore}/100
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-center">
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold font-sans uppercase inline-block ${
+                            sig.status === 'AUTO_BUY'
+                              ? 'bg-emerald-500/15 text-emerald-500'
+                              : sig.status === 'READY'
+                                ? 'bg-cyan-500/15 text-cyan-500'
+                                : sig.status === 'SKIPPED'
+                                  ? 'bg-rose-500/15 text-rose-500'
+                                  : 'bg-amber-500/15 text-amber-500'
+                          }`}
+                          title={sig.skipReason || sig.status}
+                        >
+                          {sig.status}
+                        </span>
+                        {sig.skipReason && sig.status === 'SKIPPED' && (
+                          <span className="block text-[10px] font-sans text-rose-400 mt-0.5 leading-tight">
+                            {sig.skipReason}
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-3 text-right">
+                        <div className="flex items-center justify-end gap-1.5 font-sans">
+                          <a
+                            href={`https://dexscreener.com/solana/${sig.mint}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:text-cyan-400 text-[11px] font-semibold"
+                          >
+                            Dex ↗
+                          </a>
+                          <a
+                            href={`https://solscan.io/token/${sig.mint}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:text-cyan-400 text-[11px] font-semibold"
+                          >
+                            Coin ↗
+                          </a>
+                          <button
+                            type="button"
+                            onClick={() => void handleManualPulseBuy(sig.mint)}
+                            className="px-2.5 py-1 rounded bg-cyan-600 hover:bg-cyan-500 text-white text-[11px] font-bold"
+                          >
+                            Buy
                           </button>
                         </div>
                       </td>
@@ -4355,7 +5198,7 @@ export function PythonSniperView() {
                         setDraftSettings({
                           ...draftSettings,
                           smart_money_scan_mode: modeVal,
-                          ...(modeVal !== 'alpha_signal_only'
+                          ...(modeVal !== 'alpha_signal_only' && modeVal !== 'pulse_only'
                             ? { smart_money_enabled: modeVal !== 'sniper_only' }
                             : {}),
                         });
@@ -4367,6 +5210,7 @@ export function PythonSniperView() {
                       <option value="smart_money_only">Whale Wallets Only (No Random Launches)</option>
                       <option value="sniper_only">Sniper Bot Only (Ignore Whale Wallets)</option>
                       <option value="alpha_signal_only">Alpha Signals Only (Ignore Whales &amp; Sniper)</option>
+                      <option value="pulse_only">Pulse Stage 2–3 Only (Independent Settings)</option>
                     </select>
                   </div>
 
@@ -5423,14 +6267,21 @@ export function PythonSniperView() {
                     title: 'Alpha Signals Only (Auto-Found Signal Feed)',
                     desc: 'Only buys coins triggered by Auto-Found Alpha Signals; ignores Whale Wallets and Sniper Bot launches.',
                   },
+                  {
+                    id: 'pulse_only' as const,
+                    title: 'Photon / Axiom / GMGN Pulse (Stage 2–3)',
+                    desc: 'Only trades Stage 2 (65–94% curve) & Stage 3 (Migrated AMM) coins using Pulse’s own independent settings.',
+                  },
                 ].map((opt) => (
                   <label
                     key={opt.id}
                     className={`flex items-start gap-2.5 p-3 rounded-xl border cursor-pointer transition-colors ${
                       startScanMode === opt.id
-                        ? opt.id === 'alpha_signal_only'
-                          ? 'border-amber-500 bg-amber-500/[0.06]'
-                          : 'border-teal-500 bg-teal-500/[0.06]'
+                        ? opt.id === 'pulse_only'
+                          ? 'border-cyan-500 bg-cyan-500/[0.06]'
+                          : opt.id === 'alpha_signal_only'
+                            ? 'border-amber-500 bg-amber-500/[0.06]'
+                            : 'border-teal-500 bg-teal-500/[0.06]'
                         : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 hover:border-slate-300 dark:hover:border-slate-700'
                     }`}
                   >
@@ -5440,9 +6291,17 @@ export function PythonSniperView() {
                       checked={startScanMode === opt.id}
                       onChange={() => {
                         setStartScanMode(opt.id);
-                        setStartSmartMoneyFollow(opt.id !== 'sniper_only' && opt.id !== 'alpha_signal_only');
+                        setStartSmartMoneyFollow(
+                          opt.id !== 'sniper_only' && opt.id !== 'alpha_signal_only' && opt.id !== 'pulse_only'
+                        );
                       }}
-                      className={`mt-0.5 ${opt.id === 'alpha_signal_only' ? 'text-amber-600 focus:ring-amber-500' : 'text-teal-600 focus:ring-teal-500'}`}
+                      className={`mt-0.5 ${
+                        opt.id === 'pulse_only'
+                          ? 'text-cyan-600 focus:ring-cyan-500'
+                          : opt.id === 'alpha_signal_only'
+                            ? 'text-amber-600 focus:ring-amber-500'
+                            : 'text-teal-600 focus:ring-teal-500'
+                      }`}
                     />
                     <div className="space-y-0.5">
                       <span className="font-bold text-slate-900 dark:text-slate-100 block">{opt.title}</span>
@@ -5452,9 +6311,11 @@ export function PythonSniperView() {
                 ))}
               </div>
               <p className="text-[11px] text-slate-500">
-                {startScanMode === 'alpha_signal_only'
-                  ? 'Alpha Signals Only continuously auto-finds signals across PumpPortal WS, DexScreener Boosts, and Gecko Momentum without touching Whale Wallets or general Sniper launches.'
-                  : 'Note: Whale wallet trades can take hours or days to materialize; on-chain portfolio scanning also tracks coins they have already been holding for 1h–72h+.'}
+                {startScanMode === 'pulse_only'
+                  ? `Pulse Only follows Stage ${draftSettings.pulse_stage === 'stage2' ? '2 (About to Graduate)' : draftSettings.pulse_stage === 'stage3' ? '3 (Migrated AMM)' : '2 & 3'} using Pulse’s own independent size ($${Number(draftSettings.pulse_trade_size_usd ?? 5).toFixed(2)}), age, TP/SL, and RugCheck rules.`
+                  : startScanMode === 'alpha_signal_only'
+                    ? 'Alpha Signals Only continuously auto-finds signals across PumpPortal WS, DexScreener Boosts, and Gecko Momentum without touching Whale Wallets or general Sniper launches.'
+                    : 'Note: Whale wallet trades can take hours or days to materialize; on-chain portfolio scanning also tracks coins they have already been holding for 1h–72h+.'}
               </p>
             </div>
 
@@ -5472,7 +6333,19 @@ export function PythonSniperView() {
                 onClick={async () => {
                   setShowStartModal(false);
                   const curMode = String(draftSettings.smart_money_scan_mode || 'both');
-                  if (startScanMode === 'alpha_signal_only') {
+                  if (startScanMode === 'pulse_only') {
+                    if (
+                      curMode !== 'pulse_only' ||
+                      draftSettings.pulse_auto_find === false ||
+                      draftSettings.pulse_auto_buy === false
+                    ) {
+                      await saveQuickSniperSettings({
+                        smart_money_scan_mode: 'pulse_only',
+                        pulse_auto_find: true,
+                        pulse_auto_buy: true,
+                      });
+                    }
+                  } else if (startScanMode === 'alpha_signal_only') {
                     if (
                       curMode !== 'alpha_signal_only' ||
                       draftSettings.alpha_signal_auto_find === false ||

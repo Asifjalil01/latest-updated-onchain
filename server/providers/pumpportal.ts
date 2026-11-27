@@ -58,6 +58,8 @@ export interface SyntheticPumpPortalPair {
     unique_traders_5m: number;
     v_sol: number;
     real_sol: number;
+    curve_pct: number;
+    migrated: boolean;
     creator: string;
     creator_sold: boolean;
     initial_buy_sol: number;
@@ -298,6 +300,12 @@ export class PumpPortalWsProvider {
     const cutoff = Date.now() - maxAgeMs;
     this.smartBuyBuffer = this.smartBuyBuffer.filter((e) => e.tsMs >= cutoff);
     return [...this.smartBuyBuffer];
+  }
+
+  getMigrationFeed(maxAgeMs = 1_800_000): PumpPortalEvent[] {
+    const cutoff = Date.now() - maxAgeMs;
+    this.migrationBuffer = this.migrationBuffer.filter((e) => e.receivedAtMs >= cutoff);
+    return [...this.migrationBuffer].sort((a, b) => b.receivedAtMs - a.receivedAtMs);
   }
 
   getDiscoveredWhaleWallets(limit = 30): DiscoveredWsWhale[] {
@@ -814,6 +822,8 @@ export class PumpPortalWsProvider {
           unique_traders_5m: traders5m.size,
           v_sol: Number(st.vSolInBondingCurve.toFixed(4)),
           real_sol: realSol,
+          curve_pct: Number(Math.min(100, Math.max(0, (realSol / 85) * 100)).toFixed(1)),
+          migrated: Boolean(st.migrated),
           creator: st.creator,
           creator_sold: st.creatorSold,
           initial_buy_sol: Number(st.creatorInitialBuySol.toFixed(4)),

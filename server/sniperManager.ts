@@ -308,6 +308,7 @@ export class SniperManager {
             scanMode === 'smart_money_only' ||
             (scanMode !== 'sniper_only' &&
               scanMode !== 'alpha_signal_only' &&
+              scanMode !== 'pulse_only' &&
               isPyOptionEnabled(settings, 'smart_money_enabled', true) &&
               settings.smart_money_enabled !== false);
           const autoDisc =
@@ -352,8 +353,7 @@ export class SniperManager {
 
           const alphaAutoFind =
             scanMode === 'alpha_signal_only' ||
-            (scanMode !== 'smart_money_only' &&
-              scanMode !== 'sniper_only' &&
+            (scanMode === 'both' &&
               isPyOptionEnabled(settings, 'alpha_signal_auto_find', true) &&
               settings.alpha_signal_auto_find !== false);
           const alphaRefreshMs = Math.max(
@@ -362,6 +362,20 @@ export class SniperManager {
           );
           if (alphaAutoFind && !this.alphaDiscoverInFlight && now - this.lastAlphaDiscoverAtMs >= alphaRefreshMs) {
             void this.discoverAlphaSignals({ silent: true });
+          }
+
+          const pulseAutoFind =
+            scanMode === 'pulse_only' ||
+            (scanMode !== 'smart_money_only' &&
+              scanMode !== 'sniper_only' &&
+              scanMode !== 'alpha_signal_only' &&
+              settings.pulse_auto_find !== false);
+          const pulseRefreshMs = Math.max(
+            5_000,
+            Math.min(300_000, Number(settings.pulse_refresh_interval_sec ?? 10) * 1000)
+          );
+          if (pulseAutoFind && !this.pulseDiscoverInFlight && now - this.lastPulseDiscoverAtMs >= pulseRefreshMs) {
+            void this.discoverPulseSignals({ silent: true });
           }
 
           if (now - lastSmartLog >= 25_000) {
@@ -388,6 +402,14 @@ export class SniperManager {
             this.appendLog(
               'INFO',
               `[AlphaSignal] Auto-finder active (mode: alpha_signal_only, refresh ${Math.round(alphaRefreshMs / 1000)}s, ${readyCnt} active signal(s)) — scanning WS curves + DexScreener Boosts + Gecko Momentum...`
+            );
+          } else if (scanMode === 'pulse_only' && now - lastAlphaLog >= 25_000) {
+            lastAlphaLog = now;
+            const readyCnt = this.pulseSignalsBuffer.filter((s) => s.status !== 'SKIPPED').length;
+            const stageTxt = String(settings.pulse_stage || 'both');
+            this.appendLog(
+              'INFO',
+              `[Pulse] Photon/Axiom/GMGN Stage ${stageTxt === 'stage2' ? '2 (About to Graduate)' : stageTxt === 'stage3' ? '3 (Migrated)' : '2 & 3'} active (${readyCnt} signal(s), refresh ${Math.round(pulseRefreshMs / 1000)}s)...`
             );
           }
         }
@@ -920,6 +942,29 @@ export class SniperManager {
       alpha_signal_refresh_interval_sec: 10,
       alpha_signal_max_risk_score: 45,
       alpha_signal_min_real_sol: 1.5,
+      pulse_stage: 'both',
+      pulse_auto_find: true,
+      pulse_auto_buy: true,
+      pulse_trade_size_usd: 5.0,
+      pulse_take_profit_pct: 30.0,
+      pulse_stop_loss_pct: 15.0,
+      pulse_trailing_stop_pct: 8.0,
+      pulse_max_hold_minutes: 90,
+      pulse_jito_tip_sol: 0.0005,
+      pulse_refresh_interval_sec: 10,
+      pulse_min_age_minutes: 2.0,
+      pulse_max_age_minutes: 180.0,
+      pulse_stage2_min_curve_pct: 65.0,
+      pulse_stage2_max_curve_pct: 94.0,
+      pulse_stage2_min_real_sol: 40.0,
+      pulse_stage3_min_liquidity_usd: 15000.0,
+      pulse_stage3_require_pullback: false,
+      pulse_stage3_pullback_pct: 12.0,
+      pulse_stage3_wait_sec: 30.0,
+      pulse_min_buys_m5: 10,
+      pulse_min_buy_sell_ratio_m5: 1.05,
+      pulse_min_unique_traders_5m: 10,
+      pulse_rugcheck_max_score: 50.0,
       reused_socials_enabled: true,
       max_social_reuse_count: 2,
       ws_exit_stream_enabled: true,
@@ -1374,6 +1419,7 @@ export class SniperManager {
     const startScanMode = String(settings.smart_money_scan_mode || 'both').trim().toLowerCase();
     if (
       (startScanMode === 'alpha_signal_only' ||
+        startScanMode === 'pulse_only' ||
         (isPyOptionEnabled(settings, 'use_pumpportal', true) && settings.use_pumpportal !== false)) &&
       this.orchestrator?.pumpPortal
     ) {
@@ -1392,6 +1438,14 @@ export class SniperManager {
         );
       }
       void this.discoverAlphaSignals({ silent: true });
+    }
+    if (startScanMode === 'pulse_only') {
+      const stageTxt = String(settings.pulse_stage || 'both');
+      this.appendLog(
+        'INFO',
+        `[Pulse] Strategy locked to PHOTON / AXIOM / GMGN PULSE (${stageTxt === 'stage2' ? 'Stage 2 Only · About to Graduate' : stageTxt === 'stage3' ? 'Stage 3 Only · Migrated' : 'Stage 2 + Stage 3'}) — follows Pulse settings independently of Sniper & Whales.`
+      );
+      void this.discoverPulseSignals({ silent: true });
     }
 
     if (this.process.stdout) {
@@ -2105,6 +2159,506 @@ export class SniperManager {
     };
   }
 
+  private pulseDiscoverInFlight = false;
+  private lastPulseDiscoverAtMs = 0;
+  private manualPulseBuys = new Map<string, number>();
+  private pulseSignalsBuffer: Array<{
+    id: string;
+    mint: string;
+    symbol: string;
+    name: string;
+    stage: 'stage2' | 'stage3';
+    source: string;
+    dexId: string;
+    curvePct: number;
+    realSol: number;
+    liquidityUsd: number;
+    buys5m: number;
+    sells5m: number;
+    priceChange5m: number;
+    volume5m: number;
+    riskScore: number;
+    timestamp: string;
+    status: 'AUTO_BUY' | 'READY' | 'PENDING' | 'SKIPPED';
+    skipReason?: string;
+    tsMs: number;
+    pair?: any;
+  }> = [];
+
+  private isWithinPulseAgeWindow(pair: any, settings: Record<string, any>, nowMs = Date.now()): boolean {
+    const created = Number(pair?.pairCreatedAt || 0);
+    if (!Number.isFinite(created) || created <= 0) return false;
+    const ageMin = (nowMs - created) / 60_000;
+    if (ageMin < -0.25) return false;
+    const minM = Math.max(0, Number(settings.pulse_min_age_minutes ?? 2.0) || 0);
+    const maxM = Math.max(0, Number(settings.pulse_max_age_minutes ?? 180.0) || 0);
+    if (minM > 0 && ageMin < minM) return false;
+    if (maxM > 0 && ageMin > maxM) return false;
+    return true;
+  }
+
+  private matchesPulseStagePreference(stage: 'stage2' | 'stage3', settings: Record<string, any>): boolean {
+    const raw = String(settings.pulse_stage || 'both').trim().toLowerCase();
+    if (raw === 'stage2') return stage === 'stage2';
+    if (raw === 'stage3') return stage === 'stage3';
+    return true;
+  }
+
+  public async discoverPulseSignals(options?: { force?: boolean; silent?: boolean }): Promise<{
+    ok: boolean;
+    added: number;
+    total: number;
+    signals: SniperManager['pulseSignalsBuffer'];
+  }> {
+    const now = Date.now();
+    const settings = this.readSettings();
+    const refreshMs = Math.max(
+      5_000,
+      Math.min(300_000, Number(settings.pulse_refresh_interval_sec ?? 10) * 1000)
+    );
+    if (!options?.force && (this.pulseDiscoverInFlight || now - this.lastPulseDiscoverAtMs < Math.min(refreshMs, 5_000))) {
+      return { ok: true, added: 0, total: this.pulseSignalsBuffer.length, signals: this.pulseSignalsBuffer };
+    }
+
+    this.pulseDiscoverInFlight = true;
+    this.lastPulseDiscoverAtMs = now;
+    let added = 0;
+
+    try {
+      const pp: any = this.orchestrator?.pumpPortal;
+      if (options?.force && pp) {
+        pp.start();
+      }
+
+      const stagePref = String(settings.pulse_stage || 'both').trim().toLowerCase();
+      const wantStage2 = stagePref !== 'stage3';
+      const wantStage3 = stagePref !== 'stage2';
+      const autoBuy = settings.pulse_auto_buy !== false;
+      const minCurvePct = Math.max(10, Math.min(99, Number(settings.pulse_stage2_min_curve_pct ?? 65) || 65));
+      const maxCurvePct = Math.max(minCurvePct, Math.min(100, Number(settings.pulse_stage2_max_curve_pct ?? 94) || 94));
+      const minRealSol = Math.max(0, Number(settings.pulse_stage2_min_real_sol ?? 40) || 0);
+      const minStage3Liq = Math.max(1_000, Number(settings.pulse_stage3_min_liquidity_usd ?? 15_000) || 15_000);
+      const requirePullback = Boolean(settings.pulse_stage3_require_pullback);
+      const pullbackPct = Math.max(1, Math.min(60, Number(settings.pulse_stage3_pullback_pct ?? 12) || 12));
+      const minBuys = Math.max(1, Number(settings.pulse_min_buys_m5 ?? 10) || 10);
+      const minRatio = Math.max(0.5, Number(settings.pulse_min_buy_sell_ratio_m5 ?? 1.05) || 1.05);
+      const maxRcScore = Math.max(10, Math.min(100, Number(settings.pulse_rugcheck_max_score ?? 50) || 50));
+      const solPx = this.solPriceUsd && this.solPriceUsd > 0 ? this.solPriceUsd : 150;
+      const pulseRcSettings = {
+        ...settings,
+        use_rugcheck: true,
+        early_rug_shield_enabled: true,
+        rugcheck_max_score: maxRcScore,
+        option_enabled: {
+          ...(settings.option_enabled || {}),
+          use_rugcheck: true,
+          early_rug_shield_enabled: true,
+          rugcheck_max_score: true,
+        },
+      };
+
+      const staged: Array<{
+        mint: string;
+        symbol: string;
+        name: string;
+        stage: 'stage2' | 'stage3';
+        source: string;
+        dexId: string;
+        curvePct: number;
+        realSol: number;
+        liquidityUsd: number;
+        buys5m: number;
+        sells5m: number;
+        priceChange5m: number;
+        volume5m: number;
+        riskScore: number;
+        qualifies: boolean;
+        pair: any;
+      }> = [];
+      const seenMints = new Set<string>();
+
+      // 1) PumpPortal WS (<200ms) Stage 2 (high bonding curve) & Stage 3 (live subscribeMigration events)
+      if (pp && typeof pp.getSyntheticPairs === 'function') {
+        const wsPairs = pp.getSyntheticPairs(this.solPriceUsd, 3_600_000);
+        for (const p of wsPairs) {
+          const mint = String(p?.baseToken?.address || '').trim();
+          if (!mint || mint.length < 32 || seenMints.has(mint)) continue;
+          const ppInfo = p._pumpportal || {};
+          const realSol = Number(ppInfo.real_sol || 0);
+          const curvePct = Number(ppInfo.curve_pct ?? Math.min(100, (realSol / 85) * 100));
+          const isMigrated = Boolean(ppInfo.migrated) || String(p?.dexId || '').toLowerCase() === 'pumpswap';
+          const buys = Number(p?.txns?.m5?.buys || ppInfo.buys_60s || 0);
+          const sells = Number(p?.txns?.m5?.sells || ppInfo.sells_60s || 0);
+          const liqUsd = Number(p?.liquidity?.usd || 0);
+          const creatorSold = Boolean(ppInfo.creator_sold);
+
+          if (!isMigrated && wantStage2) {
+            if (curvePct < Math.max(25, minCurvePct - 15) && realSol < Math.max(15, minRealSol * 0.5)) continue;
+            if (!this.manualPulseBuys.has(mint) && !this.isWithinPulseAgeWindow(p, settings, now)) continue;
+            const riskScore = this.computeAlphaRiskScore({
+              realSol,
+              liquidityUsd: liqUsd,
+              devBuySol: Number(ppInfo.initial_buy_sol || 0),
+              creatorSold,
+              buys,
+              sells,
+              uniqueTraders: Number(ppInfo.unique_traders_5m || 0),
+              isBondingCurve: true,
+            });
+            const inCurveBand = curvePct >= minCurvePct && curvePct <= maxCurvePct && realSol >= minRealSol;
+            const flowOk = buys >= minBuys && buys >= sells * minRatio;
+            const qualifies = !creatorSold && inCurveBand && flowOk && riskScore <= 50;
+            seenMints.add(mint);
+            staged.push({
+              mint,
+              symbol: String(p?.baseToken?.symbol || mint.slice(0, 6)),
+              name: String(p?.baseToken?.name || p?.baseToken?.symbol || 'Unknown'),
+              stage: 'stage2',
+              source: `Photon/Axiom Stage 2 · ${curvePct.toFixed(0)}% Curve`,
+              dexId: 'pumpfun',
+              curvePct: Number(curvePct.toFixed(1)),
+              realSol: Number(realSol.toFixed(2)),
+              liquidityUsd: liqUsd,
+              buys5m: buys,
+              sells5m: sells,
+              priceChange5m: Number(p?.priceChange?.m5 || 0),
+              volume5m: Number(p?.volume?.m5 || 0),
+              riskScore,
+              qualifies,
+              pair: p,
+            });
+          } else if (isMigrated && wantStage3) {
+            if (!this.manualPulseBuys.has(mint) && !this.isWithinPulseAgeWindow(p, settings, now)) continue;
+            const riskScore = this.computeAlphaRiskScore({
+              realSol,
+              liquidityUsd: Math.max(liqUsd, minStage3Liq),
+              devBuySol: 0,
+              creatorSold,
+              buys,
+              sells,
+              uniqueTraders: Number(ppInfo.unique_traders_5m || 0),
+              isBondingCurve: false,
+            });
+            const flowOk = buys >= minBuys && buys >= sells * minRatio;
+            const qualifies = !creatorSold && liqUsd >= minStage3Liq && flowOk && riskScore <= 50;
+            seenMints.add(mint);
+            staged.push({
+              mint,
+              symbol: String(p?.baseToken?.symbol || mint.slice(0, 6)),
+              name: String(p?.baseToken?.name || p?.baseToken?.symbol || 'Unknown'),
+              stage: 'stage3',
+              source: 'Axiom/GMGN Stage 3 · Live Migration',
+              dexId: 'pumpswap',
+              curvePct: 100,
+              realSol: Number(realSol.toFixed(2)),
+              liquidityUsd: liqUsd,
+              buys5m: buys,
+              sells5m: sells,
+              priceChange5m: Number(p?.priceChange?.m5 || 0),
+              volume5m: Number(p?.volume?.m5 || 0),
+              riskScore,
+              qualifies,
+              pair: p,
+            });
+          }
+        }
+      }
+
+      // 2) Live Migration Buffer + GeckoTerminal New & Trending Migrated AMM Pools (PumpSwap / Raydium / Meteora)
+      const extStage3Mints = new Set<string>();
+      if (wantStage3 && pp && typeof pp.getMigrationFeed === 'function') {
+        for (const ev of pp.getMigrationFeed(1_800_000).slice(0, 15)) {
+          if (ev?.mint && !seenMints.has(ev.mint)) extStage3Mints.add(ev.mint);
+        }
+      }
+
+      const [gtNew, gtTrending] = wantStage3
+        ? await Promise.all([
+            this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1', 4000),
+            this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/trending_pools', 4000),
+          ])
+        : [null, null];
+
+      const maxAgeMin = Math.max(0, Number(settings.pulse_max_age_minutes ?? 180) || 0);
+      for (const pool of [
+        ...(Array.isArray(gtNew?.data) ? gtNew.data : []),
+        ...(Array.isArray(gtTrending?.data) ? gtTrending.data : []),
+      ]) {
+        const attrs = pool?.attributes || {};
+        const dexRel = String(pool?.relationships?.dex?.data?.id || '').toLowerCase();
+        if (dexRel.includes('pump-fun') && !dexRel.includes('swap') && !dexRel.includes('amm')) continue;
+        const liq = Number(attrs.reserve_in_usd || 0);
+        const vol1h = Number(attrs.volume_usd?.h1 || 0);
+        if (liq < minStage3Liq * 0.7 || vol1h < 2_500) continue;
+        if (maxAgeMin > 0 && attrs.pool_created_at) {
+          const createdMs = Date.parse(String(attrs.pool_created_at));
+          if (Number.isFinite(createdMs) && (now - createdMs) / 60_000 > maxAgeMin * 1.15) continue;
+        }
+        const baseId = String(pool?.relationships?.base_token?.data?.id || '');
+        const mint = baseId.replace(/^solana_/, '').trim();
+        if (!mint || mint.length < 32 || seenMints.has(mint)) continue;
+        extStage3Mints.add(mint);
+        if (extStage3Mints.size >= 24) break;
+      }
+
+      if (extStage3Mints.size > 0) {
+        const mintList = Array.from(extStage3Mints).slice(0, 24);
+        const dsPairs = await this.fetchJsonWithTimeout(
+          `https://api.dexscreener.com/tokens/v1/solana/${mintList.join(',')}`,
+          4500
+        );
+        const bestByMint = new Map<string, any>();
+        if (Array.isArray(dsPairs)) {
+          for (const p of dsPairs) {
+            const m = String(p?.baseToken?.address || '').trim();
+            if (!m) continue;
+            const dexLow = String(p?.dexId || '').toLowerCase();
+            if (dexLow === 'pumpfun' || dexLow === 'pump') continue; // Stage 3 is graduated AMMs only
+            const liq = Number(p?.liquidity?.usd || 0);
+            const cur = bestByMint.get(m);
+            if (!cur || liq > Number(cur?.liquidity?.usd || 0)) {
+              bestByMint.set(m, p);
+            }
+          }
+        }
+        const evalNow = Date.now();
+        for (const [mint, pair] of bestByMint.entries()) {
+          if (seenMints.has(mint)) continue;
+          if (!this.manualPulseBuys.has(mint) && !this.isWithinPulseAgeWindow(pair, settings, evalNow)) continue;
+          const liqUsd = Number(pair?.liquidity?.usd || 0);
+          const buys = Number(pair?.txns?.m5?.buys || 0);
+          const sells = Number(pair?.txns?.m5?.sells || 0);
+          const chg5m = Number(pair?.priceChange?.m5 || 0);
+          const vol5m = Number(pair?.volume?.m5 || 0);
+          const px = Number(pair?.priceUsd || 0);
+          if (px <= 0 || liqUsd < minStage3Liq * 0.7) continue;
+
+          const approxRealSol = Number((liqUsd / (2 * solPx)).toFixed(2));
+          const riskScore = this.computeAlphaRiskScore({
+            realSol: approxRealSol,
+            liquidityUsd: liqUsd,
+            devBuySol: 0,
+            creatorSold: false,
+            buys,
+            sells,
+            uniqueTraders: Math.min(30, buys),
+            isBondingCurve: false,
+          });
+          const pullbackOk = !requirePullback || chg5m <= -Math.abs(pullbackPct);
+          const qualifies =
+            liqUsd >= minStage3Liq &&
+            buys >= minBuys &&
+            buys >= sells * minRatio &&
+            vol5m >= 1_000 &&
+            riskScore <= 50 &&
+            pullbackOk;
+          const dexLabel = String(pair?.dexId || 'amm');
+          seenMints.add(mint);
+          staged.push({
+            mint,
+            symbol: String(pair?.baseToken?.symbol || mint.slice(0, 6)),
+            name: String(pair?.baseToken?.name || pair?.baseToken?.symbol || 'Unknown'),
+            stage: 'stage3',
+            source: `Axiom/GMGN Stage 3 · ${dexLabel}`,
+            dexId: dexLabel,
+            curvePct: 100,
+            realSol: approxRealSol,
+            liquidityUsd: liqUsd,
+            buys5m: buys,
+            sells5m: sells,
+            priceChange5m: chg5m,
+            volume5m: vol5m,
+            riskScore,
+            qualifies,
+            pair,
+          });
+        }
+      }
+
+      // 3) Parallel RugCheck pre-screen on all qualifying Stage 2 & Stage 3 coins before marking AUTO_BUY / READY
+      const rcTargets = staged.filter((s) => s.qualifies).map((s) => s.mint).slice(0, 14);
+      const rcResults = new Map<string, { safe: boolean; reason?: string; rcScore?: number }>();
+      if (rcTargets.length > 0) {
+        const resPairs = await Promise.all(
+          rcTargets.map(async (m) => [m, await this.precheckAlphaRug(m, pulseRcSettings)] as const)
+        );
+        for (const [m, res] of resPairs) rcResults.set(m, res);
+      }
+
+      for (const item of staged) {
+        const rcVerdict = rcResults.get(item.mint);
+        const rugUnsafe = Boolean(rcVerdict && !rcVerdict.safe);
+        const finalRisk = rugUnsafe ? Math.max(item.riskScore, rcVerdict?.rcScore ?? 85) : item.riskScore;
+        const status: 'AUTO_BUY' | 'READY' | 'PENDING' | 'SKIPPED' = rugUnsafe
+          ? 'SKIPPED'
+          : item.qualifies
+            ? autoBuy
+              ? 'AUTO_BUY'
+              : 'READY'
+            : 'PENDING';
+
+        const existing = this.pulseSignalsBuffer.find((s) => s.mint === item.mint);
+        if (existing) {
+          existing.stage = item.stage;
+          existing.source = item.source;
+          existing.dexId = item.dexId;
+          existing.curvePct = item.curvePct;
+          existing.realSol = item.realSol;
+          existing.liquidityUsd = item.liquidityUsd;
+          existing.buys5m = item.buys5m;
+          existing.sells5m = item.sells5m;
+          existing.priceChange5m = item.priceChange5m;
+          existing.volume5m = item.volume5m;
+          existing.riskScore = finalRisk;
+          existing.pair = item.pair;
+          if (!this.manualPulseBuys.has(item.mint)) {
+            existing.status = status;
+            if (rugUnsafe && rcVerdict?.reason) existing.skipReason = rcVerdict.reason;
+            else delete existing.skipReason;
+          }
+        } else {
+          this.pulseSignalsBuffer.unshift({
+            id: `pls_${item.mint.slice(0, 6)}_${Date.now().toString(36)}`,
+            mint: item.mint,
+            symbol: item.symbol,
+            name: item.name,
+            stage: item.stage,
+            source: item.source,
+            dexId: item.dexId,
+            curvePct: item.curvePct,
+            realSol: item.realSol,
+            liquidityUsd: item.liquidityUsd,
+            buys5m: item.buys5m,
+            sells5m: item.sells5m,
+            priceChange5m: item.priceChange5m,
+            volume5m: item.volume5m,
+            riskScore: finalRisk,
+            timestamp: new Date().toLocaleTimeString(),
+            status,
+            ...(rugUnsafe && rcVerdict?.reason ? { skipReason: rcVerdict.reason } : {}),
+            tsMs: Date.now(),
+            pair: item.pair,
+          });
+          added += 1;
+        }
+      }
+
+      const pruneNow = Date.now();
+      const cutoff = pruneNow - 20 * 60_000;
+      this.pulseSignalsBuffer = this.pulseSignalsBuffer
+        .filter(
+          (s) =>
+            this.manualPulseBuys.has(s.mint) ||
+            (s.tsMs >= cutoff &&
+              this.matchesPulseStagePreference(s.stage, settings) &&
+              (!s.pair || this.isWithinPulseAgeWindow(s.pair, settings, pruneNow)))
+        )
+        .slice(0, 60);
+
+      if (added > 0 && !options?.silent) {
+        this.appendLog(
+          'INFO',
+          `[Pulse] Photon/Axiom/GMGN scanner found ${added} new Stage 2–3 signal(s) (${this.pulseSignalsBuffer.length} active).`
+        );
+      }
+      return { ok: true, added, total: this.pulseSignalsBuffer.length, signals: this.pulseSignalsBuffer };
+    } catch {
+      return { ok: true, added, total: this.pulseSignalsBuffer.length, signals: this.pulseSignalsBuffer };
+    } finally {
+      this.pulseDiscoverInFlight = false;
+    }
+  }
+
+  public getPulseSignals() {
+    const settings = this.readSettings();
+    const scanMode = String(settings.smart_money_scan_mode || 'both').trim().toLowerCase();
+    const nowMs = Date.now();
+    this.pulseSignalsBuffer = this.pulseSignalsBuffer.filter(
+      (s) =>
+        this.manualPulseBuys.has(s.mint) ||
+        (this.matchesPulseStagePreference(s.stage, settings) &&
+          (!s.pair || this.isWithinPulseAgeWindow(s.pair, settings, nowMs)))
+    );
+    return {
+      ok: true,
+      signals: this.pulseSignalsBuffer.map(({ pair: _pair, ...rest }) => rest),
+      active: scanMode === 'pulse_only' || settings.pulse_auto_find !== false,
+      stage: String(settings.pulse_stage || 'both'),
+      autoFind: settings.pulse_auto_find !== false,
+      autoBuy: settings.pulse_auto_buy !== false,
+      jitoTipSol: Number(settings.pulse_jito_tip_sol ?? 0.0005) || 0.0005,
+      refreshSec: Number(settings.pulse_refresh_interval_sec ?? 10) || 10,
+      scanMode,
+      lastScanAtMs: this.lastPulseDiscoverAtMs || null,
+    };
+  }
+
+  public async queueManualPulseBuy(
+    rawMint: string,
+    jitoTipSol?: number
+  ): Promise<{ ok: boolean; message: string; signal?: any }> {
+    const mint = String(rawMint || '').trim();
+    if (!mint || mint.length < 32) {
+      return { ok: false, message: 'Valid Solana token mint is required' };
+    }
+    const now = Date.now();
+    this.manualPulseBuys.set(mint, now);
+    if (typeof jitoTipSol === 'number' && Number.isFinite(jitoTipSol) && jitoTipSol >= 0) {
+      this.updateSettings({ pulse_jito_tip_sol: Math.min(0.01, Math.max(0, jitoTipSol)) });
+    }
+
+    let sig = this.pulseSignalsBuffer.find((s) => s.mint === mint);
+    if (!sig) {
+      const dsPairs = await this.fetchJsonWithTimeout(`https://api.dexscreener.com/tokens/v1/solana/${mint}`, 4000);
+      const pair = Array.isArray(dsPairs) && dsPairs.length > 0 ? dsPairs[0] : null;
+      const dexId = String(pair?.dexId || 'pumpswap').toLowerCase();
+      const isStage2 = dexId === 'pumpfun' || dexId === 'pump';
+      const symbol = String(pair?.baseToken?.symbol || mint.slice(0, 6));
+      const liqUsd = Number(pair?.liquidity?.usd || 0);
+      const solPx = this.solPriceUsd && this.solPriceUsd > 0 ? this.solPriceUsd : 150;
+      const realSol = liqUsd > 0 ? Number((liqUsd / (2 * solPx)).toFixed(2)) : 0;
+      sig = {
+        id: `pls_${mint.slice(0, 6)}_${now.toString(36)}`,
+        mint,
+        symbol,
+        name: String(pair?.baseToken?.name || symbol),
+        stage: isStage2 ? 'stage2' : 'stage3',
+        source: isStage2 ? 'Manual Pulse Stage 2' : `Manual Pulse Stage 3 · ${dexId}`,
+        dexId,
+        curvePct: isStage2 ? Math.min(99, Number(((realSol / 85) * 100).toFixed(1))) : 100,
+        realSol,
+        liquidityUsd: liqUsd,
+        buys5m: Number(pair?.txns?.m5?.buys || 0),
+        sells5m: Number(pair?.txns?.m5?.sells || 0),
+        priceChange5m: Number(pair?.priceChange?.m5 || 0),
+        volume5m: Number(pair?.volume?.m5 || 0),
+        riskScore: 22,
+        timestamp: new Date(now).toLocaleTimeString(),
+        status: 'AUTO_BUY',
+        tsMs: now,
+        pair: pair || undefined,
+      };
+      this.pulseSignalsBuffer.unshift(sig);
+    } else {
+      sig.status = 'AUTO_BUY';
+      sig.tsMs = now;
+      delete sig.skipReason;
+    }
+
+    const tipVal = Number(jitoTipSol ?? this.readSettings().pulse_jito_tip_sol ?? 0.0005);
+    this.appendLog(
+      'INFO',
+      `[Pulse] 🎯 Manual buy queued for $${sig.symbol} (${sig.stage.toUpperCase()} · ${mint.slice(0, 6)}...) with ${tipVal.toFixed(4)} SOL Jito tip.`
+    );
+    return {
+      ok: true,
+      message: this.running
+        ? `Buy queued for $${sig.symbol} (${tipVal.toFixed(4)} SOL Jito tip)`
+        : `Queued $${sig.symbol} — start the bot in Pulse (Stage 2–3) mode to execute`,
+      signal: { ...sig, pair: undefined },
+    };
+  }
+
   public getPumpPortalFeed(maxAgeMs = 180_000): {
     mints: string[];
     pairs: any[];
@@ -2150,12 +2704,29 @@ export class SniperManager {
       tsMs: number;
       pair?: any;
     }>;
+    pulse_signals: Array<{
+      mint: string;
+      symbol: string;
+      name: string;
+      stage: 'stage2' | 'stage3';
+      source: string;
+      dexId: string;
+      curvePct: number;
+      realSol: number;
+      liquidityUsd: number;
+      riskScore: number;
+      status: string;
+      tsMs: number;
+      pair?: any;
+    }>;
   } {
     const settings = this.readSettings();
     const scanMode = String(settings.smart_money_scan_mode || 'both').trim().toLowerCase();
     const alphaOnly = scanMode === 'alpha_signal_only';
+    const pulseOnly = scanMode === 'pulse_only';
     const smActive =
       !alphaOnly &&
+      !pulseOnly &&
       (scanMode === 'smart_money_only' ||
         (scanMode !== 'sniper_only' &&
           isPyOptionEnabled(settings, 'smart_money_enabled', true) &&
@@ -2167,14 +2738,23 @@ export class SniperManager {
           settings.smart_money_follow_older_coins !== false));
     const alphaActive =
       alphaOnly ||
-      (scanMode === 'both' &&
+      (!pulseOnly &&
+        scanMode === 'both' &&
         isPyOptionEnabled(settings, 'alpha_signal_auto_snipe', true) &&
         settings.alpha_signal_auto_snipe !== false);
+    const pulseActive =
+      pulseOnly ||
+      (!alphaOnly &&
+        scanMode === 'both' &&
+        settings.pulse_auto_buy !== false);
 
-    // Expire manual alpha snipes after 3 minutes
+    // Expire manual alpha/pulse snipes after 3 minutes
     const nowMs = Date.now();
     for (const [m, ts] of this.manualAlphaSnipes.entries()) {
       if (nowMs - ts > 180_000) this.manualAlphaSnipes.delete(m);
+    }
+    for (const [m, ts] of this.manualPulseBuys.entries()) {
+      if (nowMs - ts > 180_000) this.manualPulseBuys.delete(m);
     }
 
     if (alphaActive) {
@@ -2205,26 +2785,64 @@ export class SniperManager {
           }))
       : [];
 
+    const pulseCutoff = nowMs - 10 * 60_000;
+    const pulse_signals = pulseActive
+      ? this.pulseSignalsBuffer
+          .filter(
+            (s) =>
+              this.manualPulseBuys.has(s.mint) ||
+              ((s.status === 'AUTO_BUY' || s.status === 'READY') &&
+                s.tsMs >= pulseCutoff &&
+                this.matchesPulseStagePreference(s.stage, settings) &&
+                (!s.pair || this.isWithinPulseAgeWindow(s.pair, settings, nowMs)))
+          )
+          .slice(0, 30)
+          .map((s) => ({
+            mint: s.mint,
+            symbol: s.symbol,
+            name: s.name,
+            stage: s.stage,
+            source: s.source,
+            dexId: s.dexId,
+            curvePct: s.curvePct,
+            realSol: s.realSol,
+            liquidityUsd: s.liquidityUsd,
+            riskScore: s.riskScore,
+            status: this.manualPulseBuys.has(s.mint) ? 'MANUAL_QUEUED' : s.status,
+            tsMs: s.tsMs,
+            ...(s.pair ? { pair: s.pair } : {}),
+          }))
+      : [];
+
     const cutoffHoldings = nowMs - 5 * 60_000;
     this.recentWhaleHoldings = this.recentWhaleHoldings.filter((h) => h.discoveredAtMs >= cutoffHoldings);
     const whale_held_mints = followOlder ? [...this.recentWhaleHoldings] : [];
 
     if (!this.orchestrator?.pumpPortal) {
       return {
-        mints: alphaOnly ? alpha_signals.map((s) => s.mint) : [],
-        pairs: alphaOnly ? alpha_signals.map((s) => s.pair).filter(Boolean) : [],
+        mints: alphaOnly
+          ? alpha_signals.map((s) => s.mint)
+          : pulseOnly
+            ? pulse_signals.map((s) => s.mint)
+            : [],
+        pairs: alphaOnly
+          ? alpha_signals.map((s) => s.pair).filter(Boolean)
+          : pulseOnly
+            ? pulse_signals.map((s) => s.pair).filter(Boolean)
+            : [],
         solPriceUsd: this.solPriceUsd,
         open_prices: {},
         smart_sells: {},
         smart_buys: [],
         whale_held_mints,
         alpha_signals,
+        pulse_signals,
       };
     }
     const usePump = isPyOptionEnabled(settings, 'use_pumpportal', true) && settings.use_pumpportal !== false;
     const useWsExits =
       isPyOptionEnabled(settings, 'ws_exit_stream_enabled', true) && settings.ws_exit_stream_enabled !== false;
-    if (!usePump && !useWsExits && !smActive && !alphaOnly) {
+    if (!usePump && !useWsExits && !smActive && !alphaOnly && !pulseOnly) {
       return {
         mints: [],
         pairs: [],
@@ -2234,6 +2852,7 @@ export class SniperManager {
         smart_buys: [],
         whale_held_mints: [],
         alpha_signals,
+        pulse_signals,
       };
     }
     this.orchestrator.pumpPortal.start();
@@ -2254,6 +2873,21 @@ export class SniperManager {
       for (const p of ppPairs) {
         const pm = String(p?.baseToken?.address || '').trim();
         if (alphaMintSet.has(pm)) pairByMint.set(pm, p);
+      }
+      pairs = Array.from(pairByMint.values());
+    } else if (pulseOnly) {
+      // Strictly isolate Pulse (Stage 2–3) mode: never emit Stage 1 new launches, Whales, or Alpha Signals
+      const pulseMintSet = new Set(pulse_signals.map((s) => s.mint));
+      mints = Array.from(pulseMintSet);
+      const ppPairs =
+        typeof pp.getSyntheticPairs === 'function' ? pp.getSyntheticPairs(this.solPriceUsd, 3_600_000) : [];
+      const pairByMint = new Map<string, any>();
+      for (const s of pulse_signals) {
+        if (s.pair) pairByMint.set(s.mint, s.pair);
+      }
+      for (const p of ppPairs) {
+        const pm = String(p?.baseToken?.address || '').trim();
+        if (pulseMintSet.has(pm)) pairByMint.set(pm, p);
       }
       pairs = Array.from(pairByMint.values());
     } else {
@@ -2321,6 +2955,7 @@ export class SniperManager {
       smart_buys,
       whale_held_mints,
       alpha_signals,
+      pulse_signals,
     };
   }
 
@@ -2381,7 +3016,9 @@ export class SniperManager {
     const alphaJitoSol =
       scanMode === 'alpha_signal_only'
         ? Number(settings.alpha_signal_jito_tip_sol ?? 0.0005)
-        : 0;
+        : scanMode === 'pulse_only'
+          ? Number(settings.pulse_jito_tip_sol ?? 0.0005)
+          : 0;
     const rawJitoSol = Math.max(
       Number.isFinite(baseJitoSol) ? baseJitoSol : 0,
       Number.isFinite(alphaJitoSol) ? alphaJitoSol : 0
@@ -2457,7 +3094,8 @@ export class SniperManager {
       const cleanScanMode =
         rawScanMode === 'smart_money_only' ||
         rawScanMode === 'sniper_only' ||
-        rawScanMode === 'alpha_signal_only'
+        rawScanMode === 'alpha_signal_only' ||
+        rawScanMode === 'pulse_only'
           ? rawScanMode
           : 'both';
       const rawMaxW = Number(newSettings.smart_money_max_wallets ?? current.smart_money_max_wallets ?? 50);
@@ -2498,6 +3136,19 @@ export class SniperManager {
         ? 1.5
         : Math.max(0, Math.min(100, rawAlphaMinSol));
 
+      const rawPulseStage = String(newSettings.pulse_stage ?? current.pulse_stage ?? 'both').trim().toLowerCase();
+      const cleanPulseStage =
+        rawPulseStage === 'stage2' || rawPulseStage === 'stage3' ? rawPulseStage : 'both';
+      const cleanPulseRefreshSec = !Number.isFinite(
+        Number(newSettings.pulse_refresh_interval_sec ?? current.pulse_refresh_interval_sec ?? 10)
+      )
+        ? 10
+        : Math.min(300, Math.max(5, Math.round(Number(newSettings.pulse_refresh_interval_sec ?? current.pulse_refresh_interval_sec ?? 10))));
+      const rawPulseJitoTip = Number(newSettings.pulse_jito_tip_sol ?? current.pulse_jito_tip_sol ?? 0.0005);
+      const cleanPulseJitoTip = !Number.isFinite(rawPulseJitoTip)
+        ? 0.0005
+        : Math.max(0, Math.min(0.01, Number(rawPulseJitoTip.toFixed(6))));
+
       if (cleanScanMode === 'smart_money_only') {
         mergedOptionEnabled.smart_money_enabled = true;
       }
@@ -2517,8 +3168,12 @@ export class SniperManager {
         alpha_signal_jito_tip_sol: cleanAlphaJitoTip,
         alpha_signal_max_risk_score: cleanAlphaMaxRisk,
         alpha_signal_min_real_sol: cleanAlphaMinSol,
+        pulse_stage: cleanPulseStage,
+        pulse_refresh_interval_sec: cleanPulseRefreshSec,
+        pulse_jito_tip_sol: cleanPulseJitoTip,
         ...(cleanScanMode === 'smart_money_only' ? { smart_money_enabled: true } : {}),
         ...(cleanScanMode === 'alpha_signal_only' ? { alpha_signal_auto_find: true } : {}),
+        ...(cleanScanMode === 'pulse_only' ? { pulse_auto_find: true } : {}),
         mode: newSettings.mode === 'live' || current.mode === 'live'
           ? newSettings.mode === 'paper'
             ? 'paper'
@@ -2570,6 +3225,12 @@ export class SniperManager {
           this.manualAlphaSnipes.has(s.mint) ||
           !s.pair ||
           this.isWithinSettingsAgeWindow(s.pair, updated, nowPostUpdate)
+      );
+      this.pulseSignalsBuffer = this.pulseSignalsBuffer.filter(
+        (s) =>
+          this.manualPulseBuys.has(s.mint) ||
+          (this.matchesPulseStagePreference(s.stage, updated) &&
+            (!s.pair || this.isWithinPulseAgeWindow(s.pair, updated, nowPostUpdate)))
       );
       this.appendLog('INFO', 'Python bot settings updated and saved.');
       return { ok: true, settings: updated };
