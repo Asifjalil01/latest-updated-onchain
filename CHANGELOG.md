@@ -2,6 +2,19 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.45.3 — Alpha Signal Buy/Sell 1.0x Ratio & RugCheck Bundled-Insider Pre-Screening
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **Relaxed Buy/Sell Ratio (`>= 1.0x`) for Alpha Signals (`sniper/bot.py`)**:
+  - Updated `passes_filters()` so Alpha Signal coins require healthy buyer dominance (`>= 1.0x`, capped down from `1.5x` sniper defaults) instead of rejecting active multi-minute/multi-hour alpha coins for normal profit-taking (`87b/65s`), while still rejecting sell-heavy coins (`buys < sells`).
+- **Pre-Screen Bundled Insiders & RugCheck Risk Before `AUTO_SNIPED` (`server/sniperManager.ts`, `PythonSniperView.tsx`)**:
+  - Added parallel RugCheck pre-screening (`precheckAlphaRug()`) in `discoverAlphaSignals()` across qualifying WS, Boost, and Gecko candidates before marking any signal `AUTO_SNIPED` or `READY`.
+  - Bundled insider clusters, active mint/freeze authorities, rugged tokens, and high RugCheck risk coins are automatically marked `SKIPPED` with their exact reason shown in the Alpha Signals table and excluded from the `bot.py` feed.
+
+---
+
 ## v1.45.2 — Alpha Signals Enforce Settings Min/Max Coin Age Timeframe
 
 **Risk Warning: Trading can lose all of your money.**

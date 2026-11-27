@@ -1150,6 +1150,8 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
     ratio = float(cfg.get("min_buy_sell_ratio_m5", 1.5) or 0) if opt_on(cfg, "min_buy_sell_ratio_m5", True) else 0.0
     if whale_older_ok and age_s > 600.0 and ratio > 0.6:
         ratio = 0.6
+    elif alpha_sig and ratio > 1.0:
+        ratio = 1.0
     if ratio > 0 and buys < sells * ratio:
         return False, "selling pressure", f"{buys}b/{sells}s in last 5m"
     if (early_shield_on and age_s >= 20 and buys >= 6 and sells == 0) or (age_s >= 30 and buys >= 12 and sells == 0):
@@ -4404,7 +4406,9 @@ def run(once=False):
     creator_banner = f"owner-chk={'ON' if opt_on(CONFIG, 'check_creator_history', True) else 'OFF'}"
     if scan_mode_banner == "alpha_signal_only":
         al_risk = int(CONFIG.get("alpha_signal_max_risk_score", 45) or 45)
-        log(f"Alpha Rules: window {min_age_banner}–{max_age_banner} | {exit_banner} | max-risk<={al_risk}/100 | liq>=${liq_banner:.0f} | pump cap {pump_banner} | rug={'ON' if opt_on(CONFIG, 'use_rugcheck', True) else 'OFF'} | {creator_banner}")
+        al_ratio_raw = float(CONFIG.get("min_buy_sell_ratio_m5", 1.5) or 0) if opt_on(CONFIG, "min_buy_sell_ratio_m5", True) else 0.0
+        al_ratio = min(1.0, al_ratio_raw) if al_ratio_raw > 0 else 0.0
+        log(f"Alpha Rules: window {min_age_banner}–{max_age_banner} | {exit_banner} | buy/sell>={al_ratio:g}x | max-risk<={al_risk}/100 | liq>=${liq_banner:.0f} | pump cap {pump_banner} | rug={'ON' if opt_on(CONFIG, 'use_rugcheck', True) else 'OFF'} | {creator_banner}")
     elif scan_mode_banner == "smart_money_only":
         whale_h = max(0.0, float(CONFIG.get("smart_money_max_coin_age_hours", 72) or 0.0))
         whale_age_txt = "Any age" if whale_h <= 0 else f"<={whale_h:g}h"

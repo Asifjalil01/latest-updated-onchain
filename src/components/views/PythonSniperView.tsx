@@ -508,6 +508,7 @@ export function PythonSniperView() {
     riskScore: number;
     timestamp: string;
     status: 'AUTO_SNIPED' | 'READY' | 'PENDING' | 'SKIPPED';
+    skipReason?: string;
   }>>([]);
   const [alphaLoading, setAlphaLoading] = useState(false);
   const [alphaLastScanAt, setAlphaLastScanAt] = useState<number | null>(null);
@@ -2937,7 +2938,7 @@ export function PythonSniperView() {
                 Showing {alphaSignals.length} auto-discovered alpha signal(s) · Last multi-source scan: {new Date(alphaLastScanAt).toLocaleTimeString()}
               </span>
               <span>
-                Auto-Snipe qualifies: Risk &le; {Number(draftSettings.alpha_signal_max_risk_score ?? 45)}/100 · Depth &ge; {Number(draftSettings.alpha_signal_min_real_sol ?? 1.5)} SOL · Age{' '}
+                Auto-Snipe: Risk &le; {Number(draftSettings.alpha_signal_max_risk_score ?? 45)}/100 · Depth &ge; {Number(draftSettings.alpha_signal_min_real_sol ?? 1.5)} SOL · Buy/Sell &ge; 1.0x · RugCheck Pre-Screen · Age{' '}
                 {Boolean(draftSettings.option_enabled?.min_age_minutes)
                   ? `${Number(draftSettings.min_age_minutes ?? 0)}m`
                   : '0m'}
@@ -3021,9 +3022,17 @@ export function PythonSniperView() {
                         </span>
                       </td>
                       <td className="py-2.5 px-3 text-center">
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold font-sans uppercase ${sig.status === 'AUTO_SNIPED' ? 'bg-emerald-500/15 text-emerald-500' : sig.status === 'READY' ? 'bg-teal-500/15 text-teal-500' : sig.status === 'SKIPPED' ? 'bg-rose-500/15 text-rose-500' : 'bg-amber-500/15 text-amber-500'}`}>
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold font-sans uppercase inline-block ${sig.status === 'AUTO_SNIPED' ? 'bg-emerald-500/15 text-emerald-500' : sig.status === 'READY' ? 'bg-teal-500/15 text-teal-500' : sig.status === 'SKIPPED' ? 'bg-rose-500/15 text-rose-500' : 'bg-amber-500/15 text-amber-500'}`}
+                          title={sig.skipReason || sig.status}
+                        >
                           {sig.status}
                         </span>
+                        {sig.skipReason && sig.status === 'SKIPPED' && (
+                          <span className="block text-[10px] font-sans text-rose-400 mt-0.5 leading-tight">
+                            {sig.skipReason}
+                          </span>
+                        )}
                       </td>
                       <td className="py-2.5 px-3 text-right">
                         <div className="flex items-center justify-end gap-1.5 font-sans">

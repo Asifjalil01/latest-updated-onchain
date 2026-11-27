@@ -1480,6 +1480,11 @@ export class SniperManager {
     return { ok: true, watched: clean };
   }
 
+  private alphaRugPrecheckCache = new Map<
+    string,
+    { checkedAtMs: number; safe: boolean; reason?: string; rcScore?: number }
+  >();
+
   private alphaSignalsBuffer: Array<{
     id: string;
     mint: string;
@@ -1495,9 +1500,104 @@ export class SniperManager {
     riskScore: number;
     timestamp: string;
     status: 'AUTO_SNIPED' | 'READY' | 'PENDING' | 'SKIPPED';
+    skipReason?: string;
     tsMs: number;
     pair?: any;
   }> = [];
+
+  private async precheckAlphaRug(
+    mint: string,
+    settings: Record<string, any>
+  ): Promise<{ checkedAtMs: number; safe: boolean; reason?: string; rcScore?: number }> {
+    const now = Date.now();
+    const cached = this.alphaRugPrecheckCache.get(mint);
+    if (cached && now - cached.checkedAtMs < 5 * 60_000) {
+      return cached;
+    }
+
+    const useRc = isPyOptionEnabled(settings, 'use_rugcheck', true) && settings.use_rugcheck !== false;
+    if (!useRc) {
+      return { checkedAtMs: now, safe: true };
+    }
+
+    try {
+      const rc = await this.fetchJsonWithTimeout(`https://api.rugcheck.xyz/v1/tokens/${mint}/report`, 2800);
+      if (!rc || typeof rc !== 'object') {
+        return { checkedAtMs: now, safe: true };
+      }
+
+      const rawNorm = rc.score_normalised;
+      const rawScore = rc.score;
+      let normScore: number | undefined;
+      if (typeof rawNorm === 'number' && Number.isFinite(rawNorm)) {
+        normScore = rawNorm > 100 ? Math.min(100, rawNorm / 100) : rawNorm;
+      } else if (typeof rawScore === 'number' && Number.isFinite(rawScore)) {
+        normScore = rawScore > 100 ? Math.min(100, rawScore / 100) : rawScore;
+      }
+
+      if (rc.rugged === true) {
+        const res = { checkedAtMs: now, safe: false, reason: 'Rugged token', rcScore: Math.max(95, normScore ?? 95) };
+        this.alphaRugPrecheckCache.set(mint, res);
+        return res;
+      }
+
+      const blockBundles =
+        isPyOptionEnabled(settings, 'early_rug_shield_enabled', true) &&
+        settings.early_rug_shield_enabled !== false;
+      const insidersArr = Array.isArray(rc.insiderNetworks) ? rc.insiderNetworks : [];
+      const insidersCnt = Number(rc.insidersDetected || 0);
+      if (blockBundles && (insidersArr.length > 0 || insidersCnt > 0)) {
+        const clusters = Math.max(insidersArr.length, insidersCnt);
+        const res = {
+          checkedAtMs: now,
+          safe: false,
+          reason: `Bundled insiders (${clusters} cluster${clusters === 1 ? '' : 's'})`,
+          rcScore: Math.max(85, normScore ?? 85),
+        };
+        this.alphaRugPrecheckCache.set(mint, res);
+        return res;
+      }
+
+      if (rc.mintAuthority || rc.freezeAuthority) {
+        const res = {
+          checkedAtMs: now,
+          safe: false,
+          reason: rc.freezeAuthority ? 'Freeze authority active' : 'Mint authority active',
+          rcScore: Math.max(85, normScore ?? 85),
+        };
+        this.alphaRugPrecheckCache.set(mint, res);
+        return res;
+      }
+
+      const maxRcScore = isPyOptionEnabled(settings, 'rugcheck_max_score', true)
+        ? Math.max(10, Math.min(100, Number(settings.rugcheck_max_score ?? 55) || 55))
+        : 100;
+      if (normScore !== undefined && normScore >= maxRcScore) {
+        const res = {
+          checkedAtMs: now,
+          safe: false,
+          reason: `RugCheck score ${Math.round(normScore)}/${Math.round(maxRcScore)}`,
+          rcScore: Math.round(normScore),
+        };
+        this.alphaRugPrecheckCache.set(mint, res);
+        return res;
+      }
+
+      const res = {
+        checkedAtMs: now,
+        safe: true,
+        ...(normScore !== undefined ? { rcScore: Math.round(normScore) } : {}),
+      };
+      this.alphaRugPrecheckCache.set(mint, res);
+      if (this.alphaRugPrecheckCache.size > 300) {
+        const oldestKey = this.alphaRugPrecheckCache.keys().next().value;
+        if (oldestKey) this.alphaRugPrecheckCache.delete(oldestKey);
+      }
+      return res;
+    } catch {
+      return { checkedAtMs: now, safe: true };
+    }
+  }
 
   private computeAlphaRiskScore(params: {
     realSol: number;
@@ -1608,14 +1708,25 @@ export class SniperManager {
       const hasMinimumTraction = isBondingCurve
         ? realSol >= minRealSol && buys >= 3
         : liquidityUsd >= 5_000 && buys >= 4;
-      const qualifies = !creatorSold && riskScore <= maxRisk && hasMinimumTraction;
-      const nextStatus: 'AUTO_SNIPED' | 'READY' | 'PENDING' | 'SKIPPED' = creatorSold || riskScore >= 70
-        ? 'SKIPPED'
-        : qualifies
-          ? autoSnipe
-            ? 'AUTO_SNIPED'
-            : 'READY'
-          : 'PENDING';
+      const rcCached = this.alphaRugPrecheckCache.get(mint);
+      const rcUnsafe = Boolean(rcCached && now - rcCached.checkedAtMs < 5 * 60_000 && !rcCached.safe);
+      const effectiveRisk = rcUnsafe ? Math.max(riskScore, rcCached?.rcScore ?? 85) : riskScore;
+      const skipReason = rcUnsafe
+        ? rcCached?.reason
+        : creatorSold
+          ? 'Creator dumped'
+          : riskScore >= 70
+            ? 'High curve risk'
+            : undefined;
+      const qualifies = !rcUnsafe && !creatorSold && riskScore <= maxRisk && hasMinimumTraction;
+      const nextStatus: 'AUTO_SNIPED' | 'READY' | 'PENDING' | 'SKIPPED' =
+        rcUnsafe || creatorSold || riskScore >= 70
+          ? 'SKIPPED'
+          : qualifies
+            ? autoSnipe
+              ? 'AUTO_SNIPED'
+              : 'READY'
+            : 'PENDING';
 
       const existing = this.alphaSignalsBuffer.find((s) => s.mint === mint);
       if (existing) {
@@ -1623,10 +1734,12 @@ export class SniperManager {
         existing.liquidityUsd = liquidityUsd;
         existing.buys5m = buys;
         existing.sells5m = sells;
-        existing.riskScore = riskScore;
+        existing.riskScore = effectiveRisk;
         existing.pair = p;
         if (!this.manualAlphaSnipes.has(mint)) {
           existing.status = nextStatus;
+          if (skipReason) existing.skipReason = skipReason;
+          else delete existing.skipReason;
         }
         continue;
       }
@@ -1647,9 +1760,10 @@ export class SniperManager {
         devBuySol,
         buys5m: buys,
         sells5m: sells,
-        riskScore,
+        riskScore: effectiveRisk,
         timestamp: new Date(now).toLocaleTimeString(),
         status: nextStatus,
+        ...(skipReason ? { skipReason } : {}),
         tsMs: now,
         pair: p,
       });
@@ -1771,6 +1885,17 @@ export class SniperManager {
         }
 
         const evalNow = Date.now();
+        const staged: Array<{
+          mint: string;
+          pair: any;
+          srcMeta: { channelType: 'boost_alpha' | 'gecko_momentum'; source: string };
+          liqUsd: number;
+          buys: number;
+          sells: number;
+          approxRealSol: number;
+          riskScore: number;
+          qualifies: boolean;
+        }> = [];
         for (const [mint, pair] of bestPairByMint.entries()) {
           const srcMeta = candidateSources.get(mint);
           if (!srcMeta) continue;
@@ -1795,33 +1920,72 @@ export class SniperManager {
           if (riskScore > 75) continue;
 
           const qualifies = riskScore <= maxRisk && liqUsd >= 4_500 && buys >= 3 && buys >= sells && vol5m >= 500;
-          const status: 'AUTO_SNIPED' | 'READY' | 'PENDING' | 'SKIPPED' = qualifies
-            ? autoSnipe
-              ? 'AUTO_SNIPED'
-              : 'READY'
-            : 'PENDING';
+          staged.push({ mint, pair, srcMeta, liqUsd, buys, sells, approxRealSol, riskScore, qualifies });
+        }
 
-          const existing = this.alphaSignalsBuffer.find((s) => s.mint === mint);
+        // Pre-screen qualifying candidates with RugCheck (bundled insiders / rugged / mint-or-freeze auth / score)
+        const precheckTargets = staged.filter((c) => c.qualifies).map((c) => c.mint);
+        const rugByMint = new Map<string, { safe: boolean; reason?: string; rcScore?: number }>();
+        if (precheckTargets.length > 0) {
+          const results = await Promise.all(
+            precheckTargets.slice(0, 14).map(async (m) => [m, await this.precheckAlphaRug(m, settings)] as const)
+          );
+          for (const [m, res] of results) {
+            rugByMint.set(m, res);
+          }
+        }
+
+        for (const item of staged) {
+          const rcVerdict = rugByMint.get(item.mint);
+          const rugUnsafe = Boolean(rcVerdict && !rcVerdict.safe);
+          const finalRisk = rugUnsafe ? Math.max(item.riskScore, rcVerdict?.rcScore ?? 85) : item.riskScore;
+          const status: 'AUTO_SNIPED' | 'READY' | 'PENDING' | 'SKIPPED' = rugUnsafe
+            ? 'SKIPPED'
+            : item.qualifies
+              ? autoSnipe
+                ? 'AUTO_SNIPED'
+                : 'READY'
+              : 'PENDING';
+
+          const existing = this.alphaSignalsBuffer.find((s) => s.mint === item.mint);
           if (!existing) {
             this.alphaSignalsBuffer.unshift({
-              id: `${mint.slice(0, 6)}_${Date.now().toString(36)}`,
-              mint,
-              symbol: String(pair?.baseToken?.symbol || mint.slice(0, 6)),
-              name: String(pair?.baseToken?.name || pair?.baseToken?.symbol || 'Unknown'),
-              source: srcMeta.source,
-              channelType: srcMeta.channelType,
-              realSol: approxRealSol,
-              liquidityUsd: liqUsd,
+              id: `${item.mint.slice(0, 6)}_${Date.now().toString(36)}`,
+              mint: item.mint,
+              symbol: String(item.pair?.baseToken?.symbol || item.mint.slice(0, 6)),
+              name: String(item.pair?.baseToken?.name || item.pair?.baseToken?.symbol || 'Unknown'),
+              source: item.srcMeta.source,
+              channelType: item.srcMeta.channelType,
+              realSol: item.approxRealSol,
+              liquidityUsd: item.liqUsd,
               devBuySol: 0,
-              buys5m: buys,
-              sells5m: sells,
-              riskScore,
+              buys5m: item.buys,
+              sells5m: item.sells,
+              riskScore: finalRisk,
               timestamp: new Date().toLocaleTimeString(),
               status,
+              ...(rugUnsafe && rcVerdict?.reason ? { skipReason: rcVerdict.reason } : {}),
               tsMs: Date.now(),
-              pair,
+              pair: item.pair,
             });
             added += 1;
+          }
+        }
+      }
+
+      // Also pre-screen any WS or existing AUTO_SNIPED/READY buffer items that haven't been RugChecked yet
+      const unverifiedActive = this.alphaSignalsBuffer
+        .filter((s) => (s.status === 'AUTO_SNIPED' || s.status === 'READY') && !this.manualAlphaSnipes.has(s.mint))
+        .slice(0, 10);
+      if (unverifiedActive.length > 0) {
+        const wsRcResults = await Promise.all(
+          unverifiedActive.map(async (s) => [s, await this.precheckAlphaRug(s.mint, settings)] as const)
+        );
+        for (const [sig, rcRes] of wsRcResults) {
+          if (!rcRes.safe) {
+            sig.status = 'SKIPPED';
+            sig.riskScore = Math.max(sig.riskScore, rcRes.rcScore ?? 85);
+            if (rcRes.reason) sig.skipReason = rcRes.reason;
           }
         }
       }
