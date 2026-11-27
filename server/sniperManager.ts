@@ -265,6 +265,9 @@ export class SniperManager {
   }> = [];
   private whaleHoldingsCursor = 0;
   private lastSmartOldHoldingsLogMs = 0;
+  private lastAlphaDiscoverAtMs = 0;
+  private alphaDiscoverInFlight = false;
+  private manualAlphaSnipes = new Map<string, number>();
 
   constructor(options?: { baseDir?: string; startTimers?: boolean }) {
     this.baseDir = options?.baseDir || SNIPER_DIR;
@@ -293,6 +296,7 @@ export class SniperManager {
       posTimer.unref();
 
       let lastSmartLog = 0;
+      let lastAlphaLog = 0;
       let lastAutoDiscoverAt = 0;
       let autoDiscoverInFlight = false;
       const smartTimer = setInterval(() => {
@@ -303,6 +307,7 @@ export class SniperManager {
           const smEnabled =
             scanMode === 'smart_money_only' ||
             (scanMode !== 'sniper_only' &&
+              scanMode !== 'alpha_signal_only' &&
               isPyOptionEnabled(settings, 'smart_money_enabled', true) &&
               settings.smart_money_enabled !== false);
           const autoDisc =
@@ -345,6 +350,20 @@ export class SniperManager {
             });
           }
 
+          const alphaAutoFind =
+            scanMode === 'alpha_signal_only' ||
+            (scanMode !== 'smart_money_only' &&
+              scanMode !== 'sniper_only' &&
+              isPyOptionEnabled(settings, 'alpha_signal_auto_find', true) &&
+              settings.alpha_signal_auto_find !== false);
+          const alphaRefreshMs = Math.max(
+            5_000,
+            Math.min(300_000, Number(settings.alpha_signal_refresh_interval_sec ?? 10) * 1000)
+          );
+          if (alphaAutoFind && !this.alphaDiscoverInFlight && now - this.lastAlphaDiscoverAtMs >= alphaRefreshMs) {
+            void this.discoverAlphaSignals({ silent: true });
+          }
+
           if (now - lastSmartLog >= 25_000) {
             lastSmartLog = now;
             if (smEnabled) {
@@ -361,6 +380,15 @@ export class SniperManager {
                 );
               }
             }
+          }
+
+          if (scanMode === 'alpha_signal_only' && now - lastAlphaLog >= 25_000) {
+            lastAlphaLog = now;
+            const readyCnt = this.alphaSignalsBuffer.filter((s) => s.status !== 'SKIPPED').length;
+            this.appendLog(
+              'INFO',
+              `[AlphaSignal] Auto-finder active (mode: alpha_signal_only, refresh ${Math.round(alphaRefreshMs / 1000)}s, ${readyCnt} active signal(s)) — scanning WS curves + DexScreener Boosts + Gecko Momentum...`
+            );
           }
         }
       }, 4_000);
@@ -886,6 +914,12 @@ export class SniperManager {
       smart_money_follow_older_coins: true,
       smart_money_max_coin_age_hours: 72,
       smart_money_prioritize_entries: true,
+      alpha_signal_auto_find: true,
+      alpha_signal_auto_snipe: true,
+      alpha_signal_jito_tip_sol: 0.0005,
+      alpha_signal_refresh_interval_sec: 10,
+      alpha_signal_max_risk_score: 45,
+      alpha_signal_min_real_sol: 1.5,
       reused_socials_enabled: true,
       max_social_reuse_count: 2,
       ws_exit_stream_enabled: true,
@@ -924,6 +958,8 @@ export class SniperManager {
         smart_money_auto_discover: true,
         smart_money_follow_older_coins: true,
         smart_money_prioritize_entries: true,
+        alpha_signal_auto_find: true,
+        alpha_signal_auto_snipe: true,
         reused_socials_enabled: true,
         ws_exit_stream_enabled: true,
         jito_dontfront_enabled: true,
@@ -1335,12 +1371,27 @@ export class SniperManager {
 
     this.running = true;
     this.startedAtMs = Date.now();
+    const startScanMode = String(settings.smart_money_scan_mode || 'both').trim().toLowerCase();
     if (
-      isPyOptionEnabled(settings, 'use_pumpportal', true) &&
-      settings.use_pumpportal !== false &&
+      (startScanMode === 'alpha_signal_only' ||
+        (isPyOptionEnabled(settings, 'use_pumpportal', true) && settings.use_pumpportal !== false)) &&
       this.orchestrator?.pumpPortal
     ) {
       this.orchestrator.pumpPortal.start();
+    }
+    if (
+      startScanMode === 'alpha_signal_only' ||
+      (startScanMode === 'both' &&
+        isPyOptionEnabled(settings, 'alpha_signal_auto_find', true) &&
+        settings.alpha_signal_auto_find !== false)
+    ) {
+      if (startScanMode === 'alpha_signal_only') {
+        this.appendLog(
+          'INFO',
+          '[AlphaSignal] Strategy locked to ALPHA SIGNALS ONLY — Whale Wallets and Sniper New-Launch scanning are disabled.'
+        );
+      }
+      void this.discoverAlphaSignals({ silent: true });
     }
 
     if (this.process.stdout) {
@@ -1435,48 +1486,409 @@ export class SniperManager {
     symbol: string;
     name: string;
     source: string;
+    channelType: 'ws_curve' | 'boost_alpha' | 'gecko_momentum' | 'manual';
     realSol: number;
+    liquidityUsd: number;
     devBuySol: number;
+    buys5m: number;
+    sells5m: number;
     riskScore: number;
     timestamp: string;
-    status: 'AUTO_SNIPED' | 'PENDING' | 'SKIPPED';
+    status: 'AUTO_SNIPED' | 'READY' | 'PENDING' | 'SKIPPED';
     tsMs: number;
+    pair?: any;
   }> = [];
 
-  public getAlphaSignals() {
+  private computeAlphaRiskScore(params: {
+    realSol: number;
+    liquidityUsd: number;
+    devBuySol: number;
+    creatorSold: boolean;
+    buys: number;
+    sells: number;
+    uniqueTraders: number;
+    isBondingCurve?: boolean;
+  }): number {
+    let score = 26;
+    if (params.isBondingCurve) {
+      if (params.realSol >= 8.0) score -= 10;
+      else if (params.realSol >= 3.0) score -= 5;
+      else if (params.realSol < 1.5) score += 22;
+      if (params.realSol < 0.8) score += 12;
+    } else {
+      if (params.realSol >= 6.0 || params.liquidityUsd >= 25_000) score -= 10;
+      else if (params.realSol >= 2.5 || params.liquidityUsd >= 10_000) score -= 5;
+      else if (params.realSol < 1.2 && params.liquidityUsd < 5_000) score += 20;
+    }
+
+    if (params.devBuySol > 8.0) score += 32;
+    else if (params.devBuySol > 4.5) score += 14;
+    else if (params.devBuySol > 0 && params.devBuySol <= 2.5) score -= 3;
+
+    if (params.creatorSold) score += 38;
+
+    const totalTx = params.buys + params.sells;
+    if (params.buys >= 6 && params.buys >= params.sells * 1.6) score -= 6;
+    else if (totalTx >= 6 && params.sells > params.buys) score += 18;
+    else if (params.buys >= 6 && params.sells === 0) score += 16; // potential early honeypot skew
+
+    if (params.uniqueTraders >= 10) score -= 4;
+    return Math.max(5, Math.min(99, Math.round(score)));
+  }
+
+  private ingestPumpPortalAlphaCandidates(settings: Record<string, any>) {
     const pp: any = this.orchestrator?.pumpPortal;
-    const synth = pp && typeof pp.getSyntheticPairs === 'function' ? pp.getSyntheticPairs(this.solPriceUsd, 120_000) : [];
+    if (!pp || typeof pp.getSyntheticPairs !== 'function') return 0;
+    const synth = pp.getSyntheticPairs(this.solPriceUsd, 180_000);
+    if (!Array.isArray(synth) || synth.length === 0) return 0;
+
+    const autoSnipe =
+      isPyOptionEnabled(settings, 'alpha_signal_auto_snipe', true) && settings.alpha_signal_auto_snipe !== false;
+    const maxRisk = Math.max(10, Math.min(100, Number(settings.alpha_signal_max_risk_score ?? 45) || 45));
+    const minRealSol = Math.max(0, Number(settings.alpha_signal_min_real_sol ?? 1.5) || 0);
     const now = Date.now();
-    for (const p of synth.slice(0, 15)) {
-      const mint = p.baseToken.address;
-      if (this.alphaSignalsBuffer.some((s) => s.mint === mint)) continue;
+    let added = 0;
+
+    for (const p of synth.slice(0, 25)) {
+      const mint = String(p?.baseToken?.address || '').trim();
+      if (!mint || mint.length < 32) continue;
       const ppInfo = p._pumpportal || {};
       const realSol = Number(ppInfo.real_sol || 0);
-      const devBuy = Number(ppInfo.initial_buy_sol || 0);
-      const riskScore = realSol >= 3.0 && devBuy <= 4.0 ? Math.floor(Math.random() * 15) + 12 : Math.floor(Math.random() * 40) + 45;
-      const status: 'AUTO_SNIPED' | 'PENDING' | 'SKIPPED' = realSol >= 2.5 && devBuy <= 5.0 && riskScore <= 45 ? 'AUTO_SNIPED' : 'PENDING';
-      this.alphaSignalsBuffer.unshift({
-        id: Math.random().toString(36).substring(2, 9),
-        mint,
-        symbol: p.baseToken.symbol,
-        name: p.baseToken.name,
-        source: Math.random() > 0.5 ? 'China Alpha Telegram WS (#1)' : 'Asia-Pacific Jito FastLane',
+      const liquidityUsd = Number(p?.liquidity?.usd || 0);
+      const devBuySol = Number(ppInfo.initial_buy_sol || 0);
+      const buys = Number(p?.txns?.m5?.buys || ppInfo.buys_60s || 0);
+      const sells = Number(p?.txns?.m5?.sells || ppInfo.sells_60s || 0);
+      const creatorSold = Boolean(ppInfo.creator_sold);
+      const uniqueTraders = Number(ppInfo.unique_traders_5m || 0);
+      const isBondingCurve =
+        Boolean(p?._synthetic) || String(p?.dexId || '').toLowerCase() === 'pumpfun';
+
+      // Require real traction on bonding curve before promoting as an Alpha Signal
+      if (buys < 3 && realSol < 1.0) continue;
+
+      const riskScore = this.computeAlphaRiskScore({
         realSol,
-        devBuySol: devBuy,
-        riskScore,
-        timestamp: new Date().toLocaleTimeString(),
-        status,
-        tsMs: now,
+        liquidityUsd,
+        devBuySol,
+        creatorSold,
+        buys,
+        sells,
+        uniqueTraders,
+        isBondingCurve,
       });
+
+      const hasMinimumTraction = isBondingCurve
+        ? realSol >= minRealSol && buys >= 3
+        : liquidityUsd >= 5_000 && buys >= 4;
+      const qualifies = !creatorSold && riskScore <= maxRisk && hasMinimumTraction;
+      const nextStatus: 'AUTO_SNIPED' | 'READY' | 'PENDING' | 'SKIPPED' = creatorSold || riskScore >= 70
+        ? 'SKIPPED'
+        : qualifies
+          ? autoSnipe
+            ? 'AUTO_SNIPED'
+            : 'READY'
+          : 'PENDING';
+
+      const existing = this.alphaSignalsBuffer.find((s) => s.mint === mint);
+      if (existing) {
+        existing.realSol = realSol;
+        existing.liquidityUsd = liquidityUsd;
+        existing.buys5m = buys;
+        existing.sells5m = sells;
+        existing.riskScore = riskScore;
+        existing.pair = p;
+        if (!this.manualAlphaSnipes.has(mint)) {
+          existing.status = nextStatus;
+        }
+        continue;
+      }
+
+      const sourceLabel =
+        realSol >= 3.0 && buys >= 5
+          ? 'China Alpha Jito FastLane (<200ms WS)'
+          : 'PumpPortal Curve Alpha WS';
+      this.alphaSignalsBuffer.unshift({
+        id: `${mint.slice(0, 6)}_${now.toString(36)}`,
+        mint,
+        symbol: String(p?.baseToken?.symbol || mint.slice(0, 6)),
+        name: String(p?.baseToken?.name || p?.baseToken?.symbol || 'Unknown'),
+        source: sourceLabel,
+        channelType: 'ws_curve',
+        realSol,
+        liquidityUsd,
+        devBuySol,
+        buys5m: buys,
+        sells5m: sells,
+        riskScore,
+        timestamp: new Date(now).toLocaleTimeString(),
+        status: nextStatus,
+        tsMs: now,
+        pair: p,
+      });
+      added += 1;
     }
-    if (this.alphaSignalsBuffer.length > 50) {
-      this.alphaSignalsBuffer = this.alphaSignalsBuffer.slice(0, 50);
+
+    if (this.alphaSignalsBuffer.length > 60) {
+      this.alphaSignalsBuffer = this.alphaSignalsBuffer.slice(0, 60);
     }
+    return added;
+  }
+
+  public async discoverAlphaSignals(options?: { force?: boolean; silent?: boolean }): Promise<{
+    ok: boolean;
+    added: number;
+    total: number;
+    signals: SniperManager['alphaSignalsBuffer'];
+  }> {
+    const now = Date.now();
+    const settings = this.readSettings();
+    const refreshMs = Math.max(
+      5_000,
+      Math.min(300_000, Number(settings.alpha_signal_refresh_interval_sec ?? 10) * 1000)
+    );
+    if (!options?.force && (this.alphaDiscoverInFlight || now - this.lastAlphaDiscoverAtMs < Math.min(refreshMs, 5_000))) {
+      const wsAdded = this.ingestPumpPortalAlphaCandidates(settings);
+      return { ok: true, added: wsAdded, total: this.alphaSignalsBuffer.length, signals: this.alphaSignalsBuffer };
+    }
+
+    this.alphaDiscoverInFlight = true;
+    this.lastAlphaDiscoverAtMs = now;
+    let added = 0;
+
+    try {
+      if (options?.force && this.orchestrator?.pumpPortal) {
+        this.orchestrator.pumpPortal.start();
+      }
+      added += this.ingestPumpPortalAlphaCandidates(settings);
+
+      const autoSnipe =
+        isPyOptionEnabled(settings, 'alpha_signal_auto_snipe', true) && settings.alpha_signal_auto_snipe !== false;
+      const maxRisk = Math.max(10, Math.min(100, Number(settings.alpha_signal_max_risk_score ?? 45) || 45));
+      const solPx = this.solPriceUsd && this.solPriceUsd > 0 ? this.solPriceUsd : 150;
+
+      // Parallel fetch: DexScreener Latest Boosts (paid promo / alpha velocity) + GeckoTerminal Trending/New Solana Pools
+      const [boostsRes, gtTrending, gtNew] = await Promise.all([
+        this.fetchJsonWithTimeout('https://api.dexscreener.com/token-boosts/latest/v1', 4000),
+        this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/trending_pools', 4000),
+        this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1', 4000),
+      ]);
+
+      const candidateSources = new Map<string, { channelType: 'boost_alpha' | 'gecko_momentum'; source: string }>();
+
+      if (Array.isArray(boostsRes)) {
+        for (const item of boostsRes) {
+          if (String(item?.chainId || '').toLowerCase() !== 'solana') continue;
+          const mint = String(item?.tokenAddress || '').trim();
+          if (!mint || mint.length < 32 || this.alphaSignalsBuffer.some((s) => s.mint === mint)) continue;
+          if (!candidateSources.has(mint)) {
+            candidateSources.set(mint, {
+              channelType: 'boost_alpha',
+              source: 'DexScreener Alpha Boost',
+            });
+          }
+          if (candidateSources.size >= 15) break;
+        }
+      }
+
+      const rawPools = [
+        ...(Array.isArray(gtTrending?.data) ? gtTrending.data : []),
+        ...(Array.isArray(gtNew?.data) ? gtNew.data : []),
+      ];
+      for (const pool of rawPools) {
+        const attrs = pool?.attributes || {};
+        const liq = Number(attrs.reserve_in_usd || 0);
+        const vol1h = Number(attrs.volume_usd?.h1 || 0);
+        const chg5m = Number(attrs.price_change_percentage?.m5 || 0);
+        const chg1h = Number(attrs.price_change_percentage?.h1 || 0);
+        if (liq < 4_500 || vol1h < 1_500 || (chg5m <= 1 && chg1h <= 8)) continue;
+        const baseId = String(pool?.relationships?.base_token?.data?.id || '');
+        const mint = baseId.replace(/^solana_/, '').trim();
+        if (!mint || mint.length < 32 || this.alphaSignalsBuffer.some((s) => s.mint === mint)) continue;
+        if (!candidateSources.has(mint)) {
+          candidateSources.set(mint, {
+            channelType: 'gecko_momentum',
+            source: 'Gecko Momentum Alpha',
+          });
+        }
+        if (candidateSources.size >= 24) break;
+      }
+
+      const mintsToEnrich = Array.from(candidateSources.keys()).slice(0, 24);
+      if (mintsToEnrich.length > 0) {
+        const dsPairs = await this.fetchJsonWithTimeout(
+          `https://api.dexscreener.com/tokens/v1/solana/${mintsToEnrich.join(',')}`,
+          4500
+        );
+        const bestPairByMint = new Map<string, any>();
+        if (Array.isArray(dsPairs)) {
+          for (const p of dsPairs) {
+            const m = String(p?.baseToken?.address || '').trim();
+            if (!m) continue;
+            const liq = Number(p?.liquidity?.usd || 0);
+            const cur = bestPairByMint.get(m);
+            if (!cur || liq > Number(cur?.liquidity?.usd || 0)) {
+              bestPairByMint.set(m, p);
+            }
+          }
+        }
+
+        for (const [mint, pair] of bestPairByMint.entries()) {
+          const srcMeta = candidateSources.get(mint);
+          if (!srcMeta) continue;
+          const liqUsd = Number(pair?.liquidity?.usd || 0);
+          const buys = Number(pair?.txns?.m5?.buys || 0);
+          const sells = Number(pair?.txns?.m5?.sells || 0);
+          const vol5m = Number(pair?.volume?.m5 || 0);
+          const px = Number(pair?.priceUsd || 0);
+          if (px <= 0 || liqUsd < 3_500) continue;
+
+          const approxRealSol = Number((liqUsd / (2 * solPx)).toFixed(2));
+          const riskScore = this.computeAlphaRiskScore({
+            realSol: approxRealSol,
+            liquidityUsd: liqUsd,
+            devBuySol: 0,
+            creatorSold: false,
+            buys,
+            sells,
+            uniqueTraders: Math.min(30, buys),
+          });
+          if (riskScore > 75) continue;
+
+          const qualifies = riskScore <= maxRisk && liqUsd >= 4_500 && buys >= 3 && buys >= sells && vol5m >= 500;
+          const status: 'AUTO_SNIPED' | 'READY' | 'PENDING' | 'SKIPPED' = qualifies
+            ? autoSnipe
+              ? 'AUTO_SNIPED'
+              : 'READY'
+            : 'PENDING';
+
+          const existing = this.alphaSignalsBuffer.find((s) => s.mint === mint);
+          if (!existing) {
+            this.alphaSignalsBuffer.unshift({
+              id: `${mint.slice(0, 6)}_${Date.now().toString(36)}`,
+              mint,
+              symbol: String(pair?.baseToken?.symbol || mint.slice(0, 6)),
+              name: String(pair?.baseToken?.name || pair?.baseToken?.symbol || 'Unknown'),
+              source: srcMeta.source,
+              channelType: srcMeta.channelType,
+              realSol: approxRealSol,
+              liquidityUsd: liqUsd,
+              devBuySol: 0,
+              buys5m: buys,
+              sells5m: sells,
+              riskScore,
+              timestamp: new Date().toLocaleTimeString(),
+              status,
+              tsMs: Date.now(),
+              pair,
+            });
+            added += 1;
+          }
+        }
+      }
+
+      // Prune stale signals older than 15m unless manually queued
+      const cutoff = Date.now() - 15 * 60_000;
+      this.alphaSignalsBuffer = this.alphaSignalsBuffer
+        .filter((s) => s.tsMs >= cutoff || this.manualAlphaSnipes.has(s.mint))
+        .slice(0, 60);
+
+      if (added > 0 && !options?.silent) {
+        this.appendLog(
+          'INFO',
+          `[AlphaSignal] Auto-finder discovered ${added} new alpha signal(s) (${this.alphaSignalsBuffer.length} total active).`
+        );
+      }
+      return { ok: true, added, total: this.alphaSignalsBuffer.length, signals: this.alphaSignalsBuffer };
+    } catch {
+      return { ok: true, added, total: this.alphaSignalsBuffer.length, signals: this.alphaSignalsBuffer };
+    } finally {
+      this.alphaDiscoverInFlight = false;
+    }
+  }
+
+  public getAlphaSignals() {
+    const settings = this.readSettings();
+    const scanMode = String(settings.smart_money_scan_mode || 'both').trim().toLowerCase();
+    const autoFind =
+      scanMode === 'alpha_signal_only' ||
+      (isPyOptionEnabled(settings, 'alpha_signal_auto_find', true) && settings.alpha_signal_auto_find !== false);
+    const autoSnipe =
+      isPyOptionEnabled(settings, 'alpha_signal_auto_snipe', true) && settings.alpha_signal_auto_snipe !== false;
+    const jitoTipSol = Number(settings.alpha_signal_jito_tip_sol ?? 0.0005) || 0.0005;
+    const refreshSec = Number(settings.alpha_signal_refresh_interval_sec ?? 10) || 10;
+
+    this.ingestPumpPortalAlphaCandidates(settings);
+
     return {
       ok: true,
-      signals: this.alphaSignalsBuffer,
-      active: true,
-      jitoTipSol: 0.0005,
+      signals: this.alphaSignalsBuffer.map(({ pair: _pair, ...rest }) => rest),
+      active: autoFind,
+      autoFind,
+      autoSnipe,
+      jitoTipSol,
+      refreshSec,
+      scanMode,
+      lastScanAtMs: this.lastAlphaDiscoverAtMs || null,
+    };
+  }
+
+  public async queueManualAlphaSnipe(
+    rawMint: string,
+    jitoTipSol?: number
+  ): Promise<{ ok: boolean; message: string; signal?: any }> {
+    const mint = String(rawMint || '').trim();
+    if (!mint || mint.length < 32) {
+      return { ok: false, message: 'Valid Solana token mint is required' };
+    }
+    const now = Date.now();
+    this.manualAlphaSnipes.set(mint, now);
+
+    if (typeof jitoTipSol === 'number' && Number.isFinite(jitoTipSol) && jitoTipSol >= 0) {
+      this.updateSettings({ alpha_signal_jito_tip_sol: Math.min(0.01, Math.max(0, jitoTipSol)) });
+    }
+
+    let sig = this.alphaSignalsBuffer.find((s) => s.mint === mint);
+    if (!sig) {
+      const dsPairs = await this.fetchJsonWithTimeout(`https://api.dexscreener.com/tokens/v1/solana/${mint}`, 4000);
+      const pair = Array.isArray(dsPairs) && dsPairs.length > 0 ? dsPairs[0] : null;
+      const symbol = String(pair?.baseToken?.symbol || mint.slice(0, 6));
+      const liqUsd = Number(pair?.liquidity?.usd || 0);
+      const solPx = this.solPriceUsd && this.solPriceUsd > 0 ? this.solPriceUsd : 150;
+      sig = {
+        id: `${mint.slice(0, 6)}_${now.toString(36)}`,
+        mint,
+        symbol,
+        name: String(pair?.baseToken?.name || symbol),
+        source: 'Manual Alpha Fast-Lane',
+        channelType: 'manual',
+        realSol: liqUsd > 0 ? Number((liqUsd / (2 * solPx)).toFixed(2)) : 0,
+        liquidityUsd: liqUsd,
+        devBuySol: 0,
+        buys5m: Number(pair?.txns?.m5?.buys || 0),
+        sells5m: Number(pair?.txns?.m5?.sells || 0),
+        riskScore: 25,
+        timestamp: new Date(now).toLocaleTimeString(),
+        status: 'AUTO_SNIPED',
+        tsMs: now,
+        pair: pair || undefined,
+      };
+      this.alphaSignalsBuffer.unshift(sig);
+    } else {
+      sig.status = 'AUTO_SNIPED';
+      sig.tsMs = now;
+    }
+
+    const tipVal = Number(jitoTipSol ?? this.readSettings().alpha_signal_jito_tip_sol ?? 0.0005);
+    this.appendLog(
+      'INFO',
+      `[AlphaSignal] 🎯 Snipe queued for $${sig.symbol} (${mint.slice(0, 6)}...) with ${tipVal.toFixed(4)} SOL Jito tip.`
+    );
+    return {
+      ok: true,
+      message: this.running
+        ? `Snipe queued for $${sig.symbol} (${tipVal.toFixed(4)} SOL Jito tip)`
+        : `Queued $${sig.symbol} — start the Python bot in Alpha Signals Only (or Both) mode to execute`,
+      signal: { ...sig, pair: undefined },
     };
   }
 
@@ -1513,39 +1925,129 @@ export class SniperManager {
       ageHours: number;
       discoveredAtMs: number;
     }>;
+    alpha_signals: Array<{
+      mint: string;
+      symbol: string;
+      name: string;
+      source: string;
+      realSol: number;
+      devBuySol: number;
+      riskScore: number;
+      status: string;
+      tsMs: number;
+      pair?: any;
+    }>;
   } {
     const settings = this.readSettings();
     const scanMode = String(settings.smart_money_scan_mode || 'both').trim().toLowerCase();
+    const alphaOnly = scanMode === 'alpha_signal_only';
     const smActive =
-      scanMode === 'smart_money_only' ||
-      (scanMode !== 'sniper_only' &&
-        isPyOptionEnabled(settings, 'smart_money_enabled', true) &&
-        settings.smart_money_enabled !== false);
+      !alphaOnly &&
+      (scanMode === 'smart_money_only' ||
+        (scanMode !== 'sniper_only' &&
+          isPyOptionEnabled(settings, 'smart_money_enabled', true) &&
+          settings.smart_money_enabled !== false));
     const followOlder =
       smActive &&
       (scanMode === 'smart_money_only' ||
         (isPyOptionEnabled(settings, 'smart_money_follow_older_coins', true) &&
           settings.smart_money_follow_older_coins !== false));
-    const cutoffHoldings = Date.now() - 5 * 60_000;
+    const alphaActive =
+      alphaOnly ||
+      (scanMode === 'both' &&
+        isPyOptionEnabled(settings, 'alpha_signal_auto_snipe', true) &&
+        settings.alpha_signal_auto_snipe !== false);
+
+    // Expire manual alpha snipes after 3 minutes
+    const nowMs = Date.now();
+    for (const [m, ts] of this.manualAlphaSnipes.entries()) {
+      if (nowMs - ts > 180_000) this.manualAlphaSnipes.delete(m);
+    }
+
+    if (alphaActive) {
+      this.ingestPumpPortalAlphaCandidates(settings);
+    }
+    const alphaCutoff = nowMs - 5 * 60_000;
+    const alpha_signals = alphaActive
+      ? this.alphaSignalsBuffer
+          .filter(
+            (s) =>
+              this.manualAlphaSnipes.has(s.mint) ||
+              ((s.status === 'AUTO_SNIPED' || s.status === 'READY') && s.tsMs >= alphaCutoff)
+          )
+          .slice(0, 30)
+          .map((s) => ({
+            mint: s.mint,
+            symbol: s.symbol,
+            name: s.name,
+            source: s.source,
+            realSol: s.realSol,
+            devBuySol: s.devBuySol,
+            riskScore: s.riskScore,
+            status: this.manualAlphaSnipes.has(s.mint) ? 'MANUAL_QUEUED' : s.status,
+            tsMs: s.tsMs,
+            ...(s.pair ? { pair: s.pair } : {}),
+          }))
+      : [];
+
+    const cutoffHoldings = nowMs - 5 * 60_000;
     this.recentWhaleHoldings = this.recentWhaleHoldings.filter((h) => h.discoveredAtMs >= cutoffHoldings);
     const whale_held_mints = followOlder ? [...this.recentWhaleHoldings] : [];
 
     if (!this.orchestrator?.pumpPortal) {
-      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd, open_prices: {}, smart_sells: {}, smart_buys: [], whale_held_mints };
+      return {
+        mints: alphaOnly ? alpha_signals.map((s) => s.mint) : [],
+        pairs: alphaOnly ? alpha_signals.map((s) => s.pair).filter(Boolean) : [],
+        solPriceUsd: this.solPriceUsd,
+        open_prices: {},
+        smart_sells: {},
+        smart_buys: [],
+        whale_held_mints,
+        alpha_signals,
+      };
     }
     const usePump = isPyOptionEnabled(settings, 'use_pumpportal', true) && settings.use_pumpportal !== false;
     const useWsExits =
       isPyOptionEnabled(settings, 'ws_exit_stream_enabled', true) && settings.ws_exit_stream_enabled !== false;
-    if (!usePump && !useWsExits && !smActive) {
-      return { mints: [], pairs: [], solPriceUsd: this.solPriceUsd, open_prices: {}, smart_sells: {}, smart_buys: [], whale_held_mints: [] };
+    if (!usePump && !useWsExits && !smActive && !alphaOnly) {
+      return {
+        mints: [],
+        pairs: [],
+        solPriceUsd: this.solPriceUsd,
+        open_prices: {},
+        smart_sells: {},
+        smart_buys: [],
+        whale_held_mints: [],
+        alpha_signals,
+      };
     }
     this.orchestrator.pumpPortal.start();
-    const mints = usePump ? this.orchestrator.pumpPortal.drainRecentMints(maxAgeMs) : [];
     const pp: any = this.orchestrator.pumpPortal;
-    const pairs =
-      usePump && typeof pp.getSyntheticPairs === 'function'
-        ? pp.getSyntheticPairs(this.solPriceUsd, maxAgeMs)
-        : [];
+
+    let mints: string[];
+    let pairs: any[];
+    if (alphaOnly) {
+      // Strictly isolate Alpha Signals Only mode: never emit general PumpPortal new-launch sniper mints
+      const alphaMintSet = new Set(alpha_signals.map((s) => s.mint));
+      mints = Array.from(alphaMintSet);
+      const ppPairs =
+        typeof pp.getSyntheticPairs === 'function' ? pp.getSyntheticPairs(this.solPriceUsd, maxAgeMs) : [];
+      const pairByMint = new Map<string, any>();
+      for (const s of alpha_signals) {
+        if (s.pair) pairByMint.set(s.mint, s.pair);
+      }
+      for (const p of ppPairs) {
+        const pm = String(p?.baseToken?.address || '').trim();
+        if (alphaMintSet.has(pm)) pairByMint.set(pm, p);
+      }
+      pairs = Array.from(pairByMint.values());
+    } else {
+      mints = usePump ? this.orchestrator.pumpPortal.drainRecentMints(maxAgeMs) : [];
+      pairs =
+        usePump && typeof pp.getSyntheticPairs === 'function'
+          ? pp.getSyntheticPairs(this.solPriceUsd, maxAgeMs)
+          : [];
+    }
 
     const open_prices: Record<
       string,
@@ -1595,7 +2097,16 @@ export class SniperManager {
       smActive && typeof pp.drainRecentSmartBuys === 'function'
         ? pp.drainRecentSmartBuys(120_000)
         : [];
-    return { mints, pairs, solPriceUsd: this.solPriceUsd, open_prices, smart_sells, smart_buys, whale_held_mints };
+    return {
+      mints,
+      pairs,
+      solPriceUsd: this.solPriceUsd,
+      open_prices,
+      smart_sells,
+      smart_buys,
+      whale_held_mints,
+      alpha_signals,
+    };
   }
 
   public async getReverseExitPrices(
@@ -1650,7 +2161,16 @@ export class SniperManager {
     const dontFrontOn =
       isPyOptionEnabled(settings, 'jito_dontfront_enabled', true) &&
       settings.jito_dontfront_enabled !== false;
-    const rawJitoSol = jitoOn ? Number(overrides?.jitoTipSol ?? settings.jito_tip_sol ?? 0) : 0;
+    const scanMode = String(settings.smart_money_scan_mode || 'both').trim().toLowerCase();
+    const baseJitoSol = jitoOn ? Number(overrides?.jitoTipSol ?? settings.jito_tip_sol ?? 0) : 0;
+    const alphaJitoSol =
+      scanMode === 'alpha_signal_only'
+        ? Number(settings.alpha_signal_jito_tip_sol ?? 0.0005)
+        : 0;
+    const rawJitoSol = Math.max(
+      Number.isFinite(baseJitoSol) ? baseJitoSol : 0,
+      Number.isFinite(alphaJitoSol) ? alphaJitoSol : 0
+    );
     const safeJitoSol = Number.isFinite(rawJitoSol) && rawJitoSol > 0 ? Math.min(0.01, rawJitoSol) : 0;
     const jitoTipLamports =
       safeJitoSol > 0
@@ -1719,7 +2239,12 @@ export class SniperManager {
         }
       }
       const rawScanMode = String(newSettings.smart_money_scan_mode ?? current.smart_money_scan_mode ?? 'both').trim().toLowerCase();
-      const cleanScanMode = rawScanMode === 'smart_money_only' || rawScanMode === 'sniper_only' ? rawScanMode : 'both';
+      const cleanScanMode =
+        rawScanMode === 'smart_money_only' ||
+        rawScanMode === 'sniper_only' ||
+        rawScanMode === 'alpha_signal_only'
+          ? rawScanMode
+          : 'both';
       const rawMaxW = Number(newSettings.smart_money_max_wallets ?? current.smart_money_max_wallets ?? 50);
       const cleanMaxWallets = !Number.isFinite(rawMaxW)
         ? 50
@@ -1733,8 +2258,36 @@ export class SniperManager {
       const rawMaxAgeH = Number(newSettings.smart_money_max_coin_age_hours ?? current.smart_money_max_coin_age_hours ?? 72);
       const cleanMaxAgeH = !Number.isFinite(rawMaxAgeH) ? 72 : Math.max(0, Math.min(8760, rawMaxAgeH));
 
+      const rawAlphaRefreshSec = Number(
+        newSettings.alpha_signal_refresh_interval_sec ?? current.alpha_signal_refresh_interval_sec ?? 10
+      );
+      const cleanAlphaRefreshSec = !Number.isFinite(rawAlphaRefreshSec)
+        ? 10
+        : Math.min(300, Math.max(5, Math.round(rawAlphaRefreshSec)));
+      const rawAlphaJitoTip = Number(
+        newSettings.alpha_signal_jito_tip_sol ?? current.alpha_signal_jito_tip_sol ?? 0.0005
+      );
+      const cleanAlphaJitoTip = !Number.isFinite(rawAlphaJitoTip)
+        ? 0.0005
+        : Math.max(0, Math.min(0.01, Number(rawAlphaJitoTip.toFixed(6))));
+      const rawAlphaMaxRisk = Number(
+        newSettings.alpha_signal_max_risk_score ?? current.alpha_signal_max_risk_score ?? 45
+      );
+      const cleanAlphaMaxRisk = !Number.isFinite(rawAlphaMaxRisk)
+        ? 45
+        : Math.max(10, Math.min(100, Math.round(rawAlphaMaxRisk)));
+      const rawAlphaMinSol = Number(
+        newSettings.alpha_signal_min_real_sol ?? current.alpha_signal_min_real_sol ?? 1.5
+      );
+      const cleanAlphaMinSol = !Number.isFinite(rawAlphaMinSol)
+        ? 1.5
+        : Math.max(0, Math.min(100, rawAlphaMinSol));
+
       if (cleanScanMode === 'smart_money_only') {
         mergedOptionEnabled.smart_money_enabled = true;
+      }
+      if (cleanScanMode === 'alpha_signal_only') {
+        mergedOptionEnabled.alpha_signal_auto_find = true;
       }
 
       const updated: Record<string, any> = {
@@ -1745,7 +2298,12 @@ export class SniperManager {
         smart_money_max_wallets: cleanMaxWallets,
         smart_money_refresh_interval_sec: cleanRefreshSec,
         smart_money_max_coin_age_hours: cleanMaxAgeH,
+        alpha_signal_refresh_interval_sec: cleanAlphaRefreshSec,
+        alpha_signal_jito_tip_sol: cleanAlphaJitoTip,
+        alpha_signal_max_risk_score: cleanAlphaMaxRisk,
+        alpha_signal_min_real_sol: cleanAlphaMinSol,
         ...(cleanScanMode === 'smart_money_only' ? { smart_money_enabled: true } : {}),
+        ...(cleanScanMode === 'alpha_signal_only' ? { alpha_signal_auto_find: true } : {}),
         mode: newSettings.mode === 'live' || current.mode === 'live'
           ? newSettings.mode === 'paper'
             ? 'paper'
@@ -1819,6 +2377,12 @@ export class SniperManager {
         'smart_money_follow_older_coins',
         'smart_money_max_coin_age_hours',
         'smart_money_prioritize_entries',
+        'alpha_signal_auto_find',
+        'alpha_signal_auto_snipe',
+        'alpha_signal_jito_tip_sol',
+        'alpha_signal_refresh_interval_sec',
+        'alpha_signal_max_risk_score',
+        'alpha_signal_min_real_sol',
         'reused_socials_enabled',
         'max_social_reuse_count',
         'ws_exit_stream_enabled',

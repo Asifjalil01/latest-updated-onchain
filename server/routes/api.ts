@@ -1058,8 +1058,28 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
     res.json({ ...disc, holdingsScan });
   });
 
-  router.get('/sniper/alpha-signals', (_req: Request, res: Response) => {
+  router.get('/sniper/alpha-signals', async (req: Request, res: Response) => {
+    const discover = req.query?.discover === '1' || req.query?.discover === 'true';
+    if (discover) {
+      await sniperManager.discoverAlphaSignals({ force: true });
+    }
     res.json(sniperManager.getAlphaSignals());
+  });
+
+  router.post('/sniper/alpha-signals/discover', async (_req: Request, res: Response) => {
+    const disc = await sniperManager.discoverAlphaSignals({ force: true });
+    res.json({ ...sniperManager.getAlphaSignals(), added: disc.added });
+  });
+
+  router.post('/sniper/alpha-signals/snipe', async (req: Request, res: Response) => {
+    const mint = typeof req.body?.mint === 'string' ? req.body.mint.trim() : '';
+    const jitoTipSol = req.body?.jitoTipSol !== undefined ? Number(req.body.jitoTipSol) : undefined;
+    if (!mint) {
+      res.status(400).json({ ok: false, message: 'Mint is required' });
+      return;
+    }
+    const result = await sniperManager.queueManualAlphaSnipe(mint, jitoTipSol);
+    res.status(result.ok ? 200 : 400).json(result);
   });
 
   router.get('/sniper/pumpportal-mints', (_req: Request, res: Response) => {
@@ -1073,6 +1093,7 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
       smart_sells: feed.smart_sells,
       smart_buys: feed.smart_buys,
       whale_held_mints: feed.whale_held_mints,
+      alpha_signals: feed.alpha_signals,
     });
   });
 

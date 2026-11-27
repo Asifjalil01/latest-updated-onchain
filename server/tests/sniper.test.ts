@@ -3299,4 +3299,129 @@ test('v1.44.1: Active whale traders outrank capped clean holders, WS smart trade
   }
 });
 
+test('v1.45.1: Alpha Signals Only mode isolates from Whale/Sniper launches, auto-finds signals across sources, and bridges cleanly to bot.py', async () => {
+  const { PumpPortalWsProvider } = await import('../providers/pumpportal');
+  const pp = new PumpPortalWsProvider();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1451-'));
+  try {
+    const whaleAddr = 'WhaleIsolated1111111111111111111111111111111';
+    const alphaMintWs = 'AlphaWsMint11111111111111111111111111111pump';
+    const plainLaunchMint = 'PlainSniperMint1111111111111111111111111pump';
+    const boostAlphaMint = 'BoostAlphaMint111111111111111111111111111111';
+    const baseTs = Date.now() - 20_000;
+
+    // 1) Ingest strong PumpPortal WS launch (qualifies as Alpha Signal) AND plain 1-buy launch (does NOT qualify)
+    pp.ingestFrame({ mint: alphaMintWs, symbol: 'ALPHAWS', txType: 'create', traderPublicKey: 'DevAlpha111111111111111111111111111111111111', solAmount: 1.0, vSolInBondingCurve: 32.5, vTokensInBondingCurve: 900_000_000, marketCapSol: 36 }, baseTs);
+    for (let i = 0; i < 5; i += 1) {
+      pp.ingestFrame({ mint: alphaMintWs, txType: 'buy', traderPublicKey: `Buyer${i}111111111111111111111111111111111111`, solAmount: 0.6, vSolInBondingCurve: 33.5 + i * 0.5, vTokensInBondingCurve: 860_000_000 - i * 10_000_000, marketCapSol: 40 + i }, baseTs + 1000 + i * 500);
+    }
+    pp.ingestFrame({ mint: plainLaunchMint, symbol: 'PLAIN', txType: 'create', traderPublicKey: 'DevPlain111111111111111111111111111111111111', solAmount: 0.1, vSolInBondingCurve: 30.1, vTokensInBondingCurve: 990_000_000, marketCapSol: 30 }, baseTs);
+
+    // Tracked whale buys plainLaunchMint so we can prove alpha_signal_only ignores smart_buys
+    pp.setTrackedSmartWallets([whaleAddr]);
+    pp.ingestFrame({ mint: plainLaunchMint, txType: 'buy', traderPublicKey: whaleAddr, solAmount: 0.2, vSolInBondingCurve: 30.3, vTokensInBondingCurve: 980_000_000, marketCapSol: 31 }, baseTs + 3000);
+
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    (mgr as any).solPriceUsd = 150;
+    mgr.attachOrchestrator({
+      pumpPortal: pp,
+      signer: { isUnlocked: () => false, getPublicKey: () => null, getMaskedPublicKey: () => 'Locked' },
+      rpcPool: { getHealthSnapshot: () => [] },
+    } as any);
+
+    // 2) Mock external auto-finder feeds (DexScreener Boosts + DexScreener Tokens + GeckoTerminal)
+    (mgr as any).fetchJsonWithTimeout = async (url: string) => {
+      if (url.includes('token-boosts/latest')) {
+        return [{ chainId: 'solana', tokenAddress: boostAlphaMint }];
+      }
+      if (url.includes(`tokens/v1/solana/${boostAlphaMint}`)) {
+        return [
+          {
+            baseToken: { address: boostAlphaMint, symbol: 'BSTALPHA', name: 'Boost Alpha' },
+            dexId: 'pumpswap',
+            pairCreatedAt: Date.now() - 120_000,
+            priceUsd: '0.0025',
+            liquidity: { usd: 18500 },
+            volume: { m5: 4200 },
+            txns: { m5: { buys: 14, sells: 3 } },
+            priceChange: { m5: 22 },
+          },
+        ];
+      }
+      return { data: [] };
+    };
+
+    const saveRes = mgr.updateSettings({
+      smart_money_enabled: false,
+      smart_wallets: [whaleAddr],
+      smart_money_scan_mode: 'alpha_signal_only',
+      alpha_signal_auto_find: true,
+      alpha_signal_auto_snipe: true,
+      alpha_signal_jito_tip_sol: 0.0007,
+      alpha_signal_refresh_interval_sec: 10,
+    });
+    assert.equal(saveRes.ok, true);
+    assert.equal(saveRes.settings?.smart_money_scan_mode, 'alpha_signal_only');
+    // Selecting alpha_signal_only must NOT mutate Smart Money toggle or tracked whale wallets
+    assert.equal(saveRes.settings?.smart_money_enabled, false);
+    assert.deepEqual(saveRes.settings?.smart_wallets, [whaleAddr]);
+
+    // 3) Auto-finder discovers both WS & Boost alpha signals
+    const disc = await mgr.discoverAlphaSignals({ force: true });
+    assert.equal(disc.ok, true);
+    assert.ok(disc.signals.some((s) => s.mint === alphaMintWs && s.status === 'AUTO_SNIPED'));
+    assert.ok(disc.signals.some((s) => s.mint === boostAlphaMint && s.status === 'AUTO_SNIPED'));
+
+    // 4) getPumpPortalFeed in alpha_signal_only emits ONLY alpha signal mints & pairs, with zero smart_buys/whale_held_mints
+    const feed = mgr.getPumpPortalFeed();
+    assert.deepEqual(feed.smart_buys, []);
+    assert.deepEqual(feed.whale_held_mints, []);
+    assert.ok(feed.alpha_signals.some((s) => s.mint === alphaMintWs));
+    assert.ok(feed.alpha_signals.some((s) => s.mint === boostAlphaMint));
+    assert.ok(!feed.mints.includes(plainLaunchMint));
+
+    // 5) Python bot.py: alpha_signal_only ignores smart_buys & sniper launches, accepts alpha_signals
+    const pyScript = [
+      'import sys, types, json, time',
+      'req = types.ModuleType("requests")',
+      'req.Session = lambda: None',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      'now_ms = int(time.time() * 1000)',
+      'whale = "WhaleIsolated1111111111111111111111111111111"',
+      'alpha_m = "AlphaWsMint11111111111111111111111111111pump"',
+      'whale_m = "PlainSniperMint1111111111111111111111111pump"',
+      'plain_m = "RandomLaunchMint1111111111111111111111111111"',
+      'bot._ws_smart_buys.clear()',
+      'bot._smart_buy_pending_mints.clear()',
+      'bot._ws_alpha_signals.clear()',
+      'bot._alpha_pending_mints.clear()',
+      'bot._ingest_ws_bridge_payload({"ok": True, "smart_buys": [{"mint": whale_m, "wallet": whale}], "alpha_signals": [{"mint": alpha_m, "symbol": "ALPHAWS", "source": "China Alpha Jito FastLane", "riskScore": 18, "status": "AUTO_SNIPED"}]})',
+      'cfg_alpha = {**bot.CONFIG, "smart_money_scan_mode": "alpha_signal_only", "smart_wallets": [whale], "smart_money_enabled": True, "min_liquidity_usd": 4000.0, "min_volume_m5_usd": 500.0, "min_buys_m5": 2, "min_buy_sell_ratio_m5": 1.1}',
+      'pair_alpha = {"baseToken": {"address": alpha_m, "symbol": "ALPHAWS"}, "priceUsd": "0.001", "pairCreatedAt": now_ms - 3600000, "liquidity": {"usd": 12000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 10, "sells": 2}}, "priceChange": {"m5": 12}}',
+      'pair_whale = {"baseToken": {"address": whale_m, "symbol": "PLAIN"}, "priceUsd": "0.001", "pairCreatedAt": now_ms - 20000, "liquidity": {"usd": 12000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 10, "sells": 2}}, "priceChange": {"m5": 12}, "_pumpportal": {"recent_buyers": [whale]}}',
+      'pair_plain = {"baseToken": {"address": plain_m, "symbol": "RAND"}, "priceUsd": "0.001", "pairCreatedAt": now_ms - 20000, "liquidity": {"usd": 12000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 10, "sells": 2}}, "priceChange": {"m5": 12}}',
+      'ok_a, why_a, _ = bot.passes_filters(pair_alpha, cfg_alpha)',
+      'ok_w, why_w, _ = bot.passes_filters(pair_whale, cfg_alpha)',
+      'ok_p, why_p, _ = bot.passes_filters(pair_plain, cfg_alpha)',
+      'sb_in_alpha = bot._get_pair_smart_buyers(pair_whale, None, cfg_alpha)',
+      'print(json.dumps({"ok_a": ok_a, "why_a": why_a, "ok_w": ok_w, "why_w": why_w, "ok_p": ok_p, "why_p": why_p, "sb_in_alpha": sb_in_alpha}))',
+    ].join('\n');
+
+    const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyOut.ok_a, true);
+    assert.equal(pyOut.ok_w, false);
+    assert.equal(pyOut.why_w, 'not alpha signal');
+    assert.equal(pyOut.ok_p, false);
+    assert.equal(pyOut.why_p, 'not alpha signal');
+    assert.deepEqual(pyOut.sb_in_alpha, []);
+  } finally {
+    pp.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+
 

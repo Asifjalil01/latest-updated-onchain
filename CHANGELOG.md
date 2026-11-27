@@ -2,6 +2,20 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.45.1 — Alpha Signals Only Bot Mode (Isolated) & Multi-Source Signal Auto-Finder
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Added & Improved
+- **4th Scan Mode: `Alpha Signals Only` (`PythonSniperView.tsx`, `server/sniperManager.ts`, `sniper/bot.py`)**:
+  - Added **Alpha Signals Only (Auto-Found Signal Feed)** right alongside **Both**, **Whale Wallets Only**, and **Sniper Bot Only** in the **Start Python Sniper Bot** modal, **Alpha Signals** toolbar, **Smart Money** mode selector, and **Pro Desk**.
+  - Strictly isolated execution: when `Alpha Signals Only` is active, both `SniperManager` and `sniper/bot.py` trade **only** coins triggered by Alpha Signals and completely ignore Whale Wallet triggers and general Sniper Bot new launches without modifying your Whale or Sniper settings.
+  - Added `Alpha Signal` entry attribution badges (with source and risk score) in **Open positions → Entry Signal**.
+- **Continuous Multi-Source Alpha Signal Auto-Finder (`server/sniperManager.ts`, `server/routes/api.ts`, `PythonSniperView.tsx`)**:
+  - Upgraded `discoverAlphaSignals()` with automatic continuous background scanning across **PumpPortal WebSocket Curves**, **DexScreener Boosts**, and **GeckoTerminal Trending/New Momentum** pools using deterministic risk scoring (`riskScore 5–99`), configurable refresh interval (`alpha_signal_refresh_interval_sec`), persisted **Auto-Find**, **Auto-Snipe**, and **Jito Tip (SOL)** settings, plus real **`POST /api/sniper/alpha-signals/discover`** and **`POST /api/sniper/alpha-signals/snipe`** endpoints.
+
+---
+
 ## v1.45.0 — China & Alpha Signal Bot Tab & Fast-Lane Jito Feed
 
 **Risk Warning: Trading can lose all of your money.**

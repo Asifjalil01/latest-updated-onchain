@@ -94,6 +94,12 @@ CONFIG = {
     "smart_money_follow_older_coins": True,
     "smart_money_max_coin_age_hours": 72,
     "smart_money_prioritize_entries": True,
+    "alpha_signal_auto_find": True,
+    "alpha_signal_auto_snipe": True,
+    "alpha_signal_jito_tip_sol": 0.0005,
+    "alpha_signal_refresh_interval_sec": 10,
+    "alpha_signal_max_risk_score": 45,
+    "alpha_signal_min_real_sol": 1.5,
     "reused_socials_enabled": True,
     "max_social_reuse_count": 2,
     # Pro Desk — Group 2: Zero-Lag Exits & MEV / Wallet Sweep
@@ -713,6 +719,9 @@ _ws_smart_sells = {}
 _ws_smart_buys = {}           # mint -> set of tracked whale wallets
 _smart_buy_pending_mints = {} # mint -> ts
 _whale_held_eval_ts = {}      # mint -> last queued timestamp for passive whale holdings (60s cooldown)
+_ws_alpha_signals = {}        # mint -> latest alpha signal metadata dict
+_alpha_pending_mints = {}     # mint -> ts
+_alpha_pairs = {}             # mint -> cached pair payload from alpha signal
 _ws_feed_lock = threading.Lock()
 _last_ws_poll_ts = [0.0]
 
@@ -722,6 +731,7 @@ def _ingest_ws_bridge_payload(resp):
     now_ts = time.time()
     sb_added = 0
     wh_added = 0
+    al_added = 0
     with _ws_feed_lock:
         op = resp.get("open_prices")
         if isinstance(op, dict):
@@ -760,18 +770,48 @@ def _ingest_ws_bridge_payload(resp):
                         _whale_held_eval_ts[hmint] = now_ts
                         _smart_buy_pending_mints[hmint] = now_ts
                         wh_added += 1
+        al = resp.get("alpha_signals")
+        if isinstance(al, list):
+            for ev in al:
+                if not isinstance(ev, dict):
+                    continue
+                amint = str(ev.get("mint") or "").strip()
+                astat = str(ev.get("status") or "").strip().upper()
+                if amint and astat in ("AUTO_SNIPED", "READY", "MANUAL_QUEUED"):
+                    _ws_alpha_signals[amint] = {
+                        "mint": amint,
+                        "symbol": str(ev.get("symbol") or amint[:6]),
+                        "source": str(ev.get("source") or "Alpha Signal"),
+                        "realSol": float(ev.get("realSol") or 0.0),
+                        "devBuySol": float(ev.get("devBuySol") or 0.0),
+                        "riskScore": float(ev.get("riskScore") or 0.0),
+                        "status": astat,
+                    }
+                    _alpha_pending_mints[amint] = now_ts
+                    if isinstance(ev.get("pair"), dict):
+                        _alpha_pairs[amint] = ev["pair"]
+                    al_added += 1
         if len(_ws_smart_buys) > 1000:
             for k in list(_ws_smart_buys.keys())[:500]:
                 _ws_smart_buys.pop(k, None)
         if len(_whale_held_eval_ts) > 1000:
             for k in list(_whale_held_eval_ts.keys())[:500]:
                 _whale_held_eval_ts.pop(k, None)
+        if len(_ws_alpha_signals) > 500:
+            for k in list(_ws_alpha_signals.keys())[:250]:
+                _ws_alpha_signals.pop(k, None)
+        if len(_alpha_pairs) > 500:
+            for k in list(_alpha_pairs.keys())[:250]:
+                _alpha_pairs.pop(k, None)
         for k in [k for k, ts in _smart_buy_pending_mints.items() if now_ts - ts > 180.0]:
             _smart_buy_pending_mints.pop(k, None)
-    if sb_added or wh_added:
+        for k in [k for k, ts in _alpha_pending_mints.items() if now_ts - ts > 180.0]:
+            _alpha_pending_mints.pop(k, None)
+    if sb_added or wh_added or al_added:
         with _stats_lock:
             _stats["smart_buys"] = _stats.get("smart_buys", 0) + sb_added
             _stats["whale_held"] = _stats.get("whale_held", 0) + wh_added
+            _stats["alpha_signals"] = _stats.get("alpha_signals", 0) + al_added
 
 def _poll_ws_monitor_feed(cfg, force=False):
     if not opt_on(cfg, "ws_exit_stream_enabled", True) or not _bridge_base_url():
@@ -785,7 +825,8 @@ def _poll_ws_monitor_feed(cfg, force=False):
         return dict(_ws_open_prices), dict(_ws_smart_sells)
 
 def _src_pumpportal(cfg):
-    if not opt_on(cfg, "use_pumpportal", True) and _get_scan_mode(cfg) != "smart_money_only":
+    scan_mode = _get_scan_mode(cfg)
+    if not opt_on(cfg, "use_pumpportal", True) and scan_mode not in ("smart_money_only", "alpha_signal_only"):
         return []
     if _bridge_base_url():
         resp = bridge_get("/api/sniper/pumpportal-mints", timeout=4)
@@ -803,7 +844,7 @@ def _src_pumpportal(cfg):
                         _pumpportal_pairs.pop(k, None)
             if isinstance(resp.get("mints"), list):
                 return [m for m in resp["mints"] if isinstance(m, str) and m]
-    if _get_scan_mode(cfg) == "smart_money_only":
+    if scan_mode in ("smart_money_only", "alpha_signal_only"):
         return []
     data = get_json(f"{PUMPP}/coins/new")
     if not isinstance(data, list): return []
@@ -811,7 +852,7 @@ def _src_pumpportal(cfg):
 
 def _get_scan_mode(cfg):
     raw = str((cfg or {}).get("smart_money_scan_mode") or "both").strip().lower()
-    if raw in ("both", "smart_money_only", "sniper_only"):
+    if raw in ("both", "smart_money_only", "sniper_only", "alpha_signal_only"):
         return raw
     return "both"
 
@@ -826,7 +867,7 @@ SOURCES = [
 
 def fetch_candidate_mints(cfg, force=False):
     scan_mode = _get_scan_mode(cfg)
-    active_sources = [("pumpportal", 1.5, _src_pumpportal)] if scan_mode == "smart_money_only" else SOURCES
+    active_sources = [("pumpportal", 1.5, _src_pumpportal)] if scan_mode in ("smart_money_only", "alpha_signal_only") else SOURCES
     by_src = {}
     lock = threading.Lock()
     def run(name, cd, fn):
@@ -852,10 +893,22 @@ def fetch_candidate_mints(cfg, force=False):
     for t in ths: t.start()
     for t in ths: t.join(timeout=5)
     smart_priority = []
+    alpha_priority = []
     with _ws_feed_lock:
-        if _smart_buy_pending_mints:
+        if _smart_buy_pending_mints and scan_mode not in ("sniper_only", "alpha_signal_only"):
             smart_priority = list(_smart_buy_pending_mints.keys())
             _smart_buy_pending_mints.clear()
+        if _alpha_pending_mints and scan_mode not in ("sniper_only", "smart_money_only"):
+            alpha_priority = list(_alpha_pending_mints.keys())
+            _alpha_pending_mints.clear()
+    if scan_mode == "alpha_signal_only":
+        ordered_mints = []
+        for m in alpha_priority:
+            if isinstance(m, str) and 39 <= len(m) <= 50 and m not in ordered_mints:
+                ordered_mints.append(m)
+                _src_of[m] = "alpha_signal"
+        _src_stats["alpha_signal"] = {"items": len(ordered_mints), "ok_at": time.time()}
+        return ordered_mints
     if scan_mode == "smart_money_only":
         ordered_mints = []
         for m in smart_priority:
@@ -864,7 +917,7 @@ def fetch_candidate_mints(cfg, force=False):
                 _src_of[m] = "smart_money"
         _src_stats["smart_money"] = {"items": len(ordered_mints), "ok_at": time.time()}
         return ordered_mints
-    # Prioritize real-time smart-wallet signals & launch streams ahead of older lists
+    # Prioritize real-time smart-wallet signals, alpha signals & launch streams ahead of older lists
     ordered_mints = []
     seen_batch = set()
     for m in smart_priority:
@@ -873,12 +926,21 @@ def fetch_candidate_mints(cfg, force=False):
             ordered_mints.append(m)
             if m not in _src_of:
                 _src_of[m] = "smart_money"
+    for m in alpha_priority:
+        if isinstance(m, str) and 39 <= len(m) <= 50 and m not in seen_batch:
+            seen_batch.add(m)
+            ordered_mints.append(m)
+            if m not in _src_of:
+                _src_of[m] = "alpha_signal"
     for src_name in ("pumpportal", "gecko", "dex_age_gap", "profiles", "jup", "boosts"):
         for m in by_src.get(src_name, []):
             if m not in seen_batch:
                 seen_batch.add(m)
                 ordered_mints.append(m)
     fresh = _fresh_only(ordered_mints)
+    for m in alpha_priority:
+        if m in seen_batch and m not in fresh:
+            fresh.insert(0, m)
     for m in smart_priority:
         if m in seen_batch and m not in fresh:
             fresh.insert(0, m)
@@ -1046,11 +1108,15 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
     src_hint = source if source is not None else _src_of.get(mint_addr, "")
     scan_mode = _get_scan_mode(cfg)
     sb_hits = pair.get("_smart_buyers") if isinstance(pair.get("_smart_buyers"), list) else _get_pair_smart_buyers(pair, pair.get("_rep"), cfg)
+    alpha_sig = pair.get("_alpha_signal") if isinstance(pair.get("_alpha_signal"), dict) else _get_pair_alpha_signal(pair, cfg)
+    if scan_mode == "alpha_signal_only" and not alpha_sig:
+        return False, "not alpha signal", "alpha_signal_only requires Alpha Signal trigger"
     if scan_mode == "smart_money_only" and not sb_hits:
         return False, "not whale buy", "smart_money_only requires tracked whale wallet"
     whale_older_ok = bool(sb_hits) and (
         opt_on(cfg, "smart_money_follow_older_coins", True) or scan_mode == "smart_money_only"
     )
+    alpha_age_ok = bool(alpha_sig) and scan_mode == "alpha_signal_only"
     ok_plat, plat_detail = matches_enabled_platforms(pair, mint_addr, src_hint, cfg)
     if not ok_plat:
         return False, "wrong website", plat_detail
@@ -1067,6 +1133,9 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
         max_whale_h = max(0.0, float(cfg.get("smart_money_max_coin_age_hours", 72) or 0.0))
         if max_whale_h > 0.0 and age_s > max_whale_h * 3600.0:
             return False, "too old (whale cap)", f"{age_s / 3600:.1f}h > {max_whale_h:g}h whale cap"
+    elif alpha_age_ok:
+        if age_s > 24 * 3600.0:
+            return False, "too old (alpha cap)", f"{age_s / 3600:.1f}h > 24h alpha cap"
     else:
         if opt_on(cfg, "min_age_minutes", False):
             min_age_m = max(0.0, float(cfg.get("min_age_minutes", 0.0) or 0.0))
@@ -1255,11 +1324,17 @@ def score_candidate(pair, cfg, now_ms=None):
 
     freshness = max(0.0, 1.0 - min(1.0, age_s / max_age_s)) * 20.0
     smart_bonus = 0.0
-    if opt_on(cfg, "smart_money_prioritize_entries", True) and opt_on(cfg, "smart_money_enabled", True):
+    scan_mode = _get_scan_mode(cfg)
+    if scan_mode not in ("sniper_only", "alpha_signal_only") and opt_on(cfg, "smart_money_prioritize_entries", True) and opt_on(cfg, "smart_money_enabled", True):
         sb = pair.get("_smart_buyers") if isinstance(pair.get("_smart_buyers"), list) else _get_pair_smart_buyers(pair, pair.get("_rep"), cfg)
         if sb:
             smart_bonus = 150.0 * len(sb)
-    score = (ratio * 20.0) + (turnover * 15.0) + vel_bonus + freshness + min(15.0, buys * 0.25) + smart_bonus
+    alpha_bonus = 0.0
+    if scan_mode in ("both", "alpha_signal_only"):
+        al = pair.get("_alpha_signal") if isinstance(pair.get("_alpha_signal"), dict) else _get_pair_alpha_signal(pair, cfg)
+        if al:
+            alpha_bonus = max(20.0, 120.0 - float(al.get("riskScore") or 30.0))
+    score = (ratio * 20.0) + (turnover * 15.0) + vel_bonus + freshness + min(15.0, buys * 0.25) + smart_bonus + alpha_bonus
     return round(score, 4)
 
 def rank_candidates(items, cfg, now_ms=None):
@@ -2112,9 +2187,22 @@ def _analyze_sybil_funders(mint, rep, cfg):
     res = _analyze_sybil_details(mint, rep, cfg)
     return res["shared_cnt"], res["shared_funder"]
 
+def _get_pair_alpha_signal(pair, cfg):
+    scan_mode = _get_scan_mode(cfg)
+    if scan_mode in ("sniper_only", "smart_money_only"):
+        return None
+    if isinstance((pair or {}).get("_alpha_signal"), dict):
+        return pair["_alpha_signal"]
+    mint_addr = str(((pair or {}).get("baseToken") or {}).get("address") or "").strip()
+    if not mint_addr:
+        return None
+    with _ws_feed_lock:
+        sig = _ws_alpha_signals.get(mint_addr)
+        return dict(sig) if isinstance(sig, dict) else None
+
 def _get_pair_smart_buyers(pair, rep, cfg):
     scan_mode = _get_scan_mode(cfg)
-    if scan_mode == "sniper_only":
+    if scan_mode in ("sniper_only", "alpha_signal_only"):
         return []
     if scan_mode != "smart_money_only" and not opt_on(cfg, "smart_money_enabled", True):
         return []
@@ -2991,6 +3079,9 @@ class TradingAccount:
                 "creator_fast_rug_min": meta.get("creator_fast_rug_min"),
                 "smart_money_entry": smart_entry,
                 "smart_wallets_hit": smart_hits,
+                "alpha_signal_entry": bool(meta.get("alpha_signal_entry")),
+                "alpha_source": meta.get("alpha_source") or "",
+                "alpha_risk_score": meta.get("alpha_risk_score"),
                 "age_at_entry": round(meta.get("age_s", 0), 1),
                 "entry_liquidity_usd": meta.get("liquidity_usd"),
                 "current_liquidity_usd": meta.get("liquidity_usd"),
@@ -3581,7 +3672,7 @@ PaperAccount = TradingAccount
 
 # ---------------------------------------------------------------- scan / monitor
 _stats_lock = threading.Lock()
-_stats = {"since": time.time(), "cands": 0, "no_pair": 0, "checked": 0, "rejects": {}, "rug": 0, "bought": 0, "smart_buys": 0, "whale_held": 0}
+_stats = {"since": time.time(), "cands": 0, "no_pair": 0, "checked": 0, "rejects": {}, "rug": 0, "bought": 0, "smart_buys": 0, "whale_held": 0, "alpha_signals": 0}
 _last_block_log = [0.0]
 _last_rescan_delay_log = [0.0]
 _last_smart_decision_log = {}
@@ -3591,12 +3682,18 @@ def _maybe_summary():
         if time.time() - _stats["since"] < 60: return
         cands, no_pair, checked = _stats["cands"], _stats["no_pair"], _stats["checked"]
         rejects, rug, bought = dict(_stats["rejects"]), _stats["rug"], _stats["bought"]
-        sb_cnt, wh_cnt = _stats.get("smart_buys", 0), _stats.get("whale_held", 0)
+        sb_cnt, wh_cnt, al_cnt = _stats.get("smart_buys", 0), _stats.get("whale_held", 0), _stats.get("alpha_signals", 0)
         src_bits = [f"{n}={v.get('items', 0)}{'*' if time.time() - v.get('ok_at', 0) > 120 else ''}"
                     for n, v in sorted(_src_stats.items())]
-        _stats.update({"since": time.time(), "cands": 0, "no_pair": 0, "checked": 0, "rejects": {}, "rug": 0, "bought": 0, "smart_buys": 0, "whale_held": 0})
+        _stats.update({"since": time.time(), "cands": 0, "no_pair": 0, "checked": 0, "rejects": {}, "rug": 0, "bought": 0, "smart_buys": 0, "whale_held": 0, "alpha_signals": 0})
     rej_txt = " ".join(f"{k}:{v}" for k, v in sorted(rejects.items(), key=lambda kv: -kv[1]))
-    if _get_scan_mode(CONFIG) == "smart_money_only":
+    scan_mode = _get_scan_mode(CONFIG)
+    if scan_mode == "alpha_signal_only":
+        log(f"[AlphaSignal] scan summary (60s): signals-received={al_cnt} candidates={cands} not-on-dex={no_pair} evaluated={checked} rejected[{rej_txt or '-'}] rug={rug} BOUGHT={bought}")
+        if cands == 0:
+            log("[AlphaSignal] Auto-finder listening on PumpPortal WS + DexScreener Boosts + Gecko Momentum — waiting for next qualifying signal...")
+        return
+    if scan_mode == "smart_money_only":
         watched = len(CONFIG.get("smart_wallets") or [])
         max_h = max(0.0, float(CONFIG.get("smart_money_max_coin_age_hours", 72) or 0.0))
         age_txt = "any" if max_h <= 0 else f"{max_h:g}h"
@@ -3703,6 +3800,10 @@ def scan_and_buy(acct, cfg):
             ppp = _pumpportal_pairs[mint]
             liq = _f((ppp.get("liquidity") or {}).get("usd")) or 0.0
             pairs[mint] = (liq, ppp)
+        elif mint not in pairs and mint in _alpha_pairs:
+            alp = _alpha_pairs[mint]
+            liq = _f((alp.get("liquidity") or {}).get("usd")) or 0.0
+            pairs[mint] = (liq, alp)
         elif mint not in pairs and mint in _gecko_pairs:
             gp = _gecko_pairs[mint]
             liq = _f((gp.get("liquidity") or {}).get("usd")) or 0.0
@@ -3731,6 +3832,9 @@ def scan_and_buy(acct, cfg):
         sb_hits = _get_pair_smart_buyers(pair, pair.get("_rep"), cfg)
         if sb_hits:
             pair["_smart_buyers"] = sb_hits
+        alpha_sig = _get_pair_alpha_signal(pair, cfg)
+        if alpha_sig:
+            pair["_alpha_signal"] = alpha_sig
         symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
         okp, code, detail = passes_filters(pair, cfg, now_ms, source=_src_of.get(mint, ""))
         with _stats_lock: _stats["checked"] += 1
@@ -3739,7 +3843,15 @@ def scan_and_buy(acct, cfg):
                 with _seen_lock:
                     _too_old_mints[mint] = time.time()
             with _stats_lock: _stats["rejects"][code] = _stats["rejects"].get(code, 0) + 1
-            if sb_hits:
+            if alpha_sig and _get_scan_mode(cfg) == "alpha_signal_only":
+                dkey = f"alpha:{mint}:{code}"
+                now_log = time.time()
+                if now_log - _last_smart_decision_log.get(dkey, 0.0) >= 60.0:
+                    _last_smart_decision_log[dkey] = now_log
+                    if len(_last_smart_decision_log) > 500:
+                        _last_smart_decision_log.clear()
+                    log(f"⚡ [AlphaSignal] – {symbol} ({mint[:6]}..) skipped: {code} ({detail})")
+            elif sb_hits:
                 dkey = f"{mint}:{code}"
                 now_log = time.time()
                 if now_log - _last_smart_decision_log.get(dkey, 0.0) >= 60.0:
@@ -3828,8 +3940,13 @@ def scan_and_buy(acct, cfg):
             for w in (pair.get("_smart_buyers") if isinstance(pair.get("_smart_buyers"), list) else [])
             if str(w).strip()
         ))
+        alpha_sig = pair.get("_alpha_signal") if isinstance(pair.get("_alpha_signal"), dict) else _get_pair_alpha_signal(pair, cfg)
+        if _get_scan_mode(cfg) == "alpha_signal_only" and not alpha_sig:
+            continue
         if _get_scan_mode(cfg) == "smart_money_only" and not smart_buyers:
             continue
+        if alpha_sig:
+            log(f"⚡ [AlphaSignal] {alpha_sig.get('source', 'Alpha Signal')} triggered {symbol} (risk={int(float(alpha_sig.get('riskScore') or 0))}/100) — entering trade")
         if smart_buyers:
             log(f"🐋 [SmartMoney] {len(smart_buyers)} tracked whale(s) buying {symbol} ({smart_buyers[0][:6]}...) — prioritizing entry")
         conv_mult = _evaluate_conviction_mult(pair, cfg, len(smart_buyers))
@@ -3841,7 +3958,7 @@ def scan_and_buy(acct, cfg):
         c_addr = pair.get("_creator") or c_stats.get("creator") or pp_dict.get("creator") or ""
         meta = {
             "dex": pair.get("dexId") or "?",
-            "source": _src_of.get(mint, "?"),
+            "source": "alpha_signal" if alpha_sig else _src_of.get(mint, "?"),
             "creator": c_addr,
             "creator_launches": c_stats.get("total_launches"),
             "creator_prior_launches": c_stats.get("prior_launches"),
@@ -3849,6 +3966,9 @@ def scan_and_buy(acct, cfg):
             "creator_fast_rug_min": c_stats.get("fast_rug_min"),
             "smart_wallets_hit": smart_buyers,
             "smart_money_entry": bool(smart_buyers),
+            "alpha_signal_entry": bool(alpha_sig),
+            "alpha_source": (alpha_sig or {}).get("source", ""),
+            "alpha_risk_score": (alpha_sig or {}).get("riskScore"),
             "age_s": age_s,
             "liquidity_usd": liq_usd,
             "real_sol": _f(pp_dict.get("real_sol")),
@@ -4244,7 +4364,11 @@ def run(once=False):
             t_sz = float(CONFIG.get("trade_size_usd", 5.0) or 5.0) if opt_on(CONFIG, "trade_size_usd", True) else 5.0
             log(f"Wallet balance: {float(bal_sol):.4f} SOL (${float(bal_usd):.2f}) | trade size ${t_sz:.2f}")
     scan_mode_banner = _get_scan_mode(CONFIG)
-    if scan_mode_banner == "smart_money_only":
+    if scan_mode_banner == "alpha_signal_only":
+        al_refresh = int(CONFIG.get("alpha_signal_refresh_interval_sec", 10) or 10)
+        al_tip = float(CONFIG.get("alpha_signal_jito_tip_sol", 0.0005) or 0.0005)
+        log(f"Strategy: ALPHA SIGNALS ONLY (alpha_signal_only) | Auto-Finding China/Asia WS + Boost + Momentum Signals (refresh {al_refresh}s, Jito tip {al_tip:g} SOL) · Ignores Whale Wallets & Random Sniper Launches{sol_banner}")
+    elif scan_mode_banner == "smart_money_only":
         w_cnt = len(CONFIG.get("smart_wallets") or [])
         log(f"Strategy: WHALE WALLETS ONLY (smart_money_only) | Watching {w_cnt} tracked whale wallet(s) · PumpPortal Account WS + On-Chain Holdings{sol_banner}")
     else:
@@ -4282,7 +4406,10 @@ def run(once=False):
     liq_banner = float(CONFIG.get("min_liquidity_usd", 5000) or 0) if opt_on(CONFIG, "min_liquidity_usd", True) else 0
     pump_banner = f"+{float(CONFIG.get('max_price_change_m5_pct', 250) or 0):.0f}%" if opt_on(CONFIG, "max_price_change_m5_pct", True) else "OFF"
     creator_banner = f"owner-chk={'ON' if opt_on(CONFIG, 'check_creator_history', True) else 'OFF'}"
-    if scan_mode_banner == "smart_money_only":
+    if scan_mode_banner == "alpha_signal_only":
+        al_risk = int(CONFIG.get("alpha_signal_max_risk_score", 45) or 45)
+        log(f"Alpha Rules: {exit_banner} | max-risk<={al_risk}/100 | liq>=${liq_banner:.0f} | pump cap {pump_banner} | rug={'ON' if opt_on(CONFIG, 'use_rugcheck', True) else 'OFF'} | {creator_banner}")
+    elif scan_mode_banner == "smart_money_only":
         whale_h = max(0.0, float(CONFIG.get("smart_money_max_coin_age_hours", 72) or 0.0))
         whale_age_txt = "Any age" if whale_h <= 0 else f"<={whale_h:g}h"
         log(f"Whale Rules: {exit_banner} | coin-age {whale_age_txt} | liq>=${liq_banner:.0f} | pump cap {pump_banner} | rug={'ON' if opt_on(CONFIG, 'use_rugcheck', True) else 'OFF'} | {creator_banner}")

@@ -95,6 +95,9 @@ interface SniperPosition {
     winRate?: number;
     source?: string;
   }>;
+  alpha_signal_entry?: boolean;
+  alpha_source?: string;
+  alpha_risk_score?: number;
 }
 
 interface SniperLiveWallet {
@@ -158,6 +161,12 @@ const PYTHON_PRO_DESK_KEYS: Array<[string, 'bool' | 'int' | 'float' | 'string' |
   ['smart_money_prioritize_entries', 'bool'],
   ['smart_money_follow_older_coins', 'bool'],
   ['smart_money_max_coin_age_hours', 'int'],
+  ['alpha_signal_auto_find', 'bool'],
+  ['alpha_signal_auto_snipe', 'bool'],
+  ['alpha_signal_jito_tip_sol', 'float'],
+  ['alpha_signal_refresh_interval_sec', 'int'],
+  ['alpha_signal_max_risk_score', 'int'],
+  ['alpha_signal_min_real_sol', 'float'],
   ['reused_socials_enabled', 'bool'],
   ['max_social_reuse_count', 'int'],
   ['ws_exit_stream_enabled', 'bool'],
@@ -484,18 +493,39 @@ export function PythonSniperView() {
   const [exportingCsv, setExportingCsv] = useState(false);
   const [clearingLogs, setClearingLogs] = useState(false);
   const [activeTab, setActiveTab] = useState<'positions' | 'history' | 'smart_money' | 'alpha_signals' | 'logs' | 'settings' | 'pro_desk'>('positions');
-  const [alphaSignals, setAlphaSignals] = useState<Array<{ id: string; mint: string; symbol: string; name: string; source: string; realSol: number; devBuySol: number; riskScore: number; timestamp: string; status: 'AUTO_SNIPED' | 'PENDING' | 'SKIPPED' }>>([]);
+  const [alphaSignals, setAlphaSignals] = useState<Array<{
+    id: string;
+    mint: string;
+    symbol: string;
+    name: string;
+    source: string;
+    channelType?: string;
+    realSol: number;
+    liquidityUsd?: number;
+    devBuySol: number;
+    buys5m?: number;
+    sells5m?: number;
+    riskScore: number;
+    timestamp: string;
+    status: 'AUTO_SNIPED' | 'READY' | 'PENDING' | 'SKIPPED';
+  }>>([]);
   const [alphaLoading, setAlphaLoading] = useState(false);
-  const [alphaAutoSnipe, setAlphaAutoSnipe] = useState(true);
-  const [alphaJitoTip, setAlphaJitoTip] = useState(0.0005);
+  const [alphaLastScanAt, setAlphaLastScanAt] = useState<number | null>(null);
 
-  const fetchAlphaSignals = async () => {
+  const fetchAlphaSignals = async (discoverNow = false) => {
     try {
       setAlphaLoading(true);
-      const res = await fetch('/api/sniper/alpha-signals', { headers: apiToken ? { 'x-api-token': apiToken } : {} });
-      const data = await res.json();
+      const url = discoverNow ? '/api/sniper/alpha-signals/discover' : '/api/sniper/alpha-signals';
+      const data = await apiFetch<any>(
+        url,
+        discoverNow ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) } : undefined
+      );
       if (data?.ok && Array.isArray(data.signals)) {
         setAlphaSignals(data.signals);
+        if (typeof data.lastScanAtMs === 'number') setAlphaLastScanAt(data.lastScanAtMs);
+        if (discoverNow && typeof data.added === 'number' && data.added > 0) {
+          pushToast({ kind: 'success', title: `Auto-finder found ${data.added} new Alpha Signal(s)` });
+        }
       }
     } catch {} finally {
       setAlphaLoading(false);
@@ -503,19 +533,19 @@ export function PythonSniperView() {
   };
 
   useEffect(() => {
-    void fetchAlphaSignals();
+    void fetchAlphaSignals(activeTab === 'alpha_signals');
     const t = setInterval(() => {
-      void fetchAlphaSignals();
-    }, 4000);
+      void fetchAlphaSignals(activeTab === 'alpha_signals');
+    }, activeTab === 'alpha_signals' ? 4000 : 8000);
     return () => clearInterval(t);
-  }, []);
+  }, [activeTab]);
   const [historySearch, setHistorySearch] = useState('');
   const [newSmartWalletInput, setNewSmartWalletInput] = useState('');
   const [smartWalletSearch, setSmartWalletSearch] = useState('');
   const [smartWalletProfiles, setSmartWalletProfiles] = useState<Record<string, SmartWalletProfile>>({});
   const [showStartModal, setShowStartModal] = useState(false);
   const [startSmartMoneyFollow, setStartSmartMoneyFollow] = useState(true);
-  const [startScanMode, setStartScanMode] = useState<'both' | 'smart_money_only' | 'sniper_only'>('both');
+  const [startScanMode, setStartScanMode] = useState<'both' | 'smart_money_only' | 'sniper_only' | 'alpha_signal_only'>('both');
   const [savingSmartConfig, setSavingSmartConfig] = useState(false);
   const [discoveringWhales, setDiscoveringWhales] = useState(false);
   const [discoveredWhales, setDiscoveredWhales] = useState<Array<{
@@ -663,6 +693,18 @@ export function PythonSniperView() {
         nextDraft.option_enabled = {
           ...(nextDraft.option_enabled || {}),
           smart_money_follow_older_coins: patch.smart_money_follow_older_coins,
+        };
+      }
+      if (typeof patch.alpha_signal_auto_find === 'boolean') {
+        nextDraft.option_enabled = {
+          ...(nextDraft.option_enabled || {}),
+          alpha_signal_auto_find: patch.alpha_signal_auto_find,
+        };
+      }
+      if (typeof patch.alpha_signal_auto_snipe === 'boolean') {
+        nextDraft.option_enabled = {
+          ...(nextDraft.option_enabled || {}),
+          alpha_signal_auto_snipe: patch.alpha_signal_auto_snipe,
         };
       }
       const data = await apiFetch<any>('/api/sniper/settings', {
@@ -1348,12 +1390,15 @@ export function PythonSniperView() {
               } else {
                 const curScanMode =
                   draftSettings.smart_money_scan_mode === 'smart_money_only' ||
-                  draftSettings.smart_money_scan_mode === 'sniper_only'
+                  draftSettings.smart_money_scan_mode === 'sniper_only' ||
+                  draftSettings.smart_money_scan_mode === 'alpha_signal_only'
                     ? draftSettings.smart_money_scan_mode
                     : 'both';
                 setStartScanMode(curScanMode);
                 setStartSmartMoneyFollow(
-                  curScanMode === 'sniper_only' ? false : Boolean(draftSettings.smart_money_enabled !== false)
+                  curScanMode === 'sniper_only' || curScanMode === 'alpha_signal_only'
+                    ? false
+                    : Boolean(draftSettings.smart_money_enabled !== false)
                 );
                 setShowStartModal(true);
               }
@@ -1819,6 +1864,24 @@ export function PythonSniperView() {
                                 </div>
                               );
                             }
+                            if (p.alpha_signal_entry) {
+                              return (
+                                <div className="space-y-0.5">
+                                  <span
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30 text-[10px] font-bold"
+                                    title={`Bought from Alpha Signal: ${p.alpha_source || 'Alpha Stream'}${typeof p.alpha_risk_score === 'number' ? ` (Risk ${p.alpha_risk_score}/100)` : ''}`}
+                                  >
+                                    <Zap className="w-3 h-3 shrink-0" />
+                                    <span>Alpha Signal</span>
+                                  </span>
+                                  {p.alpha_source && (
+                                    <span className="block text-[10px] text-slate-500 dark:text-slate-400 truncate max-w-[140px]" title={p.alpha_source}>
+                                      {p.alpha_source}
+                                    </span>
+                                  )}
+                                </div>
+                              );
+                            }
                             return (
                               <span
                                 className="inline-block px-1.5 py-0.5 rounded bg-slate-500/10 text-slate-500 dark:text-slate-400 border border-slate-500/20 text-[10px] font-medium"
@@ -1975,16 +2038,20 @@ export function PythonSniperView() {
             <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 space-y-1.5">
               <span className="text-[11px] font-mono text-slate-500 uppercase font-semibold block">Active Scan Mode</span>
               <div className="text-base font-bold font-mono text-teal-600 dark:text-teal-400">
-                {draftSettings.smart_money_scan_mode === 'smart_money_only'
-                  ? 'Whale Wallets Only'
-                  : draftSettings.smart_money_scan_mode === 'sniper_only'
-                    ? 'Sniper Bot Only'
-                    : 'Both (Sniper + Whales)'}
+                {draftSettings.smart_money_scan_mode === 'alpha_signal_only'
+                  ? 'Alpha Signals Only'
+                  : draftSettings.smart_money_scan_mode === 'smart_money_only'
+                    ? 'Whale Wallets Only'
+                    : draftSettings.smart_money_scan_mode === 'sniper_only'
+                      ? 'Sniper Bot Only'
+                      : 'Both (Sniper + Whales)'}
               </div>
               <p className="text-[11px] text-slate-500">
-                {draftSettings.smart_money_follow_older_coins !== false
-                  ? `Follows whale coins up to ${Number(draftSettings.smart_money_max_coin_age_hours ?? 72) || '∞'}h old`
-                  : 'New launches only'}
+                {draftSettings.smart_money_scan_mode === 'alpha_signal_only'
+                  ? 'Locked to Alpha Signals Only (Whales & Sniper paused)'
+                  : draftSettings.smart_money_follow_older_coins !== false
+                    ? `Follows whale coins up to ${Number(draftSettings.smart_money_max_coin_age_hours ?? 72) || '∞'}h old`
+                    : 'New launches only'}
               </p>
             </div>
 
@@ -2037,19 +2104,21 @@ export function PythonSniperView() {
                   <select
                     value={String(draftSettings.smart_money_scan_mode || 'both')}
                     onChange={(e) => {
-                      const nextMode = e.target.value as 'both' | 'smart_money_only' | 'sniper_only';
-                      const enabledFlag = nextMode !== 'sniper_only';
+                      const nextMode = e.target.value as 'both' | 'smart_money_only' | 'sniper_only' | 'alpha_signal_only';
+                      const patch: Record<string, any> = { smart_money_scan_mode: nextMode };
+                      if (nextMode !== 'alpha_signal_only') {
+                        patch.smart_money_enabled = nextMode !== 'sniper_only';
+                      }
                       void saveQuickSniperSettings(
-                        {
-                          smart_money_scan_mode: nextMode,
-                          smart_money_enabled: enabledFlag,
-                        },
+                        patch,
                         `Scan mode set to ${
-                          nextMode === 'smart_money_only'
-                            ? 'Whale Wallets Only'
-                            : nextMode === 'sniper_only'
-                              ? 'Sniper Bot Only'
-                              : 'Both (Sniper + Whales)'
+                          nextMode === 'alpha_signal_only'
+                            ? 'Alpha Signals Only'
+                            : nextMode === 'smart_money_only'
+                              ? 'Whale Wallets Only'
+                              : nextMode === 'sniper_only'
+                                ? 'Sniper Bot Only'
+                                : 'Both (Sniper + Whales)'
                         }`
                       );
                     }}
@@ -2059,6 +2128,7 @@ export function PythonSniperView() {
                     <option value="both">Both (Sniper + Whales)</option>
                     <option value="smart_money_only">Whale Wallets Only</option>
                     <option value="sniper_only">Sniper Bot Only</option>
+                    <option value="alpha_signal_only">Alpha Signals Only</option>
                   </select>
                 </div>
 
@@ -2722,34 +2792,129 @@ export function PythonSniperView() {
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D131F] p-6 space-y-6 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-100 dark:border-slate-800">
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <Zap className="w-5 h-5 text-amber-500" />
-                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">China &amp; Alpha Signal Bot Stream</h3>
+                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">China &amp; Alpha Signal Bot Stream (Auto-Finder)</h3>
+                <span
+                  className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                    draftSettings.smart_money_scan_mode === 'alpha_signal_only'
+                      ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/30'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-500 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {draftSettings.smart_money_scan_mode === 'alpha_signal_only'
+                    ? 'MODE: ALPHA SIGNALS ONLY (ISOLATED)'
+                    : `MODE: ${String(draftSettings.smart_money_scan_mode || 'both').toUpperCase()}`}
+                </span>
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                High-speed WebSocket &amp; Telegram Alpha channel signal monitor (<span className="font-mono text-amber-600 dark:text-amber-400">&lt;200ms Jito Fast-Lane</span>). Automatically intercepts newly deployed bonding curves and executes instant anti-rug checks.
+                Continuously auto-finds high-velocity alpha signals across PumpPortal WS curves (<span className="font-mono text-amber-600 dark:text-amber-400">&lt;200ms</span>), DexScreener Boosts, and GeckoTerminal Momentum pools. Selecting <span className="font-semibold text-amber-500">Alpha Signals Only</span> trades only these signals without touching Whale Wallets or Sniper launches.
               </p>
             </div>
-            <div className="flex flex-wrap items-center gap-3">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <button
+                type="button"
+                disabled={savingSmartConfig}
+                onClick={() => {
+                  const isAlphaOnly = draftSettings.smart_money_scan_mode === 'alpha_signal_only';
+                  const nextMode = isAlphaOnly ? 'both' : 'alpha_signal_only';
+                  void saveQuickSniperSettings(
+                    {
+                      smart_money_scan_mode: nextMode,
+                      ...(nextMode === 'alpha_signal_only' ? { alpha_signal_auto_find: true } : {}),
+                    },
+                    nextMode === 'alpha_signal_only'
+                      ? 'Bot locked to Alpha Signals Only (Whales & Sniper paused)'
+                      : 'Switched back to Both (Sniper + Whales)'
+                  );
+                }}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                  draftSettings.smart_money_scan_mode === 'alpha_signal_only'
+                    ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/40'
+                    : 'bg-slate-50 dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-amber-500/40'
+                }`}
+              >
+                {draftSettings.smart_money_scan_mode === 'alpha_signal_only'
+                  ? '✓ Alpha Signals Only Active'
+                  : 'Switch to Alpha Signals Only'}
+              </button>
+
               <label className="flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs">
                 <input
                   type="checkbox"
-                  checked={alphaAutoSnipe}
-                  onChange={(e) => setAlphaAutoSnipe(e.target.checked)}
+                  checked={Boolean(draftSettings.alpha_signal_auto_find !== false)}
+                  onChange={(e) =>
+                    void saveQuickSniperSettings(
+                      { alpha_signal_auto_find: e.target.checked },
+                      e.target.checked ? 'Alpha Signal Auto-Finder enabled' : 'Alpha Signal Auto-Finder paused'
+                    )
+                  }
+                  disabled={savingSmartConfig}
                   className="rounded border-slate-300 text-amber-600 focus:ring-amber-500 w-4 h-4 cursor-pointer"
                 />
-                <span className="font-semibold text-slate-700 dark:text-slate-300">Auto-Snipe Signals</span>
+                <span className="font-semibold text-slate-700 dark:text-slate-300">Auto-Find Signals</span>
               </label>
 
-              <div className="flex items-center gap-1.5 px-3 py-1 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs">
+              <label className="flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs">
+                <input
+                  type="checkbox"
+                  checked={Boolean(draftSettings.alpha_signal_auto_snipe !== false)}
+                  onChange={(e) =>
+                    void saveQuickSniperSettings(
+                      { alpha_signal_auto_snipe: e.target.checked },
+                      e.target.checked ? 'Auto-Snipe Alpha Signals enabled' : 'Auto-Snipe Alpha Signals paused'
+                    )
+                  }
+                  disabled={savingSmartConfig}
+                  className="rounded border-slate-300 text-amber-600 focus:ring-amber-500 w-4 h-4 cursor-pointer"
+                />
+                <span className="font-semibold text-slate-700 dark:text-slate-300">Auto-Snipe</span>
+              </label>
+
+              <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs">
+                <span className="text-slate-500 font-medium">Refresh (s):</span>
+                <input
+                  type="number"
+                  min={5}
+                  max={300}
+                  step={5}
+                  value={draftSettings.alpha_signal_refresh_interval_sec ?? 10}
+                  onChange={(e) => {
+                    const val = Math.max(5, Math.min(300, parseInt(e.target.value || '10', 10) || 10));
+                    setDraftSettings({ ...draftSettings, alpha_signal_refresh_interval_sec: val });
+                    markSettingsDirty(true);
+                  }}
+                  onBlur={() => {
+                    if (isSettingsDirty) {
+                      void saveQuickSniperSettings({
+                        alpha_signal_refresh_interval_sec: Number(draftSettings.alpha_signal_refresh_interval_sec ?? 10),
+                      });
+                    }
+                  }}
+                  className="w-14 bg-white dark:bg-slate-800 px-1.5 py-0.5 rounded font-mono font-bold text-slate-800 dark:text-slate-100 focus:outline-none"
+                />
+              </div>
+
+              <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs">
                 <span className="text-slate-500 font-medium">Jito Tip (SOL):</span>
                 <input
                   type="number"
                   min={0}
                   max={0.01}
                   step={0.0001}
-                  value={alphaJitoTip}
-                  onChange={(e) => setAlphaJitoTip(parseFloat(e.target.value || '0.0005') || 0.0005)}
+                  value={draftSettings.alpha_signal_jito_tip_sol ?? 0.0005}
+                  onChange={(e) => {
+                    const val = Math.max(0, Math.min(0.01, parseFloat(e.target.value || '0.0005') || 0));
+                    setDraftSettings({ ...draftSettings, alpha_signal_jito_tip_sol: val });
+                    markSettingsDirty(true);
+                  }}
+                  onBlur={() => {
+                    if (isSettingsDirty) {
+                      void saveQuickSniperSettings({
+                        alpha_signal_jito_tip_sol: Number(draftSettings.alpha_signal_jito_tip_sol ?? 0.0005),
+                      });
+                    }
+                  }}
                   className="w-20 bg-white dark:bg-slate-800 px-2 py-0.5 rounded font-mono font-bold text-slate-800 dark:text-slate-100 focus:outline-none"
                 />
               </div>
@@ -2757,20 +2922,31 @@ export function PythonSniperView() {
               <button
                 type="button"
                 disabled={alphaLoading}
-                onClick={() => void fetchAlphaSignals()}
+                onClick={() => void fetchAlphaSignals(true)}
                 className="px-3.5 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold inline-flex items-center gap-1.5 shadow-sm disabled:opacity-50"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${alphaLoading ? 'animate-spin' : ''}`} />
-                <span>Refresh Signals</span>
+                <span>{alphaLoading ? 'Finding Signals...' : 'Auto-Find Signals Now'}</span>
               </button>
             </div>
           </div>
 
+          {alphaLastScanAt && (
+            <div className="text-[11px] font-mono text-slate-500 flex items-center justify-between">
+              <span>
+                Showing {alphaSignals.length} auto-discovered alpha signal(s) · Last multi-source scan: {new Date(alphaLastScanAt).toLocaleTimeString()}
+              </span>
+              <span>
+                Auto-Snipe qualifies: Risk &le; {Number(draftSettings.alpha_signal_max_risk_score ?? 45)}/100 · Depth &ge; {Number(draftSettings.alpha_signal_min_real_sol ?? 1.5)} SOL
+              </span>
+            </div>
+          )}
+
           {alphaSignals.length === 0 ? (
             <div className="py-16 text-center text-xs text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 rounded-xl space-y-2">
-              <p className="font-semibold text-slate-700 dark:text-slate-300">Listening to China &amp; Alpha Telegram / WS feeds...</p>
+              <p className="font-semibold text-slate-700 dark:text-slate-300">Auto-Finder scanning PumpPortal WS, DexScreener Boosts &amp; GeckoTerminal Momentum...</p>
               <p className="max-w-md mx-auto">
-                Signals will appear here in real time as soon as new token deployments or bonding curve breakouts are intercepted.
+                Click &ldquo;Auto-Find Signals Now&rdquo; or start the Python Bot in Alpha Signals Only mode to stream and snipe qualifying signals automatically.
               </p>
             </div>
           ) : (
@@ -2781,8 +2957,8 @@ export function PythonSniperView() {
                     <th className="py-2.5 px-3 font-semibold">Time</th>
                     <th className="py-2.5 px-3 font-semibold">Token / Mint</th>
                     <th className="py-2.5 px-3 font-semibold">Alpha Source</th>
-                    <th className="py-2.5 px-3 font-semibold text-right">Real SOL</th>
-                    <th className="py-2.5 px-3 font-semibold text-right">Dev Buy</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Real SOL / Liq</th>
+                    <th className="py-2.5 px-3 font-semibold text-right">Dev / 5m Flow</th>
                     <th className="py-2.5 px-3 font-semibold text-right">Risk Score</th>
                     <th className="py-2.5 px-3 font-semibold text-center">Status</th>
                     <th className="py-2.5 px-3 font-semibold text-right">Actions</th>
@@ -2796,10 +2972,11 @@ export function PythonSniperView() {
                         <span className="font-bold text-slate-900 dark:text-slate-100 block">${sig.symbol}</span>
                         <div className="flex items-center gap-1 text-[10px] text-teal-600 dark:text-teal-400">
                           <a
-                            href={`https://dexscreener.com/solana/${sig.mint}`}
+                            href={`https://solscan.io/token/${sig.mint}`}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="hover:underline font-mono"
+                            title={`Inspect ${sig.mint} on Solscan`}
                           >
                             {sig.mint.slice(0, 6)}...{sig.mint.slice(-4)}
                           </a>
@@ -2809,26 +2986,34 @@ export function PythonSniperView() {
                             className="text-slate-400 hover:text-slate-200"
                             title="Copy mint address"
                           >
-                            <Copy className="w-2.5 h-2.5" />
+                            {copiedKey === sig.mint ? <Check className="w-2.5 h-2.5 text-emerald-400" /> : <Copy className="w-2.5 h-2.5" />}
                           </button>
                         </div>
                       </td>
                       <td className="py-2.5 px-3 text-slate-600 dark:text-slate-300 font-sans text-[11px]">
                         {sig.source}
                       </td>
-                      <td className="py-2.5 px-3 text-right font-bold text-emerald-500">
-                        {sig.realSol.toFixed(2)} SOL
+                      <td className="py-2.5 px-3 text-right">
+                        <span className="font-bold text-emerald-500 block">{sig.realSol.toFixed(2)} SOL</span>
+                        {typeof sig.liquidityUsd === 'number' && sig.liquidityUsd > 0 && (
+                          <span className="text-[10px] text-slate-400">${sig.liquidityUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                        )}
                       </td>
                       <td className="py-2.5 px-3 text-right text-slate-700 dark:text-slate-300">
-                        {sig.devBuySol > 0 ? `${sig.devBuySol.toFixed(2)} SOL` : '0 SOL'}
+                        <span className="block">{sig.devBuySol > 0 ? `${sig.devBuySol.toFixed(2)} SOL` : '0 SOL'}</span>
+                        {(sig.buys5m || sig.sells5m) ? (
+                          <span className="text-[10px] text-slate-400">
+                            {sig.buys5m ?? 0}B / {sig.sells5m ?? 0}S
+                          </span>
+                        ) : null}
                       </td>
                       <td className="py-2.5 px-3 text-right font-bold">
-                        <span className={`px-1.5 py-0.5 rounded text-[10px] ${sig.riskScore <= 20 ? 'bg-emerald-500/15 text-emerald-500' : sig.riskScore <= 45 ? 'bg-amber-500/15 text-amber-500' : 'bg-rose-500/15 text-rose-500'}`}>
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] ${sig.riskScore <= 25 ? 'bg-emerald-500/15 text-emerald-500' : sig.riskScore <= 45 ? 'bg-amber-500/15 text-amber-500' : 'bg-rose-500/15 text-rose-500'}`}>
                           {sig.riskScore}/100
                         </span>
                       </td>
                       <td className="py-2.5 px-3 text-center">
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold font-sans uppercase ${sig.status === 'AUTO_SNIPED' ? 'bg-emerald-500/15 text-emerald-500' : sig.status === 'SKIPPED' ? 'bg-rose-500/15 text-rose-500' : 'bg-amber-500/15 text-amber-500'}`}>
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold font-sans uppercase ${sig.status === 'AUTO_SNIPED' ? 'bg-emerald-500/15 text-emerald-500' : sig.status === 'READY' ? 'bg-teal-500/15 text-teal-500' : sig.status === 'SKIPPED' ? 'bg-rose-500/15 text-rose-500' : 'bg-amber-500/15 text-amber-500'}`}>
                           {sig.status}
                         </span>
                       </td>
@@ -2842,10 +3027,36 @@ export function PythonSniperView() {
                           >
                             Dex ↗
                           </a>
+                          <a
+                            href={`https://solscan.io/token/${sig.mint}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:text-teal-400 text-[11px] font-semibold"
+                          >
+                            Coin ↗
+                          </a>
                           <button
                             type="button"
-                            onClick={() => {
-                              pushToast({ kind: 'success', title: `Snipe order submitted for $${sig.symbol} with ${alphaJitoTip} SOL Jito tip` });
+                            onClick={async () => {
+                              try {
+                                const tipVal = Number(draftSettings.alpha_signal_jito_tip_sol ?? 0.0005);
+                                const res = await apiFetch<any>('/api/sniper/alpha-signals/snipe', {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ mint: sig.mint, jitoTipSol: tipVal }),
+                                });
+                                pushToast({
+                                  kind: res?.ok ? 'success' : 'error',
+                                  title: res?.message || `Snipe order queued for $${sig.symbol}`,
+                                });
+                                void fetchAlphaSignals(false);
+                              } catch (err) {
+                                pushToast({
+                                  kind: 'error',
+                                  title: 'Snipe queue failed',
+                                  body: err instanceof Error ? err.message : 'Error',
+                                });
+                              }
                             }}
                             className="px-2.5 py-1 rounded bg-amber-600 hover:bg-amber-500 text-white text-[11px] font-bold"
                           >
@@ -4127,7 +4338,9 @@ export function PythonSniperView() {
                         setDraftSettings({
                           ...draftSettings,
                           smart_money_scan_mode: modeVal,
-                          smart_money_enabled: modeVal !== 'sniper_only',
+                          ...(modeVal !== 'alpha_signal_only'
+                            ? { smart_money_enabled: modeVal !== 'sniper_only' }
+                            : {}),
                         });
                         markSettingsDirty(true);
                       }}
@@ -4136,6 +4349,7 @@ export function PythonSniperView() {
                       <option value="both">Both (Sniper + Whale Wallets)</option>
                       <option value="smart_money_only">Whale Wallets Only (No Random Launches)</option>
                       <option value="sniper_only">Sniper Bot Only (Ignore Whale Wallets)</option>
+                      <option value="alpha_signal_only">Alpha Signals Only (Ignore Whales &amp; Sniper)</option>
                     </select>
                   </div>
 
@@ -5187,12 +5401,19 @@ export function PythonSniperView() {
                     title: 'Sniper Bot Only (New Launches Only)',
                     desc: 'Scans new token launches via your Sniper filters and ignores Smart Money wallet triggers.',
                   },
+                  {
+                    id: 'alpha_signal_only' as const,
+                    title: 'Alpha Signals Only (Auto-Found Signal Feed)',
+                    desc: 'Only buys coins triggered by Auto-Found Alpha Signals; ignores Whale Wallets and Sniper Bot launches.',
+                  },
                 ].map((opt) => (
                   <label
                     key={opt.id}
                     className={`flex items-start gap-2.5 p-3 rounded-xl border cursor-pointer transition-colors ${
                       startScanMode === opt.id
-                        ? 'border-teal-500 bg-teal-500/[0.06]'
+                        ? opt.id === 'alpha_signal_only'
+                          ? 'border-amber-500 bg-amber-500/[0.06]'
+                          : 'border-teal-500 bg-teal-500/[0.06]'
                         : 'border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/50 hover:border-slate-300 dark:hover:border-slate-700'
                     }`}
                   >
@@ -5202,9 +5423,9 @@ export function PythonSniperView() {
                       checked={startScanMode === opt.id}
                       onChange={() => {
                         setStartScanMode(opt.id);
-                        setStartSmartMoneyFollow(opt.id !== 'sniper_only');
+                        setStartSmartMoneyFollow(opt.id !== 'sniper_only' && opt.id !== 'alpha_signal_only');
                       }}
-                      className="mt-0.5 text-teal-600 focus:ring-teal-500"
+                      className={`mt-0.5 ${opt.id === 'alpha_signal_only' ? 'text-amber-600 focus:ring-amber-500' : 'text-teal-600 focus:ring-teal-500'}`}
                     />
                     <div className="space-y-0.5">
                       <span className="font-bold text-slate-900 dark:text-slate-100 block">{opt.title}</span>
@@ -5214,7 +5435,9 @@ export function PythonSniperView() {
                 ))}
               </div>
               <p className="text-[11px] text-slate-500">
-                Note: Whale wallet trades can take hours or days to materialize; on-chain portfolio scanning also tracks coins they have already been holding for 1h–72h+.
+                {startScanMode === 'alpha_signal_only'
+                  ? 'Alpha Signals Only continuously auto-finds signals across PumpPortal WS, DexScreener Boosts, and Gecko Momentum without touching Whale Wallets or general Sniper launches.'
+                  : 'Note: Whale wallet trades can take hours or days to materialize; on-chain portfolio scanning also tracks coins they have already been holding for 1h–72h+.'}
               </p>
             </div>
 
@@ -5231,13 +5454,27 @@ export function PythonSniperView() {
                 disabled={savingSmartConfig}
                 onClick={async () => {
                   setShowStartModal(false);
-                  const wantSmart = startScanMode !== 'sniper_only' && startSmartMoneyFollow;
                   const curMode = String(draftSettings.smart_money_scan_mode || 'both');
-                  if (startScanMode !== curMode || wantSmart !== Boolean(draftSettings.smart_money_enabled !== false)) {
-                    await saveQuickSniperSettings({
-                      smart_money_scan_mode: startScanMode,
-                      smart_money_enabled: wantSmart,
-                    });
+                  if (startScanMode === 'alpha_signal_only') {
+                    if (
+                      curMode !== 'alpha_signal_only' ||
+                      draftSettings.alpha_signal_auto_find === false ||
+                      draftSettings.alpha_signal_auto_snipe === false
+                    ) {
+                      await saveQuickSniperSettings({
+                        smart_money_scan_mode: 'alpha_signal_only',
+                        alpha_signal_auto_find: true,
+                        alpha_signal_auto_snipe: true,
+                      });
+                    }
+                  } else {
+                    const wantSmart = startScanMode !== 'sniper_only' && startSmartMoneyFollow;
+                    if (startScanMode !== curMode || wantSmart !== Boolean(draftSettings.smart_money_enabled !== false)) {
+                      await saveQuickSniperSettings({
+                        smart_money_scan_mode: startScanMode,
+                        smart_money_enabled: wantSmart,
+                      });
+                    }
                   }
                   await handleToggle();
                 }}
