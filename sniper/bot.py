@@ -1116,7 +1116,6 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
     whale_older_ok = bool(sb_hits) and (
         opt_on(cfg, "smart_money_follow_older_coins", True) or scan_mode == "smart_money_only"
     )
-    alpha_age_ok = bool(alpha_sig) and scan_mode == "alpha_signal_only"
     ok_plat, plat_detail = matches_enabled_platforms(pair, mint_addr, src_hint, cfg)
     if not ok_plat:
         return False, "wrong website", plat_detail
@@ -1133,9 +1132,6 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
         max_whale_h = max(0.0, float(cfg.get("smart_money_max_coin_age_hours", 72) or 0.0))
         if max_whale_h > 0.0 and age_s > max_whale_h * 3600.0:
             return False, "too old (whale cap)", f"{age_s / 3600:.1f}h > {max_whale_h:g}h whale cap"
-    elif alpha_age_ok:
-        if age_s > 24 * 3600.0:
-            return False, "too old (alpha cap)", f"{age_s / 3600:.1f}h > 24h alpha cap"
     else:
         if opt_on(cfg, "min_age_minutes", False):
             min_age_m = max(0.0, float(cfg.get("min_age_minutes", 0.0) or 0.0))
@@ -4408,7 +4404,7 @@ def run(once=False):
     creator_banner = f"owner-chk={'ON' if opt_on(CONFIG, 'check_creator_history', True) else 'OFF'}"
     if scan_mode_banner == "alpha_signal_only":
         al_risk = int(CONFIG.get("alpha_signal_max_risk_score", 45) or 45)
-        log(f"Alpha Rules: {exit_banner} | max-risk<={al_risk}/100 | liq>=${liq_banner:.0f} | pump cap {pump_banner} | rug={'ON' if opt_on(CONFIG, 'use_rugcheck', True) else 'OFF'} | {creator_banner}")
+        log(f"Alpha Rules: window {min_age_banner}–{max_age_banner} | {exit_banner} | max-risk<={al_risk}/100 | liq>=${liq_banner:.0f} | pump cap {pump_banner} | rug={'ON' if opt_on(CONFIG, 'use_rugcheck', True) else 'OFF'} | {creator_banner}")
     elif scan_mode_banner == "smart_money_only":
         whale_h = max(0.0, float(CONFIG.get("smart_money_max_coin_age_hours", 72) or 0.0))
         whale_age_txt = "Any age" if whale_h <= 0 else f"<={whale_h:g}h"

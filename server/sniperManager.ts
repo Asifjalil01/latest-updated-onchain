@@ -1536,10 +1536,35 @@ export class SniperManager {
     return Math.max(5, Math.min(99, Math.round(score)));
   }
 
+  private isWithinSettingsAgeWindow(pair: any, settings: Record<string, any>, nowMs = Date.now()): boolean {
+    const created = Number(pair?.pairCreatedAt || 0);
+    if (!Number.isFinite(created) || created <= 0) return false;
+    const ageMin = (nowMs - created) / 60_000;
+    if (ageMin < -0.25) return false;
+    if (isPyOptionEnabled(settings, 'min_age_minutes', false)) {
+      const minM = Math.max(0, Number(settings.min_age_minutes ?? 0) || 0);
+      if (minM > 0 && ageMin < minM) return false;
+    }
+    if (isPyOptionEnabled(settings, 'max_age_minutes', true)) {
+      const maxM = Number(settings.max_age_minutes ?? 2.0) || 0;
+      if (maxM > 0 && ageMin > maxM) return false;
+    }
+    return true;
+  }
+
+  private getAlphaSyntheticWindowMs(settings: Record<string, any>): number {
+    if (!isPyOptionEnabled(settings, 'max_age_minutes', true)) {
+      return 3_600_000;
+    }
+    const maxM = Number(settings.max_age_minutes ?? 2.0) || 0;
+    if (maxM <= 0) return 3_600_000;
+    return Math.max(180_000, Math.min(3_600_000, Math.round(maxM * 60_000)));
+  }
+
   private ingestPumpPortalAlphaCandidates(settings: Record<string, any>) {
     const pp: any = this.orchestrator?.pumpPortal;
     if (!pp || typeof pp.getSyntheticPairs !== 'function') return 0;
-    const synth = pp.getSyntheticPairs(this.solPriceUsd, 180_000);
+    const synth = pp.getSyntheticPairs(this.solPriceUsd, this.getAlphaSyntheticWindowMs(settings));
     if (!Array.isArray(synth) || synth.length === 0) return 0;
 
     const autoSnipe =
@@ -1552,6 +1577,9 @@ export class SniperManager {
     for (const p of synth.slice(0, 25)) {
       const mint = String(p?.baseToken?.address || '').trim();
       if (!mint || mint.length < 32) continue;
+      if (!this.manualAlphaSnipes.has(mint) && !this.isWithinSettingsAgeWindow(p, settings, now)) {
+        continue;
+      }
       const ppInfo = p._pumpportal || {};
       const realSol = Number(ppInfo.real_sol || 0);
       const liquidityUsd = Number(p?.liquidity?.usd || 0);
@@ -1690,9 +1718,12 @@ export class SniperManager {
         }
       }
 
+      const maxAgeEnabled = isPyOptionEnabled(settings, 'max_age_minutes', true);
+      const maxAgeMinSetting = maxAgeEnabled ? Number(settings.max_age_minutes ?? 2.0) || 0 : 0;
+
       const rawPools = [
-        ...(Array.isArray(gtTrending?.data) ? gtTrending.data : []),
         ...(Array.isArray(gtNew?.data) ? gtNew.data : []),
+        ...(Array.isArray(gtTrending?.data) ? gtTrending.data : []),
       ];
       for (const pool of rawPools) {
         const attrs = pool?.attributes || {};
@@ -1701,6 +1732,13 @@ export class SniperManager {
         const chg5m = Number(attrs.price_change_percentage?.m5 || 0);
         const chg1h = Number(attrs.price_change_percentage?.h1 || 0);
         if (liq < 4_500 || vol1h < 1_500 || (chg5m <= 1 && chg1h <= 8)) continue;
+        if (maxAgeMinSetting > 0 && attrs.pool_created_at) {
+          const createdMs = Date.parse(String(attrs.pool_created_at));
+          if (Number.isFinite(createdMs) && createdMs > 0) {
+            const ageMin = (now - createdMs) / 60_000;
+            if (ageMin > maxAgeMinSetting * 1.1) continue;
+          }
+        }
         const baseId = String(pool?.relationships?.base_token?.data?.id || '');
         const mint = baseId.replace(/^solana_/, '').trim();
         if (!mint || mint.length < 32 || this.alphaSignalsBuffer.some((s) => s.mint === mint)) continue;
@@ -1732,9 +1770,11 @@ export class SniperManager {
           }
         }
 
+        const evalNow = Date.now();
         for (const [mint, pair] of bestPairByMint.entries()) {
           const srcMeta = candidateSources.get(mint);
           if (!srcMeta) continue;
+          if (!this.isWithinSettingsAgeWindow(pair, settings, evalNow)) continue;
           const liqUsd = Number(pair?.liquidity?.usd || 0);
           const buys = Number(pair?.txns?.m5?.buys || 0);
           const sells = Number(pair?.txns?.m5?.sells || 0);
@@ -1786,10 +1826,15 @@ export class SniperManager {
         }
       }
 
-      // Prune stale signals older than 15m unless manually queued
-      const cutoff = Date.now() - 15 * 60_000;
+      // Prune stale signals older than 15m or outside Settings min/max age window unless manually queued
+      const pruneNow = Date.now();
+      const cutoff = pruneNow - 15 * 60_000;
       this.alphaSignalsBuffer = this.alphaSignalsBuffer
-        .filter((s) => s.tsMs >= cutoff || this.manualAlphaSnipes.has(s.mint))
+        .filter(
+          (s) =>
+            this.manualAlphaSnipes.has(s.mint) ||
+            (s.tsMs >= cutoff && (!s.pair || this.isWithinSettingsAgeWindow(s.pair, settings, pruneNow)))
+        )
         .slice(0, 60);
 
       if (added > 0 && !options?.silent) {
@@ -1818,6 +1863,10 @@ export class SniperManager {
     const refreshSec = Number(settings.alpha_signal_refresh_interval_sec ?? 10) || 10;
 
     this.ingestPumpPortalAlphaCandidates(settings);
+    const nowMs = Date.now();
+    this.alphaSignalsBuffer = this.alphaSignalsBuffer.filter(
+      (s) => this.manualAlphaSnipes.has(s.mint) || !s.pair || this.isWithinSettingsAgeWindow(s.pair, settings, nowMs)
+    );
 
     return {
       ok: true,
@@ -1973,7 +2022,9 @@ export class SniperManager {
           .filter(
             (s) =>
               this.manualAlphaSnipes.has(s.mint) ||
-              ((s.status === 'AUTO_SNIPED' || s.status === 'READY') && s.tsMs >= alphaCutoff)
+              ((s.status === 'AUTO_SNIPED' || s.status === 'READY') &&
+                s.tsMs >= alphaCutoff &&
+                (!s.pair || this.isWithinSettingsAgeWindow(s.pair, settings, nowMs)))
           )
           .slice(0, 30)
           .map((s) => ({
@@ -2349,6 +2400,13 @@ export class SniperManager {
           Array.isArray(updated.smart_wallets) ? updated.smart_wallets : []
         );
       }
+      const nowPostUpdate = Date.now();
+      this.alphaSignalsBuffer = this.alphaSignalsBuffer.filter(
+        (s) =>
+          this.manualAlphaSnipes.has(s.mint) ||
+          !s.pair ||
+          this.isWithinSettingsAgeWindow(s.pair, updated, nowPostUpdate)
+      );
       this.appendLog('INFO', 'Python bot settings updated and saved.');
       return { ok: true, settings: updated };
     } catch (err) {

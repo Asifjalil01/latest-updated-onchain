@@ -3329,22 +3329,36 @@ test('v1.45.1: Alpha Signals Only mode isolates from Whale/Sniper launches, auto
       rpcPool: { getHealthSnapshot: () => [] },
     } as any);
 
+    const oldBoostMint = 'OldBoostedMint11111111111111111111111111111111';
     // 2) Mock external auto-finder feeds (DexScreener Boosts + DexScreener Tokens + GeckoTerminal)
     (mgr as any).fetchJsonWithTimeout = async (url: string) => {
       if (url.includes('token-boosts/latest')) {
-        return [{ chainId: 'solana', tokenAddress: boostAlphaMint }];
+        return [
+          { chainId: 'solana', tokenAddress: boostAlphaMint },
+          { chainId: 'solana', tokenAddress: oldBoostMint },
+        ];
       }
-      if (url.includes(`tokens/v1/solana/${boostAlphaMint}`)) {
+      if (url.includes('tokens/v1/solana/')) {
         return [
           {
             baseToken: { address: boostAlphaMint, symbol: 'BSTALPHA', name: 'Boost Alpha' },
             dexId: 'pumpswap',
-            pairCreatedAt: Date.now() - 120_000,
+            pairCreatedAt: Date.now() - 45_000,
             priceUsd: '0.0025',
             liquidity: { usd: 18500 },
             volume: { m5: 4200 },
             txns: { m5: { buys: 14, sells: 3 } },
             priceChange: { m5: 22 },
+          },
+          {
+            baseToken: { address: oldBoostMint, symbol: 'OLDBST', name: 'Old Boosted Coin' },
+            dexId: 'pumpswap',
+            pairCreatedAt: Date.now() - 500 * 3600_000,
+            priceUsd: '0.015',
+            liquidity: { usd: 95000 },
+            volume: { m5: 12000 },
+            txns: { m5: { buys: 30, sells: 5 } },
+            priceChange: { m5: 18 },
           },
         ];
       }
@@ -3359,6 +3373,8 @@ test('v1.45.1: Alpha Signals Only mode isolates from Whale/Sniper launches, auto
       alpha_signal_auto_snipe: true,
       alpha_signal_jito_tip_sol: 0.0007,
       alpha_signal_refresh_interval_sec: 10,
+      min_age_minutes: 0,
+      max_age_minutes: 5,
     });
     assert.equal(saveRes.ok, true);
     assert.equal(saveRes.settings?.smart_money_scan_mode, 'alpha_signal_only');
@@ -3366,11 +3382,12 @@ test('v1.45.1: Alpha Signals Only mode isolates from Whale/Sniper launches, auto
     assert.equal(saveRes.settings?.smart_money_enabled, false);
     assert.deepEqual(saveRes.settings?.smart_wallets, [whaleAddr]);
 
-    // 3) Auto-finder discovers both WS & Boost alpha signals
+    // 3) Auto-finder discovers in-window WS & Boost alpha signals and filters out 500h-old boosted tokens
     const disc = await mgr.discoverAlphaSignals({ force: true });
     assert.equal(disc.ok, true);
     assert.ok(disc.signals.some((s) => s.mint === alphaMintWs && s.status === 'AUTO_SNIPED'));
     assert.ok(disc.signals.some((s) => s.mint === boostAlphaMint && s.status === 'AUTO_SNIPED'));
+    assert.ok(!disc.signals.some((s) => s.mint === oldBoostMint));
 
     // 4) getPumpPortalFeed in alpha_signal_only emits ONLY alpha signal mints & pairs, with zero smart_buys/whale_held_mints
     const feed = mgr.getPumpPortalFeed();
@@ -3379,8 +3396,13 @@ test('v1.45.1: Alpha Signals Only mode isolates from Whale/Sniper launches, auto
     assert.ok(feed.alpha_signals.some((s) => s.mint === alphaMintWs));
     assert.ok(feed.alpha_signals.some((s) => s.mint === boostAlphaMint));
     assert.ok(!feed.mints.includes(plainLaunchMint));
+    assert.ok(!feed.mints.includes(oldBoostMint));
 
-    // 5) Python bot.py: alpha_signal_only ignores smart_buys & sniper launches, accepts alpha_signals
+    // Tightening max_age_minutes to 10s should immediately prune older signals unless manually queued
+    mgr.updateSettings({ max_age_minutes: 0.1 });
+    assert.ok(!mgr.getAlphaSignals().signals.some((s) => s.mint === boostAlphaMint));
+
+    // 5) Python bot.py: alpha_signal_only ignores smart_buys & sniper launches, and enforces Settings min/max timeframe
     const pyScript = [
       'import sys, types, json, time',
       'req = types.ModuleType("requests")',
@@ -3398,20 +3420,33 @@ test('v1.45.1: Alpha Signals Only mode isolates from Whale/Sniper launches, auto
       'bot._ws_alpha_signals.clear()',
       'bot._alpha_pending_mints.clear()',
       'bot._ingest_ws_bridge_payload({"ok": True, "smart_buys": [{"mint": whale_m, "wallet": whale}], "alpha_signals": [{"mint": alpha_m, "symbol": "ALPHAWS", "source": "China Alpha Jito FastLane", "riskScore": 18, "status": "AUTO_SNIPED"}]})',
-      'cfg_alpha = {**bot.CONFIG, "smart_money_scan_mode": "alpha_signal_only", "smart_wallets": [whale], "smart_money_enabled": True, "min_liquidity_usd": 4000.0, "min_volume_m5_usd": 500.0, "min_buys_m5": 2, "min_buy_sell_ratio_m5": 1.1}',
+      'opts_age = {**bot.CONFIG.get("option_enabled", {}), "min_age_minutes": True, "max_age_minutes": True}',
+      'cfg_alpha_window = {**bot.CONFIG, "option_enabled": opts_age, "min_age_minutes": 1.0, "max_age_minutes": 120.0, "smart_money_scan_mode": "alpha_signal_only", "smart_wallets": [whale], "smart_money_enabled": True, "min_liquidity_usd": 4000.0, "min_volume_m5_usd": 500.0, "min_buys_m5": 2, "min_buy_sell_ratio_m5": 1.1}',
+      'cfg_alpha_tight = {**cfg_alpha_window, "min_age_minutes": 0.0, "max_age_minutes": 2.0}',
       'pair_alpha = {"baseToken": {"address": alpha_m, "symbol": "ALPHAWS"}, "priceUsd": "0.001", "pairCreatedAt": now_ms - 3600000, "liquidity": {"usd": 12000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 10, "sells": 2}}, "priceChange": {"m5": 12}}',
-      'pair_whale = {"baseToken": {"address": whale_m, "symbol": "PLAIN"}, "priceUsd": "0.001", "pairCreatedAt": now_ms - 20000, "liquidity": {"usd": 12000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 10, "sells": 2}}, "priceChange": {"m5": 12}, "_pumpportal": {"recent_buyers": [whale]}}',
-      'pair_plain = {"baseToken": {"address": plain_m, "symbol": "RAND"}, "priceUsd": "0.001", "pairCreatedAt": now_ms - 20000, "liquidity": {"usd": 12000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 10, "sells": 2}}, "priceChange": {"m5": 12}}',
-      'ok_a, why_a, _ = bot.passes_filters(pair_alpha, cfg_alpha)',
-      'ok_w, why_w, _ = bot.passes_filters(pair_whale, cfg_alpha)',
-      'ok_p, why_p, _ = bot.passes_filters(pair_plain, cfg_alpha)',
-      'sb_in_alpha = bot._get_pair_smart_buyers(pair_whale, None, cfg_alpha)',
-      'print(json.dumps({"ok_a": ok_a, "why_a": why_a, "ok_w": ok_w, "why_w": why_w, "ok_p": ok_p, "why_p": why_p, "sb_in_alpha": sb_in_alpha}))',
+      'pair_young = {**pair_alpha, "pairCreatedAt": now_ms - 10000}',
+      'pair_old = {**pair_alpha, "pairCreatedAt": now_ms - 180 * 60000}',
+      'pair_whale = {"baseToken": {"address": whale_m, "symbol": "PLAIN"}, "priceUsd": "0.001", "pairCreatedAt": now_ms - 90000, "liquidity": {"usd": 12000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 10, "sells": 2}}, "priceChange": {"m5": 12}, "_pumpportal": {"recent_buyers": [whale]}}',
+      'pair_plain = {"baseToken": {"address": plain_m, "symbol": "RAND"}, "priceUsd": "0.001", "pairCreatedAt": now_ms - 90000, "liquidity": {"usd": 12000}, "volume": {"m5": 3000}, "txns": {"m5": {"buys": 10, "sells": 2}}, "priceChange": {"m5": 12}}',
+      'ok_a, why_a, _ = bot.passes_filters(pair_alpha, cfg_alpha_window)',
+      'ok_y, why_y, _ = bot.passes_filters(pair_young, cfg_alpha_window)',
+      'ok_o, why_o, _ = bot.passes_filters(pair_old, cfg_alpha_window)',
+      'ok_t, why_t, _ = bot.passes_filters(pair_alpha, cfg_alpha_tight)',
+      'ok_w, why_w, _ = bot.passes_filters(pair_whale, cfg_alpha_window)',
+      'ok_p, why_p, _ = bot.passes_filters(pair_plain, cfg_alpha_window)',
+      'sb_in_alpha = bot._get_pair_smart_buyers(pair_whale, None, cfg_alpha_window)',
+      'print(json.dumps({"ok_a": ok_a, "why_a": why_a, "ok_y": ok_y, "why_y": why_y, "ok_o": ok_o, "why_o": why_o, "ok_t": ok_t, "why_t": why_t, "ok_w": ok_w, "why_w": why_w, "ok_p": ok_p, "why_p": why_p, "sb_in_alpha": sb_in_alpha}))',
     ].join('\n');
 
     const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
     const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
     assert.equal(pyOut.ok_a, true);
+    assert.equal(pyOut.ok_y, false);
+    assert.equal(pyOut.why_y, 'too young');
+    assert.equal(pyOut.ok_o, false);
+    assert.equal(pyOut.why_o, 'too old');
+    assert.equal(pyOut.ok_t, false);
+    assert.equal(pyOut.why_t, 'too old');
     assert.equal(pyOut.ok_w, false);
     assert.equal(pyOut.why_w, 'not alpha signal');
     assert.equal(pyOut.ok_p, false);

@@ -2937,7 +2937,15 @@ export function PythonSniperView() {
                 Showing {alphaSignals.length} auto-discovered alpha signal(s) · Last multi-source scan: {new Date(alphaLastScanAt).toLocaleTimeString()}
               </span>
               <span>
-                Auto-Snipe qualifies: Risk &le; {Number(draftSettings.alpha_signal_max_risk_score ?? 45)}/100 · Depth &ge; {Number(draftSettings.alpha_signal_min_real_sol ?? 1.5)} SOL
+                Auto-Snipe qualifies: Risk &le; {Number(draftSettings.alpha_signal_max_risk_score ?? 45)}/100 · Depth &ge; {Number(draftSettings.alpha_signal_min_real_sol ?? 1.5)} SOL · Age{' '}
+                {Boolean(draftSettings.option_enabled?.min_age_minutes)
+                  ? `${Number(draftSettings.min_age_minutes ?? 0)}m`
+                  : '0m'}
+                –
+                {draftSettings.option_enabled?.max_age_minutes !== false &&
+                Number(draftSettings.max_age_minutes ?? 2) > 0
+                  ? `${Number(draftSettings.max_age_minutes ?? 2)}m`
+                  : 'any'}
               </span>
             </div>
           )}

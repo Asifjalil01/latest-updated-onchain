@@ -2,6 +2,17 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.45.2 — Alpha Signals Enforce Settings Min/Max Coin Age Timeframe
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed & Improved
+- **Settings Min/Max Timeframe for Alpha Signals (`sniper/bot.py`, `server/sniperManager.ts`, `PythonSniperView.tsx`)**:
+  - Removed the hardcoded `24h` age cap in `alpha_signal_only` so both the Python bot (`passes_filters`) and the Alpha Signal Auto-Finder (`discoverAlphaSignals` / `ingestPumpPortalAlphaCandidates`) strictly follow your configured **Min Coin Age** (`min_age_minutes`) and **Max Coin Age** (`max_age_minutes`) settings (including their enable/disable checkboxes).
+  - Out-of-window boosted/trending pools are filtered out before entering the Alpha Signals table and feed, and the Alpha Signals status bar now displays the active Settings age window.
+
+---
+
 ## v1.45.1 — Alpha Signals Only Bot Mode (Isolated) & Multi-Source Signal Auto-Finder
 
 **Risk Warning: Trading can lose all of your money.**
