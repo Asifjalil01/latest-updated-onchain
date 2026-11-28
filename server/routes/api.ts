@@ -1017,7 +1017,10 @@ export function createApiRouter(orchestrator: BotOrchestrator, apiToken: string)
 
   router.post('/sniper/settings/reset', (req: Request, res: Response) => {
     const scopeRaw = String(req.body?.scope || 'all').trim().toLowerCase();
-    const scope = scopeRaw === 'settings' || scopeRaw === 'pro_desk' ? scopeRaw : 'all';
+    const scope =
+      scopeRaw === 'settings' || scopeRaw === 'pro_desk' || scopeRaw === 'pulse'
+        ? scopeRaw
+        : 'all';
     res.json(sniperManager.resetSettingsToDefault(scope));
   });
 

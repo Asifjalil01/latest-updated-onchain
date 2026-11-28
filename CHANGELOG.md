@@ -2,6 +2,25 @@
 
 All notable changes to **Solana Spot Bot** are documented in this file.
 
+## v1.45.5 — Ready-to-Trade Pulse Defaults, Independent RugCheck/Sizing Controls & Transient 20s Retry
+
+**Risk Warning: Trading can lose all of your money.**
+
+### Fixed & Improved
+- **Out-of-the-Box Ready-to-Trade Pulse Setup & `Reset Best Defaults` (`sniper/settings.json`, `sniper/bot.py`, `server/sniperManager.ts`, `server/routes/api.ts`, `PythonSniperView.tsx`, `sniperFormat.ts`)**:
+  - Pre-configured `/sniper/settings.json` to **Pulse Mode (`pulse_only`)** with ready-to-trade defaults (**$2** exact trade size, **+30%** Take Profit, **-18%** Stop Loss, **8%** Trailing Stop, **45m** max hold, **5s** refresh, **1.5m–120m** age window, **50–86%** Stage 2 bonding curve with **35+ SOL**, **$20,000+** Stage 3 AMM liquidity, **15+** 5m buys at **>= 1.15x** buy/sell ratio, **12+** unique 5m traders, **RugCheck <= 45**, **5%** slippage, and **50%** anti-top-wick cap) so clicking **Start** runs Pulse immediately without manual setup.
+  - Added `'pulse'` scope to `POST /api/sniper/settings/reset` (`resetSettingsToDefault('pulse')`) and replaced **Apply Fast Preset** with **Reset Best Defaults** in the **Pulse (Stage 2–3)** tab while keeping Sniper and Pro Desk resets isolated from Pulse settings.
+- **Transient RugCheck / RPC Retry Without Blacklisting or False Creator Flags (`sniper/bot.py`)**:
+  - Fixed `hard_rug_check()` and `scan_and_buy()` so transient failures (`no rugcheck report yet (fail closed)`, `unavailable (fail closed)`, or RPC timeouts) use a **20-second** retry cooldown (`_transient_rug_cooldown` and 20s cache TTL) instead of permanently blacklisting the mint, triggering the 10-minute copycat symbol cooldown, or caching for 15 minutes.
+  - Fixed a substring bug in `_mark_creator_coin_rugged` where `"rug"` matched `"rugcheck"` in `"no rugcheck report yet"`, preventing clean creators from being falsely marked as serial ruggers.
+  - Fixed module-import isolation in `sniper/bot.py` (`load_settings()` runs when executed as `__main__` or via `run()`/`maybe_reload_settings()`) so `DEFAULT_CFG` and unit tests remain unaffected by user `settings.json` edits.
+- **Independent Pulse Strict-RugCheck & Sizing Toggles + UI Precheck Sync (`sniper/bot.py`, `server/sniperManager.ts`, `PythonSniperView.tsx`)**:
+  - Added independent `pulse_strict_rugcheck` (`false` default — uses on-chain RPC mint/freeze/dev-hold/top-10 holder checks when RugCheck has not indexed a fresh launch yet) and `pulse_conviction_sizing` (`false` default — trades your exact `pulse_trade_size_usd` instead of scaling `0.6x–1.5x` via Pro Desk conviction).
+  - Synced `precheckAlphaRug()` and `discoverPulseSignals()` with `bot.py`'s `max_dev_hold_pct`, `max_top10_holder_pct` (excluding AMM/pool/locker accounts), pending RugCheck status (`PENDING · Waiting RugCheck report`), and Stage 3 observed-peak pullback tracking (`pulseStage3PeakByMint`).
+- **Changelog & Version Tracking**: Updated version to `1.45.5` in `package.json` and documented all changes in `CHANGELOG.md`.
+
+---
+
 ## v1.45.4 — Photon / Axiom / GMGN Pulse (Stage 2–3) Strategy, Dedicated Tab & Independent Settings
 
 **Risk Warning: Trading can lose all of your money.**

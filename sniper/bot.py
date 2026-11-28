@@ -104,26 +104,28 @@ CONFIG = {
     "pulse_stage": "both",
     "pulse_auto_find": True,
     "pulse_auto_buy": True,
-    "pulse_trade_size_usd": 5.0,
+    "pulse_trade_size_usd": 2.0,
     "pulse_take_profit_pct": 30.0,
-    "pulse_stop_loss_pct": 15.0,
+    "pulse_stop_loss_pct": 18.0,
     "pulse_trailing_stop_pct": 8.0,
-    "pulse_max_hold_minutes": 90,
+    "pulse_max_hold_minutes": 45,
     "pulse_jito_tip_sol": 0.0005,
-    "pulse_refresh_interval_sec": 10,
-    "pulse_min_age_minutes": 2.0,
-    "pulse_max_age_minutes": 180.0,
-    "pulse_stage2_min_curve_pct": 65.0,
-    "pulse_stage2_max_curve_pct": 94.0,
-    "pulse_stage2_min_real_sol": 40.0,
-    "pulse_stage3_min_liquidity_usd": 15000.0,
+    "pulse_refresh_interval_sec": 5,
+    "pulse_min_age_minutes": 1.5,
+    "pulse_max_age_minutes": 120.0,
+    "pulse_stage2_min_curve_pct": 50.0,
+    "pulse_stage2_max_curve_pct": 86.0,
+    "pulse_stage2_min_real_sol": 35.0,
+    "pulse_stage3_min_liquidity_usd": 20000.0,
     "pulse_stage3_require_pullback": False,
-    "pulse_stage3_pullback_pct": 12.0,
+    "pulse_stage3_pullback_pct": 10.0,
     "pulse_stage3_wait_sec": 30.0,
-    "pulse_min_buys_m5": 10,
-    "pulse_min_buy_sell_ratio_m5": 1.05,
-    "pulse_min_unique_traders_5m": 10,
-    "pulse_rugcheck_max_score": 50.0,
+    "pulse_min_buys_m5": 15,
+    "pulse_min_buy_sell_ratio_m5": 1.15,
+    "pulse_min_unique_traders_5m": 12,
+    "pulse_rugcheck_max_score": 45.0,
+    "pulse_strict_rugcheck": False,
+    "pulse_conviction_sizing": False,
     "reused_socials_enabled": True,
     "max_social_reuse_count": 2,
     # Pro Desk — Group 2: Zero-Lag Exits & MEV / Wallet Sweep
@@ -190,6 +192,7 @@ CONFIG = {
     "pool_keep_hours": 1, "pool_max_size": 500,
     "rescan_delay_after_sell_sec": 0,
 }
+DEFAULT_CFG = {k: (dict(v) if isinstance(v, dict) else (list(v) if isinstance(v, list) else v)) for k, v in CONFIG.items()}
 
 _BOOL_OPTION_KEYS = {
     "use_real_swap_quotes", "use_rugcheck", "strict_rugcheck", "require_lp_locked",
@@ -320,7 +323,8 @@ def maybe_reload_settings():
         pass
     return False
 
-load_settings()
+if __name__ == "__main__":
+    load_settings()
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 DEX = "https://api.dexscreener.com"
@@ -1223,9 +1227,12 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
         if age_s < -10: return False, "clock skew", "sync your PC clock"
     if is_pulse:
         if not is_manual_pulse:
-            p_min_m = max(0.0, float(cfg.get("pulse_min_age_minutes", 2.0) or 0.0))
-            p_max_m = max(0.0, float(cfg.get("pulse_max_age_minutes", 180.0) or 0.0))
-            if p_min_m > 0.0 and age_s < p_min_m * 60.0:
+            dex_pulse_low = str(pair.get("dexId") or "").strip().lower()
+            is_pulse_curve = dex_pulse_low in ("pumpfun", "pump")
+            p_min_m = max(0.0, float(cfg.get("pulse_min_age_minutes", 1.5) or 0.0))
+            p_max_m = max(0.0, float(cfg.get("pulse_max_age_minutes", 120.0) or 0.0))
+            # Stage 3 graduated pools already survived Stage 1-2; DexScreener resets pairCreatedAt on migration
+            if is_pulse_curve and p_min_m > 0.0 and age_s < p_min_m * 60.0:
                 return False, "pulse too young", f"{age_s / 60:.1f}m < {p_min_m:g}m pulse min"
             if p_max_m > 0.0 and age_s > p_max_m * 60.0:
                 return False, "pulse too old", f"{age_s / 60:.1f}m > {p_max_m:g}m pulse window"
@@ -1250,7 +1257,7 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
     buys, sells = int(m5.get("buys") or 0), int(m5.get("sells") or 0)
     if is_pulse:
         if not is_manual_pulse:
-            p_ratio = max(0.5, float(cfg.get("pulse_min_buy_sell_ratio_m5", 1.05) or 1.05))
+            p_ratio = max(0.5, float(cfg.get("pulse_min_buy_sell_ratio_m5", 1.15) or 1.15))
             if buys < sells * p_ratio:
                 return False, "pulse selling pressure", f"{buys}b/{sells}s < {p_ratio:g}x pulse ratio"
     else:
@@ -1316,20 +1323,20 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
                     curve_pct = _f(pulse_sig.get("curvePct"))
                 if curve_pct is None and real_sol is not None:
                     curve_pct = min(100.0, max(0.0, (real_sol / 85.0) * 100.0))
-                p_cmin = float(cfg.get("pulse_stage2_min_curve_pct", 65.0) or 65.0)
-                p_cmax = float(cfg.get("pulse_stage2_max_curve_pct", 94.0) or 94.0)
-                p_rsol = float(cfg.get("pulse_stage2_min_real_sol", 40.0) or 0.0)
+                p_cmin = float(cfg.get("pulse_stage2_min_curve_pct", 50.0) or 50.0)
+                p_cmax = float(cfg.get("pulse_stage2_max_curve_pct", 86.0) or 86.0)
+                p_rsol = float(cfg.get("pulse_stage2_min_real_sol", 35.0) or 0.0)
                 if curve_pct is not None and (curve_pct < p_cmin or curve_pct > p_cmax):
                     return False, "pulse stage2 curve", f"curve {curve_pct:.1f}% not in {p_cmin:g}-{p_cmax:g}%"
                 if real_sol is not None and p_rsol > 0 and real_sol < p_rsol:
                     return False, "pulse stage2 sol", f"real SOL {real_sol:.1f} < {p_rsol:g} SOL"
             else:
-                p_s3_liq = max(0.0, float(cfg.get("pulse_stage3_min_liquidity_usd", 15000.0) or 0.0))
+                p_s3_liq = max(0.0, float(cfg.get("pulse_stage3_min_liquidity_usd", 20000.0) or 0.0))
                 if p_s3_liq > 0 and liq_pre < p_s3_liq:
                     return False, "pulse stage3 liq", f"${liq_pre:.0f} < ${p_s3_liq:.0f} Stage 3 min"
                 if bool(cfg.get("pulse_stage3_require_pullback", False)):
                     wait_s = max(5.0, float(cfg.get("pulse_stage3_wait_sec", 30.0) or 30.0))
-                    min_dip = max(1.0, float(cfg.get("pulse_stage3_pullback_pct", 12.0) or 12.0))
+                    min_dip = max(1.0, float(cfg.get("pulse_stage3_pullback_pct", 10.0) or 10.0))
                     with _market_struct_lock:
                         peak_rec = _migration_peaks.get(mint_addr)
                         if peak_rec is None or px > peak_rec:
@@ -1384,7 +1391,7 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
         min_ratio = max(0.05, min(1.0, float(cfg.get("min_unique_makers_ratio", 0.25) or 0.25)))
         min_uniq = max(
             1,
-            int(cfg.get("pulse_min_unique_traders_5m", 10) or 10)
+            int(cfg.get("pulse_min_unique_traders_5m", 12) or 12)
             if is_pulse
             else int(cfg.get("min_unique_traders_5m", 6) or 6),
         )
@@ -1440,7 +1447,7 @@ def passes_filters(pair, cfg, now_ms=None, source=None):
 
     if is_pulse:
         if not is_manual_pulse:
-            p_min_buys = max(1, int(cfg.get("pulse_min_buys_m5", 10) or 10))
+            p_min_buys = max(1, int(cfg.get("pulse_min_buys_m5", 15) or 15))
             if buys < p_min_buys:
                 return False, "pulse few buys", f"{buys} buys < {p_min_buys} pulse min"
     elif age_s > grace_sec:
@@ -1468,7 +1475,7 @@ def score_candidate(pair, cfg, now_ms=None):
     now_ms = now_ms or int(time.time() * 1000)
     created = int(pair.get("pairCreatedAt") or 0)
     age_s = max(0.0, (now_ms - created) / 1000.0) if created > 0 else 120.0
-    max_age_m = float(cfg.get("pulse_max_age_minutes", 180) or 180) if _get_scan_mode(cfg) == "pulse_only" else (float(cfg.get("max_age_minutes", 2) or 2) if opt_on(cfg, "max_age_minutes", True) else 60.0)
+    max_age_m = float(cfg.get("pulse_max_age_minutes", 120) or 120) if _get_scan_mode(cfg) == "pulse_only" else (float(cfg.get("max_age_minutes", 2) or 2) if opt_on(cfg, "max_age_minutes", True) else 60.0)
     max_age_s = max(10.0, max_age_m * 60.0)
 
     m5 = (pair.get("txns") or {}).get("m5") or {}
@@ -1516,6 +1523,17 @@ def rank_candidates(items, cfg, now_ms=None):
 
 # ---------------------------------------------------------------- hard rug screen
 _rug_cache, _creator_meta_cache, _rug_lock = {}, {}, threading.Lock()
+_transient_rug_cooldown = {}
+
+def _is_transient_rug_error(reason):
+    low = str(reason or "").strip().lower()
+    if not low:
+        return False
+    return (
+        "no rugcheck report yet" in low
+        or "unavailable (fail closed)" in low
+        or "timed out" in low
+    )
 
 def _rpc_mint_account_info(mint, cfg=None):
     """Direct on-chain check of SPL/Token-2022 mint. Returns dict or None if RPC failed."""
@@ -2546,14 +2564,19 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
     sybil_on = opt_on(cfg, "anti_sybil_enabled", True)
     socials_on = opt_on(cfg, "reused_socials_enabled", True)
     is_pulse_cand = bool((pair or {}).get("_pulse_signal")) or _get_scan_mode(cfg) == "pulse_only"
+    eff_strict = (
+        bool(cfg.get("pulse_strict_rugcheck", False))
+        if is_pulse_cand
+        else opt_on(cfg, "strict_rugcheck", True)
+    )
     eff_rc_cap = (
-        float(cfg.get("pulse_rugcheck_max_score", 50.0) or 50.0)
+        float(cfg.get("pulse_rugcheck_max_score", 45.0) or 45.0)
         if is_pulse_cand
         else float(cfg.get("rugcheck_max_score", 55) or 55)
     )
     cache_key = (
         f"{mint}:{int(tight_score_on)}:{int(pool_depth_on)}:{int(sell_sim_on)}:{int(early_shield_on)}:{int(lp_req_on)}:"
-        f"{int(creator_chk_on)}:{int(sybil_on)}:{int(socials_on)}:{int(opt_on(cfg, 'use_rugcheck', True))}:{int(opt_on(cfg, 'strict_rugcheck', True))}:"
+        f"{int(creator_chk_on)}:{int(sybil_on)}:{int(socials_on)}:{int(opt_on(cfg, 'use_rugcheck', True))}:{int(eff_strict)}:"
         f"{int(cfg.get('max_creator_launches', 5))}:{int(cfg.get('max_creator_rugged_coins', 0))}:"
         f"{float(cfg.get('creator_fast_rug_window_min', 60) or 0):g}:{int(is_pulse_cand)}:{eff_rc_cap:g}"
     )
@@ -2568,7 +2591,7 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                 pair["_creator_stats"] = c_hit
             return hit[1]
 
-    strict = opt_on(cfg, "strict_rugcheck", True)
+    strict = eff_strict
     use_rc = opt_on(cfg, "use_rugcheck", True)
     block_bundles = opt_on(cfg, "block_insider_bundles", True)
     block_dev_dump = opt_on(cfg, "block_creator_dump", True)
@@ -2696,11 +2719,33 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
                 # Enforce RugCheck risk score at EVERY age (never skip young tokens)
                 if verdict[0] and (is_pulse_cand or opt_on(cfg, "rugcheck_max_score", True) or tight_score_on):
                     sn = _f(rep.get("score_normalised"))
-                    if sn is None and _f(rep.get("score")) is not None:
-                        raw_s = _f(rep.get("score")) or 0.0
+                    raw_s_val = _f(rep.get("score"))
+                    if sn is None and raw_s_val is not None:
+                        raw_s = raw_s_val or 0.0
                         sn = min(100.0, raw_s / 100.0) if raw_s > 100.0 else raw_s
                     if sn is not None:
                         if sn > 100: sn /= 1000.0
+                        rep_markets = rep.get("markets")
+                        is_canon_dex = is_bonding_curve or any(
+                            k in dex_id for k in ("pumpswap", "pump", "launchlab", "moonshot", "meteora")
+                        ) or (
+                            isinstance(rep_markets, list)
+                            and any(any(k in str((m or {}).get("marketType") or "").lower() for k in ("pump", "launchlab", "moonshot")) for m in rep_markets if isinstance(m, dict))
+                        )
+                        if (not lp_req_on or is_canon_dex) and isinstance(rep.get("risks"), list) and rep["risks"]:
+                            lp_bias = 0.0
+                            for r in rep["risks"]:
+                                if not isinstance(r, dict): continue
+                                rn = str(r.get("name") or "").lower()
+                                if "lp unlocked" in rn or "lp providers" in rn:
+                                    lp_bias += max(0.0, _f(r.get("score")) or 0.0)
+                            if lp_bias > 0.0:
+                                raw_tot = raw_s_val if (raw_s_val is not None and raw_s_val > 0.0) else lp_bias
+                                non_lp_raw = max(0.0, raw_tot - lp_bias)
+                                if non_lp_raw <= 100.0:
+                                    sn = min(sn, 1.0 if non_lp_raw <= 1.0 else min(15.0, round(non_lp_raw / 10.0) + 1.0))
+                                else:
+                                    sn = max(1.0, round(sn * (non_lp_raw / max(raw_tot, non_lp_raw)), 1))
                         max_rc_score = eff_rc_cap if (is_pulse_cand or opt_on(cfg, "rugcheck_max_score", True)) else 100.0
                         if tight_score_on and not is_pulse_cand:
                             max_rc_score = min(max_rc_score, 45.0)
@@ -2908,13 +2953,20 @@ def hard_rug_check(mint, cfg, age_s, pair=None):
     finally:
         pool.shutdown(wait=False)
 
-    if not verdict[0] and creator_addr and any(w in verdict[1].lower() for w in ("rug", "honeypot", "authority", "freeze", "lp burned")):
+    is_transient_fail = (not verdict[0]) and _is_transient_rug_error(verdict[1])
+    if (
+        not verdict[0]
+        and not is_transient_fail
+        and creator_addr
+        and any(w in verdict[1].lower() for w in ("rugged", "rugcheck danger", "rugcheck risk", "creator history", "honeypot", "authority", "freeze", "lp burned", "bundle", "sybil"))
+    ):
         _mark_creator_coin_rugged(mint, verdict[1], creator=creator_addr)
         _mark_social_rugged(mint)
 
     with _rug_lock:
         if len(_rug_cache) > 5000: _rug_cache.clear()
-        _rug_cache[cache_key] = (time.time(), verdict)
+        cache_ts = (time.time() - ttl + 20.0) if is_transient_fail else time.time()
+        _rug_cache[cache_key] = (cache_ts, verdict)
         if c_meta is not None:
             if len(_creator_meta_cache) > 5000: _creator_meta_cache.clear()
             _creator_meta_cache[mint] = c_meta
@@ -3075,7 +3127,7 @@ class TradingAccount:
     def _effective_trade_size_usd(self, is_pulse=False):
         c = self.cfg
         if is_pulse or _get_scan_mode(c) == "pulse_only":
-            return max(0.5, float(c.get("pulse_trade_size_usd", 5.0) or 5.0))
+            return max(0.5, float(c.get("pulse_trade_size_usd", 2.0) or 2.0))
         return float(c.get("trade_size_usd", 5.0) or 5.0) if opt_on(c, "trade_size_usd", True) else 5.0
 
     def can_open(self, is_pulse=False):
@@ -3218,7 +3270,8 @@ class TradingAccount:
                         self._in_flight_buys = max(0, self._in_flight_buys - 1)
         else:
             with self.lock:
-                fill = price * (1 + eff_slip_pct / 100.0)
+                # Record exact live market/quote entry price in Paper Mode (never inflate entry_price above DexScreener candles by max slippage tolerance)
+                fill = price
                 qty = (size * (1 - eff_fee_pct / 100.0)) / fill
 
         with self.lock:
@@ -3802,9 +3855,9 @@ class TradingAccount:
 
             pos_is_pulse = bool(pos.get("pulse_entry")) or _get_scan_mode(self.cfg) == "pulse_only"
             eff_tp = max(0.0, float(self.cfg.get("pulse_take_profit_pct", 30.0) or 0.0)) if pos_is_pulse else tp
-            eff_sl = max(0.0, float(self.cfg.get("pulse_stop_loss_pct", 15.0) or 0.0)) if pos_is_pulse else sl
+            eff_sl = max(0.0, float(self.cfg.get("pulse_stop_loss_pct", 18.0) or 0.0)) if pos_is_pulse else sl
             eff_trail = max(0.0, float(self.cfg.get("pulse_trailing_stop_pct", 8.0) or 0.0)) if pos_is_pulse else trail
-            eff_max_hold = max(0.0, float(self.cfg.get("pulse_max_hold_minutes", 90) or 0.0)) if pos_is_pulse else max_hold
+            eff_max_hold = max(0.0, float(self.cfg.get("pulse_max_hold_minutes", 45) or 0.0)) if pos_is_pulse else max_hold
             eff_recover_enabled = False if pos_is_pulse else recover_enabled
 
             held_min = max(0.0, (now_ts - pos["opened"]) / 60.0)
@@ -3999,6 +4052,8 @@ def scan_and_buy(acct, cfg):
         for p in data:
             mint = (p.get("baseToken") or {}).get("address")
             if not mint: continue
+            p_px = _f(p.get("priceUsd"))
+            if p_px is None or p_px <= 0: continue
             liq = _f((p.get("liquidity") or {}).get("usd")) or 0.0
             cur = pairs.get(mint)
             if cur is None or liq > cur[0]: pairs[mint] = (liq, p)
@@ -4045,6 +4100,7 @@ def scan_and_buy(acct, cfg):
         if _should_stop():
             return
         if mint in acct.state["positions"] or mint in acct.state["blacklist"]: continue
+        if _transient_rug_cooldown.get(mint, 0.0) > time.time(): continue
         sb_hits = _get_pair_smart_buyers(pair, pair.get("_rep"), cfg)
         if sb_hits:
             pair["_smart_buyers"] = sb_hits
@@ -4142,9 +4198,17 @@ def scan_and_buy(acct, cfg):
             rok, rwhy = hard_rug_check(mint, cfg, age_s, pair=pair)
         if not rok:
             with _stats_lock: _stats["rug"] += 1
-            log(f"✗ RUG REJECT {symbol}: {rwhy}")
-            acct.note_rejected(mint)
-            _note_symbol_cooldown(symbol, cfg)
+            if _is_transient_rug_error(rwhy):
+                now_cd = time.time()
+                if len(_transient_rug_cooldown) > 1000:
+                    for km in [km for km, exp_ts in _transient_rug_cooldown.items() if exp_ts <= now_cd]:
+                        _transient_rug_cooldown.pop(km, None)
+                _transient_rug_cooldown[mint] = now_cd + 20.0
+                log(f"⏳ RUG RETRY {symbol}: {rwhy} (retrying in 20s — not blacklisted)")
+            else:
+                log(f"✗ RUG REJECT {symbol}: {rwhy}")
+                acct.note_rejected(mint)
+                _note_symbol_cooldown(symbol, cfg)
             continue
         if _should_stop():
             return
@@ -4160,8 +4224,49 @@ def scan_and_buy(acct, cfg):
                 continue
 
         price = _f(pair.get("priceUsd"))
-        if price is None or price <= 0: continue
         liq_usd = _f((pair.get("liquidity") or {}).get("usd"))
+        # Refresh spot price right before executing buy() so 1-5s hard_rug_check latency or cached Pulse snapshots cannot enter on stale prices
+        if acct.mode != "live":
+            try:
+                cur_dex_low = str(pair.get("dexId") or "").strip().lower()
+                cur_pair_addr = str(pair.get("pairAddress") or "").strip()
+                want_curve = cur_dex_low in ("pumpfun", "pump")
+                fresh_ds = get_json(f"{DEX}/tokens/v1/solana/{mint}", timeout=2.0)
+                if isinstance(fresh_ds, list) and fresh_ds:
+                    best_fresh = None
+                    best_fresh_score = -1.0
+                    for fp in fresh_ds:
+                        if not isinstance(fp, dict):
+                            continue
+                        f_px = _f(fp.get("priceUsd"))
+                        if f_px is None or f_px <= 0:
+                            continue
+                        f_dex = str(fp.get("dexId") or "").strip().lower()
+                        f_is_curve = f_dex in ("pumpfun", "pump")
+                        if want_curve and not f_is_curve:
+                            continue
+                        if not want_curve and f_is_curve:
+                            continue
+                        f_liq = _f((fp.get("liquidity") or {}).get("usd")) or 0.0
+                        f_addr = str(fp.get("pairAddress") or "").strip()
+                        addr_bonus = 1e12 if (cur_pair_addr and f_addr == cur_pair_addr) else 0.0
+                        if addr_bonus + f_liq > best_fresh_score:
+                            best_fresh_score = addr_bonus + f_liq
+                            best_fresh = fp
+                    if best_fresh is not None:
+                        refreshed_px = _f(best_fresh.get("priceUsd"))
+                        refreshed_liq = _f((best_fresh.get("liquidity") or {}).get("usd"))
+                        if refreshed_px and refreshed_px > 0:
+                            price = refreshed_px
+                        if refreshed_liq is not None and refreshed_liq > 0:
+                            liq_usd = refreshed_liq
+                elif (price is None or price <= 0) or pair.get("_synthetic"):
+                    jup_now = _jupiter_prices([mint], cfg)
+                    if jup_now.get(mint) and jup_now[mint] > 0 and not want_curve:
+                        price = jup_now[mint]
+            except Exception:
+                pass
+        if price is None or price <= 0: continue
         smart_buyers = list(dict.fromkeys(
             str(w).strip()
             for w in (pair.get("_smart_buyers") if isinstance(pair.get("_smart_buyers"), list) else [])
@@ -4181,7 +4286,12 @@ def scan_and_buy(acct, cfg):
             log(f"⚡ [AlphaSignal] {alpha_sig.get('source', 'Alpha Signal')} triggered {symbol} (risk={int(float(alpha_sig.get('riskScore') or 0))}/100) — entering trade")
         if smart_buyers:
             log(f"🐋 [SmartMoney] {len(smart_buyers)} tracked whale(s) buying {symbol} ({smart_buyers[0][:6]}...) — prioritizing entry")
-        conv_mult = _evaluate_conviction_mult(pair, cfg, len(smart_buyers))
+        is_pulse_trade = bool(pulse_sig) or _get_scan_mode(cfg) == "pulse_only"
+        conv_mult = (
+            _evaluate_conviction_mult(pair, cfg, len(smart_buyers))
+            if (not is_pulse_trade or bool(cfg.get("pulse_conviction_sizing", False)))
+            else 1.0
+        )
         regime_mult = float((regime or {}).get("size_mult", 1.0) or 1.0)
         streak_mult = float((streak or {}).get("size_mult", 1.0) or 1.0)
         total_size_mult = round(max(0.1, min(3.0, conv_mult * regime_mult * streak_mult)), 3)
@@ -4237,7 +4347,7 @@ def _reverse_quote_prices(pos_dict, cfg, sol_px, acct=None):
     tp = float(cfg.get("take_profit_pct") or 0.0) if opt_on(cfg, "take_profit_pct", True) else 0.0
     sl = float(cfg.get("stop_loss_pct") or 0.0) if opt_on(cfg, "stop_loss_pct", True) else 0.0
     p_tp = float(cfg.get("pulse_take_profit_pct") or 30.0)
-    p_sl = float(cfg.get("pulse_stop_loss_pct") or 15.0)
+    p_sl = float(cfg.get("pulse_stop_loss_pct") or 18.0)
     near_exit = False
     for _m, p in pos_dict.items():
         pnl = float(p.get("pnl_pct") or 0.0)
@@ -4396,18 +4506,22 @@ def monitor(acct):
     early_shield_on = opt_on(acct.cfg, "early_rug_shield_enabled", True)
     block_dev_dump = opt_on(acct.cfg, "block_creator_dump", True)
     creator_dump_mints = []
+    now_ws_ms = time.time() * 1000.0
     for wm, snap in ws_open.items():
         if wm in pos and isinstance(snap, dict):
+            p_ref = pos[wm]
+            p_dex_low = str(p_ref.get("dex") or "").strip().lower()
+            is_curve_pos = p_dex_low in ("", "?", "pumpfun", "pump")
             wpx = _f(snap.get("priceUsd"))
             wliq = _f(snap.get("liquidityUsd"))
             wrs = _f(snap.get("realSol"))
-            if wpx and wpx > 0:
+            snap_age_ms = now_ws_ms - float(snap.get("lastTradeAtMs") or 0.0)
+            if is_curve_pos and wpx and wpx > 0 and (snap.get("lastTradeAtMs") is None or snap_age_ms <= 15000.0):
                 prices[wm] = wpx
-            if wliq and wliq > 0:
+            if is_curve_pos and wliq and wliq > 0:
                 liquidities[wm] = wliq
             if wrs is not None and wrs >= 0:
                 real_sol_updates[wm] = wrs
-            p_ref = pos[wm]
             snap_creator = str(snap.get("creator") or "").strip()
             if snap_creator and not p_ref.get("creator"):
                 p_ref["creator"] = snap_creator
@@ -4607,7 +4721,7 @@ def run(once=False):
     scan_mode_banner = _get_scan_mode(CONFIG)
     if scan_mode_banner == "pulse_only":
         p_stage = str(CONFIG.get("pulse_stage") or "both")
-        p_refresh = int(CONFIG.get("pulse_refresh_interval_sec", 10) or 10)
+        p_refresh = int(CONFIG.get("pulse_refresh_interval_sec", 5) or 5)
         p_tip = float(CONFIG.get("pulse_jito_tip_sol", 0.0005) or 0.0005)
         log(f"Strategy: PHOTON / AXIOM / GMGN PULSE (pulse_only) | Stage={p_stage} (refresh {p_refresh}s, Jito tip {p_tip:g} SOL) · Independent Pulse Settings (Ignores Sniper/Whales){sol_banner}")
     elif scan_mode_banner == "alpha_signal_only":
@@ -4654,15 +4768,16 @@ def run(once=False):
     pump_banner = f"+{float(CONFIG.get('max_price_change_m5_pct', 250) or 0):.0f}%" if opt_on(CONFIG, "max_price_change_m5_pct", True) else "OFF"
     creator_banner = f"owner-chk={'ON' if opt_on(CONFIG, 'check_creator_history', True) else 'OFF'}"
     if scan_mode_banner == "pulse_only":
-        p_sz = float(CONFIG.get("pulse_trade_size_usd", 5.0) or 5.0)
+        p_sz = float(CONFIG.get("pulse_trade_size_usd", 2.0) or 2.0)
         p_tp = float(CONFIG.get("pulse_take_profit_pct", 30.0) or 30.0)
-        p_sl = float(CONFIG.get("pulse_stop_loss_pct", 15.0) or 15.0)
+        p_sl = float(CONFIG.get("pulse_stop_loss_pct", 18.0) or 18.0)
         p_tr = float(CONFIG.get("pulse_trailing_stop_pct", 8.0) or 8.0)
-        p_cmin = float(CONFIG.get("pulse_stage2_min_curve_pct", 65.0) or 65.0)
-        p_cmax = float(CONFIG.get("pulse_stage2_max_curve_pct", 94.0) or 94.0)
-        p_s3 = float(CONFIG.get("pulse_stage3_min_liquidity_usd", 15000.0) or 15000.0)
-        p_rc = float(CONFIG.get("pulse_rugcheck_max_score", 50.0) or 50.0)
-        log(f"Pulse Rules: size=${p_sz:g} | TP +{p_tp:g}% / SL -{p_sl:g}% / Trail {p_tr:g}% | Stage2 curve {p_cmin:g}-{p_cmax:g}% | Stage3 liq>=${p_s3:.0f} | RugCheck<{p_rc:g} | {creator_banner}")
+        p_cmin = float(CONFIG.get("pulse_stage2_min_curve_pct", 50.0) or 50.0)
+        p_cmax = float(CONFIG.get("pulse_stage2_max_curve_pct", 86.0) or 86.0)
+        p_s3 = float(CONFIG.get("pulse_stage3_min_liquidity_usd", 20000.0) or 20000.0)
+        p_rc = float(CONFIG.get("pulse_rugcheck_max_score", 45.0) or 45.0)
+        p_strict = bool(CONFIG.get("pulse_strict_rugcheck", False))
+        log(f"Pulse Rules: size=${p_sz:g} | TP +{p_tp:g}% / SL -{p_sl:g}% / Trail {p_tr:g}% | Stage2 curve {p_cmin:g}-{p_cmax:g}% | Stage3 liq>=${p_s3:.0f} | RugCheck<{p_rc:g} (strict={'ON' if p_strict else 'OFF'}) | {creator_banner}")
     elif scan_mode_banner == "alpha_signal_only":
         al_risk = int(CONFIG.get("alpha_signal_max_risk_score", 45) or 45)
         al_ratio_raw = float(CONFIG.get("min_buy_sell_ratio_m5", 1.5) or 0) if opt_on(CONFIG, "min_buy_sell_ratio_m5", True) else 0.0
@@ -4717,5 +4832,8 @@ def run(once=False):
         log("Python sniper loop exited cleanly.")
 
 if __name__ == "__main__":
-    if "--probe" in sys.argv: probe(CONFIG)
-    else: run(once="--once" in sys.argv)
+    if "--probe" in sys.argv:
+        load_settings()
+        probe(CONFIG)
+    else:
+        run(once="--once" in sys.argv)

@@ -195,6 +195,8 @@ const PYTHON_PRO_DESK_KEYS: Array<[string, 'bool' | 'int' | 'float' | 'string' |
   ['pulse_min_buy_sell_ratio_m5', 'float'],
   ['pulse_min_unique_traders_5m', 'int'],
   ['pulse_rugcheck_max_score', 'float'],
+  ['pulse_strict_rugcheck', 'bool'],
+  ['pulse_conviction_sizing', 'bool'],
   ['reused_socials_enabled', 'bool'],
   ['max_social_reuse_count', 'int'],
   ['ws_exit_stream_enabled', 'bool'],
@@ -891,7 +893,7 @@ export function PythonSniperView() {
   const [confirmDeleteMint, setConfirmDeleteMint] = useState<string | null>(null);
   const [deletingMint, setDeletingMint] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
-  const [resettingDefaults, setResettingDefaults] = useState<'settings' | 'pro_desk' | null>(null);
+  const [resettingDefaults, setResettingDefaults] = useState<'settings' | 'pro_desk' | 'pulse' | null>(null);
 
   const fetchStatus = async () => {
     try {
@@ -1053,7 +1055,7 @@ export function PythonSniperView() {
     }
   };
 
-  const handleResetDefaults = async (scope: 'settings' | 'pro_desk') => {
+  const handleResetDefaults = async (scope: 'settings' | 'pro_desk' | 'pulse') => {
     setResettingDefaults(scope);
     try {
       const data = await apiFetch<any>('/api/sniper/settings/reset', {
@@ -1066,11 +1068,18 @@ export function PythonSniperView() {
         markSettingsDirty(false);
         pushToast({
           kind: 'success',
-          title: scope === 'pro_desk' ? 'Pro Desk Reset to Default' : 'Settings Reset to Default',
+          title:
+            scope === 'pro_desk'
+              ? 'Pro Desk Reset to Default'
+              : scope === 'pulse'
+                ? 'Pulse Reset to Best Defaults'
+                : 'Settings Reset to Default',
           body:
             scope === 'pro_desk'
               ? 'All Pro Desk modules and thresholds have been restored to best Quick-Profit defaults and saved.'
-              : 'All Settings filters, exits, and Rug Shield options have been restored to best Quick-Profit defaults and saved.',
+              : scope === 'pulse'
+                ? 'Pulse Stage 2–3 settings ($2 size, TP +30% / SL -18% / Trail 8%, 50–86% curve, $20k AMM liq, RugCheck <= 45) restored and locked to Pulse Mode.'
+                : 'All Settings filters, exits, and Rug Shield options have been restored to best Quick-Profit defaults and saved.',
         });
         void fetchStatus();
       } else {
@@ -3450,7 +3459,7 @@ export function PythonSniperView() {
             >
               {pulseManualBuying
                 ? 'Queuing Buy...'
-                : `Buy Coin Now ($${Number(draftSettings.pulse_trade_size_usd ?? 5).toFixed(2)})`}
+                : `Buy Coin Now ($${Number(draftSettings.pulse_trade_size_usd ?? 2).toFixed(2)})`}
             </button>
           </div>
 
@@ -3465,43 +3474,59 @@ export function PythonSniperView() {
                   Trade size, exits, coin age, curve %, AMM liquidity, and RugCheck threshold applied exclusively when Pulse trades.
                 </p>
               </div>
-              <button
-                type="button"
-                disabled={savingSmartConfig}
-                onClick={async () => {
-                  await saveQuickSniperSettings(
-                    {
-                      pulse_stage: String(draftSettings.pulse_stage || 'both'),
-                      pulse_trade_size_usd: Number(draftSettings.pulse_trade_size_usd ?? 5),
-                      pulse_take_profit_pct: Number(draftSettings.pulse_take_profit_pct ?? 30),
-                      pulse_stop_loss_pct: Number(draftSettings.pulse_stop_loss_pct ?? 15),
-                      pulse_trailing_stop_pct: Number(draftSettings.pulse_trailing_stop_pct ?? 8),
-                      pulse_max_hold_minutes: Number(draftSettings.pulse_max_hold_minutes ?? 90),
-                      pulse_jito_tip_sol: Number(draftSettings.pulse_jito_tip_sol ?? 0.0005),
-                      pulse_refresh_interval_sec: Number(draftSettings.pulse_refresh_interval_sec ?? 10),
-                      pulse_min_age_minutes: Number(draftSettings.pulse_min_age_minutes ?? 2),
-                      pulse_max_age_minutes: Number(draftSettings.pulse_max_age_minutes ?? 180),
-                      pulse_stage2_min_curve_pct: Number(draftSettings.pulse_stage2_min_curve_pct ?? 65),
-                      pulse_stage2_max_curve_pct: Number(draftSettings.pulse_stage2_max_curve_pct ?? 94),
-                      pulse_stage2_min_real_sol: Number(draftSettings.pulse_stage2_min_real_sol ?? 40),
-                      pulse_stage3_min_liquidity_usd: Number(draftSettings.pulse_stage3_min_liquidity_usd ?? 15000),
-                      pulse_stage3_require_pullback: Boolean(draftSettings.pulse_stage3_require_pullback),
-                      pulse_stage3_pullback_pct: Number(draftSettings.pulse_stage3_pullback_pct ?? 12),
-                      pulse_stage3_wait_sec: Number(draftSettings.pulse_stage3_wait_sec ?? 30),
-                      pulse_min_buys_m5: Number(draftSettings.pulse_min_buys_m5 ?? 10),
-                      pulse_min_buy_sell_ratio_m5: Number(draftSettings.pulse_min_buy_sell_ratio_m5 ?? 1.05),
-                      pulse_min_unique_traders_5m: Number(draftSettings.pulse_min_unique_traders_5m ?? 10),
-                      pulse_rugcheck_max_score: Number(draftSettings.pulse_rugcheck_max_score ?? 50),
-                    },
-                    'Pulse independent settings saved'
-                  );
-                  void fetchPulseSignals(true);
-                }}
-                className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold inline-flex items-center gap-1.5 shadow-sm disabled:opacity-50"
-              >
-                <Save className="w-3.5 h-3.5" />
-                <span>Save Pulse Settings</span>
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={savingSmartConfig || resettingDefaults === 'pulse'}
+                  onClick={async () => {
+                    await handleResetDefaults('pulse');
+                    void fetchPulseSignals(true);
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-600 dark:text-amber-300 border border-amber-500/30 text-xs font-semibold disabled:opacity-50"
+                  title="Restores recommended Pulse defaults ($2 size, TP +30% / SL -18% / Trail 8%, 50–86% curve, $20k AMM liq, RugCheck <= 45) and activates Pulse Mode"
+                >
+                  {resettingDefaults === 'pulse' ? 'Resetting...' : 'Reset Best Defaults'}
+                </button>
+                <button
+                  type="button"
+                  disabled={savingSmartConfig}
+                  onClick={async () => {
+                    await saveQuickSniperSettings(
+                      {
+                        pulse_stage: String(draftSettings.pulse_stage || 'both'),
+                        pulse_trade_size_usd: Number(draftSettings.pulse_trade_size_usd ?? 2),
+                        pulse_take_profit_pct: Number(draftSettings.pulse_take_profit_pct ?? 30),
+                        pulse_stop_loss_pct: Number(draftSettings.pulse_stop_loss_pct ?? 18),
+                        pulse_trailing_stop_pct: Number(draftSettings.pulse_trailing_stop_pct ?? 8),
+                        pulse_max_hold_minutes: Number(draftSettings.pulse_max_hold_minutes ?? 45),
+                        pulse_jito_tip_sol: Number(draftSettings.pulse_jito_tip_sol ?? 0.0005),
+                        pulse_refresh_interval_sec: Number(draftSettings.pulse_refresh_interval_sec ?? 5),
+                        pulse_min_age_minutes: Number(draftSettings.pulse_min_age_minutes ?? 1.5),
+                        pulse_max_age_minutes: Number(draftSettings.pulse_max_age_minutes ?? 120),
+                        pulse_stage2_min_curve_pct: Number(draftSettings.pulse_stage2_min_curve_pct ?? 50),
+                        pulse_stage2_max_curve_pct: Number(draftSettings.pulse_stage2_max_curve_pct ?? 86),
+                        pulse_stage2_min_real_sol: Number(draftSettings.pulse_stage2_min_real_sol ?? 35),
+                        pulse_stage3_min_liquidity_usd: Number(draftSettings.pulse_stage3_min_liquidity_usd ?? 20000),
+                        pulse_stage3_require_pullback: Boolean(draftSettings.pulse_stage3_require_pullback),
+                        pulse_stage3_pullback_pct: Number(draftSettings.pulse_stage3_pullback_pct ?? 10),
+                        pulse_stage3_wait_sec: Number(draftSettings.pulse_stage3_wait_sec ?? 30),
+                        pulse_min_buys_m5: Number(draftSettings.pulse_min_buys_m5 ?? 15),
+                        pulse_min_buy_sell_ratio_m5: Number(draftSettings.pulse_min_buy_sell_ratio_m5 ?? 1.15),
+                        pulse_min_unique_traders_5m: Number(draftSettings.pulse_min_unique_traders_5m ?? 12),
+                        pulse_rugcheck_max_score: Number(draftSettings.pulse_rugcheck_max_score ?? 45),
+                        pulse_strict_rugcheck: Boolean(draftSettings.pulse_strict_rugcheck),
+                        pulse_conviction_sizing: Boolean(draftSettings.pulse_conviction_sizing),
+                      },
+                      'Pulse independent settings saved'
+                    );
+                    void fetchPulseSignals(true);
+                  }}
+                  className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold inline-flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  <span>Save Pulse Settings</span>
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-6 gap-3 text-xs">
@@ -3511,9 +3536,9 @@ export function PythonSniperView() {
                   type="number"
                   step="0.5"
                   min={0.5}
-                  value={draftSettings.pulse_trade_size_usd ?? 5}
+                  value={draftSettings.pulse_trade_size_usd ?? 2}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, pulse_trade_size_usd: parseFloat(e.target.value || '5') || 5 });
+                    setDraftSettings({ ...draftSettings, pulse_trade_size_usd: parseFloat(e.target.value || '2') || 2 });
                     markSettingsDirty(true);
                   }}
                   className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
@@ -3539,7 +3564,7 @@ export function PythonSniperView() {
                   type="number"
                   step="1"
                   min={0}
-                  value={draftSettings.pulse_stop_loss_pct ?? 15}
+                  value={draftSettings.pulse_stop_loss_pct ?? 18}
                   onChange={(e) => {
                     setDraftSettings({ ...draftSettings, pulse_stop_loss_pct: parseFloat(e.target.value || '0') || 0 });
                     markSettingsDirty(true);
@@ -3567,7 +3592,7 @@ export function PythonSniperView() {
                   type="number"
                   step="5"
                   min={0}
-                  value={draftSettings.pulse_max_hold_minutes ?? 90}
+                  value={draftSettings.pulse_max_hold_minutes ?? 45}
                   onChange={(e) => {
                     setDraftSettings({ ...draftSettings, pulse_max_hold_minutes: parseInt(e.target.value || '0', 10) || 0 });
                     markSettingsDirty(true);
@@ -3582,9 +3607,9 @@ export function PythonSniperView() {
                   step="5"
                   min={5}
                   max={300}
-                  value={draftSettings.pulse_refresh_interval_sec ?? 10}
+                  value={draftSettings.pulse_refresh_interval_sec ?? 5}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, pulse_refresh_interval_sec: parseInt(e.target.value || '10', 10) || 10 });
+                    setDraftSettings({ ...draftSettings, pulse_refresh_interval_sec: parseInt(e.target.value || '5', 10) || 5 });
                     markSettingsDirty(true);
                   }}
                   className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
@@ -3592,12 +3617,12 @@ export function PythonSniperView() {
               </div>
 
               <div>
-                <label className="block text-[10px] text-slate-500 mb-1">Min Age (min)</label>
+                <label className="block text-[10px] text-slate-500 mb-1">Min Age (Stage 2, min)</label>
                 <input
                   type="number"
                   step="0.5"
                   min={0}
-                  value={draftSettings.pulse_min_age_minutes ?? 2}
+                  value={draftSettings.pulse_min_age_minutes ?? 1.5}
                   onChange={(e) => {
                     setDraftSettings({ ...draftSettings, pulse_min_age_minutes: parseFloat(e.target.value || '0') || 0 });
                     markSettingsDirty(true);
@@ -3611,7 +3636,7 @@ export function PythonSniperView() {
                   type="number"
                   step="5"
                   min={0}
-                  value={draftSettings.pulse_max_age_minutes ?? 180}
+                  value={draftSettings.pulse_max_age_minutes ?? 120}
                   onChange={(e) => {
                     setDraftSettings({ ...draftSettings, pulse_max_age_minutes: parseFloat(e.target.value || '0') || 0 });
                     markSettingsDirty(true);
@@ -3626,9 +3651,9 @@ export function PythonSniperView() {
                   step="1"
                   min={10}
                   max={99}
-                  value={draftSettings.pulse_stage2_min_curve_pct ?? 65}
+                  value={draftSettings.pulse_stage2_min_curve_pct ?? 50}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, pulse_stage2_min_curve_pct: parseFloat(e.target.value || '65') || 65 });
+                    setDraftSettings({ ...draftSettings, pulse_stage2_min_curve_pct: parseFloat(e.target.value || '50') || 50 });
                     markSettingsDirty(true);
                   }}
                   className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
@@ -3641,9 +3666,9 @@ export function PythonSniperView() {
                   step="1"
                   min={20}
                   max={100}
-                  value={draftSettings.pulse_stage2_max_curve_pct ?? 94}
+                  value={draftSettings.pulse_stage2_max_curve_pct ?? 86}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, pulse_stage2_max_curve_pct: parseFloat(e.target.value || '94') || 94 });
+                    setDraftSettings({ ...draftSettings, pulse_stage2_max_curve_pct: parseFloat(e.target.value || '86') || 86 });
                     markSettingsDirty(true);
                   }}
                   className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
@@ -3655,7 +3680,7 @@ export function PythonSniperView() {
                   type="number"
                   step="1"
                   min={0}
-                  value={draftSettings.pulse_stage2_min_real_sol ?? 40}
+                  value={draftSettings.pulse_stage2_min_real_sol ?? 35}
                   onChange={(e) => {
                     setDraftSettings({ ...draftSettings, pulse_stage2_min_real_sol: parseFloat(e.target.value || '0') || 0 });
                     markSettingsDirty(true);
@@ -3669,9 +3694,9 @@ export function PythonSniperView() {
                   type="number"
                   step="1000"
                   min={1000}
-                  value={draftSettings.pulse_stage3_min_liquidity_usd ?? 15000}
+                  value={draftSettings.pulse_stage3_min_liquidity_usd ?? 20000}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, pulse_stage3_min_liquidity_usd: parseFloat(e.target.value || '15000') || 15000 });
+                    setDraftSettings({ ...draftSettings, pulse_stage3_min_liquidity_usd: parseFloat(e.target.value || '20000') || 20000 });
                     markSettingsDirty(true);
                   }}
                   className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
@@ -3684,9 +3709,9 @@ export function PythonSniperView() {
                   type="number"
                   step="1"
                   min={1}
-                  value={draftSettings.pulse_min_buys_m5 ?? 10}
+                  value={draftSettings.pulse_min_buys_m5 ?? 15}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, pulse_min_buys_m5: parseInt(e.target.value || '10', 10) || 10 });
+                    setDraftSettings({ ...draftSettings, pulse_min_buys_m5: parseInt(e.target.value || '15', 10) || 15 });
                     markSettingsDirty(true);
                   }}
                   className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
@@ -3698,9 +3723,9 @@ export function PythonSniperView() {
                   type="number"
                   step="0.05"
                   min={0.5}
-                  value={draftSettings.pulse_min_buy_sell_ratio_m5 ?? 1.05}
+                  value={draftSettings.pulse_min_buy_sell_ratio_m5 ?? 1.15}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, pulse_min_buy_sell_ratio_m5: parseFloat(e.target.value || '1.05') || 1.05 });
+                    setDraftSettings({ ...draftSettings, pulse_min_buy_sell_ratio_m5: parseFloat(e.target.value || '1.15') || 1.15 });
                     markSettingsDirty(true);
                   }}
                   className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
@@ -3712,9 +3737,9 @@ export function PythonSniperView() {
                   type="number"
                   step="1"
                   min={1}
-                  value={draftSettings.pulse_min_unique_traders_5m ?? 10}
+                  value={draftSettings.pulse_min_unique_traders_5m ?? 12}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, pulse_min_unique_traders_5m: parseInt(e.target.value || '10', 10) || 10 });
+                    setDraftSettings({ ...draftSettings, pulse_min_unique_traders_5m: parseInt(e.target.value || '12', 10) || 12 });
                     markSettingsDirty(true);
                   }}
                   className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
@@ -3727,9 +3752,9 @@ export function PythonSniperView() {
                   step="5"
                   min={10}
                   max={100}
-                  value={draftSettings.pulse_rugcheck_max_score ?? 50}
+                  value={draftSettings.pulse_rugcheck_max_score ?? 45}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, pulse_rugcheck_max_score: parseFloat(e.target.value || '50') || 50 });
+                    setDraftSettings({ ...draftSettings, pulse_rugcheck_max_score: parseFloat(e.target.value || '45') || 45 });
                     markSettingsDirty(true);
                   }}
                   className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
@@ -3743,9 +3768,9 @@ export function PythonSniperView() {
                   min={1}
                   max={60}
                   disabled={!draftSettings.pulse_stage3_require_pullback}
-                  value={draftSettings.pulse_stage3_pullback_pct ?? 12}
+                  value={draftSettings.pulse_stage3_pullback_pct ?? 10}
                   onChange={(e) => {
-                    setDraftSettings({ ...draftSettings, pulse_stage3_pullback_pct: parseFloat(e.target.value || '12') || 12 });
+                    setDraftSettings({ ...draftSettings, pulse_stage3_pullback_pct: parseFloat(e.target.value || '10') || 10 });
                     markSettingsDirty(true);
                   }}
                   className="w-full px-2.5 py-1.5 rounded-lg font-mono bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-50"
@@ -3766,6 +3791,44 @@ export function PythonSniperView() {
                 </label>
               </div>
             </div>
+
+            <div className="flex flex-wrap items-center gap-3 pt-1 text-xs">
+              <label
+                className="flex items-center gap-2 cursor-pointer px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                title="When OFF (recommended), Pulse uses on-chain RPC mint/freeze/dev-hold/top-10 holder checks when RugCheck has not indexed a fresh coin yet. Turn ON to block coins until RugCheck API responds."
+              >
+                <input
+                  type="checkbox"
+                  checked={Boolean(draftSettings.pulse_strict_rugcheck)}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_strict_rugcheck: e.target.checked });
+                    markSettingsDirty(true);
+                  }}
+                  className="rounded text-cyan-600 focus:ring-cyan-500"
+                />
+                <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                  Require RugCheck Report (Fail Closed)
+                </span>
+              </label>
+
+              <label
+                className="flex items-center gap-2 cursor-pointer px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                title="When OFF (recommended), Pulse buys the exact Trade Size ($) you configured. Turn ON to scale size 0.6x–1.5x using Pro Desk conviction scoring."
+              >
+                <input
+                  type="checkbox"
+                  checked={Boolean(draftSettings.pulse_conviction_sizing)}
+                  onChange={(e) => {
+                    setDraftSettings({ ...draftSettings, pulse_conviction_sizing: e.target.checked });
+                    markSettingsDirty(true);
+                  }}
+                  className="rounded text-cyan-600 focus:ring-cyan-500"
+                />
+                <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                  Dynamic Sizing (0.6x–1.5x)
+                </span>
+              </label>
+            </div>
           </div>
 
           {/* Summary Strip */}
@@ -3775,11 +3838,11 @@ export function PythonSniperView() {
               {pulseLastScanAt ? ` · Last scan: ${new Date(pulseLastScanAt).toLocaleTimeString()}` : ''}
             </span>
             <span>
-              Age {Number(draftSettings.pulse_min_age_minutes ?? 2)}m–
-              {Number(draftSettings.pulse_max_age_minutes ?? 180) > 0 ? `${Number(draftSettings.pulse_max_age_minutes ?? 180)}m` : 'any'} ·
-              Curve {Number(draftSettings.pulse_stage2_min_curve_pct ?? 65)}–{Number(draftSettings.pulse_stage2_max_curve_pct ?? 94)}% ·
-              AMM Liq &ge; ${Number(draftSettings.pulse_stage3_min_liquidity_usd ?? 15000).toLocaleString()} ·
-              RugCheck &le; {Number(draftSettings.pulse_rugcheck_max_score ?? 50)}
+              Stage 2 Age {Number(draftSettings.pulse_min_age_minutes ?? 1.5)}m–
+              {Number(draftSettings.pulse_max_age_minutes ?? 120) > 0 ? `${Number(draftSettings.pulse_max_age_minutes ?? 120)}m` : 'any'} ·
+              Curve {Number(draftSettings.pulse_stage2_min_curve_pct ?? 50)}–{Number(draftSettings.pulse_stage2_max_curve_pct ?? 86)}% ·
+              AMM Liq &ge; ${Number(draftSettings.pulse_stage3_min_liquidity_usd ?? 20000).toLocaleString()} ·
+              RugCheck &le; {Number(draftSettings.pulse_rugcheck_max_score ?? 45)}
             </span>
           </div>
 
@@ -3891,8 +3954,12 @@ export function PythonSniperView() {
                         >
                           {sig.status}
                         </span>
-                        {sig.skipReason && sig.status === 'SKIPPED' && (
-                          <span className="block text-[10px] font-sans text-rose-400 mt-0.5 leading-tight">
+                        {sig.skipReason && (sig.status === 'SKIPPED' || sig.status === 'PENDING') && (
+                          <span
+                            className={`block text-[10px] font-sans mt-0.5 leading-tight ${
+                              sig.status === 'SKIPPED' ? 'text-rose-400' : 'text-amber-500 dark:text-amber-400'
+                            }`}
+                          >
                             {sig.skipReason}
                           </span>
                         )}
@@ -6270,7 +6337,7 @@ export function PythonSniperView() {
                   {
                     id: 'pulse_only' as const,
                     title: 'Photon / Axiom / GMGN Pulse (Stage 2–3)',
-                    desc: 'Only trades Stage 2 (65–94% curve) & Stage 3 (Migrated AMM) coins using Pulse’s own independent settings.',
+                    desc: 'Only trades Stage 2 (50–86% curve) & Stage 3 (Migrated AMM) coins using Pulse’s own independent settings.',
                   },
                 ].map((opt) => (
                   <label
@@ -6312,7 +6379,7 @@ export function PythonSniperView() {
               </div>
               <p className="text-[11px] text-slate-500">
                 {startScanMode === 'pulse_only'
-                  ? `Pulse Only follows Stage ${draftSettings.pulse_stage === 'stage2' ? '2 (About to Graduate)' : draftSettings.pulse_stage === 'stage3' ? '3 (Migrated AMM)' : '2 & 3'} using Pulse’s own independent size ($${Number(draftSettings.pulse_trade_size_usd ?? 5).toFixed(2)}), age, TP/SL, and RugCheck rules.`
+                  ? `Pulse Only follows Stage ${draftSettings.pulse_stage === 'stage2' ? '2 (About to Graduate)' : draftSettings.pulse_stage === 'stage3' ? '3 (Migrated AMM)' : '2 & 3'} using Pulse’s own independent size ($${Number(draftSettings.pulse_trade_size_usd ?? 2).toFixed(2)}), age, TP/SL, and RugCheck rules.`
                   : startScanMode === 'alpha_signal_only'
                     ? 'Alpha Signals Only continuously auto-finds signals across PumpPortal WS, DexScreener Boosts, and Gecko Momentum without touching Whale Wallets or general Sniper launches.'
                     : 'Note: Whale wallet trades can take hours or days to materialize; on-chain portfolio scanning also tracks coins they have already been holding for 1h–72h+.'}

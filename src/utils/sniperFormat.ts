@@ -517,7 +517,7 @@ export function validatePythonSniperSettings(
     }
   }
 
-  const pSize = parseFloat(String(settings.pulse_trade_size_usd ?? 5));
+  const pSize = parseFloat(String(settings.pulse_trade_size_usd ?? 2));
   if (!Number.isFinite(pSize) || pSize <= 0) {
     return {
       valid: false,
@@ -525,8 +525,8 @@ export function validatePythonSniperSettings(
       recovery: null,
     };
   }
-  const pMinAge = parseFloat(String(settings.pulse_min_age_minutes ?? 2));
-  const pMaxAge = parseFloat(String(settings.pulse_max_age_minutes ?? 180));
+  const pMinAge = parseFloat(String(settings.pulse_min_age_minutes ?? 1.5));
+  const pMaxAge = parseFloat(String(settings.pulse_max_age_minutes ?? 120));
   if (!Number.isFinite(pMinAge) || pMinAge < 0) {
     return {
       valid: false,
@@ -541,8 +541,8 @@ export function validatePythonSniperSettings(
       recovery: null,
     };
   }
-  const pCurveMin = parseFloat(String(settings.pulse_stage2_min_curve_pct ?? 65));
-  const pCurveMax = parseFloat(String(settings.pulse_stage2_max_curve_pct ?? 94));
+  const pCurveMin = parseFloat(String(settings.pulse_stage2_min_curve_pct ?? 50));
+  const pCurveMax = parseFloat(String(settings.pulse_stage2_max_curve_pct ?? 86));
   if (!Number.isFinite(pCurveMin) || !Number.isFinite(pCurveMax) || pCurveMin < 0 || pCurveMax > 100 || pCurveMin >= pCurveMax) {
     return {
       valid: false,

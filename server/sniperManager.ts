@@ -945,26 +945,28 @@ export class SniperManager {
       pulse_stage: 'both',
       pulse_auto_find: true,
       pulse_auto_buy: true,
-      pulse_trade_size_usd: 5.0,
+      pulse_trade_size_usd: 2.0,
       pulse_take_profit_pct: 30.0,
-      pulse_stop_loss_pct: 15.0,
+      pulse_stop_loss_pct: 18.0,
       pulse_trailing_stop_pct: 8.0,
-      pulse_max_hold_minutes: 90,
+      pulse_max_hold_minutes: 45,
       pulse_jito_tip_sol: 0.0005,
-      pulse_refresh_interval_sec: 10,
-      pulse_min_age_minutes: 2.0,
-      pulse_max_age_minutes: 180.0,
-      pulse_stage2_min_curve_pct: 65.0,
-      pulse_stage2_max_curve_pct: 94.0,
-      pulse_stage2_min_real_sol: 40.0,
-      pulse_stage3_min_liquidity_usd: 15000.0,
+      pulse_refresh_interval_sec: 5,
+      pulse_min_age_minutes: 1.5,
+      pulse_max_age_minutes: 120.0,
+      pulse_stage2_min_curve_pct: 50.0,
+      pulse_stage2_max_curve_pct: 86.0,
+      pulse_stage2_min_real_sol: 35.0,
+      pulse_stage3_min_liquidity_usd: 20000.0,
       pulse_stage3_require_pullback: false,
-      pulse_stage3_pullback_pct: 12.0,
+      pulse_stage3_pullback_pct: 10.0,
       pulse_stage3_wait_sec: 30.0,
-      pulse_min_buys_m5: 10,
-      pulse_min_buy_sell_ratio_m5: 1.05,
-      pulse_min_unique_traders_5m: 10,
-      pulse_rugcheck_max_score: 50.0,
+      pulse_min_buys_m5: 15,
+      pulse_min_buy_sell_ratio_m5: 1.15,
+      pulse_min_unique_traders_5m: 12,
+      pulse_rugcheck_max_score: 45.0,
+      pulse_strict_rugcheck: false,
+      pulse_conviction_sizing: false,
       reused_socials_enabled: true,
       max_social_reuse_count: 2,
       ws_exit_stream_enabled: true,
@@ -1536,7 +1538,7 @@ export class SniperManager {
 
   private alphaRugPrecheckCache = new Map<
     string,
-    { checkedAtMs: number; safe: boolean; reason?: string; rcScore?: number }
+    { checkedAtMs: number; safe: boolean; reason?: string; rcScore?: number; pendingReport?: boolean; strictApplied?: boolean }
   >();
 
   private alphaSignalsBuffer: Array<{
@@ -1562,22 +1564,42 @@ export class SniperManager {
   private async precheckAlphaRug(
     mint: string,
     settings: Record<string, any>
-  ): Promise<{ checkedAtMs: number; safe: boolean; reason?: string; rcScore?: number }> {
+  ): Promise<{ checkedAtMs: number; safe: boolean; reason?: string; rcScore?: number; pendingReport?: boolean; strictApplied?: boolean }> {
     const now = Date.now();
+    const isStrict =
+      typeof settings._pulse_strict_override === 'boolean'
+        ? settings._pulse_strict_override
+        : isPyOptionEnabled(settings, 'strict_rugcheck', true) && settings.strict_rugcheck !== false;
     const cached = this.alphaRugPrecheckCache.get(mint);
-    if (cached && now - cached.checkedAtMs < 5 * 60_000) {
+    const cacheTtlMs = cached?.pendingReport ? 20_000 : 5 * 60_000;
+    if (cached && cached.strictApplied === isStrict && now - cached.checkedAtMs < cacheTtlMs) {
       return cached;
     }
 
     const useRc = isPyOptionEnabled(settings, 'use_rugcheck', true) && settings.use_rugcheck !== false;
     if (!useRc) {
-      return { checkedAtMs: now, safe: true };
+      return { checkedAtMs: now, safe: true, strictApplied: isStrict };
     }
 
     try {
       const rc = await this.fetchJsonWithTimeout(`https://api.rugcheck.xyz/v1/tokens/${mint}/report`, 2800);
-      if (!rc || typeof rc !== 'object') {
-        return { checkedAtMs: now, safe: true };
+      if (!rc || typeof rc !== 'object' || (!Array.isArray(rc.risks) && rc.score == null)) {
+        const missingRes = isStrict
+          ? {
+              checkedAtMs: now,
+              safe: false,
+              pendingReport: true,
+              strictApplied: isStrict,
+              reason: 'Waiting RugCheck report',
+            }
+          : {
+              checkedAtMs: now,
+              safe: true,
+              pendingReport: true,
+              strictApplied: isStrict,
+            };
+        this.alphaRugPrecheckCache.set(mint, missingRes);
+        return missingRes;
       }
 
       const rawNorm = rc.score_normalised;
@@ -1589,8 +1611,31 @@ export class SniperManager {
         normScore = rawScore > 100 ? Math.min(100, rawScore / 100) : rawScore;
       }
 
+      // RugCheck scores fresh PumpSwap/Meteora pools ~52 solely due to 'Large Amount of LP Unlocked'
+      // / 'Low amount of LP Providers' before LP burn/lock indexing settles. Strip that LP bias when LP lock isn't required.
+      const lpReqOn =
+        isPyOptionEnabled(settings, 'require_lp_locked', false) && settings.require_lp_locked === true;
+      if (!lpReqOn && Array.isArray(rc.risks) && rc.risks.length > 0 && normScore !== undefined) {
+        let lpBiasRaw = 0;
+        for (const r of rc.risks) {
+          const rName = String(r?.name || '').toLowerCase();
+          if (rName.includes('lp unlocked') || rName.includes('lp providers')) {
+            lpBiasRaw += Math.max(0, Number(r?.score || 0));
+          }
+        }
+        if (lpBiasRaw > 0) {
+          const rawTotal = typeof rawScore === 'number' && Number.isFinite(rawScore) && rawScore > 0 ? rawScore : lpBiasRaw;
+          const nonLpRaw = Math.max(0, rawTotal - lpBiasRaw);
+          if (nonLpRaw <= 100) {
+            normScore = Math.min(normScore, nonLpRaw <= 1 ? 1 : Math.min(15, Math.round(nonLpRaw / 10) + 1));
+          } else {
+            normScore = Math.max(1, Math.round(normScore * (nonLpRaw / Math.max(rawTotal, nonLpRaw))));
+          }
+        }
+      }
+
       if (rc.rugged === true) {
-        const res = { checkedAtMs: now, safe: false, reason: 'Rugged token', rcScore: Math.max(95, normScore ?? 95) };
+        const res = { checkedAtMs: now, safe: false, strictApplied: isStrict, reason: 'Rugged token', rcScore: Math.max(95, normScore ?? 95) };
         this.alphaRugPrecheckCache.set(mint, res);
         return res;
       }
@@ -1605,6 +1650,7 @@ export class SniperManager {
         const res = {
           checkedAtMs: now,
           safe: false,
+          strictApplied: isStrict,
           reason: `Bundled insiders (${clusters} cluster${clusters === 1 ? '' : 's'})`,
           rcScore: Math.max(85, normScore ?? 85),
         };
@@ -1616,6 +1662,7 @@ export class SniperManager {
         const res = {
           checkedAtMs: now,
           safe: false,
+          strictApplied: isStrict,
           reason: rc.freezeAuthority ? 'Freeze authority active' : 'Mint authority active',
           rcScore: Math.max(85, normScore ?? 85),
         };
@@ -1630,6 +1677,7 @@ export class SniperManager {
         const res = {
           checkedAtMs: now,
           safe: false,
+          strictApplied: isStrict,
           reason: `RugCheck score ${Math.round(normScore)}/${Math.round(maxRcScore)}`,
           rcScore: Math.round(normScore),
         };
@@ -1637,9 +1685,101 @@ export class SniperManager {
         return res;
       }
 
+      // Sync creator/dev wallet hold % limit with bot.py hard_rug_check
+      if (isPyOptionEnabled(settings, 'max_dev_hold_pct', true)) {
+        const maxDevPct = Number(settings.max_dev_hold_pct ?? 5) || 0;
+        if (maxDevPct > 0) {
+          const creatorAddr = String(rc.creator || '').trim();
+          const tokMeta = rc.token && typeof rc.token === 'object' ? rc.token : {};
+          const tokDec = Number.isFinite(Number(tokMeta.decimals)) ? Number(tokMeta.decimals) : 6;
+          const rawSup = Number(tokMeta.supply || 0);
+          const effSup = rawSup > 0 && tokDec >= 0 ? rawSup / Math.pow(10, tokDec) : 0;
+          const creatorBal = Number(rc.creatorBalance);
+          if (Number.isFinite(creatorBal) && effSup > 0) {
+            const devUi = creatorBal > effSup * 10 ? creatorBal / Math.pow(10, tokDec) : creatorBal;
+            const devPct = (devUi / effSup) * 100;
+            if (devPct > maxDevPct) {
+              const res = {
+                checkedAtMs: now,
+                safe: false,
+                strictApplied: isStrict,
+                reason: `Dev holds ${devPct.toFixed(1)}% > ${maxDevPct}%`,
+                rcScore: Math.max(70, Math.round(normScore ?? 70)),
+              };
+              this.alphaRugPrecheckCache.set(mint, res);
+              return res;
+            }
+          }
+          if (creatorAddr && Array.isArray(rc.topHolders)) {
+            for (const th of rc.topHolders.slice(0, 20)) {
+              if (th && (th.owner === creatorAddr || th.address === creatorAddr)) {
+                const cPct = Number(th.pct || 0);
+                if (cPct > maxDevPct) {
+                  const res = {
+                    checkedAtMs: now,
+                    safe: false,
+                    strictApplied: isStrict,
+                    reason: `Dev holds ${cPct.toFixed(1)}% > ${maxDevPct}%`,
+                    rcScore: Math.max(70, Math.round(normScore ?? 70)),
+                  };
+                  this.alphaRugPrecheckCache.set(mint, res);
+                  return res;
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // Sync top-10 non-pool holder concentration check with bot.py hard_rug_check
+      if (isPyOptionEnabled(settings, 'max_top10_holder_pct', true) && Array.isArray(rc.topHolders) && rc.topHolders.length > 0) {
+        const maxTop10 = Number(settings.max_top10_holder_pct ?? 35) || 35;
+        const knownPools = new Set<string>([
+          '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1',
+          '11111111111111111111111111111111',
+        ]);
+        if (rc.knownAccounts && typeof rc.knownAccounts === 'object') {
+          for (const [addr, kinfo] of Object.entries<any>(rc.knownAccounts)) {
+            const kt = String(kinfo?.type || '').toUpperCase();
+            if (kt === 'AMM' || kt === 'LOCKER' || kt === 'POOL' || kt === 'CLOB') {
+              knownPools.add(addr);
+            }
+          }
+        }
+        if (Array.isArray(rc.markets)) {
+          for (const m of rc.markets) {
+            if (m?.pubkey) knownPools.add(String(m.pubkey));
+          }
+        }
+        const nonPoolPcts: number[] = [];
+        for (const h of rc.topHolders.slice(0, 20)) {
+          const addr = String(h?.address || '');
+          const owner = String(h?.owner || '');
+          if (knownPools.has(addr) || knownPools.has(owner)) continue;
+          const pct = Number(h?.pct);
+          if (Number.isFinite(pct)) nonPoolPcts.push(pct);
+        }
+        if (nonPoolPcts.length > 0) {
+          const top10Pct = nonPoolPcts.slice(0, 10).reduce((a, b) => a + b, 0);
+          if (top10Pct > maxTop10) {
+            const res = {
+              checkedAtMs: now,
+              safe: false,
+              strictApplied: isStrict,
+              reason: `Top-10 hold ${top10Pct.toFixed(1)}% > ${maxTop10}%`,
+              rcScore: Math.max(70, Math.round(normScore ?? 70)),
+            };
+            this.alphaRugPrecheckCache.set(mint, res);
+            return res;
+          }
+        }
+      }
+
       const res = {
         checkedAtMs: now,
         safe: true,
+        strictApplied: isStrict,
         ...(normScore !== undefined ? { rcScore: Math.round(normScore) } : {}),
       };
       this.alphaRugPrecheckCache.set(mint, res);
@@ -1649,7 +1789,22 @@ export class SniperManager {
       }
       return res;
     } catch {
-      return { checkedAtMs: now, safe: true };
+      const errRes = isStrict
+        ? {
+            checkedAtMs: now,
+            safe: false,
+            pendingReport: true,
+            strictApplied: isStrict,
+            reason: 'Waiting RugCheck report',
+          }
+        : {
+            checkedAtMs: now,
+            safe: true,
+            pendingReport: true,
+            strictApplied: isStrict,
+          };
+      this.alphaRugPrecheckCache.set(mint, errRes);
+      return errRes;
     }
   }
 
@@ -2184,15 +2339,20 @@ export class SniperManager {
     tsMs: number;
     pair?: any;
   }> = [];
+  private pulseStage3PeakByMint = new Map<string, number>();
 
   private isWithinPulseAgeWindow(pair: any, settings: Record<string, any>, nowMs = Date.now()): boolean {
     const created = Number(pair?.pairCreatedAt || 0);
     if (!Number.isFinite(created) || created <= 0) return false;
     const ageMin = (nowMs - created) / 60_000;
     if (ageMin < -0.25) return false;
-    const minM = Math.max(0, Number(settings.pulse_min_age_minutes ?? 2.0) || 0);
-    const maxM = Math.max(0, Number(settings.pulse_max_age_minutes ?? 180.0) || 0);
-    if (minM > 0 && ageMin < minM) return false;
+    const dexLow = String(pair?.dexId || '').trim().toLowerCase();
+    const isBondingCurve = dexLow === 'pumpfun' || dexLow === 'pump';
+    const minM = Math.max(0, Number(settings.pulse_min_age_minutes ?? 1.5) || 0);
+    const maxM = Math.max(0, Number(settings.pulse_max_age_minutes ?? 120.0) || 0);
+    // Stage 3 (Migrated) pools already survived the entire Stage 1-2 bonding curve;
+    // DexScreener resets pairCreatedAt at migration, so Min Age applies only to Stage 2 bonding curves.
+    if (isBondingCurve && minM > 0 && ageMin < minM) return false;
     if (maxM > 0 && ageMin > maxM) return false;
     return true;
   }
@@ -2214,7 +2374,7 @@ export class SniperManager {
     const settings = this.readSettings();
     const refreshMs = Math.max(
       5_000,
-      Math.min(300_000, Number(settings.pulse_refresh_interval_sec ?? 10) * 1000)
+      Math.min(300_000, Number(settings.pulse_refresh_interval_sec ?? 5) * 1000)
     );
     if (!options?.force && (this.pulseDiscoverInFlight || now - this.lastPulseDiscoverAtMs < Math.min(refreshMs, 5_000))) {
       return { ok: true, added: 0, total: this.pulseSignalsBuffer.length, signals: this.pulseSignalsBuffer };
@@ -2234,24 +2394,28 @@ export class SniperManager {
       const wantStage2 = stagePref !== 'stage3';
       const wantStage3 = stagePref !== 'stage2';
       const autoBuy = settings.pulse_auto_buy !== false;
-      const minCurvePct = Math.max(10, Math.min(99, Number(settings.pulse_stage2_min_curve_pct ?? 65) || 65));
-      const maxCurvePct = Math.max(minCurvePct, Math.min(100, Number(settings.pulse_stage2_max_curve_pct ?? 94) || 94));
-      const minRealSol = Math.max(0, Number(settings.pulse_stage2_min_real_sol ?? 40) || 0);
-      const minStage3Liq = Math.max(1_000, Number(settings.pulse_stage3_min_liquidity_usd ?? 15_000) || 15_000);
+      const minCurvePct = Math.max(10, Math.min(99, Number(settings.pulse_stage2_min_curve_pct ?? 50) || 50));
+      const maxCurvePct = Math.max(minCurvePct, Math.min(100, Number(settings.pulse_stage2_max_curve_pct ?? 86) || 86));
+      const minRealSol = Math.max(0, Number(settings.pulse_stage2_min_real_sol ?? 35) || 0);
+      const minStage3Liq = Math.max(1_000, Number(settings.pulse_stage3_min_liquidity_usd ?? 20_000) || 20_000);
       const requirePullback = Boolean(settings.pulse_stage3_require_pullback);
-      const pullbackPct = Math.max(1, Math.min(60, Number(settings.pulse_stage3_pullback_pct ?? 12) || 12));
-      const minBuys = Math.max(1, Number(settings.pulse_min_buys_m5 ?? 10) || 10);
-      const minRatio = Math.max(0.5, Number(settings.pulse_min_buy_sell_ratio_m5 ?? 1.05) || 1.05);
-      const maxRcScore = Math.max(10, Math.min(100, Number(settings.pulse_rugcheck_max_score ?? 50) || 50));
+      const pullbackPct = Math.max(1, Math.min(60, Number(settings.pulse_stage3_pullback_pct ?? 10) || 10));
+      const minBuys = Math.max(1, Number(settings.pulse_min_buys_m5 ?? 15) || 15);
+      const minRatio = Math.max(0.5, Number(settings.pulse_min_buy_sell_ratio_m5 ?? 1.15) || 1.15);
+      const maxRcScore = Math.max(10, Math.min(100, Number(settings.pulse_rugcheck_max_score ?? 45) || 45));
+      const pulseStrictRc = Boolean(settings.pulse_strict_rugcheck);
       const solPx = this.solPriceUsd && this.solPriceUsd > 0 ? this.solPriceUsd : 150;
       const pulseRcSettings = {
         ...settings,
         use_rugcheck: true,
+        strict_rugcheck: pulseStrictRc,
+        _pulse_strict_override: pulseStrictRc,
         early_rug_shield_enabled: true,
         rugcheck_max_score: maxRcScore,
         option_enabled: {
           ...(settings.option_enabled || {}),
           use_rugcheck: true,
+          strict_rugcheck: pulseStrictRc,
           early_rug_shield_enabled: true,
           rugcheck_max_score: true,
         },
@@ -2273,9 +2437,12 @@ export class SniperManager {
         volume5m: number;
         riskScore: number;
         qualifies: boolean;
+        pendingReason?: string;
         pair: any;
       }> = [];
       const seenMints = new Set<string>();
+
+      const extStage3Mints = new Set<string>();
 
       // 1) PumpPortal WS (<200ms) Stage 2 (high bonding curve) & Stage 3 (live subscribeMigration events)
       if (pp && typeof pp.getSyntheticPairs === 'function') {
@@ -2307,7 +2474,22 @@ export class SniperManager {
             });
             const inCurveBand = curvePct >= minCurvePct && curvePct <= maxCurvePct && realSol >= minRealSol;
             const flowOk = buys >= minBuys && buys >= sells * minRatio;
-            const qualifies = !creatorSold && inCurveBand && flowOk && riskScore <= 50;
+            const qualifies = !creatorSold && inCurveBand && flowOk && riskScore <= Math.max(50, maxRcScore);
+            const pendingReason = creatorSold
+              ? 'Creator sold'
+              : curvePct < minCurvePct
+                ? `Curve ${curvePct.toFixed(0)}% < ${minCurvePct}%`
+                : curvePct > maxCurvePct
+                  ? `Curve ${curvePct.toFixed(0)}% > ${maxCurvePct}%`
+                  : realSol < minRealSol
+                    ? `${realSol.toFixed(1)} < ${minRealSol} SOL`
+                    : buys < minBuys
+                      ? `${buys}B < ${minBuys} buys`
+                      : buys < sells * minRatio
+                        ? `${buys}B/${sells}S < ${minRatio}x`
+                        : !qualifies
+                          ? `Risk ${riskScore}`
+                          : undefined;
             seenMints.add(mint);
             staged.push({
               mint,
@@ -2325,9 +2507,17 @@ export class SniperManager {
               volume5m: Number(p?.volume?.m5 || 0),
               riskScore,
               qualifies,
+              ...(pendingReason ? { pendingReason } : {}),
               pair: p,
             });
           } else if (isMigrated && wantStage3) {
+            // If WS migration arrived without reserve/trade stats yet ($0 / 0B / 0S / $?),
+            // forward to extStage3Mints so DexScreener enriches its real PumpSwap pool instead of emitting a ghost row.
+            const symRaw = String(p?.baseToken?.symbol || '').trim();
+            if (liqUsd <= 0 || (buys === 0 && sells === 0) || !symRaw || symRaw === '?') {
+              extStage3Mints.add(mint);
+              continue;
+            }
             if (!this.manualPulseBuys.has(mint) && !this.isWithinPulseAgeWindow(p, settings, now)) continue;
             const riskScore = this.computeAlphaRiskScore({
               realSol,
@@ -2340,12 +2530,23 @@ export class SniperManager {
               isBondingCurve: false,
             });
             const flowOk = buys >= minBuys && buys >= sells * minRatio;
-            const qualifies = !creatorSold && liqUsd >= minStage3Liq && flowOk && riskScore <= 50;
+            const qualifies = !creatorSold && liqUsd >= minStage3Liq && flowOk && riskScore <= Math.max(50, maxRcScore);
+            const pendingReason = creatorSold
+              ? 'Creator sold'
+              : liqUsd < minStage3Liq
+                ? `Liq $${Math.round(liqUsd).toLocaleString()} < $${minStage3Liq.toLocaleString()}`
+                : buys < minBuys
+                  ? `${buys}B < ${minBuys} buys`
+                  : buys < sells * minRatio
+                    ? `${buys}B/${sells}S < ${minRatio}x`
+                    : !qualifies
+                      ? `Risk ${riskScore}`
+                      : undefined;
             seenMints.add(mint);
             staged.push({
               mint,
-              symbol: String(p?.baseToken?.symbol || mint.slice(0, 6)),
-              name: String(p?.baseToken?.name || p?.baseToken?.symbol || 'Unknown'),
+              symbol: symRaw || mint.slice(0, 6),
+              name: String(p?.baseToken?.name || symRaw || 'Unknown'),
               stage: 'stage3',
               source: 'Axiom/GMGN Stage 3 · Live Migration',
               dexId: 'pumpswap',
@@ -2358,26 +2559,79 @@ export class SniperManager {
               volume5m: Number(p?.volume?.m5 || 0),
               riskScore,
               qualifies,
+              ...(pendingReason ? { pendingReason } : {}),
               pair: p,
             });
           }
         }
       }
 
-      // 2) Live Migration Buffer + GeckoTerminal New & Trending Migrated AMM Pools (PumpSwap / Raydium / Meteora)
-      const extStage3Mints = new Set<string>();
+      // 2) Live Migration Buffer + Pump.fun Active Stage 2 Curves + GeckoTerminal Migrated AMM Pools
       if (wantStage3 && pp && typeof pp.getMigrationFeed === 'function') {
         for (const ev of pp.getMigrationFeed(1_800_000).slice(0, 15)) {
           if (ev?.mint && !seenMints.has(ev.mint)) extStage3Mints.add(ev.mint);
         }
       }
 
-      const [gtNew, gtTrending] = wantStage3
-        ? await Promise.all([
-            this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1', 4000),
-            this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/trending_pools', 4000),
-          ])
-        : [null, null];
+      const [pfStage2Res1, pfStage2Res2, gtNew, gtTrending] = await Promise.all([
+        wantStage2
+          ? this.fetchJsonWithTimeout(
+              'https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=false&complete=false',
+              3500
+            )
+          : Promise.resolve(null),
+        wantStage2
+          ? this.fetchJsonWithTimeout(
+              'https://frontend-api-v3.pump.fun/coins?offset=50&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=false&complete=false',
+              3500
+            )
+          : Promise.resolve(null),
+        wantStage3
+          ? this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1', 4000)
+          : Promise.resolve(null),
+        wantStage3
+          ? this.fetchJsonWithTimeout('https://api.geckoterminal.com/api/v2/networks/solana/trending_pools', 4000)
+          : Promise.resolve(null),
+      ]);
+
+      const pfStage2Meta = new Map<
+        string,
+        { realSol: number; curvePct: number; vSol: number; liquidityUsd: number; creator: string; symbol: string; name: string }
+      >();
+      const pfCombined = [
+        ...(Array.isArray(pfStage2Res1) ? pfStage2Res1 : []),
+        ...(Array.isArray(pfStage2Res2) ? pfStage2Res2 : []),
+      ];
+      if (wantStage2 && pfCombined.length > 0) {
+        const minAgeMin = Math.max(0, Number(settings.pulse_min_age_minutes ?? 1.0) || 0);
+        const maxAgeMin2 = Math.max(0, Number(settings.pulse_max_age_minutes ?? 180.0) || 0);
+        for (const c of pfCombined) {
+          if (!c || c.complete) continue;
+          const mint = String(c.mint || '').trim();
+          if (!mint || mint.length < 32 || seenMints.has(mint) || pfStage2Meta.has(mint)) continue;
+          const createdTs = Number(c.created_timestamp || 0);
+          if (createdTs > 0 && !this.manualPulseBuys.has(mint)) {
+            const ageMin = (now - createdTs) / 60_000;
+            if (ageMin < minAgeMin || (maxAgeMin2 > 0 && ageMin > maxAgeMin2 * 1.05)) continue;
+          }
+          const mcapSol = Number(c.market_cap_quote || (solPx > 0 ? Number(c.usd_market_cap || 0) / solPx : 0));
+          if (!Number.isFinite(mcapSol) || mcapSol <= 30) continue;
+          const vSol = Math.sqrt(mcapSol * 32.19);
+          const realSol = Math.max(0, vSol - 30);
+          const curvePct = Math.min(100, (realSol / 85) * 100);
+          if (curvePct < Math.max(30, minCurvePct - 15) || curvePct > 99.5) continue;
+          pfStage2Meta.set(mint, {
+            realSol: Number(realSol.toFixed(2)),
+            curvePct: Number(curvePct.toFixed(1)),
+            vSol: Number(vSol.toFixed(2)),
+            liquidityUsd: Number((vSol * 2 * solPx).toFixed(2)),
+            creator: String(c.creator || ''),
+            symbol: String(c.symbol || mint.slice(0, 6)),
+            name: String(c.name || c.symbol || 'Unknown'),
+          });
+          if (pfStage2Meta.size >= 16) break;
+        }
+      }
 
       const maxAgeMin = Math.max(0, Number(settings.pulse_max_age_minutes ?? 180) || 0);
       for (const pool of [
@@ -2401,28 +2655,110 @@ export class SniperManager {
         if (extStage3Mints.size >= 24) break;
       }
 
-      if (extStage3Mints.size > 0) {
-        const mintList = Array.from(extStage3Mints).slice(0, 24);
+      const stage2LookupMints = Array.from(pfStage2Meta.keys()).filter((m) => !seenMints.has(m));
+      const stage3LookupMints = Array.from(extStage3Mints).filter((m) => !seenMints.has(m));
+      const combinedMints = Array.from(new Set([...stage2LookupMints, ...stage3LookupMints])).slice(0, 30);
+
+      if (combinedMints.length > 0) {
         const dsPairs = await this.fetchJsonWithTimeout(
-          `https://api.dexscreener.com/tokens/v1/solana/${mintList.join(',')}`,
+          `https://api.dexscreener.com/tokens/v1/solana/${combinedMints.join(',')}`,
           4500
         );
-        const bestByMint = new Map<string, any>();
+        const bestStage2ByMint = new Map<string, any>();
+        const bestStage3ByMint = new Map<string, any>();
         if (Array.isArray(dsPairs)) {
           for (const p of dsPairs) {
             const m = String(p?.baseToken?.address || '').trim();
             if (!m) continue;
             const dexLow = String(p?.dexId || '').toLowerCase();
-            if (dexLow === 'pumpfun' || dexLow === 'pump') continue; // Stage 3 is graduated AMMs only
-            const liq = Number(p?.liquidity?.usd || 0);
-            const cur = bestByMint.get(m);
-            if (!cur || liq > Number(cur?.liquidity?.usd || 0)) {
-              bestByMint.set(m, p);
+            if (dexLow === 'pumpfun' || dexLow === 'pump') {
+              if (pfStage2Meta.has(m) && !bestStage2ByMint.has(m)) {
+                bestStage2ByMint.set(m, p);
+              }
+            } else if (extStage3Mints.has(m)) {
+              const liq = Number(p?.liquidity?.usd || 0);
+              const cur = bestStage3ByMint.get(m);
+              if (!cur || liq > Number(cur?.liquidity?.usd || 0)) {
+                bestStage3ByMint.set(m, p);
+              }
             }
           }
         }
         const evalNow = Date.now();
-        for (const [mint, pair] of bestByMint.entries()) {
+        for (const [mint, meta] of pfStage2Meta.entries()) {
+          if (seenMints.has(mint)) continue;
+          const pair = bestStage2ByMint.get(mint);
+          if (!pair) continue;
+          if (!this.manualPulseBuys.has(mint) && !this.isWithinPulseAgeWindow(pair, settings, evalNow)) continue;
+          const px = Number(pair?.priceUsd || 0);
+          if (px <= 0) continue;
+          const liqUsd = Number(pair?.liquidity?.usd || meta.liquidityUsd || 0);
+          const buys = Number(pair?.txns?.m5?.buys || 0);
+          const sells = Number(pair?.txns?.m5?.sells || 0);
+          const chg5m = Number(pair?.priceChange?.m5 || 0);
+          const vol5m = Number(pair?.volume?.m5 || 0);
+          const enrichedPair = {
+            ...pair,
+            liquidity: { ...(pair.liquidity || {}), usd: liqUsd },
+            _pumpportal: {
+              ...(pair._pumpportal || {}),
+              curve_pct: meta.curvePct,
+              real_sol: meta.realSol,
+              v_sol: meta.vSol,
+              migrated: false,
+              ...(meta.creator ? { creator: meta.creator } : {}),
+            },
+          };
+          const riskScore = this.computeAlphaRiskScore({
+            realSol: meta.realSol,
+            liquidityUsd: liqUsd,
+            devBuySol: 0,
+            creatorSold: false,
+            buys,
+            sells,
+            uniqueTraders: Math.min(30, buys),
+            isBondingCurve: true,
+          });
+          const inCurveBand =
+            meta.curvePct >= minCurvePct && meta.curvePct <= maxCurvePct && meta.realSol >= minRealSol;
+          const flowOk = buys >= minBuys && buys >= sells * minRatio;
+          const qualifies = inCurveBand && flowOk && riskScore <= Math.max(50, maxRcScore);
+          const pendingReason = meta.curvePct < minCurvePct
+            ? `Curve ${meta.curvePct.toFixed(0)}% < ${minCurvePct}%`
+            : meta.curvePct > maxCurvePct
+              ? `Curve ${meta.curvePct.toFixed(0)}% > ${maxCurvePct}%`
+              : meta.realSol < minRealSol
+                ? `${meta.realSol.toFixed(1)} < ${minRealSol} SOL`
+                : buys < minBuys
+                  ? `${buys}B < ${minBuys} buys`
+                  : buys < sells * minRatio
+                    ? `${buys}B/${sells}S < ${minRatio}x`
+                    : !qualifies
+                      ? `Risk ${riskScore}`
+                      : undefined;
+          seenMints.add(mint);
+          staged.push({
+            mint,
+            symbol: String(pair?.baseToken?.symbol || meta.symbol),
+            name: String(pair?.baseToken?.name || meta.name),
+            stage: 'stage2',
+            source: `Photon/Axiom Stage 2 · ${meta.curvePct.toFixed(0)}% Curve`,
+            dexId: 'pumpfun',
+            curvePct: meta.curvePct,
+            realSol: meta.realSol,
+            liquidityUsd: liqUsd,
+            buys5m: buys,
+            sells5m: sells,
+            priceChange5m: chg5m,
+            volume5m: vol5m,
+            riskScore,
+            qualifies,
+            ...(pendingReason ? { pendingReason } : {}),
+            pair: enrichedPair,
+          });
+        }
+
+        for (const [mint, pair] of bestStage3ByMint.entries()) {
           if (seenMints.has(mint)) continue;
           if (!this.manualPulseBuys.has(mint) && !this.isWithinPulseAgeWindow(pair, settings, evalNow)) continue;
           const liqUsd = Number(pair?.liquidity?.usd || 0);
@@ -2444,14 +2780,38 @@ export class SniperManager {
             uniqueTraders: Math.min(30, buys),
             isBondingCurve: false,
           });
-          const pullbackOk = !requirePullback || chg5m <= -Math.abs(pullbackPct);
+          let prevPeak = this.pulseStage3PeakByMint.get(mint) || 0;
+          if (px > prevPeak) {
+            prevPeak = px;
+            this.pulseStage3PeakByMint.set(mint, px);
+            if (this.pulseStage3PeakByMint.size > 500) {
+              const oldMint = this.pulseStage3PeakByMint.keys().next().value;
+              if (oldMint) this.pulseStage3PeakByMint.delete(oldMint);
+            }
+          }
+          const peakDipPct = prevPeak > 0 ? ((prevPeak - px) / prevPeak) * 100 : 0;
+          const effDipPct = Math.max(peakDipPct, chg5m < 0 ? -chg5m : 0);
+          const pullbackOk = !requirePullback || effDipPct >= Math.abs(pullbackPct);
           const qualifies =
             liqUsd >= minStage3Liq &&
             buys >= minBuys &&
             buys >= sells * minRatio &&
             vol5m >= 1_000 &&
-            riskScore <= 50 &&
+            riskScore <= Math.max(50, maxRcScore) &&
             pullbackOk;
+          const pendingReason = liqUsd < minStage3Liq
+            ? `Liq $${Math.round(liqUsd).toLocaleString()} < $${minStage3Liq.toLocaleString()}`
+            : buys < minBuys
+              ? `${buys}B < ${minBuys} buys`
+              : buys < sells * minRatio
+                ? `${buys}B/${sells}S < ${minRatio}x`
+                : vol5m < 1_000
+                  ? `Vol $${Math.round(vol5m)} < $1k`
+                  : !pullbackOk
+                    ? `Wait -${pullbackPct}% dip (${effDipPct.toFixed(1)}%)`
+                    : !qualifies
+                      ? `Risk ${riskScore}`
+                      : undefined;
           const dexLabel = String(pair?.dexId || 'amm');
           seenMints.add(mint);
           staged.push({
@@ -2470,6 +2830,7 @@ export class SniperManager {
             volume5m: vol5m,
             riskScore,
             qualifies,
+            ...(pendingReason ? { pendingReason } : {}),
             pair,
           });
         }
@@ -2477,7 +2838,7 @@ export class SniperManager {
 
       // 3) Parallel RugCheck pre-screen on all qualifying Stage 2 & Stage 3 coins before marking AUTO_BUY / READY
       const rcTargets = staged.filter((s) => s.qualifies).map((s) => s.mint).slice(0, 14);
-      const rcResults = new Map<string, { safe: boolean; reason?: string; rcScore?: number }>();
+      const rcResults = new Map<string, { safe: boolean; reason?: string; rcScore?: number; pendingReport?: boolean }>();
       if (rcTargets.length > 0) {
         const resPairs = await Promise.all(
           rcTargets.map(async (m) => [m, await this.precheckAlphaRug(m, pulseRcSettings)] as const)
@@ -2487,15 +2848,18 @@ export class SniperManager {
 
       for (const item of staged) {
         const rcVerdict = rcResults.get(item.mint);
-        const rugUnsafe = Boolean(rcVerdict && !rcVerdict.safe);
+        const isPendingRc = Boolean(rcVerdict && !rcVerdict.safe && rcVerdict.pendingReport);
+        const rugUnsafe = Boolean(rcVerdict && !rcVerdict.safe && !rcVerdict.pendingReport);
         const finalRisk = rugUnsafe ? Math.max(item.riskScore, rcVerdict?.rcScore ?? 85) : item.riskScore;
         const status: 'AUTO_BUY' | 'READY' | 'PENDING' | 'SKIPPED' = rugUnsafe
           ? 'SKIPPED'
-          : item.qualifies
-            ? autoBuy
-              ? 'AUTO_BUY'
-              : 'READY'
-            : 'PENDING';
+          : isPendingRc
+            ? 'PENDING'
+            : item.qualifies
+              ? autoBuy
+                ? 'AUTO_BUY'
+                : 'READY'
+              : 'PENDING';
 
         const existing = this.pulseSignalsBuffer.find((s) => s.mint === item.mint);
         if (existing) {
@@ -2513,7 +2877,8 @@ export class SniperManager {
           existing.pair = item.pair;
           if (!this.manualPulseBuys.has(item.mint)) {
             existing.status = status;
-            if (rugUnsafe && rcVerdict?.reason) existing.skipReason = rcVerdict.reason;
+            if ((rugUnsafe || isPendingRc) && rcVerdict?.reason) existing.skipReason = rcVerdict.reason;
+            else if (status === 'PENDING' && item.pendingReason) existing.skipReason = item.pendingReason;
             else delete existing.skipReason;
           }
         } else {
@@ -2535,7 +2900,11 @@ export class SniperManager {
             riskScore: finalRisk,
             timestamp: new Date().toLocaleTimeString(),
             status,
-            ...(rugUnsafe && rcVerdict?.reason ? { skipReason: rcVerdict.reason } : {}),
+            ...( (rugUnsafe || isPendingRc) && rcVerdict?.reason
+              ? { skipReason: rcVerdict.reason }
+              : status === 'PENDING' && item.pendingReason
+                ? { skipReason: item.pendingReason }
+                : {}),
             tsMs: Date.now(),
             pair: item.pair,
           });
@@ -2872,7 +3241,15 @@ export class SniperManager {
       }
       for (const p of ppPairs) {
         const pm = String(p?.baseToken?.address || '').trim();
-        if (alphaMintSet.has(pm)) pairByMint.set(pm, p);
+        if (!alphaMintSet.has(pm)) continue;
+        const existing = pairByMint.get(pm);
+        if (!existing) {
+          pairByMint.set(pm, p);
+        } else if (existing && !existing._synthetic && p._pumpportal && !existing._pumpportal) {
+          pairByMint.set(pm, { ...existing, _pumpportal: p._pumpportal });
+        } else if (existing?._synthetic && !p._pumpportal?.migrated) {
+          pairByMint.set(pm, p);
+        }
       }
       pairs = Array.from(pairByMint.values());
     } else if (pulseOnly) {
@@ -2887,7 +3264,15 @@ export class SniperManager {
       }
       for (const p of ppPairs) {
         const pm = String(p?.baseToken?.address || '').trim();
-        if (pulseMintSet.has(pm)) pairByMint.set(pm, p);
+        if (!pulseMintSet.has(pm)) continue;
+        const existing = pairByMint.get(pm);
+        if (!existing) {
+          pairByMint.set(pm, p);
+        } else if (existing && !existing._synthetic && p._pumpportal && !existing._pumpportal) {
+          pairByMint.set(pm, { ...existing, _pumpportal: p._pumpportal });
+        } else if (existing?._synthetic && !p._pumpportal?.migrated) {
+          pairByMint.set(pm, p);
+        }
       }
       pairs = Array.from(pairByMint.values());
     } else {
@@ -3239,11 +3624,38 @@ export class SniperManager {
     }
   }
 
-  public resetSettingsToDefault(scope: 'settings' | 'pro_desk' | 'all' = 'all') {
+  public resetSettingsToDefault(scope: 'settings' | 'pro_desk' | 'pulse' | 'all' = 'all') {
     try {
       const current = this.readSettings();
       const mode = this.getMode(current);
       const defaults = this.getDefaultSettings();
+      const pulseKeys = new Set<string>([
+        'pulse_stage',
+        'pulse_auto_find',
+        'pulse_auto_buy',
+        'pulse_trade_size_usd',
+        'pulse_take_profit_pct',
+        'pulse_stop_loss_pct',
+        'pulse_trailing_stop_pct',
+        'pulse_max_hold_minutes',
+        'pulse_jito_tip_sol',
+        'pulse_refresh_interval_sec',
+        'pulse_min_age_minutes',
+        'pulse_max_age_minutes',
+        'pulse_stage2_min_curve_pct',
+        'pulse_stage2_max_curve_pct',
+        'pulse_stage2_min_real_sol',
+        'pulse_stage3_min_liquidity_usd',
+        'pulse_stage3_require_pullback',
+        'pulse_stage3_pullback_pct',
+        'pulse_stage3_wait_sec',
+        'pulse_min_buys_m5',
+        'pulse_min_buy_sell_ratio_m5',
+        'pulse_min_unique_traders_5m',
+        'pulse_rugcheck_max_score',
+        'pulse_strict_rugcheck',
+        'pulse_conviction_sizing',
+      ]);
       const proDeskKeys = new Set<string>([
         'anti_sybil_enabled',
         'fresh_wallet_minutes',
@@ -3302,7 +3714,12 @@ export class SniperManager {
       const defaultOpt = (defaults.option_enabled || {}) as Record<string, boolean>;
       let updated: Record<string, any>;
 
-      if (scope === 'pro_desk') {
+      if (scope === 'pulse') {
+        updated = { ...current, mode, smart_money_scan_mode: 'pulse_only' };
+        for (const k of pulseKeys) {
+          updated[k] = defaults[k];
+        }
+      } else if (scope === 'pro_desk') {
         updated = { ...current, mode };
         for (const k of proDeskKeys) {
           updated[k] = defaults[k];
@@ -3320,6 +3737,11 @@ export class SniperManager {
       } else if (scope === 'settings') {
         updated = { ...defaults, mode };
         for (const k of proDeskKeys) {
+          if (k in current) {
+            updated[k] = current[k];
+          }
+        }
+        for (const k of pulseKeys) {
           if (k in current) {
             updated[k] = current[k];
           }
@@ -3343,11 +3765,13 @@ export class SniperManager {
         (this.orchestrator.jupiter as any)?.setApiKey?.(jupKey || '');
       }
       const scopeLabel =
-        scope === 'pro_desk'
-          ? 'Python Pro Desk reset to Quick-Profit default settings.'
-          : scope === 'settings'
-            ? 'Python Sniper Settings reset to Quick-Profit default settings.'
-            : 'Python Sniper Settings & Pro Desk reset to Quick-Profit defaults.';
+        scope === 'pulse'
+          ? 'Pulse (Stage 2–3) reset to best ready-to-trade default settings.'
+          : scope === 'pro_desk'
+            ? 'Python Pro Desk reset to Quick-Profit default settings.'
+            : scope === 'settings'
+              ? 'Python Sniper Settings reset to Quick-Profit default settings.'
+              : 'Python Sniper Settings & Pro Desk reset to Quick-Profit defaults.';
       this.appendLog('INFO', scopeLabel);
       return { ok: true, scope, settings: updated };
     } catch (err) {

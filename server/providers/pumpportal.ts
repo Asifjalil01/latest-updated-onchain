@@ -851,11 +851,13 @@ export class PumpPortalWsProvider {
       if (!mint) continue;
       const st = this.tokenStates.get(mint);
       if (!st) continue;
-      const hasCurve = st.vSolInBondingCurve > 0 && st.vTokensInBondingCurve > 0;
+      const hasCurve = !st.migrated && st.vSolInBondingCurve > 0 && st.vTokensInBondingCurve > 0;
       const priceSol = hasCurve ? st.vSolInBondingCurve / st.vTokensInBondingCurve : 0;
       const priceUsd = solPx > 0 && priceSol > 0 ? priceSol * solPx : 0;
       const liquidityUsd =
-        solPx > 0 && st.vSolInBondingCurve > 0 ? Number((st.vSolInBondingCurve * 2 * solPx).toFixed(2)) : 0;
+        !st.migrated && solPx > 0 && st.vSolInBondingCurve > 0
+          ? Number((st.vSolInBondingCurve * 2 * solPx).toFixed(2))
+          : 0;
       const realSol = st.vSolInBondingCurve > 30 ? Number((st.vSolInBondingCurve - 30).toFixed(4)) : 0;
 
       const traders5m = new Set<string>();

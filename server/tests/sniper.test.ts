@@ -3503,7 +3503,9 @@ test('v1.45.4: Photon/Axiom/GMGN Pulse (Stage 2-3) uses independent settings, fi
   try {
     const stage1Newborn = 'Stage1NewbornMint11111111111111111111111pump';
     const stage2Curve = 'Stage2CurveMint1111111111111111111111111pump';
+    const pfStage2Mint = 'PumpFunApiStage2Mint11111111111111111111pump';
     const stage3Migrated = 'Stage3MigratedMint11111111111111111111111111';
+    const ghostMigrMint = 'GhostMigrMint111111111111111111111111111pump';
     const bundledStage3 = 'BundledStage3Mint11111111111111111111111111';
     const manualCoin = 'ManualPulseCoin11111111111111111111111111111';
     const whaleAddr = 'WhalePulseIgnored111111111111111111111111111';
@@ -3542,6 +3544,9 @@ test('v1.45.4: Photon/Axiom/GMGN Pulse (Stage 2-3) uses independent settings, fi
         baseTs + 10_000 + i * 2000
       );
     }
+
+    // Live migration frame without liquidity/symbol/trades ($0 / 0B / 0S / $?) must NOT create ghost row
+    pp.ingestFrame({ mint: ghostMigrMint, txType: 'migrate' }, Date.now() - 2_000);
 
     const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
     (mgr as any).solPriceUsd = 150;
@@ -3583,8 +3588,32 @@ test('v1.45.4: Photon/Axiom/GMGN Pulse (Stage 2-3) uses independent settings, fi
           ],
         };
       }
+      if (url.includes('frontend-api-v3.pump.fun')) {
+        return [
+          {
+            mint: pfStage2Mint,
+            symbol: 'PFSTG2',
+            name: 'PumpFun API Stage 2',
+            complete: false,
+            created_timestamp: Date.now() - 5 * 60_000,
+            market_cap_quote: 265, // sqrt(265*32.19)=92.36 -> realSol=62.36 -> 73.4% curve
+            usd_market_cap: 39750,
+            creator: 'DevPF21111111111111111111111111111111111111',
+          },
+        ];
+      }
       if (url.includes('tokens/v1/solana/')) {
         return [
+          {
+            baseToken: { address: pfStage2Mint, symbol: 'PFSTG2', name: 'PumpFun API Stage 2' },
+            dexId: 'pumpfun',
+            pairCreatedAt: Date.now() - 5 * 60_000,
+            priceUsd: '0.00004',
+            liquidity: { usd: 0 },
+            volume: { m5: 6200 },
+            txns: { m5: { buys: 28, sells: 7 } },
+            priceChange: { m5: 34 },
+          },
           {
             baseToken: { address: stage3Migrated, symbol: 'STG3', name: 'Migrated Stage 3' },
             dexId: 'pumpswap',
@@ -3606,6 +3635,19 @@ test('v1.45.4: Photon/Axiom/GMGN Pulse (Stage 2-3) uses independent settings, fi
             priceChange: { m5: 11 },
           },
         ];
+      }
+      if (url.includes(`rugcheck.xyz/v1/tokens/${stage3Migrated}/report`)) {
+        // Real-world PumpSwap/Meteora RugCheck report: 52 solely from LP Unlocked + LP Providers -> must PASS cleanly!
+        return {
+          score: 11400,
+          score_normalised: 52,
+          insiderNetworks: [],
+          insidersDetected: 0,
+          risks: [
+            { name: 'Large Amount of LP Unlocked', score: 10999, level: 'danger' },
+            { name: 'Low amount of LP Providers', score: 400, level: 'warn' },
+          ],
+        };
       }
       if (url.includes(`rugcheck.xyz/v1/tokens/${bundledStage3}/report`)) {
         return { score_normalised: 15, insiderNetworks: [{ id: 'c1', size: 6 }], insidersDetected: 6, risks: [] };
@@ -3656,12 +3698,14 @@ test('v1.45.4: Photon/Axiom/GMGN Pulse (Stage 2-3) uses independent settings, fi
     assert.equal(saveRes.settings?.pulse_trade_size_usd, 7.5);
     assert.equal(saveRes.settings?.trade_size_usd, 99.0);
 
-    // Discover Stage 2 + Stage 3 coins: both clean Stage 2 & Stage 3 qualify, bundled Stage 3 marked SKIPPED, Stage 1 ignored
+    // Discover Stage 2 + Stage 3 coins: both WS + Pump.fun Stage 2 & LP-unlocked Stage 3 qualify, ghost migration excluded, bundled Stage 3 marked SKIPPED, Stage 1 ignored
     const discBoth = await mgr.discoverPulseSignals({ force: true });
     assert.equal(discBoth.ok, true);
     assert.ok(discBoth.signals.some((s) => s.mint === stage2Curve && s.stage === 'stage2' && s.status === 'AUTO_BUY'));
+    assert.ok(discBoth.signals.some((s) => s.mint === pfStage2Mint && s.stage === 'stage2' && s.status === 'AUTO_BUY'));
     assert.ok(discBoth.signals.some((s) => s.mint === stage3Migrated && s.stage === 'stage3' && s.status === 'AUTO_BUY'));
     assert.ok(!discBoth.signals.some((s) => s.mint === stage1Newborn));
+    assert.ok(!discBoth.signals.some((s) => s.mint === ghostMigrMint));
     const bundledRow = discBoth.signals.find((s) => s.mint === bundledStage3);
     assert.equal(bundledRow?.status, 'SKIPPED');
 
@@ -3725,7 +3769,17 @@ test('v1.45.4: Photon/Axiom/GMGN Pulse (Stage 2-3) uses independent settings, fi
       'trail_armed = acct.state["positions"][stg2_m].get("trailing_active")',
       'acct.check_exits({stg2_m: entry_px * 1.18})',
       'exited_by_pulse_trail = stg2_m not in acct.state["positions"]',
-      'print(json.dumps({"ok2": ok2, "why2": why2, "ok3": ok3, "why3": why3, "ok1": ok1, "why1": why1, "ok2_in_s3_only": ok2_in_s3_only, "why2_s3": why2_s3, "buy_cost": buy_cost, "pulse_entry": pos.get("pulse_entry"), "pulse_stage": pos.get("pulse_stage"), "trail_armed": trail_armed, "exited_by_pulse_trail": exited_by_pulse_trail}))',
+      'bot._rpc_mint_account_info = lambda *a, **k: {"decimals": 6, "supply_ui": 1_000_000_000.0, "mint_auth": False, "freeze_auth": False, "disallowed_extensions": []}',
+      'bot._check_sell_route = lambda *a, **k: (True, "ok")',
+      'bot._resolve_creator_via_rpc = lambda *a, **k: ""',
+      'bot._fetch_rugcheck_report = lambda m: {"score": 11400, "score_normalised": 52, "risks": [{"name": "Large Amount of LP Unlocked", "score": 10999, "level": "danger"}, {"name": "Low amount of LP Providers", "score": 400, "level": "warn"}], "insiderNetworks": [], "topHolders": []} if m == stg3_m else {"score": 60001, "score_normalised": 73, "risks": [{"name": "Creator history of rugged tokens", "score": 60000, "level": "danger"}], "insiderNetworks": [], "topHolders": []}',
+      'rc_lp_ok, rc_lp_why = bot.hard_rug_check(stg3_m, {**cfg_pulse, "pulse_rugcheck_max_score": 50.0, "strict_rugcheck": False}, 480.0, pair=pair_stg3)',
+      'rc_real_rug_ok, rc_real_rug_why = bot.hard_rug_check(stg1_m, {**cfg_pulse, "pulse_rugcheck_max_score": 50.0, "strict_rugcheck": False}, 480.0, pair=pair_stg3)',
+      'pair_stg3_fresh = {**pair_stg3, "pairCreatedAt": now_ms - 25_000}',
+      'ok3_fresh, why3_fresh, _ = bot.passes_filters(pair_stg3_fresh, cfg_pulse)',
+      'pair_stg2_young = {**pair_stg2, "pairCreatedAt": now_ms - 25_000}',
+      'ok2_young, why2_young, _ = bot.passes_filters(pair_stg2_young, cfg_pulse)',
+      'print(json.dumps({"ok2": ok2, "why2": why2, "ok3": ok3, "why3": why3, "ok1": ok1, "why1": why1, "ok2_in_s3_only": ok2_in_s3_only, "why2_s3": why2_s3, "ok3_fresh": ok3_fresh, "ok2_young": ok2_young, "why2_young": why2_young, "buy_cost": buy_cost, "pulse_entry": pos.get("pulse_entry"), "pulse_stage": pos.get("pulse_stage"), "trail_armed": trail_armed, "exited_by_pulse_trail": exited_by_pulse_trail, "rc_lp_ok": rc_lp_ok, "rc_real_rug_ok": rc_real_rug_ok}))',
     ].join('\n');
 
     const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
@@ -3736,16 +3790,329 @@ test('v1.45.4: Photon/Axiom/GMGN Pulse (Stage 2-3) uses independent settings, fi
     assert.equal(pyOut.why1, 'not pulse signal');
     assert.equal(pyOut.ok2_in_s3_only, false);
     assert.equal(pyOut.why2_s3, 'pulse stage mismatch');
+    assert.equal(pyOut.ok3_fresh, true);
+    assert.equal(pyOut.ok2_young, false);
+    assert.equal(pyOut.why2_young, 'pulse too young');
     assert.ok(pyOut.buy_cost > 7.0 && pyOut.buy_cost < 8.5, `Expected Pulse $7.50 buy size, got ${pyOut.buy_cost}`);
     assert.equal(pyOut.pulse_entry, true);
     assert.equal(pyOut.pulse_stage, 'stage2');
     assert.equal(pyOut.trail_armed, true);
     assert.equal(pyOut.exited_by_pulse_trail, true);
+    assert.equal(pyOut.rc_lp_ok, true);
+    assert.equal(pyOut.rc_real_rug_ok, false);
+
+    // Paper entry_price must match exact market spot price (never inflated above DexScreener candles by slippage_pct)
+    const entryCheckScript = [
+      'import sys, types, json',
+      'req = types.ModuleType("requests")',
+      'req.Session = lambda: None',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      `TMP_DIR = ${JSON.stringify(tmpDir)}`,
+      'bot._base_dir = lambda: TMP_DIR',
+      'cfg_s = {**bot.CONFIG, "mode": "paper", "slippage_pct": 10.0, "fee_pct": 1.0}',
+      'acct = bot.TradingAccount(cfg_s, mode="paper")',
+      'acct.buy("MintSpotExact11111111111111111111111111111", "JENSEN", 0.00001680, meta={"dex": "pumpswap", "source": "pulse_stage3"})',
+      'ep = acct.state["positions"]["MintSpotExact11111111111111111111111111111"]["entry_price"]',
+      'print(json.dumps({"entry_price": ep}))',
+    ].join('\n');
+    const epOut = JSON.parse(execFileSync('python3', ['-c', entryCheckScript], { encoding: 'utf-8' }).trim().split('\n').pop() || '{}');
+    assert.ok(Math.abs(epOut.entry_price - 0.0000168) < 1e-12, `Expected exact spot entry 0.0000168, got ${epOut.entry_price}`);
+
+    // Migrated PumpPortal mints must not emit frozen bonding-curve prices in live snapshots
+    const migTs = Date.now();
+    pp.ingestFrame({
+      mint: stage3Migrated,
+      txType: 'migrate',
+      vSolInBondingCurve: 115,
+      vTokensInBondingCurve: 206_000_000,
+    }, migTs + 500);
+    const migSnap = pp.getLiveMintSnapshots([stage3Migrated], 71.0, migTs + 1000);
+    assert.equal(migSnap[stage3Migrated]?.priceUsd, 0);
   } finally {
     pp.stop();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('v1.45.5: Pulse optimal defaults, independent RugCheck/conviction controls, transient 20s retry without false blacklist or creator rug, and UI precheck sync', async () => {
+  const { PumpPortalWsProvider } = await import('../providers/pumpportal');
+  const pp = new PumpPortalWsProvider();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper-v1455-'));
+  try {
+    const mgr = new SniperManager({ baseDir: tmpDir, startTimers: false });
+    (mgr as any).solPriceUsd = 150;
+    mgr.attachOrchestrator({
+      pumpPortal: pp,
+      signer: { isUnlocked: () => false, getPublicKey: () => null, getMaskedPublicKey: () => 'Locked' },
+      rpcPool: { getHealthSnapshot: () => [] },
+    } as any);
+
+    // 1. resetSettingsToDefault('pulse') applies best defaults & locks to pulse_only
+    mgr.updateSettings({
+      pulse_trade_size_usd: 25,
+      pulse_stop_loss_pct: 5,
+      pulse_strict_rugcheck: true,
+      pulse_conviction_sizing: true,
+      smart_money_scan_mode: 'both',
+    });
+    const pulseReset = mgr.resetSettingsToDefault('pulse');
+    assert.equal(pulseReset.ok, true);
+    const pr = pulseReset.settings as Record<string, any>;
+    assert.equal(pr.smart_money_scan_mode, 'pulse_only');
+    assert.equal(pr.pulse_trade_size_usd, 2);
+    assert.equal(pr.pulse_take_profit_pct, 30);
+    assert.equal(pr.pulse_stop_loss_pct, 18);
+    assert.equal(pr.pulse_trailing_stop_pct, 8);
+    assert.equal(pr.pulse_max_hold_minutes, 45);
+    assert.equal(pr.pulse_refresh_interval_sec, 5);
+    assert.equal(pr.pulse_min_age_minutes, 1.5);
+    assert.equal(pr.pulse_max_age_minutes, 120);
+    assert.equal(pr.pulse_stage2_min_curve_pct, 50);
+    assert.equal(pr.pulse_stage2_max_curve_pct, 86);
+    assert.equal(pr.pulse_stage2_min_real_sol, 35);
+    assert.equal(pr.pulse_stage3_min_liquidity_usd, 20000);
+    assert.equal(pr.pulse_stage3_require_pullback, false);
+    assert.equal(pr.pulse_stage3_pullback_pct, 10);
+    assert.equal(pr.pulse_min_buys_m5, 15);
+    assert.equal(pr.pulse_min_buy_sell_ratio_m5, 1.15);
+    assert.equal(pr.pulse_min_unique_traders_5m, 12);
+    assert.equal(pr.pulse_rugcheck_max_score, 45);
+    assert.equal(pr.pulse_strict_rugcheck, false);
+    assert.equal(pr.pulse_conviction_sizing, false);
+
+    // Resetting Sniper 'settings' preserves Pulse independent settings
+    mgr.updateSettings({ pulse_trade_size_usd: 4.5, trade_size_usd: 19 });
+    const afterSniperReset = mgr.resetSettingsToDefault('settings').settings as Record<string, any>;
+    assert.equal(afterSniperReset.trade_size_usd, 5);
+    assert.equal(afterSniperReset.pulse_trade_size_usd, 4.5);
+
+    // Restore Pulse defaults for signal discovery checks
+    mgr.resetSettingsToDefault('pulse');
+
+    // 2. Precheck sync: missing RugCheck with strict=true -> PENDING, strict=false -> AUTO_BUY; high dev hold -> SKIPPED
+    const mintMissingRc = 'MintPulseNoReport111111111111111111111111111';
+    const mintHighDev = 'MintPulseHighDev1111111111111111111111111111';
+    const mintPullback = 'MintPulsePullback111111111111111111111111111';
+    let pullbackStage3Px = 0.01;
+
+    (mgr as any).fetchJsonWithTimeout = async (url: string) => {
+      if (url.includes('geckoterminal.com')) {
+        return {
+          data: [
+            {
+              attributes: {
+                address: 'PoolNoRc1',
+                reserve_in_usd: '30000',
+                volume_usd: { h1: '18000' },
+                pool_created_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+              },
+              relationships: {
+                dex: { data: { id: 'pumpswap' } },
+                base_token: { data: { id: `solana_${mintMissingRc}` } },
+              },
+            },
+            {
+              attributes: {
+                address: 'PoolHighDev1',
+                reserve_in_usd: '32000',
+                volume_usd: { h1: '18000' },
+                pool_created_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+              },
+              relationships: {
+                dex: { data: { id: 'pumpswap' } },
+                base_token: { data: { id: `solana_${mintHighDev}` } },
+              },
+            },
+            {
+              attributes: {
+                address: 'PoolPullback1',
+                reserve_in_usd: '35000',
+                volume_usd: { h1: '20000' },
+                pool_created_at: new Date(Date.now() - 6 * 60_000).toISOString(),
+              },
+              relationships: {
+                dex: { data: { id: 'pumpswap' } },
+                base_token: { data: { id: `solana_${mintPullback}` } },
+              },
+            },
+          ],
+        };
+      }
+      if (url.includes('tokens/v1/solana/')) {
+        return [
+          {
+            baseToken: { address: mintMissingRc, symbol: 'NORC', name: 'No Report Yet' },
+            dexId: 'pumpswap',
+            pairCreatedAt: Date.now() - 5 * 60_000,
+            priceUsd: '0.004',
+            liquidity: { usd: 30000 },
+            volume: { m5: 9000 },
+            txns: { m5: { buys: 22, sells: 8 } },
+            priceChange: { m5: 12 },
+          },
+          {
+            baseToken: { address: mintHighDev, symbol: 'HDEV', name: 'High Dev Hold' },
+            dexId: 'pumpswap',
+            pairCreatedAt: Date.now() - 5 * 60_000,
+            priceUsd: '0.004',
+            liquidity: { usd: 32000 },
+            volume: { m5: 9000 },
+            txns: { m5: { buys: 22, sells: 8 } },
+            priceChange: { m5: 12 },
+          },
+          {
+            baseToken: { address: mintPullback, symbol: 'DIP3', name: 'Pullback Stage 3' },
+            dexId: 'pumpswap',
+            pairCreatedAt: Date.now() - 6 * 60_000,
+            priceUsd: String(pullbackStage3Px),
+            liquidity: { usd: 35000 },
+            volume: { m5: 10000 },
+            txns: { m5: { buys: 25, sells: 9 } },
+            priceChange: { m5: 5 },
+          },
+        ];
+      }
+      if (url.includes(`rugcheck.xyz/v1/tokens/${mintMissingRc}/report`)) {
+        return null; // RugCheck hasn't indexed yet
+      }
+      if (url.includes(`rugcheck.xyz/v1/tokens/${mintHighDev}/report`)) {
+        return {
+          score_normalised: 12,
+          creator: 'DevHeavy111111111111111111111111111111111111',
+          creatorBalance: 0,
+          topHolders: [
+            { address: 'DevHeavy111111111111111111111111111111111111', owner: 'DevHeavy111111111111111111111111111111111111', pct: 12.5 },
+          ],
+          insiderNetworks: [],
+          risks: [],
+        };
+      }
+      if (url.includes(`rugcheck.xyz/v1/tokens/${mintPullback}/report`)) {
+        return { score_normalised: 10, insiderNetworks: [], insidersDetected: 0, risks: [] };
+      }
+      return null;
+    };
+
+    // Strict ON -> missing RugCheck yields PENDING (not SKIPPED), high dev yields SKIPPED
+    mgr.updateSettings({ pulse_strict_rugcheck: true });
+    const discStrict = await mgr.discoverPulseSignals({ force: true });
+    const rowNoRcStrict = discStrict.signals.find((s) => s.mint === mintMissingRc);
+    const rowHighDev = discStrict.signals.find((s) => s.mint === mintHighDev);
+    assert.equal(rowNoRcStrict?.status, 'PENDING');
+    assert.match(rowNoRcStrict?.skipReason || '', /Waiting RugCheck report/i);
+    assert.equal(rowHighDev?.status, 'SKIPPED');
+    assert.match(rowHighDev?.skipReason || '', /Dev holds/i);
+
+    // Strict OFF -> missing RugCheck yields AUTO_BUY
+    mgr.updateSettings({ pulse_strict_rugcheck: false });
+    const discOpen = await mgr.discoverPulseSignals({ force: true });
+    const rowNoRcOpen = discOpen.signals.find((s) => s.mint === mintMissingRc);
+    assert.equal(rowNoRcOpen?.status, 'AUTO_BUY');
+
+    // Stage 3 Pullback Dip tracking from observed peak
+    mgr.updateSettings({ pulse_stage3_require_pullback: true, pulse_stage3_pullback_pct: 10 });
+    const discPeak = await mgr.discoverPulseSignals({ force: true });
+    const rowAtPeak = discPeak.signals.find((s) => s.mint === mintPullback);
+    assert.equal(rowAtPeak?.status, 'PENDING');
+    assert.match(rowAtPeak?.skipReason || '', /dip/i);
+
+    pullbackStage3Px = 0.0085; // -15% drop from 0.01 peak despite +5% m5 candle
+    const discDipped = await mgr.discoverPulseSignals({ force: true });
+    const rowAfterDip = discDipped.signals.find((s) => s.mint === mintPullback);
+    assert.equal(rowAfterDip?.status, 'AUTO_BUY');
+
+    // 3. Python bot.py: transient missing RugCheck retry without blacklist/creator rug + Pulse fixed $2 sizing
+    const pyScript = [
+      'import sys, types, json, time',
+      'req = types.ModuleType("requests")',
+      'req.Session = lambda: None',
+      'sys.modules["requests"] = req',
+      'sys.path.insert(0, "sniper")',
+      'import bot',
+      `TMP_DIR = ${JSON.stringify(tmpDir)}`,
+      'bot._base_dir = lambda: TMP_DIR',
+      'now_ms = int(time.time() * 1000)',
+      'm_no_rc = "MintPyTransient1111111111111111111111111111"',
+      'creator_clean = "CreatorClean11111111111111111111111111111111"',
+      'pair_rc = {"baseToken": {"address": m_no_rc, "symbol": "ERLOCK"}, "dexId": "pumpswap", "priceUsd": "0.002", "pairCreatedAt": now_ms - 180000, "liquidity": {"usd": 25000}, "volume": {"m5": 9000}, "txns": {"m5": {"buys": 20, "sells": 8}}, "_pumpportal": {"creator": creator_clean, "curve_pct": 100.0, "migrated": True}, "_pulse_signal": {"mint": m_no_rc, "symbol": "ERLOCK", "stage": "stage3", "source": "Axiom/GMGN Stage 3", "riskScore": 15, "status": "AUTO_BUY"}}',
+      'bot._rpc_mint_account_info = lambda *a, **k: {"decimals": 6, "supply_ui": 1_000_000_000.0, "mint_auth": False, "freeze_auth": False, "disallowed_extensions": []}',
+      'bot._check_sell_route = lambda *a, **k: (True, "ok")',
+      'bot._resolve_creator_via_rpc = lambda *a, **k: creator_clean',
+      'bot._rpc_top_holders = lambda *a, **k: (18.0, 4.0)',
+      'bot._rpc_owner_token_pct = lambda *a, **k: 0.0',
+      'bot._fetch_rugcheck_report = lambda m: None',
+      'cfg_open = {**bot.DEFAULT_CFG, "smart_money_scan_mode": "pulse_only", "pulse_strict_rugcheck": False}',
+      'cfg_strict = {**bot.DEFAULT_CFG, "smart_money_scan_mode": "pulse_only", "pulse_strict_rugcheck": True}',
+      'ok_open, why_open = bot.hard_rug_check(m_no_rc, cfg_open, 180.0, pair=pair_rc)',
+      'ok_strict, why_strict = bot.hard_rug_check(m_no_rc, cfg_strict, 180.0, pair=pair_rc)',
+      'hist = bot._load_creator_history()',
+      'creator_rugged = bool((hist.get(creator_clean) or {}).get(m_no_rc, {}).get("rugged"))',
+      // Verify transient cache TTL is ~20s (not 15m = 900s)
+      'strict_cache_age = None',
+      'for ck, (cts, cval) in bot._rug_cache.items():',
+      '    if ck.startswith(m_no_rc + ":") and not cval[0]:',
+      '        strict_cache_age = time.time() - cts',
+      // Verify scan_and_buy puts transient rug errors into _transient_rug_cooldown without blacklisting or symbol cooldown
+      'acct = bot.TradingAccount(cfg_strict, mode="paper")',
+      'bot._transient_rug_cooldown.clear()',
+      'bot._rejected_symbol_cooldown.clear()',
+      'bot._evaluate_sol_regime = lambda c: {"action": "ok", "size_mult": 1.0}',
+      'bot._evaluate_streak_throttle = lambda a, c: {"action": "ok", "size_mult": 1.0}',
+      'bot._ws_pulse_signals[m_no_rc] = pair_rc["_pulse_signal"]',
+      'bot._pulse_pairs[m_no_rc] = pair_rc',
+      'bot.fetch_candidate_mints = lambda c: [m_no_rc]',
+      'bot.get_json = lambda url, **k: [pair_rc] if "tokens/v1/solana" in url else None',
+      'bot.scan_and_buy(acct, cfg_strict)',
+      'in_blacklist = m_no_rc in acct.state.get("blacklist", [])',
+      'in_transient_cd = m_no_rc in bot._transient_rug_cooldown',
+      'in_sym_cd = "ERLOCK" in bot._rejected_symbol_cooldown',
+      // Verify pulse_conviction_sizing=False uses exact pulse_trade_size_usd ($2.00) even when smart_buyers/high vol present
+      'bot._transient_rug_cooldown.clear()',
+      'bot._rug_cache.clear()',
+      'm_exact = "MintPyPulseBuyExact11111111111111111111111"',
+      'pair_buy = {**pair_rc, "baseToken": {"address": m_exact, "symbol": "EXACT2"}, "_smart_buyers": ["W1", "W2"], "liquidity": {"usd": 45000}, "volume": {"m5": 35000}, "txns": {"m5": {"buys": 80, "sells": 15}}, "_pulse_signal": {**pair_rc["_pulse_signal"], "mint": m_exact, "symbol": "EXACT2"}}',
+      'bot._ws_pulse_signals[m_exact] = pair_buy["_pulse_signal"]',
+      'bot._pulse_pairs[m_exact] = pair_buy',
+      'acct_open = bot.TradingAccount({**cfg_open, "pulse_trade_size_usd": 2.0, "pulse_conviction_sizing": False}, mode="paper")',
+      'bot.fetch_candidate_mints = lambda c: [m_exact]',
+      'bot.get_json = lambda url, **k: [pair_buy] if "tokens/v1/solana" in url else None',
+      'bot.get_sol_price_usd = lambda *a, **k: (150.0, time.time())',
+      'bot.scan_and_buy(acct_open, acct_open.cfg)',
+      'pos_exact = acct_open.state["positions"].get(m_exact, {})',
+      // Also verify pulse_conviction_sizing=True scales size > $2.00 on high-conviction coin
+      'm_conv = "MintPyPulseBuyConv111111111111111111111111"',
+      'pair_conv = {**pair_buy, "baseToken": {"address": m_conv, "symbol": "CONV2"}, "_pulse_signal": {**pair_buy["_pulse_signal"], "mint": m_conv, "symbol": "CONV2"}}',
+      'bot._ws_pulse_signals[m_conv] = pair_conv["_pulse_signal"]',
+      'bot._pulse_pairs[m_conv] = pair_conv',
+      'bot._rug_cache.clear()',
+      'acct_conv = bot.TradingAccount({**cfg_open, "pulse_trade_size_usd": 2.0, "pulse_conviction_sizing": True}, mode="paper")',
+      'bot.fetch_candidate_mints = lambda c: [m_conv]',
+      'bot.get_json = lambda url, **k: [pair_conv] if "tokens/v1/solana" in url else None',
+      'bot.scan_and_buy(acct_conv, acct_conv.cfg)',
+      'pos_conv = acct_conv.state["positions"].get(m_conv, {})',
+      'print(json.dumps({"ok_open": ok_open, "why_open": why_open, "ok_strict": ok_strict, "why_strict": why_strict, "creator_rugged": creator_rugged, "strict_cache_age": strict_cache_age, "in_blacklist": in_blacklist, "in_transient_cd": in_transient_cd, "in_sym_cd": in_sym_cd, "exact_cost": pos_exact.get("cost"), "conv_cost": pos_conv.get("cost")}))',
+    ].join('\n');
+
+    const rawPy = execFileSync('python3', ['-c', pyScript], { encoding: 'utf-8' });
+    const pyOut = JSON.parse(rawPy.trim().split('\n').pop() || '{}');
+    assert.equal(pyOut.ok_open, true);
+    assert.equal(pyOut.ok_strict, false);
+    assert.match(pyOut.why_strict, /no rugcheck report yet/i);
+    assert.equal(pyOut.creator_rugged, false);
+    assert.ok(typeof pyOut.strict_cache_age === 'number' && pyOut.strict_cache_age > 800, 'Transient error must use short ~20s TTL instead of 15m TTL');
+    assert.equal(pyOut.in_blacklist, false);
+    assert.equal(pyOut.in_transient_cd, true);
+    assert.equal(pyOut.in_sym_cd, false);
+    assert.ok(Math.abs((pyOut.exact_cost ?? 0) - 2.0) < 0.01, `Expected exact $2.00 Pulse buy size, got ${pyOut.exact_cost}`);
+    assert.ok((pyOut.conv_cost ?? 0) > 2.2, `Expected conviction-scaled >$2.20 Pulse buy size when enabled, got ${pyOut.conv_cost}`);
+  } finally {
+    pp.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 
 
